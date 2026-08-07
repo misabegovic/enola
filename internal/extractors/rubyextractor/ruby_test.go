@@ -2117,10 +2117,15 @@ end
 			names[f.Name] = f.Props["method"].(string)
 		}
 	}
+	// `on: :member` addresses the resource itself and takes :id; only a bare
+	// verb nests under the parent's :step_id. Verified against
+	// ActionDispatch::Routing::RouteSet on Rails 7.2, which serves
+	// GET /api/steps/:id/audit — this assertion previously read :step_id and
+	// was asserting an endpoint Rails does not serve.
 	for path, method := range map[string]string{
 		"/api/steps/:step_id/status":   "GET",
 		"/api/steps/:step_id/reset":    "POST",
-		"/api/steps/:step_id/audit":    "GET",
+		"/api/steps/:id/audit":         "GET",
 		"/api/steps/get_custom_fields": "GET",
 		"/api/steps/callback":          "POST",
 	} {

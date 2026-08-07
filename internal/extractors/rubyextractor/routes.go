@@ -96,17 +96,50 @@ type routeScope struct {
 	// resources declared inside a *plural* `resources` block must nest under; empty for
 	// namespace/scope/singular-resource scopes, which add no member id to their children.
 	memberParam string
+	// shallow records that an enclosing `resources` declared shallow: true.
+	// Rails scopes the flag lexically to everything nested inside, so it has to
+	// travel down the stack rather than be read off each call.
+	shallow bool
+	// dropParentMember marks a scope that suppresses the enclosing resource's
+	// member param: `member`/`collection` blocks address the resource itself
+	// rather than something nested under it.
+	dropParentMember bool
 }
 
-// buildPrefix constructs the current URL prefix from the scope stack.
+// buildPrefix constructs the current URL prefix from the scope stack,
+// materializing each resource's member param as it goes.
+//
+// The member param has to live here rather than be read off the innermost
+// scope by each caller, because anything may sit between a parent resource and
+// what it nests: `resources :companies do namespace :api do resources :sections
+// end end` is served at /companies/:company_id/api/sections. Reading the param
+// from the top of the stack loses it the moment a namespace or scope
+// intervenes — which is the shape a real monolith is full of.
 func buildPrefix(stack []routeScope) string {
-	var parts []string
-	for _, s := range stack {
-		if s.pathPrefix != "" {
-			parts = append(parts, s.pathPrefix)
+	var b strings.Builder
+	for i, s := range stack {
+		b.WriteString(s.pathPrefix)
+		if s.memberParam == "" {
+			continue
 		}
+		if i+1 < len(stack) && stack[i+1].dropParentMember {
+			continue
+		}
+		b.WriteString("/:" + s.memberParam)
 	}
-	return strings.Join(parts, "")
+	return b.String()
+}
+
+// collectionPrefix is the path of the innermost resource itself rather than of
+// something nested under it: what `on: :collection` and a `collection` block
+// address.
+func collectionPrefix(stack []routeScope) string {
+	if len(stack) == 0 {
+		return ""
+	}
+	trimmed := append([]routeScope{}, stack...)
+	trimmed[len(trimmed)-1].memberParam = ""
+	return buildPrefix(trimmed)
 }
 
 // restAction describes a single RESTful action.

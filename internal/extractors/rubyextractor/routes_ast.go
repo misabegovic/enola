@@ -34,7 +34,8 @@ func parseRouteFile(src []byte, relFile, initialPrefix string) ([]facts.Fact, ma
 	if initialPrefix != "" {
 		stack = []routeScope{{pathPrefix: initialPrefix}}
 	}
-	rw := &routeWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile), draws: map[string]string{}}
+	rw := &routeWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile),
+		draws: map[string]string{}, concerns: map[string]*sitter.Node{}}
 	rw.walk(tree.RootNode(), stack)
 	return rw.out, rw.draws
 }
@@ -47,6 +48,11 @@ type routeWalker struct {
 	// draws maps each draw(:pkg) delegation found in this file to the URL prefix it
 	// is scoped under, so the caller can parse config/routes/<pkg>.rb with it.
 	draws map[string]string
+	// concerns holds each `concern :name do ... end` body so a later
+	// `concerns: :name` can replay it in the scope that includes it. Rails
+	// requires the definition to precede its use, so a single forward pass is
+	// enough and a missing name resolves to nothing rather than to a guess.
+	concerns map[string]*sitter.Node
 }
 
 // walk iterates the statements of a program / body_statement, dispatching each
@@ -94,12 +100,17 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// /steps/:step_id/status), as does `on: :member`; only `on: :collection`
 		// stays at the collection path. Explicit member/collection blocks push
 		// their own scope, whose memberParam is empty, so nothing doubles.
-		if len(stack) > 0 {
-			if mp := stack[len(stack)-1].memberParam; mp != "" {
-				if pairSymbol(args, "on", rw.src) != "collection" {
-					path = "/:" + mp + path
-				}
-			}
+		// Rails distinguishes three placements inside a `resources` block and
+		// they do not agree on the parameter name. A bare verb nests under the
+		// parent member id (`/steps/:step_id/status`), which buildPrefix has
+		// already supplied; `on: :member` addresses the resource itself and
+		// uses `:id` (`/steps/:id/audit`); `on: :collection` stays at the
+		// collection path.
+		switch pairSymbol(args, "on", rw.src) {
+		case "collection":
+			prefix = collectionPrefix(stack)
+		case "member":
+			prefix = collectionPrefix(stack) + "/:id"
 		}
 		props := map[string]any{
 			"method":    strings.ToUpper(method),
@@ -142,13 +153,14 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// member (`/widgets/:widget_id/...`); the parent supplies that param via the
 		// enclosing scope's memberParam. parentScopePrefix is the parent resource's own
 		// path segment, needed to compute the shallow path below.
-		parentMember := ""
-		parentScopePrefix := ""
+		// buildPrefix has already materialized the enclosing resource's member
+		// param, so the segment must not repeat it. parentNesting is what a
+		// shallow member route strips back off.
+		parentNesting := ""
 		if len(stack) > 0 {
 			if p := stack[len(stack)-1].memberParam; p != "" {
-				parentMember = "/:" + p
+				parentNesting = stack[len(stack)-1].pathPrefix + "/:" + p
 			}
-			parentScopePrefix = stack[len(stack)-1].pathPrefix
 		}
 		// `path:` overrides the URL segment while the resource name still drives the
 		// props and the nested member param (Rails derives `:name_id` from the name).
@@ -156,7 +168,7 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		if p := pairString(args, "path", rw.src); p != "" {
 			segmentName = strings.Trim(p, "/")
 		}
-		segment := parentMember + "/" + segmentName
+		segment := "/" + segmentName
 		resourcePath := prefix + segment
 
 		// Rails `shallow: true` serves a nested plural resource's MEMBER routes
@@ -164,8 +176,14 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// and its member param are dropped — while the collection routes
 		// (index/create/new) stay nested. shallowBase is the prefix with the parent
 		// resource segment stripped, plus this resource's own segment.
-		shallow := !singular && parentMember != "" && pairBool(args, "shallow", rw.src)
-		shallowBase := strings.TrimSuffix(prefix, parentScopePrefix) + "/" + segmentName
+		// `shallow: true` is declared on the *parent* and applies to everything
+		// nested inside it, so it has to be inherited down the stack rather than
+		// read only off this call. Reading it locally means the common spelling —
+		// `resources :posts, shallow: true do resources :comments end` — never
+		// takes effect on the resource it was written for.
+		shallow := !singular && parentNesting != "" &&
+			(pairBool(args, "shallow", rw.src) || inheritedShallow(stack))
+		shallowBase := strings.TrimSuffix(prefix, parentNesting) + "/" + segmentName
 
 		actions := restfulActions(only, except)
 		if singular {
@@ -184,13 +202,27 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 				"action":    a.name,
 			})
 		}
-		if body != nil {
-			// A plural resource exposes a member id to its children; a singular one does not.
-			childMember := ""
-			if !singular {
-				childMember = singularize(name) + "_id"
+		// A plural resource exposes a member id to its children; a singular one does not.
+		childMember := ""
+		if !singular {
+			childMember = singularize(name) + "_id"
+		}
+		childScope := append(stack, routeScope{
+			pathPrefix:  segment,
+			memberParam: childMember,
+			shallow:     pairBool(args, "shallow", rw.src) || inheritedShallow(stack),
+		})
+		// `resources :folders, concerns: :archivable` replays the concern's routes
+		// inside this resource, exactly as if they had been written in its block.
+		// The common spelling carries no block at all, so this must sit outside
+		// the body guard rather than inside it.
+		for _, included := range symbolValues(findPairValue(args, "concerns", rw.src), rw.src) {
+			if defined := rw.concerns[included]; defined != nil {
+				rw.walk(defined, childScope)
 			}
-			rw.walk(body, append(stack, routeScope{pathPrefix: segment, memberParam: childMember}))
+		}
+		if body != nil {
+			rw.walk(body, childScope)
 		}
 
 	case "match":
@@ -231,8 +263,8 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// `path:` overrides the URL segment (module stays the symbol name), e.g.
 		// `namespace :admin, path: 'administration'`.
 		pathSeg := "/" + name
-		if p := pairString(args, "path", rw.src); p != "" {
-			if !strings.HasPrefix(p, "/") {
+		if p, present := pairStringPresent(args, "path", rw.src); present {
+			if p != "" && !strings.HasPrefix(p, "/") {
 				p = "/" + p
 			}
 			pathSeg = p
@@ -244,17 +276,20 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// positional string path or a `path:` keyword for the URL prefix, and `module:`
 		// for the controller namespace.
 		ns := routeScope{}
-		path := firstStringArg(args, rw.src)
+		// Only a *positional* string is a path. `scope module: "internal"` names
+		// a controller namespace and contributes no URL segment; reading its
+		// value as a path prefixes every route inside with /internal.
+		path, explicit := firstPositionalString(args, rw.src), false
 		if path == "" {
-			path = pairString(args, "path", rw.src)
+			path, explicit = pairStringPresent(args, "path", rw.src)
 		}
 		if path == "" {
 			// A bare positional symbol is a path prefix: `scope :users` == `scope
 			// path: 'users'`. (module: is a keyword pair, so it is not read here.)
 			path = firstSymbolArg(args, rw.src)
 		}
-		if path != "" {
-			if !strings.HasPrefix(path, "/") {
+		if path != "" || explicit {
+			if path != "" && !strings.HasPrefix(path, "/") {
 				path = "/" + path
 			}
 			ns.pathPrefix = path
@@ -266,13 +301,30 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			rw.walk(body, append(stack, ns))
 		}
 
+	case "concern":
+		// `concern :name do ... end` defines routes to be replayed wherever the
+		// concern is included; it declares nothing on its own.
+		if name := firstSymbolArg(args, rw.src); name != "" && body != nil {
+			rw.concerns[name] = body
+		}
+
+	case "concerns":
+		// `concerns :a, :b` includes them at this point in the current scope.
+		for _, name := range positionalSymbols(args, rw.src) {
+			if included := rw.concerns[name]; included != nil {
+				rw.walk(included, stack)
+			}
+		}
+
 	case "member", "collection":
 		memberPrefix := ""
 		if method == "member" {
 			memberPrefix = "/:id"
 		}
 		if body != nil {
-			rw.walk(body, append(stack, routeScope{pathPrefix: memberPrefix}))
+			rw.walk(body, append(stack, routeScope{
+				pathPrefix: memberPrefix, dropParentMember: true,
+			}))
 		}
 
 	case "draw":
@@ -370,10 +422,20 @@ func expandOptionalSegments(path string) []string {
 
 // pairString returns the string content of a `key: "value"` pair.
 func pairString(args *sitter.Node, key string, src []byte) string {
-	if v := findPairValue(args, key, src); v != nil {
-		return firstStringArg(v, src)
+	value, _ := pairStringPresent(args, key, src)
+	return value
+}
+
+// pairStringPresent distinguishes `path: ""` from no `path:` at all. Rails
+// treats the empty string as a real override — `namespace :app, path: ""`
+// mounts at the root and contributes no segment — so a caller that cannot tell
+// the two apart falls back to the namespace name and invents a segment.
+func pairStringPresent(args *sitter.Node, key string, src []byte) (string, bool) {
+	v := findPairValue(args, key, src)
+	if v == nil {
+		return "", false
 	}
-	return ""
+	return firstStringArg(v, src), true
 }
 
 // pairSymbol returns the symbol name of a `key: :value` pair.
@@ -434,4 +496,57 @@ func findPairValue(args *sitter.Node, key string, src []byte) *sitter.Node {
 		}
 	}
 	return nil
+}
+
+// inheritedShallow reports whether any enclosing scope declared shallow
+// nesting. Rails scopes it lexically, so the flag is a property of the
+// surrounding block rather than of the call that happens to read it.
+func inheritedShallow(stack []routeScope) bool {
+	for _, scope := range stack {
+		if scope.shallow {
+			return true
+		}
+	}
+	return false
+}
+
+// firstPositionalString returns the first *direct* string argument, ignoring
+// keyword pairs entirely.
+//
+// firstStringArg recurses into the whole argument node, so for
+// `scope module: "internal"` it returns "internal" — the value of a keyword
+// that names a controller namespace, not a URL segment. Reading it as a path
+// prefixes every route in the block with a segment Rails never serves.
+func firstPositionalString(args *sitter.Node, src []byte) string {
+	if args == nil {
+		return ""
+	}
+	for i := uint(0); i < args.ChildCount(); i++ {
+		child := args.Child(i)
+		if child.Kind() != "string" {
+			continue
+		}
+		for j := uint(0); j < child.ChildCount(); j++ {
+			if child.Child(j).Kind() == "string_content" {
+				return rubyText(child.Child(j), src)
+			}
+		}
+	}
+	return ""
+}
+
+// positionalSymbols returns the direct symbol arguments of a call, ignoring
+// keyword pairs: the `:a, :b` of `concerns :a, :b`.
+func positionalSymbols(args *sitter.Node, src []byte) []string {
+	if args == nil {
+		return nil
+	}
+	var out []string
+	for i := uint(0); i < args.ChildCount(); i++ {
+		child := args.Child(i)
+		if child.Kind() == "simple_symbol" {
+			out = append(out, strings.TrimPrefix(rubyText(child, src), ":"))
+		}
+	}
+	return out
 }
