@@ -1,0 +1,60 @@
+# enola configuration for a Swift / iOS project.
+#
+# Detection: The Swift extractor activates when Package.swift, .xcodeproj,
+#            or .xcworkspace is present.
+# Features:  Classes, structs, enums, protocols, extensions, actors,
+#            SwiftUI views (View, App, Scene), UIKit components,
+#            Combine ViewModels (ObservableObject, @Observable),
+#            architectural patterns (Repositories, Use Cases, Coordinators,
+#            Services, DI Containers), @MainActor annotations.
+
+repo: "."
+ignore:
+  # Dependencies and tooling
+  - ".git/**"
+  - ".enola/**"
+  # Swift / Xcode build and cache
+  - "DerivedData/**"
+  - "**/DerivedData/**"
+  - "*.xcodeproj/**"
+  - "*.xcworkspace/**"
+  - "Pods/**"
+  - "**/Pods/**"
+  - ".build/**"
+  - "**/.build/**"
+  # SPM/Xcode build & package artifacts at any depth (basename match — the
+  # **/x/** form above only catches top-level occurrences), plus timestamped
+  # backup dirs like .build.bak-YYYYMMDD / .swiftpm.bak-YYYYMMDD.
+  - "**/.build"
+  - "**/.swiftpm"
+  - "**/*.bak-*"
+  # Tests
+  - "**/*Tests.swift"
+  - "**/*Test.swift"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+extractors:
+  - swift
+# explainers: / renderers: are deliberately absent.
+#
+# A list-valued key REPLACES the built-in list rather than extending it, so naming
+# a subset here silently disables everything that ships beyond it — this file used
+# to pin four explainers, turning off the other six (god-class, hotspots,
+# unused-routes, dependency-depth, exported-surface, complexity-outliers) for anyone
+# who adopted it. Omitting the keys means new plugins arrive automatically.
+output:
+  dir: ".enola"
+  max_context_tokens: 16000

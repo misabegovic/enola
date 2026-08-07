@@ -1,0 +1,117 @@
+# enola configuration for cross-repo analysis.
+#
+# This config enables all extractors so it works regardless of which
+# languages each repository uses. There are two ways to build the combined
+# snapshot; they produce the same graph.
+#
+# A. Name the cluster here, and index it in one command:
+#
+#      enola --generate examples/multi-repo.yaml
+#
+#    Uncomment `repos:` below. Entries resolve relative to THIS FILE, not to
+#    your working directory, so the config can be checked in and means the
+#    same thing on a laptop and in CI. Order is semantic: the first entry
+#    resets the graph and the rest are added to it.
+#
+# B. Drive it from your agent, one repo at a time:
+#
+#      1. > "Generate an architectural snapshot of /path/to/ruby-monolith"
+#      2. > "Generate a snapshot of /path/to/go-service with append mode"
+#
+# Then query across repos:
+#      > "Query all route facts"                      (all repos)
+#      > "Query all symbols in go-service"             (single repo)
+#
+# Each repo is tagged with a label derived from its directory name
+# (e.g. /path/to/go-service -> "go-service"). File paths in the
+# fact store are prefixed with the repo label in multi-repo mode.
+#
+# Cross-repo edges, `coverage_report` and unused-route findings only exist
+# with two or more repos loaded — which is what either route above gives you.
+
+repo: "."
+
+# repos:
+#   - ../ruby-monolith
+#   - ../go-service
+#   - ../web-client
+ignore:
+  # Dependencies and tooling
+  - "vendor/**"
+  - "node_modules/**"
+  - ".git/**"
+  - ".enola/**"
+  # Go tests
+  - "**/*_test.go"
+  # TypeScript tests
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.spec.ts"
+  - "**/*.spec.tsx"
+  # Kotlin / Android build and cache
+  - "build/**"
+  - "**/build/**"
+  - ".gradle/**"
+  - "**/.gradle/**"
+  - "**/generated/**"
+  - "**/*Test.kt"
+  - "**/androidTest/**"
+  # Swift / Xcode build and cache
+  - "DerivedData/**"
+  - "**/DerivedData/**"
+  - "*.xcodeproj/**"
+  - "*.xcworkspace/**"
+  - "Pods/**"
+  - "**/Pods/**"
+  - ".build/**"
+  - "**/.build/**"
+  - "**/*Tests.swift"
+  - "**/*Test.swift"
+  # Ruby / Rails
+  - "**/spec/**/*_spec.rb"
+  - "**/test/**/*_test.rb"
+  - "tmp/**"
+  - "log/**"
+  - "public/assets/**"
+  - "public/packs/**"
+  # Next.js / build and cache
+  - ".next/**"
+  - "out/**"
+  - ".vercel/**"
+  - ".turbo/**"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+# extractors: / explainers: / renderers: are all deliberately absent.
+#
+# A list-valued key REPLACES the built-in list rather than extending it, so naming
+# a subset here silently disables everything that ships beyond it — this file used
+# to pin four explainers, turning off the other six (god-class, hotspots,
+# unused-routes, dependency-depth, exported-surface, complexity-outliers) for anyone
+# who adopted it. Omitting the keys means new plugins arrive automatically.
+#
+# `extractors:` was the same mistake, and worse here than anywhere else. This file
+# pinned five languages while its own header promised it "enables all extractors so
+# it works regardless of which languages each repository uses" — so a cluster
+# containing a PHP, Rust, Python, Java or C++ repository indexed it as though the
+# language were unsupported. A cluster config is the one place you cannot know in
+# advance which languages will turn up, which is exactly why it must not guess.
+#
+# The per-language examples (go.yaml, ruby.yaml, …) DO pin one extractor, and that
+# is correct: naming the language is the entire point of those files. The rule is
+# "pin a plugin list only when the list is the reason the file exists".
+output:
+  dir: ".enola"
+  max_context_tokens: 16000

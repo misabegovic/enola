@@ -1,0 +1,72 @@
+# enola configuration for a Python project.
+#
+# Detection: The Python extractor activates when any of the following are found
+#            at the repo root or up to 3 subdirectory levels deep (for monorepos):
+#            pyproject.toml, setup.py, requirements.txt, Pipfile,
+#            pytest.ini, mypy.ini, tox.ini, setup.cfg
+#
+# Features:  Classes (with base class / RelImplements edges, generic params stripped),
+#            functions and methods (sync and async), indentation-based scope tracking
+#            for nested classes, imports (bare import and from...import),
+#            FastAPI / Starlette route decorators (@router.get/post/put/delete/...),
+#            SQLAlchemy __tablename__ storage facts, multi-line docstring skipping.
+
+repo: "."
+ignore:
+  # Dependencies and tooling
+  - ".git/**"
+  - ".enola/**"
+  - "__pycache__/**"
+  - "**/__pycache__/**"
+  - ".venv/**"
+  - "**/.venv/**"
+  - "venv/**"
+  - "**/venv/**"
+  # Definitive catch for any oddly-named env (conda/direnv/.tox/.nox all nest one).
+  - "**/site-packages/**"
+  - ".tox/**"
+  - "**/.tox/**"
+  - "**/.nox/**"
+  - ".mypy_cache/**"
+  - "**/.mypy_cache/**"
+  - ".pytest_cache/**"
+  - "**/.pytest_cache/**"
+  - "*.egg-info/**"
+  - "**/*.egg-info/**"
+  - "dist/**"
+  - "build/**"
+  # Tests
+  - "**/test_*.py"
+  - "**/*_test.py"
+  - "**/tests/**"
+  - "**/test/**"
+  - "**/conftest.py"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+  # Alembic migrations (generated SQL — low signal)
+  - "**/alembic/**"
+  - "**/migrations/**"
+extractors:
+  - python
+# explainers: / renderers: are deliberately absent.
+#
+# A list-valued key REPLACES the built-in list rather than extending it, so naming
+# a subset here silently disables everything that ships beyond it — this file used
+# to pin four explainers, turning off the other six (god-class, hotspots,
+# unused-routes, dependency-depth, exported-surface, complexity-outliers) for anyone
+# who adopted it. Omitting the keys means new plugins arrive automatically.
+output:
+  dir: ".enola"
+  max_context_tokens: 16000

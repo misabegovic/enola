@@ -1,0 +1,149 @@
+repo: "."
+ignore:
+  # Dependencies and tooling
+  # Any-depth forms: a monorepo's sub-app carries its own node_modules/dist,
+  # and root-anchored globs let a nested tree straight into the graph (a
+  # production monolith's sub-app node_modules contributed ~880k facts).
+  - "**/vendor/**"
+  - "**/node_modules/**"
+  - "**/.git/**"
+  - "**/dist/**"
+  - "**/build/**"
+  - "**/tmp/**"
+  - "**/public/assets/**"
+  - ".enola/**"
+  # Go reserves testdata/ for fixtures and never compiles it. Fixture repos are
+  # miniature codebases, so indexing them injects their routes and client call
+  # sites into the host repo's graph. Kept in sync with config.Default().
+  - "**/testdata/**"
+  # Python virtual environments, installed dependencies, and tool caches. A
+  # repo-local .venv/venv holds the whole dependency tree (thousands of
+  # third-party .py files) and must never be indexed — it dominates snapshot
+  # time. site-packages is the definitive catch for any oddly-named env
+  # (.tox/.nox/conda/direnv all nest one). Kept in sync with config.Default().
+  - "**/.venv/**"
+  - "**/venv/**"
+  - "**/site-packages/**"
+  - "**/.tox/**"
+  - "**/.nox/**"
+  - "**/.eggs/**"
+  - "**/__pycache__/**"
+  - "**/.mypy_cache/**"
+  - "**/.pytest_cache/**"
+  - "**/.ruff_cache/**"
+  # Tests
+  - "**/*_test.go"
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.spec.ts"
+  - "**/*.spec.tsx"
+  # Ember's convention is a HYPHENATED suffix under tests/ (ember-cli generates
+  # and qunit discovers tests/**/*-test.*). The directory is demanded for the
+  # same reason as Ruby's below: a bare "**/*-test.ts" also swallows production
+  # code that merely ends in the token (an experimentation util named ab-test.ts).
+  - "**/tests/**/*-test.js"
+  - "**/tests/**/*-test.ts"
+  - "**/tests/**/*-test.gjs"
+  - "**/tests/**/*-test.gts"
+  # Ruby has no co-located test convention (RSpec requires spec/, Minitest
+  # defaults to test/), so these demand the directory as well as the filename: a
+  # bare "**/*_test.rb" also swallows production code that merely ends in the
+  # token. Kept in sync with config.Default().
+  - "**/spec/**/*_spec.rb"
+  - "**/test/**/*_test.rb"
+  # Python. A pytest fixture that assembles a throwaway app is a route-mount
+  # fact, and the repo-wide prefix fixpoint folds every mount it can see — so a
+  # test-only prefix rewrites production routes. conftest.py and the test_ prefix
+  # are pytest-reserved; a whole tests/ tree goes too, since fixtures and
+  # factories carry no test_ prefix. Kept in sync with config.Default().
+  - "**/conftest.py"
+  - "**/test_*.py"
+  - "**/tests/**/*.py"
+  - "**/test/**/*.py"
+  # Next.js / build and cache
+  - ".next/**"
+  - "out/**"
+  - ".vercel/**"
+  - ".turbo/**"
+  - "dist/**"
+  - "coverage/**"
+  - ".nuxt/**"
+  - ".svelte-kit/**"
+  # Rust / Maven / Gradle build output, at any depth.
+  - "**/target/**"
+  # Minified / bundled JS (also detected heuristically by the extractor; kept in
+  # sync with config.Default() in internal/config/config.go)
+  - "**/*.min.js"
+  - "**/*.bundle.js"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data (YAML, JSON)
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Optional: Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+  # Kotlin / Android build and cache
+  - "build/**"
+  - "**/build/**"
+  - ".gradle/**"
+  - "**/.gradle/**"
+  - "**/generated/**"
+  # Kotlin tests
+  - "**/*Test.kt"
+  - "**/androidTest/**"
+  # Swift / Xcode build and cache
+  - "DerivedData/**"
+  - "**/DerivedData/**"
+  - "*.xcodeproj/**"
+  - "*.xcworkspace/**"
+  - "Pods/**"
+  - "**/Pods/**"
+  - ".build/**"
+  - "**/.build/**"
+  # SPM/Xcode build & package artifacts at any depth (basename match — the
+  # **/x/** form above only catches top-level occurrences), plus timestamped
+  # backup dirs like .build.bak-YYYYMMDD / .swiftpm.bak-YYYYMMDD.
+  - "**/.build"
+  - "**/.swiftpm"
+  - "**/*.bak-*"
+  # Swift tests
+  - "**/*Tests.swift"
+  - "**/*Test.swift"
+  # Ruby / Rails
+  - "**/spec/**/*_spec.rb"
+  - "**/test/**/*_test.rb"
+  - "tmp/**"
+  - "log/**"
+  - "public/assets/**"
+  - "public/packs/**"
+  # PHP tests (PHPUnit / Pest / Codeception). Excluded so test request
+  # simulations (e.g. Symfony WebTestCase `$client->request(...)`) are not
+  # indexed as production routes/clients, and the fact graph stays focused.
+  - "tests/**"
+  - "**/*Test.php"
+  - "**/*TestCase.php"
+  - "**/*Cest.php"
+# extractors: / explainers: / renderers: are deliberately ABSENT.
+#
+# Each of these keys REPLACES the built-in list rather than extending it, so a
+# file that merely mirrors config.Default() can do only one thing: fall behind it.
+# This file used to list eleven extractors, which silently disabled Rust for every
+# repository it governed from the day the Rust extractor landed — and because a
+# config beside the binary also applies to repositories elsewhere, that reached far
+# past this one. Omitting the keys means new extractors, explainers and renderers
+# are picked up automatically.
+#
+# Set them only to genuinely narrow a run (e.g. `extractors: [go]` to index Go
+# alone). enola warns when an extractor you excluded would have detected the repo.
+output:
+  dir: ".enola"
+  max_context_tokens: 4000
+# incremental: true   # reuse each extractor's cached facts when its files are unchanged (default: true)

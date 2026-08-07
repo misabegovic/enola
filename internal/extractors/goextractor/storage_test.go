@@ -1,0 +1,321 @@
+package goextractor
+
+import (
+	"testing"
+
+	"github.com/enola-labs/enola/internal/facts"
+)
+
+func TestExtractStorage_CreateTable(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/db/tables.go": `package db
+
+const CreateUsersTable = ` + "`" + `
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(255) NOT NULL UNIQUE,
+    email VARCHAR(255) NOT NULL UNIQUE
+);` + "`" + `
+
+const CreateOrdersTable = ` + "`" + `
+CREATE TABLE orders (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL
+);` + "`" + `
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+
+	foundUsers := false
+	foundOrders := false
+	for _, s := range storage {
+		if s.Name == "users" && s.Props["storage_kind"] == "table" && s.Props["operation"] == "CREATE" {
+			foundUsers = true
+		}
+		if s.Name == "orders" && s.Props["storage_kind"] == "table" && s.Props["operation"] == "CREATE" {
+			foundOrders = true
+		}
+	}
+	if !foundUsers {
+		t.Error("expected storage fact for CREATE TABLE users")
+	}
+	if !foundOrders {
+		t.Error("expected storage fact for CREATE TABLE orders")
+	}
+}
+
+func TestExtractStorage_SelectQuery(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"internal/repo/user.go": `package repo
+
+import "database/sql"
+
+func GetUsers(db *sql.DB) {
+	query := "SELECT id, username FROM users WHERE active = 1"
+	_ = query
+}
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+
+	found := false
+	for _, s := range storage {
+		if s.Name == "users" && s.Props["operation"] == "SELECT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected storage fact for SELECT FROM users")
+	}
+}
+
+func TestExtractStorage_InsertUpdateDelete(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"internal/repo/orders.go": `package repo
+
+const insertOrder = "INSERT INTO orders (user_id, total) VALUES (?, ?)"
+const updateOrder = "UPDATE orders SET total = ? WHERE id = ?"
+const deleteOrder = "DELETE FROM orders WHERE id = ?"
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+
+	ops := make(map[string]bool)
+	for _, s := range storage {
+		if s.Name == "orders" {
+			ops[s.Props["operation"].(string)] = true
+		}
+	}
+	if !ops["INSERT"] {
+		t.Error("expected storage fact for INSERT INTO orders")
+	}
+	if !ops["UPDATE"] {
+		t.Error("expected storage fact for UPDATE orders")
+	}
+	if !ops["DELETE"] {
+		t.Error("expected storage fact for DELETE FROM orders")
+	}
+}
+
+func TestExtractStorage_RawStringLiteral(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"internal/repo/query.go": "package repo\n\nconst q = `SELECT * FROM bookings WHERE user_id = ?`\n",
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+
+	found := false
+	for _, s := range storage {
+		if s.Name == "bookings" && s.Props["operation"] == "SELECT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected storage fact for SELECT FROM bookings in raw string")
+	}
+}
+
+func TestExtractStorage_Dedup(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"internal/repo/user.go": `package repo
+
+const q1 = "SELECT id FROM users WHERE active = 1"
+const q2 = "SELECT name FROM users WHERE id = ?"
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+
+	selectCount := 0
+	for _, s := range storage {
+		if s.Name == "users" && s.Props["operation"] == "SELECT" {
+			selectCount++
+		}
+	}
+	if selectCount != 1 {
+		t.Errorf("expected 1 deduplicated SELECT storage fact for users, got %d", selectCount)
+	}
+}
+
+func TestExtractStorage_NoStorage(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/util.go": `package util
+
+func Add(a, b int) int {
+	return a + b
+}
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+	if len(storage) != 0 {
+		t.Errorf("expected 0 storage facts for non-storage file, got %d", len(storage))
+	}
+}
+
+// English prose is not SQL. `FROM <word>` is an ordinary English phrase, and every one of
+// these literals is real text from this repository's own help and error strings — each of
+// which used to become a `storage` fact for a table named `the`, `what`, `one` or `in`.
+//
+// This is the regression guard for a stricter promise than the other tests here make. A
+// false FINDING is an opinion a reader can weigh; a false FACT is part of the layer
+// everything else is computed from, and enola's central claim is that its facts are derived
+// rather than guessed. A regex reading prose as SQL is guessing.
+func TestExtractStorage_ProseIsNotSQL(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/cli/help.go": `package cli
+
+const (
+	shapeNote  = "the shape below comes from the parent commits each snapshot recorded"
+	orderNote  = "it says what happened next, never what came from what"
+	coverNote  = "telling a genuinely isolated service apart from one whose edges were lost"
+	graphNote  = "the revision it descends from in the graph, so those rows report movement"
+	whereNote  = "the delta from the previous snapshot, where the numbers moved"
+	updateNote = "update the baseline before you start, then check the diff after"
+)
+`,
+	})
+
+	if storage := findFactsByKind(ff, facts.KindStorage); len(storage) != 0 {
+		var names []string
+		for _, s := range storage {
+			names = append(names, s.Name)
+		}
+		t.Errorf("prose produced %d storage fact(s) %v — a fact enola cannot derive must not be invented",
+			len(storage), names)
+	}
+}
+
+// The other half of the same promise: real SQL must still be read, including the shapes the
+// gate could plausibly have broken — a multi-table join, a subquery, and a query spread over
+// several lines.
+func TestExtractStorage_RealSQLSurvivesTheProseGate(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"internal/repo/report.go": `package repo
+
+const joined = ` + "`" + `
+SELECT u.id, o.total
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE u.active = 1
+` + "`" + `
+
+const subquery = "SELECT * FROM accounts WHERE id IN (SELECT account_id FROM ledger)"
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+	got := map[string]bool{}
+	for _, s := range storage {
+		if s.Props["operation"] == "SELECT" {
+			got[s.Name] = true
+		}
+	}
+	// The multi-line query's FROM table and its JOIN target, and the subquery's inner
+	// table. A query names every table it reads, and a reader that stopped at FROM was
+	// describing a two-table join as a one-table read.
+	for _, want := range []string{"users", "orders", "accounts", "ledger"} {
+		if !got[want] {
+			t.Errorf("SELECT over %q was not extracted (got %v)", want, got)
+		}
+	}
+}
+
+// The reason JOIN is read from inside the FROM CLAUSE rather than from the literal.
+//
+// Grafana ships a 100 KB JSON schema as one Go string. Somewhere in it is the word SELECT,
+// and somewhere else — thousands of characters away, in unrelated prose — is "join time".
+// A literal-wide scan reports a table called `time`. Bounding the search to the span
+// between FROM and the clause that ends it means a distant word cannot attach to a query it
+// has nothing to do with.
+func TestExtractStorage_DistantWordsDoNotJoinAQuery(t *testing.T) {
+	filler := ""
+	for i := 0; i < 200; i++ {
+		filler += "documentation prose that goes on for a while and mentions nothing structural. "
+	}
+	ff := extractAll(t, map[string]string{
+		"pkg/schema/schema.go": `package schema
+
+const manifest = ` + "`" + `
+{"description":"you may SELECT a panel type here","fields":{"x":1}}
+` + filler + `
+you can join time series together before rendering them
+` + "`" + `
+`,
+	})
+
+	for _, s := range findFactsByKind(ff, facts.KindStorage) {
+		t.Errorf("a distant word was attached to an unrelated SELECT: table %q from %s", s.Name, s.File)
+	}
+}
+
+// A comment inside a query is prose surrounded by SQL, so it defeats every gate: the
+// literal really is SQL and the words in the comment are still English. Real example, from a
+// Grafana migration, which produced a table called `was`.
+func TestExtractStorage_CommentsInsideAQueryAreNotRead(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/db/migrate.go": `package db
+
+const sqlite = ` + "`" + `
+-- For SQLite we need to recreate the table with primary key. CREATE TABLE was
+-- generated by ".schema file" command after running migration.
+CREATE TABLE file_new (path TEXT PRIMARY KEY);
+` + "`" + `
+`,
+	})
+
+	got := map[string]bool{}
+	for _, s := range findFactsByKind(ff, facts.KindStorage) {
+		got[s.Name] = true
+	}
+	if got["was"] {
+		t.Error("a word from a SQL comment was read as a table")
+	}
+	if !got["file_new"] {
+		t.Errorf("the real CREATE TABLE was lost along with the comment (got %v)", got)
+	}
+}
+
+// `sql = "CREATE TABLE IF NOT EXISTS "` — the table name is appended separately, so the
+// literal ENDS after the keywords. Go's regexp is RE2 and has no atomic groups, so the
+// optional `IF NOT EXISTS` clause backtracks and the capture lands on the keyword itself.
+// Real code: Grafana's xorm does this in two places.
+func TestExtractStorage_CreateTablePrefixIsNotATable(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/db/dialect.go": `package db
+
+func prefix() string {
+	sql := "CREATE TABLE IF NOT EXISTS "
+	return sql
+}
+`,
+	})
+
+	for _, s := range findFactsByKind(ff, facts.KindStorage) {
+		t.Errorf("a SQL keyword was read as a table name: %q", s.Name)
+	}
+}
+
+func TestExtractStorage_AlterTable(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/db/migrations.go": `package db
+
+const migration = "ALTER TABLE users ADD COLUMN phone VARCHAR(20)"
+`,
+	})
+
+	storage := findFactsByKind(ff, facts.KindStorage)
+
+	found := false
+	for _, s := range storage {
+		if s.Name == "users" && s.Props["operation"] == "ALTER" && s.Props["storage_kind"] == "table" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected storage fact for ALTER TABLE users")
+	}
+}
