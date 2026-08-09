@@ -966,3 +966,71 @@ func walkIdx(ps []P) int {
 		t.Errorf("index-through-outer-var scaling_loop_depth = %d, want 1", got)
 	}
 }
+
+// callsOf returns the call targets recorded on one symbol.
+func callsOf(t *testing.T, files map[string]string, symbol string) []string {
+	t.Helper()
+	for _, f := range extractAll(t, files) {
+		if f.Kind != facts.KindSymbol || f.Name != symbol {
+			continue
+		}
+		var out []string
+		for _, r := range f.Relations {
+			if r.Kind == facts.RelCalls {
+				out = append(out, r.Target)
+			}
+		}
+		return out
+	}
+	t.Fatalf("no symbol %q extracted", symbol)
+	return nil
+}
+
+func hasCall(calls []string, want string) bool {
+	for _, c := range calls {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A generic call's callee is an IndexExpr, not a selector, so every call written
+// `api.Request[Task](…)` was dropped without a signal. aboard-cli routes its whole
+// API surface through two such helpers and emitted no call edge to either — while
+// `fmt.Sprintf` two lines below in the same closure came through.
+func TestGoCalls_GenericInstantiationIsACall(t *testing.T) {
+	calls := callsOf(t, map[string]string{
+		"internal/api/api.go": "package api\n\n" +
+			"func Request[T any](path string) (T, error) { var z T; return z, nil }\n" +
+			"func Fetch[K comparable, V any](path string) (V, error) { var z V; return z, nil }\n",
+		"internal/cli/tasks.go": "package cli\n\n" +
+			"import (\n\t\"fmt\"\n\n\t\"testmod/internal/api\"\n)\n\n" +
+			"func TasksCmd() string {\n" +
+			"\tenv, _ := api.Request[int](\"/me/tasks\")\n" +
+			"\tpair, _ := api.Fetch[string, int](\"/me/pairs\")\n" +
+			"\treturn fmt.Sprintf(\"%v %v\", env, pair)\n}\n",
+	}, "internal/cli.TasksCmd")
+
+	for _, want := range []string{"internal/api.Request", "internal/api.Fetch", "fmt.Sprintf"} {
+		if !hasCall(calls, want) {
+			t.Errorf("want %q among calls, got %v", want, calls)
+		}
+	}
+}
+
+// The fail-closed half. `a[i](…)` is a call out of a map or slice of funcs and is
+// syntactically identical to a single-argument instantiation; resolveChain turns a
+// bare identifier into <pkg>.<name>, so unwrapping it would draw a confident edge
+// to a real package-level variable rather than dangle.
+func TestGoCalls_UnqualifiedIndexCallIsNotAttributed(t *testing.T) {
+	calls := callsOf(t, map[string]string{
+		"internal/cli/dispatch.go": "package cli\n\n" +
+			"var Handlers = map[string]func() int{}\n\n" +
+			"func Dispatch(name string) int {\n\treturn Handlers[name]()\n}\n",
+	}, "internal/cli.Dispatch")
+
+	if hasCall(calls, "internal/cli.Handlers") {
+		t.Errorf("a map-of-funcs call must not become an edge to the map; got %v", calls)
+	}
+}

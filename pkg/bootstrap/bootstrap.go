@@ -49,6 +49,7 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/swiftextractor"
 	"github.com/enola-labs/enola/internal/extractors/tsextractor"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/linkers/binders/clientseam"
 	"github.com/enola-labs/enola/internal/linkers/binders/emberresolver"
 	"github.com/enola-labs/enola/internal/linkers/binders/grpcclientfqn"
 	"github.com/enola-labs/enola/internal/linkers/binders/grpcimpl"
@@ -410,6 +411,7 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 
 	// Register all OSS binders. Stage() decides when each runs relative to cross-repo
 	// linking, so the order here is presentation only — see plugin.Binder.
+	eng.RegisterBinder(clientseam.New())
 	eng.RegisterBinder(grpcclientfqn.New())
 	eng.RegisterBinder(emberresolver.New())
 	eng.RegisterBinder(grpcimpl.New())

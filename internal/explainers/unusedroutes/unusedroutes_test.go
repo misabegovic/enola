@@ -24,8 +24,18 @@ func TestExplain_FlagsCandidatesWithCaveat(t *testing.T) {
 		facts.Fact{Kind: facts.KindService, Name: "golf-ui", Repo: "golf-ui"},
 		flaggedRoute("golf", "/api/secret/cleanup", "POST"),
 		flaggedRoute("golf", "/api/legacy/export", "GET"),
-		// A called route (no flag) must not appear.
+		// A called route must not appear in the list, but must still count in the
+		// denominator — it carries the positive marker, which is what says the
+		// linker looked at it and found a caller. A route with neither marker is
+		// one the linker declined to evaluate (a UI route, a GraphQL operation, a
+		// generic path) and is excluded from both, because a proportion whose
+		// denominator includes unevaluated routes describes a population the
+		// numerator was never drawn from.
 		facts.Fact{Kind: facts.KindRoute, Name: "/api/items/{id}", Repo: "golf",
+			Props: map[string]any{"method": "GET", "role": "server",
+				"matched_by_clients": true}},
+		// Declined by the linker: present, served, and correctly outside the ratio.
+		facts.Fact{Kind: facts.KindRoute, Name: "/health", Repo: "golf",
 			Props: map[string]any{"method": "GET", "role": "server"}},
 	)
 
@@ -64,9 +74,13 @@ func TestExplain_CapsSamplesAndEvidence(t *testing.T) {
 	// Enough called routes that the unmatched share stays below the threshold at
 	// which the finding is about the client set rather than the endpoints. This
 	// test is about sample capping, and it must keep exercising that branch.
+	// They carry the positive marker: that is what says the linker evaluated
+	// them and found a caller, and only evaluated routes belong in the
+	// denominator.
 	for i := 0; i < 20; i++ {
 		store.Add(facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/api/called%02d", i), Repo: "golf",
-			Props: map[string]any{"method": "GET", "role": "server"}})
+			Props: map[string]any{"method": "GET", "role": "server",
+				"matched_by_clients": true}})
 	}
 
 	insights, err := New().Explain(context.Background(), store)
@@ -106,9 +120,11 @@ func TestExplain_MultipleReposSortedAndRoutesSorted(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		store.Add(
 			facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/api/zc%d", i), Repo: "zulu",
-				Props: map[string]any{"method": "GET", "role": "server"}},
+				Props: map[string]any{"method": "GET", "role": "server",
+					"matched_by_clients": true}},
 			facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/api/ac%d", i), Repo: "alpha",
-				Props: map[string]any{"method": "GET", "role": "server"}},
+				Props: map[string]any{"method": "GET", "role": "server",
+					"matched_by_clients": true}},
 		)
 	}
 
@@ -145,9 +161,12 @@ func TestExplain_NoMethodFallbackAndUnlabeledRepo(t *testing.T) {
 		// Called routes in the same bucket, so the unmatched share stays low
 		// enough that this stays a candidate list. The test is about the
 		// unlabeled-repo fallback and the missing-method label.
-		facts.Fact{Kind: facts.KindRoute, Name: "/api/called1", Props: map[string]any{"method": "GET"}},
-		facts.Fact{Kind: facts.KindRoute, Name: "/api/called2", Props: map[string]any{"method": "GET"}},
-		facts.Fact{Kind: facts.KindRoute, Name: "/api/called3", Props: map[string]any{"method": "GET"}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/called1",
+			Props: map[string]any{"method": "GET", "matched_by_clients": true}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/called2",
+			Props: map[string]any{"method": "GET", "matched_by_clients": true}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/called3",
+			Props: map[string]any{"method": "GET", "matched_by_clients": true}},
 	)
 
 	insights, err := New().Explain(context.Background(), store)
@@ -211,5 +230,38 @@ func TestExplain_ThinClientCoverageDescribesTheSnapshot(t *testing.T) {
 	}
 	if in.Confidence < 0.8 {
 		t.Errorf("the claim about coverage is a confident one: %v", in.Confidence)
+	}
+}
+
+// The count of routes nothing assessed is part of the finding, not a detail of
+// the implementation. "27 of 39 unused" and "27 of 39, with 827 more the pass
+// could not look at" describe very different repositories, and only the second
+// one is true of `insights`.
+func TestExplain_ReportsWhatWasNotAssessed(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindService, Name: "svc", Repo: "svc"},
+		flaggedRoute("svc", "/api/orders", "GET"),
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/items", Repo: "svc",
+			Props: map[string]any{"method": "GET", "role": "server", "matched_by_clients": true}},
+		// Neither marker: the linker declined to reason about these.
+		facts.Fact{Kind: facts.KindRoute, Name: "/health", Repo: "svc",
+			Props: map[string]any{"method": "GET", "role": "server"}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/dashboard", Repo: "svc",
+			Props: map[string]any{"method": "GET", "role": "server", "type": "page"}},
+	)
+
+	insights, err := New().Explain(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) != 1 {
+		t.Fatalf("expected 1 insight, got %d", len(insights))
+	}
+	if !strings.Contains(insights[0].Title, "1 of 2 route(s)") {
+		t.Errorf("the denominator must be the routes actually assessed, got %q", insights[0].Title)
+	}
+	if !strings.Contains(insights[0].Description, "A further 2 route(s)") {
+		t.Errorf("the unassessed count must appear in the finding, got %q", insights[0].Description)
 	}
 }

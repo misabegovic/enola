@@ -328,8 +328,8 @@ func TestNewer(t *testing.T) {
 		current, latest string
 		want            bool
 	}{
-		{"0.3.2", "0.3.12", true},   // not a string comparison: "0.3.12" < "0.3.2" lexically
-		{"0.3.12", "0.3.2", false},  // and the reverse must not fire either
+		{"0.3.2", "0.3.12", true},  // not a string comparison: "0.3.12" < "0.3.2" lexically
+		{"0.3.12", "0.3.2", false}, // and the reverse must not fire either
 		{"0.3.12", "0.3.12", false},
 		{"0.9.9", "1.0.0", true},
 		{"1.0.0", "0.9.9", false},

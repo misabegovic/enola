@@ -203,6 +203,42 @@ type rubyBodyMetrics struct {
 	// extractor states what it saw and the consumer joins it.
 	blockBindings []string
 	blockSeen     map[string]bool
+
+	// localTypes records `name=Class` for a variable assigned from a constant's
+	// factory or finder. It is the receiver information this graph has never
+	// had: 1,062 such assignments on the monolith, typing 1,238 association
+	// reads that currently resolve to nothing because `@meeting.candidates` and
+	// `client.post` are the same shape without it.
+	//
+	// Only a constant receiver types anything. `x = helper.build` says nothing
+	// about x, and guessing there is the name-coincidence failure that produced
+	// seven candidates and zero true findings.
+	localTypes []string
+	localSeen  map[string]bool
+}
+
+// typingMethods are the constant-receiver calls whose result is an instance of
+// that constant. A class method that returns something else — `Company.count`,
+// `Company.table_name` — types nothing.
+var typingMethods = map[string]bool{
+	"new": true, "find": true, "find_by": true, "find_by!": true,
+	"create": true, "create!": true, "first": true, "last": true,
+	"find_or_create_by": true, "find_or_initialize_by": true,
+}
+
+func (m *rubyBodyMetrics) recordLocalType(name, class string) {
+	if m == nil || name == "" || class == "" {
+		return
+	}
+	entry := name + "=" + class
+	if m.localSeen == nil {
+		m.localSeen = map[string]bool{}
+	}
+	if m.localSeen[entry] {
+		return
+	}
+	m.localSeen[entry] = true
+	m.localTypes = append(m.localTypes, entry)
 }
 
 func (m *rubyBodyMetrics) recordBlockBinding(param, collection string) {
@@ -695,6 +731,10 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 		sort.Strings(w.metrics.blockBindings)
 		props["block_bindings"] = w.metrics.blockBindings
 	}
+	if len(w.metrics.localTypes) > 0 {
+		sort.Strings(w.metrics.localTypes)
+		props["local_types"] = w.metrics.localTypes
+	}
 	if w.metrics.recursive {
 		props["recursive_self"] = true
 	}
@@ -958,6 +998,18 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 				// `u.posts` or `record.reload`). It is not a graph edge, but its method
 				// name feeds the perf metric so the enterprise analyzer can flag
 				// lazy-loaded association / per-iteration I/O (N+1).
+				//
+				// The RECEIVER is kept when it is a plain variable, and that is the
+				// whole difference between a name and an N+1. `form_questions.each { |q|
+				// q.form_answers }` is a query per iteration only because `q` is a
+				// FormQuestion; recording it as bare `form_answers` throws away the one
+				// thing that makes it decidable, and a consumer joining block bindings
+				// to association facts found exactly zero because of it. With the
+				// receiver, `q.form_answers` joins to `q=form_questions` and resolves.
+				if isVarReceiver(recv.Kind()) {
+					w.recordInLoopCall(rubyText(recv, w.src) + "." + name)
+					break
+				}
 				w.recordInLoopCall(name)
 			}
 		}
@@ -1019,6 +1071,18 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		// and handled before the generic descent because descending would walk
 		// the target as if it were a read — which is how the first version
 		// reported every write as a read.
+		// `x = Meeting.find(id)` types x as a Meeting for the rest of the body.
+		if left := node.ChildByFieldName("left"); left != nil &&
+			(left.Kind() == "identifier" || left.Kind() == "instance_variable") {
+			if right := node.ChildByFieldName("right"); right != nil && right.Kind() == "call" {
+				recv := right.ChildByFieldName("receiver")
+				meth := right.ChildByFieldName("method")
+				if recv != nil && meth != nil && recv.Kind() == "constant" &&
+					typingMethods[rubyText(meth, w.src)] {
+					w.metrics.recordLocalType(rubyText(left, w.src), rubyText(recv, w.src))
+				}
+			}
+		}
 		if left := node.ChildByFieldName("left"); left != nil && left.Kind() == "instance_variable" {
 			name := rubyText(left, w.src)
 			w.metrics.recordFieldAccess(name, true)

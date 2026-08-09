@@ -90,3 +90,51 @@ func TestNestedLoopsRankAbove(t *testing.T) {
 		t.Fatalf("a depth-2 query should rank above a depth-1 one:\n%s", out)
 	}
 }
+
+func assoc(model, name, target string) facts.Fact {
+	return facts.Fact{Kind: facts.KindAssociation, Name: model + "#" + name, Repo: "app",
+		Props: map[string]any{"model": model, "association": name, "target": target}}
+}
+
+func bound(name string, bindings, calls []string) facts.Fact {
+	return facts.Fact{Kind: facts.KindSymbol, Name: name, Repo: "app", File: "app/x.rb",
+		Props: map[string]any{"language": "ruby", "loop_depth": 1,
+			"block_bindings": bindings, "calls_in_loop": calls}}
+}
+
+// The shape everyone means by N+1, and the one that measured to zero true
+// findings before block bindings existed: an association read on the element of
+// a collection. `form_questions.each { |q| q.form_answers }` is a query per
+// iteration only because `q` is a FormQuestion — and the binding is what says so.
+func TestAnAssociationReadOnABoundElementIsReported(t *testing.T) {
+	out := titles(t, store(
+		assoc("Company", "form_questions", "FormQuestion"),
+		assoc("FormQuestion", "form_answers", "FormAnswer"),
+		bound("Report#build", []string{"q=form_questions"}, []string{"q.form_answers"})))
+	if !strings.Contains(out, "q.form_answers") {
+		t.Fatalf("the typed association read was not reported:\n%s", out)
+	}
+}
+
+// Without the binding the receiver is untyped, and `client.post` matching an
+// association named `post` on an unrelated model is exactly how the first
+// version produced seven candidates and zero true findings.
+func TestAnUnboundReceiverIsNotReported(t *testing.T) {
+	out := titles(t, store(
+		assoc("Blog", "post", "Post"),
+		bound("Poster#send", []string{"x=widgets"}, []string{"client.post"})))
+	if out != "" {
+		t.Fatalf("an untyped receiver was reported:\n%s", out)
+	}
+}
+
+// A method that is not an association on the bound element's type is a plain
+// call, not a query.
+func TestANonAssociationMethodOnABoundElementIsNotReported(t *testing.T) {
+	out := titles(t, store(
+		assoc("Company", "users", "User"),
+		bound("R#run", []string{"u=users"}, []string{"u.full_name"})))
+	if out != "" {
+		t.Fatalf("a non-association read was reported:\n%s", out)
+	}
+}

@@ -53,7 +53,7 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 	// read as a proportion. Without it a finding says "3,392 route(s) have no
 	// caller" and reads as 3,392 dead endpoints, when what it actually means is
 	// that the client set is incomplete.
-	served := map[string]int{}
+	served, declined := map[string]int{}, map[string]int{}
 	for _, f := range store.ByKind(facts.KindRoute) {
 		if f.Props == nil {
 			continue
@@ -61,9 +61,25 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		if role, _ := f.Props["role"].(string); role == "client" {
 			continue
 		}
+		// Only routes the linker actually evaluated. It declines, with reasons,
+		// to reason about UI routes, GraphQL operations, methodless routes and
+		// generic paths like /health — 3,471 of the estate's 9,135 server routes
+		// — and counting those in the denominator makes the proportion describe
+		// a population the numerator was never drawn from. A finding reading
+		// "3,391 of 4,403 unmatched" was mixing routes that were checked with
+		// routes that were never reached.
 		repo := f.Repo
 		if repo == "" {
 			repo = "(unlabeled)"
+		}
+		if f.Props["unmatched_by_clients"] != true && f.Props["matched_by_clients"] != true {
+			// Counted, not dropped. A route the linker declined belongs in the
+			// finding as a coverage fact — it is the difference between "39
+			// endpoints, 27 unused" and "39 of 866 endpoints could be assessed
+			// at all", and a reader who is not told the second will read the
+			// first as a statement about the repository.
+			declined[repo]++
+			continue
 		}
 		served[repo]++
 	}
@@ -99,6 +115,15 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		if total > 0 {
 			share = float64(len(routes)) / float64(total)
 		}
+		unexamined := ""
+		if declined[repo] > 0 {
+			unexamined = fmt.Sprintf(
+				" A further %d route(s) in %s were not assessed at all — page routes, GraphQL "+
+					"operations, routes with no HTTP verb and generic paths, which this pass "+
+					"declines to reason about. They are outside both counts above, and their "+
+					"use is unknown rather than absent.",
+				declined[repo], repo)
+		}
 
 		// When nearly everything is unmatched, the snapshot is telling you about
 		// its own client set rather than about the endpoints. Teamtailor reports
@@ -115,8 +140,8 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 						"At that proportion this describes the snapshot's client set, not the endpoints: an API "+
 						"whose callers are browsers, third-party integrators or apps outside the estate cannot "+
 						"be assessed this way. Add the missing client repositories and regenerate before reading "+
-						"any of these as dead.",
-					len(routes), repo, total, share*100),
+						"any of these as dead.%s",
+					len(routes), repo, total, share*100, unexamined),
 				Confidence: 0.9,
 				Actions: []string{
 					"Add the repositories that call this API and regenerate; the list is not meaningful until then",
@@ -131,8 +156,8 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			Description: fmt.Sprintf("%d of %s's %d server route(s) matched no client call site in any loaded repo. "+
 				"These are candidates unused by the loaded clients ONLY — the snapshot cannot see consumers it "+
 				"does not contain (admin/ops scripts, cron jobs, webhooks, third-party API clients, mobile deep "+
-				"links). Verify each against those before removing the endpoint. Samples: %s.",
-				len(routes), repo, total, sampleList(routes)),
+				"links). Verify each against those before removing the endpoint.%s Samples: %s.",
+				len(routes), repo, total, unexamined, sampleList(routes)),
 			Confidence: 0.6,
 			Evidence:   evidenceFor(routes),
 			Actions: []string{
