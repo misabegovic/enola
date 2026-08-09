@@ -1,6 +1,7 @@
 package tsextractor
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -55,13 +56,68 @@ func isHbsFile(path string) bool {
 	return strings.ToLower(filepath.Ext(path)) == ".hbs"
 }
 
-// detectEmber reports whether the repo declares ember-source, reusing the same
-// package.json primitive (and tsRoot + repo-root fallback) as Vue/Nuxt/ORM
-// detection.
+// detectEmber reports whether this repository contains an Ember application.
+//
+// It used to check only the TypeScript root and the repository root, which
+// misses the shape this estate actually has: an Ember application nested inside
+// a backend repository. Teamtailor's `ember_app/package.json` declares
+// ember-source and the repository root's does not — and because the root has a
+// package.json at all, findTSRoot returns the root and the fallback branch
+// never fires. The flag stayed false, and everything gated on it produced
+// nothing: 510 router declarations, 373 ember-data models and 1,363 classic
+// templates, all silently absent while 1,866 components extracted fine, because
+// a .gts file importing @glimmer/component needs no flag to be recognisable.
+//
+// The nested search is bounded and stops at the directories a JavaScript
+// project never keeps source in. A repository is Ember if any package.json it
+// contains says so.
 func detectEmber(repoPath string) bool {
 	tsRoot, _ := findTSRoot(repoPath)
-	return hasPkgDependency(tsRoot, "ember-source") ||
-		(tsRoot != repoPath && hasPkgDependency(repoPath, "ember-source"))
+	if hasPkgDependency(tsRoot, "ember-source") ||
+		(tsRoot != repoPath && hasPkgDependency(repoPath, "ember-source")) {
+		return true
+	}
+	return nestedPkgDeclares(repoPath, "ember-source", emberSearchDepth)
+}
+
+// emberSearchDepth is how deep a nested application may sit. Two levels covers
+// `ember_app/` and `frontend/app/`; deeper than that and the directory is not
+// the repository's frontend, it is a fixture or a vendored copy.
+const emberSearchDepth = 2
+
+// nestedPkgDeclares reports whether any package.json within depth levels of root
+// declares the dependency.
+func nestedPkgDeclares(root, dependency string, depth int) bool {
+	if depth <= 0 {
+		return false
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || skipForPkgSearch(entry.Name()) {
+			continue
+		}
+		child := filepath.Join(root, entry.Name())
+		if hasPkgDependency(child, dependency) {
+			return true
+		}
+		if nestedPkgDeclares(child, dependency, depth-1) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipForPkgSearch names the directories a JavaScript project never keeps its
+// own manifest in, so the walk does not wander into dependencies or fixtures.
+func skipForPkgSearch(name string) bool {
+	switch name {
+	case "node_modules", "vendor", "tmp", "dist", "build", "coverage", "spec", "test", "tests", "fixtures":
+		return true
+	}
+	return strings.HasPrefix(name, ".")
 }
 
 // emberTemplateSegment is one <template> block sliced out of a .gts/.gjs file.

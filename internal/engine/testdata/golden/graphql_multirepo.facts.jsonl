@@ -1,6 +1,7 @@
 {"kind":"dependency","name":"client -\u003e server","repo":"client","props":{"endpoint_count":1,"endpoints":["Query.pageViews"],"synthetic":"crossrepo","type":"cross_repo","via":["graphql"]}}
 {"kind":"dependency","name":"reporter -\u003e server","repo":"reporter","props":{"endpoint_count":2,"endpoints":["Query.company","Query.pageViews"],"synthetic":"crossrepo","type":"cross_repo","via":["graphql"]}}
 {"kind":"dependency","name":"src -\u003e graphql-tag","file":"client/src/stats.js","line":1,"repo":"client","props":{"language":"typescript","source":"external"},"relations":[{"kind":"imports","target":"graphql-tag"}]}
+{"kind":"extraction","name":"ruby:calls","file":"server/server","repo":"server","props":{"edge_coverage":[{"detected":3,"edge_type":"ruby_call","resolved":0,"unresolved":3}],"extractor":"ruby","language":"ruby","unresolved_macros":"unknown_constant=2,unqualified_method=1"}}
 {"kind":"file_ref","name":"src/stats.js","file":"client/src/stats.js","line":1,"repo":"client","props":{"language":"typescript"},"relations":[{"kind":"calls","target":"src.gql"}]}
 {"kind":"intent","name":"consumes server via graphql","file":"reporter/enola-intent.yaml","repo":"reporter","props":{"intent_kind":"consumes","source":"enola-intent.yaml","target":"server","via":"graphql"}}
 {"kind":"module","name":"app/graphql/types","file":"server/app/graphql/types","repo":"server","props":{"language":"ruby","module_role":"unknown"}}

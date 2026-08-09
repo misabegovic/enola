@@ -155,6 +155,21 @@ const (
 	RouteSourceGraphQLOperation  = "graphql-operation-file"
 	RouteSourceGraphQLRubyString = "graphql-ruby-string"
 	RouteSourceSymfonyConfig     = "symfony-config" // Symfony YAML/XML route config
+
+	// Scala. The Play routes file is a DSL of its own rather than Scala source, and
+	// declares a whole application's HTTP surface in one place; the other two are
+	// route trees written in Scala. sttp is the hand-written client call site.
+	RouteSourcePlayRoutes      = "play-routes"       // Play conf/routes and its included *.routes
+	RouteSourcePekkoHTTP       = "pekko-http"        // Pekko/Akka HTTP routing directives
+	RouteSourceHTTP4s          = "http4s"            // http4s HttpRoutes.of pattern match
+	RouteSourceScalaHTTPClient = "scala-http-client" // sttp / Play WS / http4s client
+
+	// Dart covers both spellings with one value, because both are hand-written
+	// requests and the linker has no reason to tell them apart: a package:http /
+	// dio call site, and a retrofit/chopper annotated interface method. The latter
+	// generates its implementation into a .g.dart the extractor excludes, so the
+	// annotation IS the call site as far as extraction is concerned.
+	RouteSourceDartHTTPClient = "dart-http-client"
 )
 
 // HandWrittenClientSources is the set of RouteSource values that mean "a human wrote
@@ -186,6 +201,8 @@ var HandWrittenClientSources = map[string]bool{
 	RouteSourceGoGRPCClient:      true,
 	RouteSourceTSGRPCClient:      true,
 	RouteSourcePythonGRPCClient:  true,
+	RouteSourceScalaHTTPClient:   true,
+	RouteSourceDartHTTPClient:    true,
 }
 
 // AllRouteSources is every registered RouteSource value. It exists for the conformance
@@ -213,6 +230,11 @@ var AllRouteSources = map[string]bool{
 	RouteSourceOpenAPI:           true,
 	RouteSourceOpenAPITypeScript: true,
 	RouteSourceSymfonyConfig:     true,
+	RouteSourcePlayRoutes:        true,
+	RouteSourcePekkoHTTP:         true,
+	RouteSourceHTTP4s:            true,
+	RouteSourceScalaHTTPClient:   true,
+	RouteSourceDartHTTPClient:    true,
 }
 
 // DepSource values — the PropSource prop on a KindDependency fact. A SECOND, unrelated
@@ -251,8 +273,18 @@ const (
 // swiftextractor names each module fact BY its target, so two modules never share
 // one, and a cycle between them really is a cycle between separately built units.
 var CompilationUnitProps = []string{
-	"crate",   // Rust: the Cargo crate a module directory belongs to
-	"project", // C#: the MSBuild project (assembly) a module directory belongs to
+	"crate",      // Rust: the Cargo crate a module directory belongs to
+	"project",    // C#: the MSBuild project (assembly) a module directory belongs to
+	"jvm_module", // Scala: the sbt/Maven/Gradle module a source directory compiles into
+	// Dart: the pub package a library belongs to. Dart is the most permissive case
+	// this table covers — where MSBuild and Cargo FORBID a cycle between units, Dart
+	// does not even forbid one between libraries INSIDE a unit: circular imports are
+	// legal, compile, and are common in practice (a model importing its repository
+	// while the repository imports the model). So a Dart cycle is never a build-order
+	// defect, and without this row the explainer would report a mutual import as
+	// something that "can cause initialization issues" — which for Dart is simply not
+	// true.
+	"pub_package",
 }
 
 // CompilationUnit returns the build unit a module fact belongs to, or "" when the

@@ -37,8 +37,8 @@ func TestExplain_FlagsCandidatesWithCaveat(t *testing.T) {
 		t.Fatalf("expected 1 per-repo insight, got %d: %+v", len(insights), insights)
 	}
 	in := insights[0]
-	if !strings.Contains(in.Title, "golf") || !strings.Contains(in.Title, "2 route") {
-		t.Errorf("title should name repo and count; got %q", in.Title)
+	if !strings.Contains(in.Title, "golf") || !strings.Contains(in.Title, "2 of 3 route") {
+		t.Errorf("title should name repo, unmatched count and total; got %q", in.Title)
 	}
 	// The mandatory out-of-snapshot caveat must be present.
 	for _, want := range []string{"loaded clients ONLY", "webhooks", "Verify"} {
@@ -61,6 +61,13 @@ func TestExplain_CapsSamplesAndEvidence(t *testing.T) {
 	for i := 0; i < n; i++ {
 		store.Add(flaggedRoute("golf", fmt.Sprintf("/api/ep%02d", i), "POST"))
 	}
+	// Enough called routes that the unmatched share stays below the threshold at
+	// which the finding is about the client set rather than the endpoints. This
+	// test is about sample capping, and it must keep exercising that branch.
+	for i := 0; i < 20; i++ {
+		store.Add(facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/api/called%02d", i), Repo: "golf",
+			Props: map[string]any{"method": "GET", "role": "server"}})
+	}
 
 	insights, err := New().Explain(context.Background(), store)
 	if err != nil {
@@ -71,8 +78,8 @@ func TestExplain_CapsSamplesAndEvidence(t *testing.T) {
 	}
 	in := insights[0]
 	// The title counts ALL flagged routes, not just the sampled ones.
-	if !strings.Contains(in.Title, fmt.Sprintf("%d route", n)) {
-		t.Errorf("title should report full count %d, got %q", n, in.Title)
+	if !strings.Contains(in.Title, fmt.Sprintf("%d of 50 route", n)) {
+		t.Errorf("title should report full count %d and the total, got %q", n, in.Title)
 	}
 	// Samples are truncated with a "+N more" marker.
 	if !strings.Contains(in.Description, "(+5 more)") {
@@ -93,6 +100,17 @@ func TestExplain_MultipleReposSortedAndRoutesSorted(t *testing.T) {
 		flaggedRoute("zulu", "/api/z1", "GET"),
 		flaggedRoute("alpha", "/api/a1", "POST"),
 	)
+	// Called routes keep each repo's unmatched share below the point at which the
+	// finding becomes one about the client set. This test is about ordering and
+	// evidence keying, and it has to keep exercising that branch.
+	for i := 0; i < 4; i++ {
+		store.Add(
+			facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/api/zc%d", i), Repo: "zulu",
+				Props: map[string]any{"method": "GET", "role": "server"}},
+			facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/api/ac%d", i), Repo: "alpha",
+				Props: map[string]any{"method": "GET", "role": "server"}},
+		)
+	}
 
 	insights, err := New().Explain(context.Background(), store)
 	if err != nil {
@@ -124,6 +142,12 @@ func TestExplain_NoMethodFallbackAndUnlabeledRepo(t *testing.T) {
 		facts.Fact{Kind: facts.KindService, Name: "svc", Repo: "svc"},
 		// No Repo label -> "(unlabeled)" bucket; no method prop -> label is the bare name.
 		facts.Fact{Kind: facts.KindRoute, Name: "/api/loose", Props: map[string]any{"unmatched_by_clients": true}},
+		// Called routes in the same bucket, so the unmatched share stays low
+		// enough that this stays a candidate list. The test is about the
+		// unlabeled-repo fallback and the missing-method label.
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/called1", Props: map[string]any{"method": "GET"}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/called2", Props: map[string]any{"method": "GET"}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/api/called3", Props: map[string]any{"method": "GET"}},
 	)
 
 	insights, err := New().Explain(context.Background(), store)
@@ -152,5 +176,40 @@ func TestExplain_SingleRepoNoServiceNodesYieldsNothing(t *testing.T) {
 	}
 	if len(insights) != 0 {
 		t.Errorf("single-repo snapshot should yield no insights, got %d", len(insights))
+	}
+}
+
+// TestExplain_ThinClientCoverageDescribesTheSnapshot pins the case the estate
+// actually hit: teamtailor reported 3,392 of 3,732 routes unmatched, because its
+// callers are browsers and third-party integrators rather than repositories.
+// Presenting that as a list of dead-endpoint candidates is how a finding earns
+// being ignored wholesale.
+func TestExplain_ThinClientCoverageDescribesTheSnapshot(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(facts.Fact{Kind: facts.KindService, Name: "public-api", Repo: "public-api"})
+	for i := 0; i < 90; i++ {
+		store.Add(flaggedRoute("public-api", fmt.Sprintf("/v1/ep%02d", i), "GET"))
+	}
+	for i := 0; i < 10; i++ {
+		store.Add(facts.Fact{Kind: facts.KindRoute, Name: fmt.Sprintf("/v1/called%02d", i), Repo: "public-api",
+			Props: map[string]any{"method": "GET", "role": "server"}})
+	}
+
+	insights, err := New().Explain(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) != 1 {
+		t.Fatalf("expected 1 insight, got %d", len(insights))
+	}
+	in := insights[0]
+	if !strings.Contains(in.Title, "too thin") {
+		t.Errorf("the finding must be about the client set, not the endpoints; got %q", in.Title)
+	}
+	if len(in.Evidence) != 0 {
+		t.Errorf("listing 90 endpoints as candidates is the thing this branch exists to avoid; got %d", len(in.Evidence))
+	}
+	if in.Confidence < 0.8 {
+		t.Errorf("the claim about coverage is a confident one: %v", in.Confidence)
 	}
 }

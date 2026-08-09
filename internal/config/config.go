@@ -322,6 +322,63 @@ func Default() *Config {
 			"**/Tests/**/*.axaml",
 			"**/Test/**/*.axaml",
 			"**/*.Tests/**/*.axaml",
+			// Scala test source sets. Scoped to the SOURCE SET (src/test, src/it,
+			// src/multi-jvm), never to a directory merely NAMED `test`, and with no
+			// filename pattern at all. Both restrictions are measured rather than
+			// cautious: a one-segment `**/test/**/*.scala` deletes 183 production
+			// files across the benchmark corpus — 175 of them zio's own test LIBRARY,
+			// which compiles from `test-magnolia/src/main/scala-3/zio/test/` and whose
+			// package is literally `zio.test`. That is the Ruby `cache_warmup_ab_test.rb`
+			// hazard in its Scala form, and a filename pattern like `**/*Spec.scala`
+			// would add a second one. sbt settles it by convention — test sources live
+			// in a test source set — so the source set is what is matched, which is
+			// also why the prefix needs TWO directory segments (see matchDirScopedGlob).
+			// The doubled `src/test` covers every layout in the corpus: `src/test/scala`,
+			// the cross-build variants `src/test/scala-3` and `src/test/scala-2.13`,
+			// and lila's bare `src/test`.
+			// Keep in sync with TestGlobs below: a file that stops being a test must
+			// stop being ignored, or it is dropped without being recovered.
+			"**/src/test/**/*.scala",
+			"**/src/it/**/*.scala",
+			"**/src/multi-jvm/**/*.scala",
+			// Dart tests. Directory-scoped, following the Ruby and C# precedent: pub's
+			// convention puts them under a package's `test/` (and `integration_test/`)
+			// directory, and a bare `**/*_test.dart` would additionally swallow
+			// production files that merely end in the token. Keep in sync with
+			// TestGlobs below.
+			"**/test/**/*.dart",
+			"**/integration_test/**/*.dart",
+			"**/test_driver/**/*.dart",
+			// Dart code generation output. This is not tidiness: build_runner output is
+			// the MAJORITY of files in a real Flutter project, and none of it is code a
+			// human navigates. One @freezed model yields a .freezed.dart of hundreds of
+			// generated lines plus a .g.dart of serialization; indexing them inflates
+			// symbol counts and manufactures god-class and complexity findings about
+			// machine output. Kept in sync with generatedSuffixes in the dart extractor,
+			// which applies the same list when the walker hands it a file directly.
+			"**/*.g.dart",
+			"**/*.freezed.dart",
+			"**/*.mocks.dart",
+			"**/*.gr.dart",
+			"**/*.config.dart",
+			"**/*.pb.dart",
+			"**/*.pbenum.dart",
+			"**/*.pbjson.dart",
+			"**/*.pbserver.dart",
+			"**/*.pbgrpc.dart",
+			// Dart/Flutter build and package caches.
+			"**/.dart_tool/**",
+			"**/.pub-cache/**",
+			"**/.flutter-plugins",
+			"**/.flutter-plugins-dependencies",
+			// The Dart SDK's own parser fixtures and language suite are programs
+			// DESIGNED to be rejected — `trailing_comma_error_test.dart` and its
+			// neighbours are deliberately invalid Dart, and front_end/testcases holds
+			// thousands of them. They are ordinary source to the walker and would be
+			// counted as parse failures against the grammar. Only the dart-lang/sdk
+			// repository has these, but the cost of the two globs is nil elsewhere.
+			"**/pkg/front_end/testcases/**",
+			"**/pkg/_fe_analyzer_shared/test/**",
 			// enola's own output. This is the DEFAULT location only; the glob for the
 			// configured one is derived in Normalize, which is what makes a custom
 			// output.dir safe. The literal stays because a repository that used the
@@ -422,9 +479,24 @@ func Default() *Config {
 			"**/tests/**/*.cshtml", "**/test/**/*.cshtml", "**/Tests/**/*.cshtml", "**/Test/**/*.cshtml", "**/*.Tests/**/*.cshtml",
 			"**/tests/**/*.xaml", "**/test/**/*.xaml", "**/Tests/**/*.xaml", "**/Test/**/*.xaml", "**/*.Tests/**/*.xaml",
 			"**/tests/**/*.axaml", "**/test/**/*.axaml", "**/Tests/**/*.axaml", "**/Test/**/*.axaml", "**/*.Tests/**/*.axaml",
+			// Scala has no TestRefExtractor yet, so these three are the same
+			// deliberate no-op as Python's and C#'s: listed because Ignore above
+			// requires the two lists to agree, and so that implementing
+			// ScalaExtractor.ExtractTestRefs switches the signal on without a second
+			// config change. Until then, a Scala symbol called only from a spec reads
+			// as dead — expect dead-code false positives on Scala repos until it lands.
+			"**/src/test/**/*.scala",
+			"**/src/it/**/*.scala",
+			"**/src/multi-jvm/**/*.scala",
+			// Dart. Unlike Scala's above, these are live: DartExtractor implements
+			// TestRefExtractor, so a production symbol whose only caller is its test
+			// keeps a reference and does not read as dead.
+			"**/test/**/*.dart",
+			"**/integration_test/**/*.dart",
+			"**/test_driver/**/*.dart",
 		},
-		Extractors: []string{"cpp", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "hcl", "ansible", "mdintent"},
-		Explainers: []string{"cycles", "layers", "crossrepo", "coverage", "unused-routes", "god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers", "intent"},
+		Extractors: []string{"cpp", "dart", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "scala", "hcl", "ansible", "mdintent"},
+		Explainers: []string{"cycles", "layers", "crossrepo", "coverage", "unused-routes", "god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers", "intent", "domain", "query-loops", "entry-points"},
 		Renderers:  []string{"llm_context"},
 		Output: OutputConfig{
 			Dir:              defaultOutputDir,

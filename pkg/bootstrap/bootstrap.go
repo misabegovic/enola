@@ -21,14 +21,18 @@ import (
 	crossrepoexp "github.com/enola-labs/enola/internal/explainers/crossrepo"
 	"github.com/enola-labs/enola/internal/explainers/cycles"
 	"github.com/enola-labs/enola/internal/explainers/depth"
+	"github.com/enola-labs/enola/internal/explainers/domain"
+	"github.com/enola-labs/enola/internal/explainers/entrypoints"
 	"github.com/enola-labs/enola/internal/explainers/godclass"
 	"github.com/enola-labs/enola/internal/explainers/hotspots"
 	"github.com/enola-labs/enola/internal/explainers/intentcheck"
 	"github.com/enola-labs/enola/internal/explainers/layers"
+	"github.com/enola-labs/enola/internal/explainers/queryloops"
 	"github.com/enola-labs/enola/internal/explainers/surface"
 	"github.com/enola-labs/enola/internal/explainers/unusedroutes"
 	"github.com/enola-labs/enola/internal/extractors/ansibleextractor"
 	"github.com/enola-labs/enola/internal/extractors/cppextractor"
+	"github.com/enola-labs/enola/internal/extractors/dartextractor"
 	"github.com/enola-labs/enola/internal/extractors/dotnetextractor"
 	"github.com/enola-labs/enola/internal/extractors/goextractor"
 	"github.com/enola-labs/enola/internal/extractors/grpcextractor"
@@ -41,6 +45,7 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/pythonextractor"
 	"github.com/enola-labs/enola/internal/extractors/rubyextractor"
 	"github.com/enola-labs/enola/internal/extractors/rustextractor"
+	"github.com/enola-labs/enola/internal/extractors/scalaextractor"
 	"github.com/enola-labs/enola/internal/extractors/swiftextractor"
 	"github.com/enola-labs/enola/internal/extractors/tsextractor"
 	"github.com/enola-labs/enola/internal/facts"
@@ -390,6 +395,8 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	eng.RegisterExtractor(swiftextractor.New())
 	eng.RegisterExtractor(rubyextractor.New())
 	eng.RegisterExtractor(rustextractor.New())
+	eng.RegisterExtractor(scalaextractor.New())
+	eng.RegisterExtractor(dartextractor.New())
 
 	// Resolve the linking vocabulary once and hand it to everything that matches under
 	// it, so the signals and the unmatched-route binder cannot disagree about what
@@ -423,6 +430,9 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	eng.RegisterExplainer(crossrepoexp.New())
 	eng.RegisterExplainer(coverage.New())
 	eng.RegisterExplainer(unusedroutes.New())
+	eng.RegisterExplainer(domain.New())
+	eng.RegisterExplainer(queryloops.New())
+	eng.RegisterExplainer(entrypoints.New())
 	eng.RegisterExplainer(godclass.New())
 	eng.RegisterExplainer(hotspots.New())
 	eng.RegisterExplainer(depth.New())

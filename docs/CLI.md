@@ -388,7 +388,35 @@ Every path argument follows the same rule: **a directory is a repository, a file
 | `--status --all` | The same usage, broken down per repository. |
 | `--no-dashboard` | Start the MCP server without the localhost dashboard. |
 | `--version` | Print the build version. |
+| `--version --json` | Print the build version and the extractor version as JSON, on stdout. This is the release manifest — see [Staying current](#staying-current). |
 | `--help`, `-h` | Show usage. |
+
+### Staying current
+
+enola releases often, so it tells you when you are behind — without ever making you wait on the network.
+
+A background check runs at most once every 12 hours and caches its answer in `~/.enola/update.json`. Every notice you see is a read of that file, so no command ever blocks on a request, and a machine with no network behaves exactly like one that is up to date. The check itself runs only where nothing is waiting on it: the detached session-start hook, and the MCP server's startup.
+
+When a newer release exists, `check`, `--generate` and `doctor` print one line on **stderr** (never stdout, so `--json` output stays a clean document), and `enola upgrade` installs it:
+
+```
+enola v0.3.12 is available (you have v0.3.2) — extractors changed since your build,
+so this graph is missing facts a current enola would extract. Run `enola upgrade`.
+```
+
+The second clause is the only detail the notice carries, and it is the one worth acting on. **Extractor version** is `internal/engine.cacheVersion`, the constant bumped whenever an extractor starts reading something differently — the same value every snapshot records as `extractor_version`. When it has moved, your build is not merely older: the graphs it produces are missing facts a current enola would extract. When it has not, the clause is absent.
+
+Deliberately, the notice does **not** summarise what changed. Release titles are narrow, so any one headline undersells a ten-version gap and oversells a one-version gap — and the changes that matter most are the least visible, since a release adding one language while fixing another language's routing reads as neither to the person who needed the fix.
+
+Your agent gets the same information once per session, appended to its first MCP tool result. That wording is different on purpose: it states the fact, assigns the decision to you, and names no command. An agent told to run `enola upgrade` would run it mid-task on a machine it was not asked to modify — and would achieve nothing visible, because replacing the binary leaves the already-running server on the old one.
+
+The check never runs for a build from source (it is ahead of the last release, not behind it), never when `CI` is set, and not at all with:
+
+```bash
+export ENOLA_NO_UPDATE_CHECK=1
+```
+
+`enola doctor` reports the standing answer either way, including when it is "up to date".
 
 ### Wiring it into your agents - `enola install`
 
@@ -409,7 +437,7 @@ enola uninstall               # remove it all again
 | Cursor | `.cursor/rules/enola.mdc` *(owned)* | — no user-level rules directory |
 | GitHub Copilot | `.github/instructions/enola.instructions.md` *(owned)* | — lives in IDE/account settings |
 | Codex · Copilot · Pi | `AGENTS.md` *(marked block, only if it already exists)* | — |
-| Codex | *covered by `AGENTS.md`* | `~/.codex/AGENTS.md` *(marked block)* |
+| Codex | `.codex/hooks.json` *(managed entries, `--hooks` only)*, covered by `AGENTS.md` otherwise | `~/.codex/AGENTS.md` *(marked block)*, `~/.codex/hooks.json` *(managed entries, `--hooks` only)* |
 | Pi | *covered by `AGENTS.md`* | `~/.pi/agent/AGENTS.md` *(marked block)* |
 
 **Codex, Copilot and Pi all read the repository's `AGENTS.md`**, so locally one block serves all three - enola won't write a second repo-local file for them, which would only put the same instruction into the same context window twice. Their `--global` entries add what `AGENTS.md` can't: guidance in projects where nobody has run `enola install`. Those are written only when the tool's config directory already exists, so enola never creates `~/.codex` for someone who doesn't use Codex.
@@ -441,7 +469,9 @@ It is deliberately opt-in and deliberately quiet:
 - **It never breaks your session.** Every failure path - no snapshot, unreadable input, a directory that isn't a repository - exits cleanly and says nothing. A broken enola must never look like a broken session.
 - **It merges into your config.** Your existing hooks, permissions and settings are preserved; `uninstall` removes exactly enola's entries and nothing else.
 
-The hooks shell out to `enola hook session-start` and `enola hook stop`, which is what you'll see in `.claude/settings.json`, pinned to the absolute path of the binary you installed with. You never run them yourself.
+The hooks shell out to `enola hook session-start` and `enola hook stop`, which is what you'll see in `.claude/settings.json` (or Codex's `hooks.json`), pinned to the absolute path of the binary you installed with. You never run them yourself.
+
+Codex additionally requires you to approve a new hook once before it will run it - inside Codex, run `/hooks`. That's a Codex requirement, not something `enola install` can do for you.
 
 ### The gate - `enola check`
 
@@ -651,4 +681,3 @@ enola --generate ci/cluster.yaml
 Entries resolve **relative to the config file**, not to your working directory, so a cluster config can be checked in and means the same thing on a laptop and in CI. (`repo:` is unchanged: a single repository, relative to the working directory.) Order matters - the first entry resets the graph and the rest are added to it.
 
 ---
-

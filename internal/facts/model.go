@@ -37,6 +37,28 @@ const (
 	// is SUPPOSED to do, and the intent explainer verdicts the two against each
 	// other. Carries intent_kind plus provenance (source, overridden).
 	KindIntent = "intent"
+
+	// KindExtraction is one extractor's account of what it saw and could not
+	// resolve, for one repository. It carries the same `edge_coverage` prop the
+	// cross-repo layer puts on a service, because coverage in this codebase
+	// travels as facts — the linker's sink is an accumulator convenience, never
+	// the channel. An extractor that reports nothing emits no fact at all, so a
+	// consumer can tell "reported zero" from "never reported".
+	KindExtraction = "extraction"
+
+	// KindAssociation is one declared relationship between two models — a Rails
+	// belongs_to/has_one/has_many/has_and_belongs_to_many, or another framework's
+	// equivalent. It names its target rather than referencing the target's fact,
+	// because an association whose other end was never extracted is exactly the
+	// cross-boundary relationship most worth knowing about, and an edge that can
+	// only exist when both ends were read would drop it silently.
+	//
+	// An association whose target cannot be named emits NO fact and increments
+	// the extractor's coverage counter instead. Every consumer of this graph
+	// treats an edge as something you can follow, so an edge with no target is
+	// either ignored or miscounted; "I saw 45 of these and could not name their
+	// targets" belongs in a report, not in an untraversable edge.
+	KindAssociation = "association"
 	// KindTestRef is a reference-only fact emitted from a test/spec file. It carries
 	// solely RelCalls relations naming the production symbols the test exercises
 	// (Name/File are the test file path). Test files are excluded from normal
@@ -322,6 +344,19 @@ type CoverageSummary struct {
 	CoverageGaps    int `json:"coverage_gaps"`            // services classified ServiceCoverageGap: no resolved outbound edge, yet unresolved call sites were detected. A service that resolved some edges is partially covered, not a gap
 	UnresolvedEdges int `json:"unresolved_edges"`         // detected outbound edges that did not resolve to a loaded service (internal blind spots; excludes external)
 	ExternalEdges   int `json:"external_edges,omitempty"` // detected outbound edges to hardcoded external hosts (third-party APIs) — expected, not a blind spot
+
+	// ExtractorsReporting counts extractors that accounted for their own misses.
+	// It is deliberately separate from the service tallies above: an extraction
+	// blind spot ("this macro declares routes I cannot read") is a different
+	// claim from a cross-repo one ("this call site names a service I cannot
+	// find"), and summing them would answer neither question.
+	//
+	// Zero here means nobody reported, which is NOT the same as nothing missed —
+	// the distinction this field exists to preserve, and the one that let an
+	// unresolved counter read 0 over 1,363 templates it never examined.
+	ExtractorsReporting int `json:"extractors_reporting,omitempty"`
+	// ExtractionUnresolved is what those reporting extractors could not resolve.
+	ExtractionUnresolved int `json:"extraction_unresolved,omitempty"`
 }
 
 // Receipt is the compact, machine-readable manifest written to receipt.json — a

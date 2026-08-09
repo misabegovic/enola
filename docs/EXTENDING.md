@@ -340,27 +340,102 @@ existed. Nothing failed, because nothing tied the reading side to the writing si
 
 ### Props an explainer reads
 
-Routes are not the only contract. Two module/symbol props are read outside the
-package that writes them, and both are **tables rather than branches**, so teaching
+Routes are not the only contract. Three module/symbol props are read outside the
+package that writes them, and they are **tables rather than branches**, so teaching
 another language is a row:
 
-- **`CompilationUnitProps`** (`crate`, `project`) names the build unit a module
-  compiles into. The cycles explainer uses it to tell a build-order defect from a
-  cycle that is merely internal to one assembly or crate — MSBuild and Cargo both
-  forbid cycles *between* units, so a cycle found in C# or Rust is necessarily
-  within one. A prop belongs here only when several module facts can share a value:
-  Swift's `spm_target` is deliberately absent, because swiftextractor names each
-  module fact *by* its target and two never share one.
+- **`CompilationUnitProps`** (`crate`, `project`, `jvm_module`, `pub_package`) names
+  the build unit a module compiles into. The cycles explainer uses it to tell a
+  build-order defect from a cycle that is merely internal to one unit — MSBuild and
+  Cargo both forbid cycles *between* units, so a cycle found in C# or Rust is
+  necessarily within one. A prop belongs here only when several module facts can
+  share a value: Swift's `spm_target` is deliberately absent, because swiftextractor
+  names each module fact *by* its target and two never share one.
+
+  The languages differ in how much the prop buys, and Dart is the extreme. Scala
+  imposes no package-level acyclicity within an sbt module, so a cycle there is legal;
+  **Dart does not even forbid circular imports between libraries** — they are legal,
+  they compile, and they are ordinary — so a Dart cycle is never a build-order defect
+  at all. Registering the prop is what stops the explainer telling a Flutter author
+  their mutual import "can cause initialization issues".
 - **`data_holder`** marks a type that declares state and no behaviour. The
   enterprise package-metrics explainer spares such packages its "extract
   interfaces" advice, and recognises a dedicated construct (`data_class`, `record`)
   where one exists. Emit `data_holder` when your language has none in common use —
-  C# writes its DTOs as plain classes with auto-properties.
+  C# writes its DTOs as plain classes with auto-properties. Scala emits it for a
+  `case class` even though that *is* a dedicated construct: the reading side knows
+  only the three key strings, so a fourth would need a change on both sides to say
+  something the generic marker already says.
+- **`abstract`** decides whether a type counts toward package-metrics abstractness,
+  and it is **authoritative** — it can demote as well as promote. Set it when your
+  language's interface-kind construct is not reliably an abstraction: a Ruby module
+  is a mixin *or* a namespace, and a Scala trait routinely carries its whole
+  implementation, so both languages compute it (from the members present) rather
+  than letting the keyword decide. Leave it unset where an interface always is one,
+  as in Go — absence means "abstract", so emitting it only when true is the same as
+  not emitting it at all.
 
 An enterprise explainer cannot import `internal/facts`, so it mirrors these key
 strings locally. That is the same arrangement the route `source` values have, and it
 carries the same hazard: a prop renamed on one side goes silently unread on the
 other.
+
+---
+
+## The shape of a fact is a contract too
+
+The prop *values* above are not the only thing a reader in another package depends on.
+Two structural conventions are load-bearing, undocumented until an extractor broke both,
+and they fail in the worst possible way: **silently, by producing degenerate output
+rather than wrong output**, so every test stays green and the tool merely reports
+nothing interesting.
+
+**A dependency fact is named `"<importer> -> <imported>"`.**
+
+```go
+facts.Fact{
+    Kind:      facts.KindDependency,
+    Name:      pkgDir + " -> " + target,   // NOT just target
+    Relations: []facts.Relation{{Kind: facts.RelImports, Target: target}},
+}
+```
+
+The relation carries the imported side; the *name* is the only place the **importing**
+side survives, and the enterprise package-metrics explainer recovers it by splitting on
+`" -> "`. Name a dependency by its target alone and every one of your language's edges
+is invisible there — efferent coupling comes out 0 for every package, average
+instability 0.00, and the most depended-upon package of a real application is whatever
+generated directory happened to have three importers.
+
+**A symbol carries a `declares` relation to its module.**
+
+```go
+Relations: []facts.Relation{
+    {Kind: facts.RelDeclares, Target: pkgDir},
+    // …anything else this symbol declares, in any order
+}
+```
+
+That same explainer attributes a symbol to a package through this edge. Emit it and
+your language gets package metrics; omit it and every symbol falls out of the
+population.
+
+**Order does not matter, and that is a repair rather than a courtesy.** The explainer
+used to take the first `declares` target and stop, which quietly assumed a symbol
+declares nothing but its own module — true of Go, false of any language whose *types*
+declare their own members, which is natural and which Dart does. A method name was then
+read as a package name, minting one phantom package per class: 1,746 of them on one
+repository against 199 real modules, the same failure the exported-surface explainer
+documents for .NET arrived at from a different direction. It now resolves the target
+against the known module set, so a member edge arriving first cannot be mistaken for a
+package. Prefer emitting the module edge first anyway — it reads better and matches Go —
+but nothing breaks if you do not.
+
+Neither convention is checked by the golden tests, because both produce perfectly
+well-formed facts. The way to catch this class of mistake is to run the enterprise tools
+over a real repository in your language and ask whether the numbers are *plausible*, not
+merely present: a metric that is uniformly `0.00`, or a "most depended-upon package"
+naming a generated directory, is the shape of a contract that was never met.
 
 ---
 

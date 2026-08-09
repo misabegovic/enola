@@ -19,6 +19,7 @@ import (
 	"github.com/enola-labs/enola/internal/drift"
 	"github.com/enola-labs/enola/internal/engine"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/updatecheck"
 	"github.com/enola-labs/enola/internal/version"
 	"github.com/enola-labs/enola/pkg/coverage"
 	"github.com/enola-labs/enola/pkg/mcputil"
@@ -102,6 +103,17 @@ type Server struct {
 	freshMu     sync.Mutex
 	freshBanner string
 	freshAt     time.Time
+
+	// updateSaid is set once the "a newer enola exists" notice has been attached to a
+	// tool result, so it is said once per SERVER PROCESS and never again.
+	//
+	// Once-per-process is the whole cadence policy, and it needs no file and no
+	// cross-process coordination to implement: a server process is a session, so the
+	// agent hears it on its first tool call and is left alone for the rest of the work.
+	// Repeating it on every result — which is what the freshness banner does, because
+	// staleness is actionable RIGHT NOW and this is not — would make it wallpaper by
+	// the third call and dilute the banner that does need attention.
+	updateSaid atomic.Bool
 }
 
 // New creates a new MCP server wired to the given engine.
@@ -111,7 +123,7 @@ func New(eng *engine.Engine, cfg *config.Config) (*Server, error) {
 		cfg: cfg,
 	}
 
-	instructions := "Use this server to explore a repository's architecture as queryable facts. Run generate_snapshot first to index a codebase, then use explore, query_facts, show_symbol, traverse, find_path, and impact_analysis to understand code structure, dependencies, and change impact. When knowledge pages compile into the snapshot (enola_intent), governing_intent answers the reverse query directly — which pages govern a file or fact, and which code a page governs. Explainers run automatically during generate_snapshot and compute findings (dependency cycles, layer violations, unused/dead routes, god-classes, hotspots, and more) — fetch them with query_insights rather than re-deriving them by hand. To find backend HTTP routes that no loaded client calls, take a multi-repo (append-mode) snapshot of the backend plus its clients, then call query_insights(explainer='unused-routes') or query_facts(kind=route, prop=unmatched_by_clients, prop_value=true). To verify what a change did to the architecture, pin a baseline before editing and diff after: generate_snapshot → set_baseline → make changes → generate_snapshot → diff_snapshot. diff_snapshot is delta-only (it reports just what changed — new/resolved findings, new coupling, added/removed symbols — never pre-existing state), so prefer it over re-reading files to confirm a change. Supports Go, TypeScript/JavaScript (incl. Vue, Svelte, Ember), Python, Java, Kotlin, Ruby, PHP, Swift, Rust, C/C++, .NET (C#/VB.NET/F#/Razor/XAML), Terraform/HCL, Ansible, gRPC/Protobuf, OpenAPI, and GraphQL."
+	instructions := "Use this server to explore a repository's architecture as queryable facts. Run generate_snapshot first to index a codebase, then use explore, query_facts, show_symbol, traverse, find_path, and impact_analysis to understand code structure, dependencies, and change impact. When knowledge pages compile into the snapshot (enola_intent), governing_intent answers the reverse query directly — which pages govern a file or fact, and which code a page governs. Explainers run automatically during generate_snapshot and compute findings (dependency cycles, layer violations, unused/dead routes, god-classes, hotspots, and more) — fetch them with query_insights rather than re-deriving them by hand. To find backend HTTP routes that no loaded client calls, take a multi-repo (append-mode) snapshot of the backend plus its clients, then call query_insights(explainer='unused-routes') or query_facts(kind=route, prop=unmatched_by_clients, prop_value=true). To verify what a change did to the architecture, pin a baseline before editing and diff after: generate_snapshot → set_baseline → make changes → generate_snapshot → diff_snapshot. diff_snapshot is delta-only (it reports just what changed — new/resolved findings, new coupling, added/removed symbols — never pre-existing state), so prefer it over re-reading files to confirm a change. Supports Go, TypeScript/JavaScript (incl. Vue, Svelte, Ember), Python, Java, Kotlin, Scala, Dart/Flutter, Ruby, PHP, Swift, Rust, C/C++, .NET (C#/VB.NET/F#/Razor/XAML), Terraform/HCL, Ansible, gRPC/Protobuf, OpenAPI, and GraphQL."
 	if cfg != nil && cfg.ChangeVerifyHint != "" {
 		instructions += " " + cfg.ChangeVerifyHint
 	}
@@ -135,6 +147,7 @@ func New(eng *engine.Engine, cfg *config.Config) (*Server, error) {
 	// server after New returns.
 	s.mcp.AddReceivingMiddleware(s.valueMiddleware)
 	s.mcp.AddReceivingMiddleware(s.freshnessMiddleware)
+	s.mcp.AddReceivingMiddleware(s.updateMiddleware)
 
 	return s, nil
 }
@@ -143,6 +156,16 @@ func New(eng *engine.Engine, cfg *config.Config) (*Server, error) {
 func (s *Server) Run(ctx context.Context) error {
 	s.startTime = time.Now()
 	log.Println("[server] starting MCP server on stdio transport")
+
+	// In a goroutine, and its result is never awaited: a server that took even a
+	// moment to start because of an update check would be paying a latency cost on
+	// every session for information that is only ever advisory. Whatever it finds
+	// lands in the cache and is read by the NEXT tool call, or the next session — the
+	// banner reads the file, never this. The hook covers the case where hooks are
+	// installed; this covers everyone else, since an MCP-only user has no other
+	// long-lived process that could refresh it.
+	go updatecheck.Refresh(ctx)
+
 	return s.mcp.Run(ctx, &mcp.StdioTransport{})
 }
 
@@ -421,6 +444,48 @@ func (s *Server) freshnessBanner() string {
 	s.freshBanner = banner
 	s.freshAt = time.Now()
 	return banner
+}
+
+// updateMiddleware attaches a one-time notice that a newer enola exists.
+//
+// Kept separate from freshnessMiddleware rather than folded into it, because the two
+// answer different questions on different clocks: freshness is about THIS graph being
+// behind THIS tree and is worth repeating until fixed; this is about the binary being
+// behind the release stream, is not actionable inside the session, and is said once.
+// Sharing a code path would force one cadence onto both.
+//
+// It appends rather than prepends: the freshness warning is the one the agent may need
+// to act on before trusting the result, so it stays at the top.
+//
+// Everything it reads is local — updatecheck.AgentLine reads a cached file — so this
+// adds no latency and no network call to a tool call. See internal/updatecheck.
+func (s *Server) updateMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		result, err := next(ctx, method, req)
+		if err != nil || method != "tools/call" {
+			return result, err
+		}
+		params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
+		if !ok || bannerSuppressed(params.Name) {
+			return result, err
+		}
+		ctr, ok := result.(*mcp.CallToolResult)
+		if !ok || ctr == nil || ctr.IsError {
+			return result, err
+		}
+		notice := updatecheck.AgentLine(engine.ExtractorVersion())
+		if notice == "" {
+			return result, err
+		}
+		// Claimed with CompareAndSwap, not a check-then-set: tool calls are dispatched
+		// concurrently by the MCP SDK, and two arriving together would otherwise both
+		// see false and both append.
+		if !s.updateSaid.CompareAndSwap(false, true) {
+			return result, err
+		}
+		ctr.Content = append(ctr.Content, &mcp.TextContent{Text: "\n\n" + notice})
+		return result, err
+	}
 }
 
 // humanizeDuration renders a coarse, human-friendly age (minutes/hours/days).
@@ -820,7 +885,7 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name: "generate_snapshot",
 		Description: "Index a repository and extract its architecture as queryable facts. " +
-			"Supports Go, TypeScript/JavaScript (incl. Vue, Svelte, Ember), Python, Java, Kotlin, Ruby, PHP, Swift, Rust, C/C++, .NET (C#/VB.NET/F#/Razor/XAML), Terraform/HCL, Ansible, gRPC/Protobuf, OpenAPI, and GraphQL. " +
+			"Supports Go, TypeScript/JavaScript (incl. Vue, Svelte, Ember), Python, Java, Kotlin, Scala, Dart/Flutter, Ruby, PHP, Swift, Rust, C/C++, .NET (C#/VB.NET/F#/Razor/XAML), Terraform/HCL, Ansible, gRPC/Protobuf, OpenAPI, and GraphQL. " +
 			"Produces facts of kind: module, symbol, route, storage, dependency, service. " +
 			"Run this first before any other tool. Re-run after code changes. " +
 			"To VERIFY a change you are about to make, call set_baseline right after this first snapshot (BEFORE editing); " +
@@ -1465,6 +1530,24 @@ func (s *Server) registerTools() {
 			}
 		}
 		return jsonResult(resp)
+	})
+
+	// Tool: endpoint_impact
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name: "endpoint_impact",
+		Description: "Answer what changing an HTTP endpoint reaches: the route, the controller serving it, the models that controller touches, the models associated with those, and the physical tables behind them. " +
+			"Use impact_analysis when you have a symbol; use this when what you have is a URL. " +
+			"Client call sites and mock-server routes are excluded — this answers about what the application serves. " +
+			"Each hop can run out, and the result names the one that did: a route whose controller does not resolve is reported as reaching an UNKNOWN set, not an empty one.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args endpointImpactArgs) (*mcp.CallToolResult, any, error) {
+		store := s.eng.Store()
+		if store.Count() == 0 {
+			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
+		}
+		if args.Endpoint == "" {
+			return errorResult("endpoint is required"), nil, nil
+		}
+		return jsonResult(store.AnalyzeEndpoint(args.Endpoint, args.MaxRoutes))
 	})
 
 	// Tool: impact_analysis
@@ -2564,6 +2647,11 @@ type findPathArgs struct {
 }
 
 // impactAnalysisArgs are the arguments for the impact_analysis tool.
+type endpointImpactArgs struct {
+	Endpoint  string `json:"endpoint" jsonschema:"required,The HTTP endpoint being changed. Substring match on the path, optionally prefixed with a verb: 'GET /v1/candidates' or just '/v1/candidates'."`
+	MaxRoutes int    `json:"max_routes,omitempty" jsonschema:"How many matched endpoints to follow (1-200). A bare prefix can match hundreds. Default: 25."`
+}
+
 type impactAnalysisArgs struct {
 	Target         string `json:"target" jsonschema:"required,The node being changed (fact name, substring match). Supports scoped prefixes repo:/kind:/file: to disambiguate."`
 	MaxDepth       int    `json:"max_depth,omitempty" jsonschema:"How many hops of impact to compute (1-10). Default: 3."`

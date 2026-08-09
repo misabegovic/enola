@@ -93,6 +93,7 @@ func DefaultHelp(bin Binary) HelpSpec {
 			{Flag: "baseline", Desc: "Manage the diff baseline — the \"before\" your changes are graded\nagainst. \"pin\" snapshots the repository and freezes it (no separate\n--generate needed), \"show\" reports what the current baseline\ndescribes, \"clear\" removes it. The baseline is stored per-repository,\nin that repo's output dir, so several repos each keep their own."},
 			{Flag: "check", Desc: "Grade what a change did to the architecture against the pinned\nbaseline, and exit with a code CI can act on:\n  0 clean · 1 regression · 2 error · 3 declined (not comparable)\nRead-only by default — nothing is written, and the baseline stays\nput, so it can be run as often as you like. Run\n\"" + bin.Name + " check --help\" for the flags."},
 			{Flag: "coverage", Desc: "Report which cross-repo edges were resolved and which were not,\nper service — telling a genuinely isolated service apart from one\nwhose outbound edges could not be followed. Needs two or more\nrepositories in one graph. A report, not a gate: always exits 0."},
+			{Flag: "endpoint", Desc: "Report what changing an HTTP endpoint reaches: the controller\nserving it, the models that controller touches, the models\nassociated with those, the tables behind them, and the callers,\nincluding the frontend screen a calling route module implements.\nUse impact_analysis when you have a symbol; use this when what\nyou have is a URL."},
 			{Flag: "log", Desc: "EXPERIMENTAL. Show what this repository's architecture has done over\ntime — one line per recorded snapshot, with what changed since the\none before it. Read-only: it reports what was observed and never\nsnapshots to fill a gap. Every snapshot is recorded as a revision\n(~450 bytes, outside the repo); set `history.enabled: false` to stop."},
 			{Flag: "show", Desc: "EXPERIMENTAL. Show what ONE recorded revision did to the architecture\n— \"log\" says a revision added twelve facts, this says which twelve.\nReconstructs the revision and its predecessor out of\nthe stored history and compares them, so a past change is described in the same words it\nwas described in at the time. A revision is a snapshot id or prefix, a\ngit commit, HEAD~N, @<seq>, a ref name, or `latest` (the default)."},
 			{Flag: "diff", Desc: "EXPERIMENTAL. Show the architecture delta between any two recorded\nrevisions — the question a week of work produces, where \"show\" answers\nfor a single one. Either side of the range may be empty, meaning the\noldest or newest recorded revision."},
@@ -108,6 +109,7 @@ func DefaultHelp(bin Binary) HelpSpec {
 			{Flag: "--status --all", Desc: "Show the per-repo breakdown instead (from ~/.enola/usage/)"},
 			{Flag: "--no-dashboard", Desc: "Do not start the localhost dashboard alongside the MCP server"},
 			{Flag: "--version", Desc: "Print version information"},
+			{Flag: "--version --json", Desc: "Print the version and the extractor version as JSON, on stdout.\nThis is the release manifest: what a build is called, and what it\nEXTRACTS LIKE. See UPDATES."},
 			{Flag: "--help, -h", Desc: "Show this help message"},
 		},
 		ConfigDoc: "Path to the config file (default: mcp-arch.yaml). Set `repos:` in it to\n  name a multi-repo cluster; entries resolve relative to the config file, so\n  a checked-in cluster config means the same thing wherever it is run from.",
@@ -141,6 +143,7 @@ func DefaultHelp(bin Binary) HelpSpec {
 		Sections: []Section{
 			gateSection(bin),
 			dashboardSection(),
+			updatesSection(bin),
 			mcpConfigSection(bin),
 			buildSection(bin),
 		},
@@ -190,6 +193,31 @@ func dashboardSection() Section {
   graph receipts, and refreshes every 30 seconds. Run "--status" while the server
   is up to get its URL, or pass "--no-dashboard" to skip it entirely.
 `,
+	}
+}
+
+// updatesSection documents the passive update notice, and — the part that has to be
+// discoverable — how to switch it off. A tool that reaches the network on someone's
+// machine owes them a documented way to stop it, in the help they already read.
+func updatesSection(bin Binary) Section {
+	return Section{
+		Title: "UPDATES",
+		Body: fmt.Sprintf(`  enola checks at most once every 12 hours, in the background, whether a newer
+  release exists, and caches the answer in ~/.enola/update.json. No command ever
+  waits on the network for it: the notice you see is a read of that file. When
+  a newer release is found, "%s doctor" reports it and "%s upgrade"
+  installs it.
+
+  The notice says whether the EXTRACTORS changed, not what else did. That single
+  bit is the one that matters for your data: it means snapshots from your build
+  are missing facts a current enola would extract.
+
+  It is silent for a dev build, and disabled entirely by:
+
+    export ENOLA_NO_UPDATE_CHECK=1
+
+  It also never runs when CI is set.
+`, bin.Name, bin.Name),
 	}
 }
 

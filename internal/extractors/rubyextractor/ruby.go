@@ -179,6 +179,17 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 	if isRails {
 		routeFacts := extractAllRoutes(repoPath, files)
 		allFacts = append(allFacts, routeFacts...)
+
+		assocFacts, assocUnresolved := extractAssociations(repoPath, files)
+		allFacts = append(allFacts, assocFacts...)
+		if fact, ok := associationCoverageFact(repoPath, len(assocFacts), assocUnresolved); ok {
+			allFacts = append(allFacts, fact)
+		}
+	}
+
+	resolvedCalls, unresolvedCalls := countResolvedCalls(allFacts)
+	if fact, ok := callCoverageFact(repoPath, resolvedCalls, unresolvedCalls); ok {
+		allFacts = append(allFacts, fact)
 	}
 
 	// Extract Ruby calls embedded in view templates (ERB/Slim/HAML) so helpers and
@@ -294,4 +305,44 @@ func isPublicAPI(relFile string, pkg *packwerkInfo) bool {
 
 	publicDir := filepath.Join(ownerPkg, "app", "public")
 	return strings.HasPrefix(relFile, publicDir+"/") || strings.HasPrefix(relFile, publicDir+"\\")
+}
+
+// countResolvedCalls splits call edges into those naming a symbol this
+// extraction emitted and those naming something else, so the coverage fact
+// reports a ratio rather than a total.
+func countResolvedCalls(all []facts.Fact) (int, map[string]int) {
+	known := make(map[string]bool, len(all))
+	for _, fact := range all {
+		if fact.Kind == facts.KindSymbol {
+			known[fact.Name] = true
+		}
+	}
+	resolved := 0
+	unresolved := map[string]int{}
+	for _, fact := range all {
+		if fact.Kind != facts.KindSymbol {
+			continue
+		}
+		for _, rel := range fact.Relations {
+			if rel.Kind != facts.RelCalls {
+				continue
+			}
+			if known[rel.Target] {
+				resolved++
+				continue
+			}
+			// Named by cause rather than lumped: a bare method name is an
+			// unresolved receiver, a dotted one is a call on something untyped,
+			// and a constant is a class this extraction never saw.
+			switch {
+			case strings.Contains(rel.Target, "."):
+				unresolved["untyped_receiver"]++
+			case rel.Target != "" && rel.Target[0] >= 'A' && rel.Target[0] <= 'Z':
+				unresolved["unknown_constant"]++
+			default:
+				unresolved["unqualified_method"]++
+			}
+		}
+	}
+	return resolved, unresolved
 }
