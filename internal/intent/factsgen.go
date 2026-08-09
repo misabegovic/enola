@@ -109,6 +109,13 @@ func CompilePageFacts(p *PageIntent, pageFile string) []facts.Fact {
 					"to":          r.To,
 					"source":      pageFile,
 				},
+				// Also a graph relation, not only a prop. Every traversal in the
+				// system walks Relations — traverse, find_path, impact_analysis,
+				// crossrepo — so an edge that lives only in props is invisible to
+				// all of them, and `govern` worked purely because it reimplements
+				// the join by hand. The props stay: they are what govern and the
+				// intentcheck explainer already read.
+				Relations: []facts.Relation{{Kind: facts.RelDependsOn, Target: r.To}},
 			})
 		}
 		for _, a := range pg.Anchors {
@@ -122,6 +129,13 @@ func CompilePageFacts(p *PageIntent, pageFile string) []facts.Fact {
 					"path":         a.Path,
 					"source":       pageFile,
 				},
+				// Repo-qualified, because that is how a file is named everywhere
+				// else in a union and an unqualified path would bind to whichever
+				// repository happened to have one by that name.
+				Relations: []facts.Relation{{
+					Kind:   facts.RelDependsOn,
+					Target: a.Repo + "/" + a.Path,
+				}},
 			})
 		}
 	}
