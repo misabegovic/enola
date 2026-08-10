@@ -18,10 +18,12 @@ const PageIntentKey = "enola_intent"
 // owner — because the page lives where the decision lives, not inside the
 // repo it governs.
 type PageIntent struct {
-	Page     *PageDecl   `yaml:"page"`
-	Consumes []PageSeam  `yaml:"consumes"`
-	Layers   []PageLayer `yaml:"layers"`
-	Claims   []Claim     `yaml:"claims"`
+	Page       *PageDecl             `yaml:"page"`
+	Consumes   []PageSeam            `yaml:"consumes"`
+	Layers     []PageLayer           `yaml:"layers"`
+	Claims     []Claim               `yaml:"claims"`
+	Components []ConstraintComponent `yaml:"components"`
+	Rules      []ConstraintRule      `yaml:"rules"`
 }
 
 // PageDecl declares the page itself as a knowledge node: what kind of
@@ -109,6 +111,52 @@ type Claim struct {
 	Consumer   string `yaml:"consumer"`
 	Provider   string `yaml:"provider"`
 	Via        string `yaml:"via"`
+}
+
+// ConstraintComponent names a set of measured facts by where they live: any
+// fact whose file falls under a match pattern (and, when narrowed, whose kind
+// or exact name agrees) is a member. Components exist so rules can speak about
+// the architecture in the page's own vocabulary — "the domain", "the adapters"
+// — instead of repeating path lists per rule.
+type ConstraintComponent struct {
+	Name        string   `yaml:"name"`
+	Match       []string `yaml:"match"`
+	Kind        string   `yaml:"kind"`
+	NamePattern string   `yaml:"name_pattern"`
+}
+
+// ConstraintRule forbids one component reaching another via a named edge kind.
+// Unlike a claim (a measurement expected to hold), a rule carries enforcement
+// semantics: a matching edge is a decided-rule breach at full confidence, and
+// Because — mandatory — is the rationale the resulting finding surfaces, so a
+// violation always says why the rule exists, not only that it was broken.
+type ConstraintRule struct {
+	ID      string `yaml:"id"`
+	Forbid  string `yaml:"forbid"`
+	To      string `yaml:"to"`
+	Via     string `yaml:"via"`
+	Because string `yaml:"because"`
+}
+
+// AllowedComponentKinds is the closed fact-kind vocabulary a component selector
+// may narrow to — the measured kinds the constraints explainer resolves over.
+var AllowedComponentKinds = map[string]bool{
+	"module": true, "symbol": true, "route": true, "storage": true,
+}
+
+func allowedComponentKinds() string {
+	return "module, route, storage, symbol"
+}
+
+// AllowedRuleVias is the closed edge vocabulary a rule may forbid — relation
+// kinds the graph actually carries, so a rule can only forbid something the
+// evaluator can see.
+var AllowedRuleVias = map[string]bool{
+	"depends_on": true, "imports": true, "calls": true,
+}
+
+func allowedRuleVias() string {
+	return "calls, depends_on, imports"
 }
 
 // ParsePage reads a markdown page's frontmatter and returns its enola_intent
@@ -214,10 +262,62 @@ func (p *PageIntent) Validate() error {
 			problems = append(problems, fmt.Sprintf("claims[%d]: unknown metric %q (allowed: fact-count, seam)", i, c.Metric))
 		}
 	}
+	componentNames := map[string]bool{}
+	for i, c := range p.Components {
+		if !validToken(c.Name) {
+			problems = append(problems, fmt.Sprintf("components[%d]: name %q must be a lowercase token", i, c.Name))
+		}
+		if len(c.Match) == 0 {
+			problems = append(problems, fmt.Sprintf("components[%d] (%s): needs at least one match pattern", i, c.Name))
+		}
+		for j, m := range c.Match {
+			if !validConstraintMatch(m) {
+				problems = append(problems, fmt.Sprintf("components[%d].match[%d]: %q must be an exact path or a prefix/** subtree (no other glob forms)", i, j, m))
+			}
+		}
+		if c.Kind != "" && !AllowedComponentKinds[c.Kind] {
+			problems = append(problems, fmt.Sprintf("components[%d]: kind %q is not a measured fact kind (allowed: %s)", i, c.Kind, allowedComponentKinds()))
+		}
+		componentNames[c.Name] = true
+	}
+	ruleIDs := map[string]bool{}
+	for i, r := range p.Rules {
+		if !validToken(r.ID) {
+			problems = append(problems, fmt.Sprintf("rules[%d]: id %q must be a lowercase token", i, r.ID))
+		} else if ruleIDs[r.ID] {
+			problems = append(problems, fmt.Sprintf("rules[%d]: id %q is declared twice on this page", i, r.ID))
+		}
+		ruleIDs[r.ID] = true
+		if !componentNames[r.Forbid] {
+			problems = append(problems, fmt.Sprintf("rules[%d] (%s): forbid %q names no declared component", i, r.ID, r.Forbid))
+		}
+		if !componentNames[r.To] {
+			problems = append(problems, fmt.Sprintf("rules[%d] (%s): to %q names no declared component", i, r.ID, r.To))
+		}
+		if !AllowedRuleVias[r.Via] {
+			problems = append(problems, fmt.Sprintf("rules[%d] (%s): via %q is not a rule edge kind (allowed: %s)", i, r.ID, r.Via, allowedRuleVias()))
+		}
+		if r.Because == "" {
+			problems = append(problems, fmt.Sprintf("rules[%d] (%s): needs a because — a rule with no stated rationale cannot surface one in its findings", i, r.ID))
+		}
+	}
 	if len(problems) > 0 {
 		return fmt.Errorf("invalid %s block: %s", PageIntentKey, strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// validConstraintMatch enforces the same bounded glob dialect declared layers
+// match with (see layers' matchDeclaredLayerPath): an exact repo-relative path,
+// or a `prefix/**` subtree — nothing more. Any other glob metacharacter is
+// rejected at parse time, so a selector the evaluator would silently fail to
+// match is an error the page author sees instead.
+func validConstraintMatch(pattern string) bool {
+	prefix, _ := strings.CutSuffix(pattern, "/**")
+	if prefix == "" {
+		return false
+	}
+	return !strings.ContainsAny(prefix, "*?[]{}")
 }
 
 func validToken(s string) bool {

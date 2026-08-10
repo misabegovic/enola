@@ -86,6 +86,81 @@ func TestResolve_ClusterOverridesWholesale(t *testing.T) {
 	}
 }
 
+func constraintPage(components []ConstraintComponent, rules []ConstraintRule) *PageIntent {
+	return &PageIntent{Components: components, Rules: rules}
+}
+
+func TestPageValidate_ConstraintVocabulary(t *testing.T) {
+	good := ConstraintComponent{Name: "domain", Match: []string{"app/domain/**", "lib/pricing"}}
+	adapters := ConstraintComponent{Name: "adapters", Match: []string{"app/adapters/**"}}
+	rule := ConstraintRule{ID: "domain-stays-pure", Forbid: "domain", To: "adapters", Via: "depends_on", Because: "the domain must not know its delivery mechanisms"}
+	if err := constraintPage([]ConstraintComponent{good, adapters}, []ConstraintRule{rule}).Validate(); err != nil {
+		t.Fatalf("a well-formed constraint block must validate, got: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		components []ConstraintComponent
+		rules      []ConstraintRule
+		wantIn     string
+	}{
+		"free glob rejected": {
+			[]ConstraintComponent{{Name: "domain", Match: []string{"app/*/domain"}}}, nil, "prefix/**"},
+		"component kind vocabulary is closed": {
+			[]ConstraintComponent{{Name: "domain", Match: []string{"app/domain/**"}, Kind: "class"}}, nil, "module, route, storage, symbol"},
+		"matchless component rejected": {
+			[]ConstraintComponent{{Name: "domain"}}, nil, "at least one match"},
+		"via vocabulary is closed": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", Via: "uses", Because: "x"}}, "calls, depends_on, imports"},
+		"undeclared component rejected": {
+			[]ConstraintComponent{good},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", Via: "calls", Because: "x"}}, "names no declared component"},
+		"duplicate rule id rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{rule, rule}, "declared twice"},
+		"missing because rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", Via: "calls"}}, "because"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := constraintPage(tc.components, tc.rules).Validate()
+			if err == nil {
+				t.Fatal("an ill-formed constraint block must be a validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("the error must name what is allowed; got: %v", err)
+			}
+		})
+	}
+}
+
+func TestCompilePageFacts_ComponentsAndRules(t *testing.T) {
+	page := constraintPage(
+		[]ConstraintComponent{{Name: "domain", Match: []string{"lib/pricing", "app/domain/**"}, Kind: "module", NamePattern: "app/domain/billing"}},
+		[]ConstraintRule{{ID: "domain-stays-pure", Forbid: "domain", To: "adapters", Via: "depends_on", Because: "why"}},
+	)
+	ff := CompilePageFacts(page, "wiki/p.md")
+	if len(ff) != 2 {
+		t.Fatalf("facts = %d, want 2: %+v", len(ff), ff)
+	}
+	comp, rule := ff[0], ff[1]
+	if comp.Name != "component: domain" || comp.File != "wiki/p.md" {
+		t.Errorf("component fact = %+v", comp)
+	}
+	// Sorted regardless of declaration order, so the compiled fact fingerprints
+	// the declared SET.
+	if got := comp.PropString("match"); got != "app/domain/** lib/pricing" {
+		t.Errorf("match prop = %q, want the sorted join", got)
+	}
+	if comp.PropString("kind") != "module" || comp.PropString("name_pattern") != "app/domain/billing" {
+		t.Errorf("component props = %+v", comp.Props)
+	}
+	if rule.Name != "rule: domain-stays-pure" ||
+		rule.PropString("forbid") != "domain" || rule.PropString("to") != "adapters" ||
+		rule.PropString("via") != "depends_on" || rule.PropString("because") != "why" {
+		t.Errorf("rule fact = %+v", rule)
+	}
+}
+
 // A claim's compiled name is what a failed-claim finding is titled with, so an
 // absent optional prefix must not leave a gap in it.
 func TestClaimNames_OmitAbsentPrefixes(t *testing.T) {

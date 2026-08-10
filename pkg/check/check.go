@@ -48,7 +48,7 @@ func (s Status) ExitCode() int {
 }
 
 // DefaultFailExplainers is the set of explainers whose new findings break a build
-// by default: dependency cycles, and nothing else.
+// by default: dependency cycles and declared-constraint violations, nothing else.
 //
 // The obvious design — "fail on confidence 1.0, because ARCHITECTURE.md says 1.0 is a
 // structural fact and anything below is a heuristic" — does not survive contact with the
@@ -63,7 +63,10 @@ func (s Status) ExitCode() int {
 // Gating on the number alone would therefore fail builds for a new statistical outlier and
 // for a re-detected architecture pattern. So the explainer is the primary filter and
 // confidence is a floor applied within it. See MinConfidence.
-var DefaultFailExplainers = []string{"cycles"}
+//
+// Constraints belongs here for the same reason cycles does: its rules are declared and its
+// matching is exact, so a violation is a decided-rule breach, not a heuristic candidate.
+var DefaultFailExplainers = []string{"cycles", "constraints"}
 
 // DefaultMinConfidence is the floor applied WITHIN the failing explainers.
 //

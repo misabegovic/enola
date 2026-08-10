@@ -2,6 +2,7 @@ package intent
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -203,6 +204,47 @@ func CompilePageFacts(p *PageIntent, pageFile string) []facts.Fact {
 			name = fmt.Sprintf("claim: seam %s -> %s via %s", c.Consumer, c.Provider, c.Via)
 		}
 		out = append(out, facts.Fact{Kind: facts.KindIntent, Name: name, File: pageFile, Props: props})
+	}
+	for _, c := range p.Components {
+		// Patterns are sorted before joining so the compiled fact — and every
+		// fingerprint downstream of it — is a function of the declared SET, not
+		// of the YAML order the author happened to write.
+		match := append([]string(nil), c.Match...)
+		sort.Strings(match)
+		props := map[string]any{
+			"intent_kind": "component",
+			"component":   c.Name,
+			"match":       strings.Join(match, " "),
+			"source":      pageFile,
+		}
+		if c.Kind != "" {
+			props["kind"] = c.Kind
+		}
+		if c.NamePattern != "" {
+			props["name_pattern"] = c.NamePattern
+		}
+		out = append(out, facts.Fact{
+			Kind:  facts.KindIntent,
+			Name:  "component: " + c.Name,
+			File:  pageFile,
+			Props: props,
+		})
+	}
+	for _, r := range p.Rules {
+		out = append(out, facts.Fact{
+			Kind: facts.KindIntent,
+			Name: "rule: " + r.ID,
+			File: pageFile,
+			Props: map[string]any{
+				"intent_kind": "rule",
+				"rule":        r.ID,
+				"forbid":      r.Forbid,
+				"to":          r.To,
+				"via":         r.Via,
+				"because":     r.Because,
+				"source":      pageFile,
+			},
+		})
 	}
 	return out
 }
