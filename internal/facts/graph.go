@@ -305,7 +305,7 @@ func NewGraph(ff []Fact) *Graph {
 			continue
 		}
 		sk, _ := f.Props["symbol_kind"].(string)
-		if sk != SymbolMethod && sk != SymbolFunc {
+		if sk != SymbolMethod && sk != SymbolFunc && sk != SymbolGetter {
 			continue
 		}
 		if owner := g.methodOwner(f.Name); owner != "" {

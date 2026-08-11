@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -255,6 +257,50 @@ type Fooer interface {
 	}
 	if iface.Props["exported"] != true {
 		t.Errorf("Fooer exported = %v, want true", iface.Props["exported"])
+	}
+}
+
+func TestExtract_InterfaceMethodSymbols(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"pkg/iface.go": `package pkg
+
+import "io"
+
+type Renderer interface {
+	io.Reader
+	Instance(name string, data any) error
+	reset()
+}
+`,
+	})
+
+	instance, ok := findFact(ff, "pkg.Renderer.Instance")
+	if !ok {
+		t.Fatal("expected a symbol fact for the interface method pkg.Renderer.Instance")
+	}
+	if instance.Props["symbol_kind"] != facts.SymbolMethod {
+		t.Errorf("Instance symbol_kind = %v, want method", instance.Props["symbol_kind"])
+	}
+	if instance.Props["exported"] != true {
+		t.Errorf("Instance exported = %v, want true", instance.Props["exported"])
+	}
+	if instance.Props["receiver"] != "Renderer" {
+		t.Errorf("Instance receiver = %v, want Renderer", instance.Props["receiver"])
+	}
+	if !hasRelation(instance, facts.RelDeclares, "pkg") {
+		t.Error("Instance should declare into its package")
+	}
+
+	unexported, ok := findFact(ff, "pkg.Renderer.reset")
+	if !ok {
+		t.Fatal("expected a symbol fact for the unexported interface method pkg.Renderer.reset")
+	}
+	if unexported.Props["exported"] != false {
+		t.Errorf("reset exported = %v, want false", unexported.Props["exported"])
+	}
+
+	if _, ok := findFact(ff, "pkg.Renderer.Read"); ok {
+		t.Error("an embedded interface's methods must not be expanded into symbol facts")
 	}
 }
 
@@ -1032,5 +1078,33 @@ func TestGoCalls_UnqualifiedIndexCallIsNotAttributed(t *testing.T) {
 
 	if hasCall(calls, "internal/cli.Handlers") {
 		t.Errorf("a map-of-funcs call must not become an edge to the map; got %v", calls)
+	}
+}
+
+func TestExtract_FactSequenceIsIdenticalAcrossRuns(t *testing.T) {
+	files := map[string]string{}
+	for _, pkg := range []string{"alpha", "bravo", "charlie", "delta", "echo"} {
+		files["internal/"+pkg+"/"+pkg+".go"] = "package " + pkg + "\n\n" +
+			"func Do() int {\n\tif true {\n\t\treturn 1\n\t}\n\treturn 0\n}\n"
+	}
+	dir := setupGoProject(t, files)
+	relFiles := make([]string, 0, len(files))
+	for f := range files {
+		relFiles = append(relFiles, f)
+	}
+	sort.Strings(relFiles)
+
+	first, err := New().Extract(context.Background(), dir, relFiles)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		got, err := New().Extract(context.Background(), dir, relFiles)
+		if err != nil {
+			t.Fatalf("run %d: Extract: %v", i, err)
+		}
+		if !reflect.DeepEqual(got, first) {
+			t.Fatalf("run %d: fact sequence differs from first run", i)
+		}
 	}
 }

@@ -185,7 +185,13 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 		if fact, ok := associationCoverageFact(repoPath, len(assocFacts), assocUnresolved); ok {
 			allFacts = append(allFacts, fact)
 		}
+
+		allFacts = append(allFacts, extractBroadcasts(repoPath, files)...)
 	}
+
+	// Schema facts from the database's own dump, folded after the model pass so
+	// a table a model already claims lands its census on that model's fact.
+	allFacts = append(allFacts, applyStructureSQL(repoPath, allFacts)...)
 
 	resolvedCalls, unresolvedCalls := countResolvedCalls(allFacts)
 	if fact, ok := callCoverageFact(repoPath, resolvedCalls, unresolvedCalls); ok {
@@ -197,7 +203,7 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 	// reference-only KindFileRef facts (no symbols); parsed in parallel.
 	var tmplFiles []string
 	for _, relFile := range files {
-		if isTemplateFile(relFile) {
+		if isTemplateFile(relFile) || isJbuilderFile(relFile) {
 			tmplFiles = append(tmplFiles, relFile)
 		}
 	}
@@ -207,7 +213,10 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 			log.Printf("[ruby-extractor] error reading template %s: %v", relFile, err)
 			return nil
 		}
-		return extractTemplateRefs(src, relFile)
+		ff := extractTemplateRefs(src, relFile)
+		ff = append(ff, extractStimulusBindings(repoPath, relFile, src)...)
+		ff = append(ff, extractRenderTargets(repoPath, relFile, src)...)
+		return append(ff, extractTurboFrames(relFile, src)...)
 	})
 	for _, ff := range tmplFacts {
 		allFacts = append(allFacts, ff...)
@@ -279,13 +288,19 @@ func isRubyFile(path string) bool {
 	return filepath.Base(path) == "Rakefile"
 }
 
-// OwnsFile implements plugin.FileOwner for incremental caching. It is
-// extension-only (no repoPath is available to sniff shebangs), so extensionless
-// Ruby executables are not tracked for incremental cache invalidation; edits to
-// them won't invalidate the cache key on their own. This is acceptable — such
-// files are rare and the cacheVersion bump forces a full re-extract when the
-// extractor's behavior changes.
-func (e *RubyExtractor) OwnsFile(relFile string) bool { return isRubyFile(relFile) }
+// OwnsFile implements plugin.FileOwner for incremental caching and the file
+// census. It claims everything Extract actually reads: Ruby source, the view
+// templates the reference pass parses (ERB/Slim/HAML), and Jbuilder views —
+// an unclaimed-but-parsed template lied twice, reading as a vocabulary gap on
+// the census while its edits failed to invalidate this extractor's cache key.
+// It is extension-only (no repoPath is available to sniff shebangs), so
+// extensionless Ruby executables are not tracked for incremental cache
+// invalidation; edits to them won't invalidate the cache key on their own.
+// This is acceptable — such files are rare and the cacheVersion bump forces a
+// full re-extract when the extractor's behavior changes.
+func (e *RubyExtractor) OwnsFile(relFile string) bool {
+	return isRubyFile(relFile) || isTemplateFile(relFile) || isJbuilderFile(relFile)
+}
 
 // isPublicAPI checks if a file is within a packwerk package's app/public/ directory.
 func isPublicAPI(relFile string, pkg *packwerkInfo) bool {

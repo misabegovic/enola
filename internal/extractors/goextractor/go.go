@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -53,6 +54,16 @@ func (e *GoExtractor) Detect(repoPath string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// OwnsFile declares the paths this extractor reads: Go source, plus the module
+// manifests whose contents steer resolution (readModulePath reads go.mod). It
+// makes the extractor cacheable like the other language extractors and lets
+// the file census attribute unparsed .go files to it rather than reporting Go
+// as an extension nothing claims.
+func (e *GoExtractor) OwnsFile(relFile string) bool {
+	base := filepath.Base(relFile)
+	return strings.HasSuffix(relFile, ".go") || base == "go.mod" || base == "go.sum"
 }
 
 // parsedPkg holds parsing results for a single Go package directory.
@@ -104,11 +115,17 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 		pp.fileMap[f] = parsed
 	}
 
+	pkgDirs := make([]string, 0, len(parsedPkgs))
+	for pkgDir := range parsedPkgs {
+		pkgDirs = append(pkgDirs, pkgDir)
+	}
+	sort.Strings(pkgDirs)
+
 	// Build declared package-name map so buildFileImports can resolve implicit
 	// aliases correctly (e.g. "go-auth" path base → "auth" package name).
 	pkgNames := make(map[string]string)
-	for pkgDir, pp := range parsedPkgs {
-		if pp.pkgName != "" {
+	for _, pkgDir := range pkgDirs {
+		if pp := parsedPkgs[pkgDir]; pp.pkgName != "" {
 			pkgNames[pkgDir] = pp.pkgName
 		}
 	}
@@ -117,13 +134,13 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// This allows cross-package field-chain resolution (e.g., a subpackage can
 	// look up fields of a root-package struct).
 	globalFieldTypes := make(map[string]string)
-	for pkgDir, pp := range parsedPkgs {
+	for _, pkgDir := range pkgDirs {
 		select {
 		case <-ctx.Done():
 			return allFacts, ctx.Err()
 		default:
 		}
-		for k, v := range collectFieldTypes(pp.parsedFiles, pkgDir, modulePath, pkgNames) {
+		for k, v := range collectFieldTypes(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames) {
 			globalFieldTypes[k] = v
 		}
 	}
@@ -132,8 +149,8 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// method wire paths) so consumer call sites in any package resolve to the
 	// "/pkg.Service/Method" they invoke.
 	var allParsed []*ast.File
-	for _, pp := range parsedPkgs {
-		allParsed = append(allParsed, pp.parsedFiles...)
+	for _, pkgDir := range pkgDirs {
+		allParsed = append(allParsed, parsedPkgs[pkgDir].parsedFiles...)
 	}
 	grpcStubs := buildGoGRPCStubIndex(allParsed)
 
@@ -144,7 +161,8 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	routePrefixes := buildRoutePrefixIndex(parsedPkgs, modulePath, pkgNames, globalFieldTypes)
 
 	// Pass 3: extract facts per package using the global field types.
-	for pkgDir, pp := range parsedPkgs {
+	for _, pkgDir := range pkgDirs {
+		pp := parsedPkgs[pkgDir]
 		select {
 		case <-ctx.Done():
 			return allFacts, ctx.Err()
@@ -478,6 +496,7 @@ func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *
 		}
 	case *ast.InterfaceType:
 		kind = facts.SymbolInterface
+		result = append(result, interfaceMethodSymbols(fset, t, relFile, pkgDir, name)...)
 	default:
 		kind = facts.SymbolType
 	}
@@ -511,6 +530,40 @@ func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *
 	}
 
 	result = append(result, symbolFact)
+	return result
+}
+
+// interfaceMethodSymbols emits one symbol fact per named method an interface
+// declaration carries. The declaration is as measurable as the interface type
+// fact beside it, and it is the member the constraints evaluator needs: a call
+// edge through an interface value targets pkgDir.Iface.Method, and exact-name,
+// fail-closed resolution grounds only on a fact by that name (finding 0009).
+// Embedded interfaces have no method name of their own here and emit nothing —
+// expanding them would guess at another declaration's contents.
+func interfaceMethodSymbols(fset *token.FileSet, iface *ast.InterfaceType, relFile, pkgDir, ifaceName string) []facts.Fact {
+	var result []facts.Fact
+	if iface.Methods == nil {
+		return result
+	}
+	for _, field := range iface.Methods.List {
+		for _, methodIdent := range field.Names {
+			result = append(result, facts.Fact{
+				Kind: facts.KindSymbol,
+				Name: pkgDir + "." + ifaceName + "." + methodIdent.Name,
+				File: relFile,
+				Line: fset.Position(methodIdent.Pos()).Line,
+				Props: map[string]any{
+					"symbol_kind": facts.SymbolMethod,
+					"exported":    methodIdent.IsExported(),
+					"language":    "go",
+					"receiver":    ifaceName,
+				},
+				Relations: []facts.Relation{
+					{Kind: facts.RelDeclares, Target: pkgDir},
+				},
+			})
+		}
+	}
 	return result
 }
 
@@ -974,9 +1027,10 @@ func collectFieldTypes(files []*ast.File, pkgDir, modulePath string, pkgNames ma
 // Falls back to the raw joined string when resolution is not possible, so no call is dropped.
 //
 // Known limitation: calls through an interface value (e.g. iface.Method()) cannot be
-// statically bound to a concrete implementation without type-flow analysis, so the
-// resolved target may name an interface method that has no backing symbol fact. Such
-// edges surface as "unresolved" nodes during traversal rather than concrete callees.
+// statically bound to a concrete implementation without type-flow analysis. The
+// resolved target names the interface method, which interfaceMethodSymbols backs with
+// a declared symbol fact — the edge grounds on the declaration, never on a guessed
+// implementation.
 func resolveChain(chain []string, ctx resolveCtx) string {
 	switch len(chain) {
 	case 0:

@@ -56,6 +56,7 @@ import (
 	"github.com/enola-labs/enola/internal/linkers/binders/grpcimpl"
 	"github.com/enola-labs/enola/internal/linkers/binders/httphandler"
 	"github.com/enola-labs/enola/internal/linkers/binders/unmatchedroutes"
+	"github.com/enola-labs/enola/internal/linkers/binders/vendoredspecs"
 	graphqlsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/graphqlsig"
 	httpsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/http"
 	importsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/imports"
@@ -64,6 +65,7 @@ import (
 	"github.com/enola-labs/enola/internal/linkers/vocab"
 	"github.com/enola-labs/enola/internal/renderers/llmcontext"
 	"github.com/enola-labs/enola/internal/server"
+	"github.com/enola-labs/enola/pkg/plan"
 	"github.com/enola-labs/enola/pkg/plugin"
 	"github.com/enola-labs/enola/pkg/status"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -215,6 +217,10 @@ func (e *Engine) RegisterExtractor(ext plugin.Extractor) {
 	e.eng.RegisterExtractor(ext)
 }
 
+func (e *Engine) Extractors() []plugin.Extractor {
+	return e.eng.Extractors()
+}
+
 // RegisterExplainer adds an explainer to the engine.
 func (e *Engine) RegisterExplainer(exp plugin.Explainer) {
 	e.eng.RegisterExplainer(exp)
@@ -262,6 +268,23 @@ func (s *Server) StartTime() time.Time {
 // additional (license-gated) tools before calling Run.
 func (s *Server) MCP() *mcp.Server {
 	return s.srv.MCPServer()
+}
+
+func (s *Server) SetPlanEngineFactory(factory plan.EngineFactory) {
+	s.srv.SetPlanEngineFactory(factory)
+}
+
+func PlanEngineFactory(cfg *config.Config) plan.EngineFactory {
+	return func() (plan.Generator, error) {
+		eng, err := engine.New(cfg)
+		if err != nil {
+			return nil, err
+		}
+		registerOSSPlugins(eng, cfg)
+		wrapped := &Engine{eng: eng}
+		wrapped.SetPersistCache(false)
+		return wrapped, nil
+	}
 }
 
 // Options controls bootstrap behavior.
@@ -379,7 +402,11 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create engine: %w", err)
 	}
+	registerOSSPlugins(eng, cfg)
+	return &Engine{eng: eng}, cfg, nil
+}
 
+func registerOSSPlugins(eng *engine.Engine, cfg *config.Config) {
 	// Register all OSS extractors
 	eng.RegisterExtractor(cppextractor.New())
 	eng.RegisterExtractor(dotnetextractor.New())
@@ -417,6 +444,7 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	eng.RegisterBinder(emberresolver.New())
 	eng.RegisterBinder(grpcimpl.New())
 	eng.RegisterBinder(httphandler.New())
+	eng.RegisterBinder(vendoredspecs.New())
 	eng.RegisterBinder(unmatchedroutes.New(linkVocab))
 
 	// Register all OSS cross-repo signals. Phase() decides when each runs, so the
@@ -446,8 +474,6 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 
 	// Register all OSS renderers
 	eng.RegisterRenderer(llmcontext.New(cfg.Output.MaxContextTokens))
-
-	return &Engine{eng: eng}, cfg, nil
 }
 
 // NewServer creates an MCP server wired to the given Engine.
@@ -456,6 +482,7 @@ func NewServer(eng *Engine, cfg *config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	srv.SetPlanEngineFactory(PlanEngineFactory(cfg))
 	// The one place the soft memory limit is worth announcing. ConfigureRuntime is
 	// silent (see its doc) because a working default is not news on every CLI
 	// invocation — but a server is long-lived, holds whole graphs in memory, and its

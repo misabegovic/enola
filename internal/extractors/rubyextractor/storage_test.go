@@ -24,6 +24,37 @@ func TestSequelModelBase(t *testing.T) {
 	}
 }
 
+// TestExplicitTableNameCorrectsModelFact: `self.table_name = "…"` must become
+// the model's own storage truth. The defect this pins: the declared name was
+// extracted as a second, standalone table fact while the model's fact kept the
+// convention-derived name — a table that does not exist — so every join from
+// model to physical table silently resolved to the wrong one, with the
+// correction sitting beside it looking like additional information.
+func TestExplicitTableNameCorrectsModelFact(t *testing.T) {
+	src := []byte("class LegacyThing < ApplicationRecord\n  self.table_name = \"old_things\"\nend\n")
+	ff := extractFileAST(src, "app/models/legacy_thing.rb", true, true)
+	var model *facts.Fact
+	for i := range ff {
+		if ff[i].Kind != facts.KindStorage {
+			continue
+		}
+		if ff[i].Name == "LegacyThing" {
+			model = &ff[i]
+			continue
+		}
+		t.Errorf("unexpected standalone storage fact %q — the declared table corrects the model's fact, it never becomes a fact of its own", ff[i].Name)
+	}
+	if model == nil {
+		t.Fatal("model emitted no storage fact")
+	}
+	if model.Props["table"] != "old_things" {
+		t.Fatalf("model table = %v, want the declared old_things, not the derived legacy_things", model.Props["table"])
+	}
+	if model.Props["table_source"] != "declared" {
+		t.Fatalf("table_source = %v, want declared — a stated name is not a convention holding", model.Props["table_source"])
+	}
+}
+
 func TestSequelModelDatasetForm_ThroughAST(t *testing.T) {
 	src := []byte("class CustomerRecord < Sequel::Model(:customers)\n  def display_name\n    name.upcase\n  end\nend\n")
 	ff := extractFileAST(src, "app/models/customer_record.rb", true, true)

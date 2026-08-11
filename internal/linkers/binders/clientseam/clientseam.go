@@ -50,7 +50,7 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	seams := reachesHTTP(all)
 
 	var out []facts.Fact
-	seen := map[string]bool{}
+	chosen := map[string]int{}
 	for _, f := range all {
 		if f.Kind != facts.KindSymbol {
 			continue
@@ -67,12 +67,7 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			// One route per repo+method+path. A CLI calls the same collection
 			// endpoint from several commands, and three facts for one contract
 			// would inflate every count computed over them.
-			identity := f.Repo + "\x00" + verb + "\x00" + path
-			if seen[identity] {
-				continue
-			}
-			seen[identity] = true
-			out = append(out, facts.Fact{
+			route := facts.Fact{
 				Kind: facts.KindRoute,
 				Name: path,
 				File: f.File,
@@ -89,7 +84,16 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 					// rediscover the indirection that hid it in the first place.
 					"seam": callee,
 				},
-			})
+			}
+			identity := f.Repo + "\x00" + verb + "\x00" + path
+			at, exists := chosen[identity]
+			switch {
+			case !exists:
+				chosen[identity] = len(out)
+				out = append(out, route)
+			case earlierSite(route, out[at]):
+				out[at] = route
+			}
 		}
 	}
 	// The candidate list is scaffolding and does not belong in the published
@@ -152,6 +156,13 @@ func reachesHTTP(all []facts.Fact) map[string]bool {
 		}
 	}
 	return reaching
+}
+
+func earlierSite(a, b facts.Fact) bool {
+	if a.File != b.File {
+		return a.File < b.File
+	}
+	return a.Line < b.Line
 }
 
 func key(repo, name string) string { return repo + "\x00" + name }

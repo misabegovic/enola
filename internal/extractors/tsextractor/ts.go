@@ -117,6 +117,15 @@ func hasTSMarkers(dir string) bool {
 			return true
 		}
 	}
+
+	// config/importmap.rb marks the same Rails frontend when importmap-rails
+	// manages it: pins live in Ruby, so the app ships no package.json at all and
+	// every package.json rule above is blind to it — an importmap app's whole
+	// app/javascript tree (Stimulus controllers included) was claimed by this
+	// extractor and never parsed.
+	if _, err := os.Stat(filepath.Join(dir, "config", "importmap.rb")); err == nil {
+		return true
+	}
 	// A dependency-free plain-JavaScript package is still a JavaScript project:
 	// a Node CLI with zero deps declares itself structurally (bin, main,
 	// exports, type, workspaces, or any dependency map). Only a bare
@@ -658,6 +667,9 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 
 		classBody := findChildByKind(node, "class_body")
 		classifySymbol(&f, symbolName, classBody, ctx, facts.SymbolClass)
+		if names := classDecoratorNames(node, src); names != "" {
+			f.Props["decorators"] = names
+		}
 		result = append(result, f)
 
 		// TypeORM: a class decorated @Entity is a table. The storage fact is a COMPANION
@@ -682,8 +694,20 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 
 		// Extract class methods
 		if classBody != nil {
+			var pendingDecorators []string
 			for j := range classBody.ChildCount() {
 				member := classBody.Child(j)
+				if member.Kind() == "decorator" {
+					if dn, _ := decoratorNameArgs(member, src); dn != "" {
+						pendingDecorators = append(pendingDecorators, dn)
+					}
+					continue
+				}
+				if member.Kind() == "comment" || !member.IsNamed() {
+					continue
+				}
+				memberDecorators := append(pendingDecorators, ownDecoratorNames(member, src)...)
+				pendingDecorators = nil
 				if member.Kind() != "method_definition" && member.Kind() != "public_field_definition" {
 					continue
 				}
@@ -715,6 +739,17 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 					"language":    "typescript",
 					"receiver":    symbolName,
 				}
+				if names := decoratorSetProp(memberDecorators); names != "" {
+					mProps["decorators"] = names
+				}
+				if isGetterDefinition(member) {
+					mProps["symbol_kind"] = facts.SymbolGetter
+					mProps["getter_calls"] = countCallRelations(callRels)
+				}
+				if stimulusStaticField(member, mName, relFile) {
+					mProps["framework"] = "stimulus"
+					mProps["stimulus_static"] = mName
+				}
 				applyTSMetrics(mProps, m)
 				result = append(result, facts.Fact{
 					Kind:      facts.KindSymbol,
@@ -724,6 +759,30 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 					Props:     mProps,
 					Relations: mRels,
 				})
+			}
+		}
+
+	case "expression_statement":
+		// CommonJS export assignment: `exports.name = function` /
+		// `module.exports.name = function`. None of the declaration-shaped cases
+		// fire in a classic Node file, so a CommonJS module's whole public
+		// surface was invisible — an Express controller written as
+		// `exports.index = function(req, res)` emitted nothing at all. Only the
+		// member-assignment-of-a-function shape emits a symbol; a plain value,
+		// a re-exported identifier, or a whole-object `module.exports = {…}`
+		// carries no declaration this pass can name without guessing.
+		assign := findChildByKind(node, "assignment_expression")
+		if assign == nil {
+			break
+		}
+		name := commonJSExportName(assign.ChildByFieldName("left"), src)
+		if name == "" {
+			break
+		}
+		if right := assign.ChildByFieldName("right"); right != nil {
+			switch right.Kind() {
+			case "function_expression", "arrow_function", "generator_function":
+				result = append(result, e.funcSymbol(node, right, ctx, name, true))
 			}
 		}
 
@@ -824,6 +883,36 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 
 // funcSymbol builds a function/component symbol fact. declNode supplies the source
 // location; body is walked for outgoing calls and JSX-based classification.
+// commonJSExportName returns the exported member name when left is the
+// `exports.<name>` or `module.exports.<name>` shape, and "" for every other
+// assignment target — including bare `module.exports`, whose assigned value
+// has no member name to carry.
+func commonJSExportName(left *sitter.Node, src []byte) string {
+	if left == nil || left.Kind() != "member_expression" {
+		return ""
+	}
+	prop := left.ChildByFieldName("property")
+	if prop == nil || prop.Kind() != "property_identifier" {
+		return ""
+	}
+	obj := left.ChildByFieldName("object")
+	if obj == nil {
+		return ""
+	}
+	if obj.Kind() == "identifier" && nodeText(obj, src) == "exports" {
+		return nodeText(prop, src)
+	}
+	if obj.Kind() == "member_expression" {
+		inner := obj.ChildByFieldName("object")
+		innerProp := obj.ChildByFieldName("property")
+		if inner != nil && inner.Kind() == "identifier" && nodeText(inner, src) == "module" &&
+			innerProp != nil && nodeText(innerProp, src) == "exports" {
+			return nodeText(prop, src)
+		}
+	}
+	return ""
+}
+
 func (e *TSExtractor) funcSymbol(declNode, body *sitter.Node, ctx *extractCtx, name string, exported bool) facts.Fact {
 	rels := []facts.Relation{{Kind: facts.RelDeclares, Target: ctx.dir}}
 	callRels, m := collectCallsWithMetrics(body, ctx.src, ctx.dir, "", ctx.importMap, ctx.ioBindings, ctx.dir+"."+name, name)
@@ -1084,8 +1173,8 @@ func detectNextJSAt(dir string) bool {
 
 func isTypeScriptFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".ts" || ext == ".tsx" || ext == ".vue" || ext == ".js" || ext == ".jsx" || ext == ".svelte" ||
-		ext == ".gts" || ext == ".gjs" || ext == ".hbs" || ext == ".graphql" || ext == ".gql"
+	return ext == ".ts" || ext == ".tsx" || ext == ".vue" || ext == ".js" || ext == ".jsx" || ext == ".mjs" ||
+		ext == ".svelte" || ext == ".gts" || ext == ".gjs" || ext == ".hbs" || ext == ".graphql" || ext == ".gql"
 }
 
 // minifiedLineThreshold is the line length above which a file is treated as
@@ -1623,7 +1712,7 @@ func resolveImportPath(importPath, fileDir string, aliases map[string]tsAlias) (
 
 // tsModuleExts are the source extensions a bare import path may resolve to, tried in
 // TS-before-JS order (a project with both prefers the typed file).
-var tsModuleExts = []string{".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".gts", ".gjs"}
+var tsModuleExts = []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".vue", ".svelte", ".gts", ".gjs"}
 
 // resolveModuleFile resolves an extensionless internal import path to the actual
 // source file backing it, using the set of known indexed files. It returns the

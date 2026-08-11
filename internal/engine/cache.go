@@ -1522,7 +1522,112 @@ import (
 // Measured before/after on excalidraw, supabase and bitwarden-clients; the exact match
 // mode is carried on the alias rather than inferred, because a bare `@acme/common` used
 // as a prefix would also swallow `@acme/common-utils`.
-const cacheVersion = "v194"
+// v195: Ruby reads db/structure.sql when present — the database's own account of the
+// schema, which model-derived storage facts can only infer. Each pg_dump CREATE TABLE
+// yields a storage fact (or, for a table an ActiveRecord/Sequel model already claims,
+// a census folded onto the model's existing fact — one table, one storage identity)
+// carrying sorted `columns` and single-column `fk_constraints` ("column->reftable")
+// props, which is what lets a declared require-rule verdict schema discipline (every
+// company_id column carries its companies FK) from measured facts. Line/regex-based on
+// the pg_dump shapes only; composite FKs and unrecognized lines are skipped, never
+// guessed.
+// v196: Stimulus markup bindings become named facts. A `data-controller="x"` or
+// `data-action="click->x#y"` attribute in an .html.erb view emits one dependency-style
+// fact per declared controller identifier ("stimulus-binding: <file> -> <x>", with a
+// `binding` prop naming the declaring attributes) at resolution_level
+// "markup-declared" — the honest level: the binding is stated in markup, not resolved
+// through code. The fact links to app/javascript/controllers/<x>_controller.(js|ts)
+// only when that conventional file exists; otherwise it stays name-only. Identifiers
+// that are not plain Stimulus tokens (ERB interpolations) declare nothing — fail
+// closed, never a guessed edge.
+// v197: finding 0007's next markup slice, fail-closed at every shape. Literal Turbo
+// frame ids (`turbo_frame_tag :post_1`, `data-turbo-frame="results"`) in view
+// templates become dependency facts named "turbo-frame: <file> -> <id>" at
+// markup-declared — the frame id is an identity two markup sites share, so it is
+// recorded without resolution; dom_id calls, interpolation and the reserved `_top`
+// target emit nothing. Model-side `broadcasts_to` with a literal symbol/string
+// stream becomes "broadcast: <Model> -> <stream>" at literal-declared; the common
+// lambda form computes its stream per record at runtime and emits nothing. And the
+// TS extractor tags the static targets/values fields it already parses on
+// conventionally-placed Stimulus controllers with classification props
+// (framework=stimulus, stimulus_static=targets|values) — props only, on symbols
+// that already exist, so a consumer can finally ask which controllers declare
+// which magic accessors.
+// v198: importmap-rails apps are detected as JavaScript projects. The TS extractor
+// claimed every .js file (its FileOwner glob) but Detect knew only package.json and
+// tsconfig shapes, so a Rails app whose pins live in config/importmap.rb — which
+// ships no package.json at all — never ran the extractor: on the census that was
+// 74 of the 8-repo sample's 100 skipped-with-cause files (once-campfire), every one
+// of them a claimed, parseable, unparsed source file. config/importmap.rb presence
+// now switches the extractor on; vendored minified bundles under vendor/javascript
+// are still skipped by the existing minified gate, which is the honest account.
+// v199: the rest of the view-composition surface, fail-closed at every shape. A
+// hand-written `<turbo-frame id="composer">` element declares its frame id exactly
+// as turbo_frame_tag does — it is the helper's rendered output, and the shape a
+// helper-free view writes — so it now emits the same "turbo-frame:" fact; an id
+// carrying ERB still fails the id gate. And a literal render target (`render
+// "accounts/help_contact"`, quoted, with or without partial:) becomes a dependency
+// fact "render: <view> -> <target>" at literal-declared, linked to the partial file
+// only when Rails' underscore lookup finds it on disk — `render @post`,
+// interpolation and variables emit nothing, so view-to-view composition enters the
+// graph without a single guessed edge.
+// v200: CommonJS export assignments declare symbols. `exports.name = function` and
+// `module.exports.name = function` are the whole public surface of a classic Node
+// module, and no declaration-shaped case ever fired on them — an Express
+// controller written that way emitted nothing, which the census surfaced as
+// "claimed by typescript, no facts emitted". The member-assignment-of-a-function
+// shape now yields an exported function symbol; plain values, re-exported
+// identifiers and whole-object `module.exports = {…}` still emit nothing, because
+// there is no member name to carry or no declaration to classify without guessing.
+// v201: Go interface methods declare symbols. An interface declaration's named
+// methods each emit a symbol fact (pkgDir.Iface.Method, symbol_kind method,
+// exported per the method name's own Go case, receiver carrying the interface
+// name) beside the interface fact that was already emitted. The constraints
+// evaluator resolves edge targets by exact fact name, fail closed, and a call
+// through an interface value targets exactly that name — so a declared forbid
+// rule over a dependency visibly in the source yielded zero verdicts (finding
+// 0009, gin's c.engine.HTMLRender.Instance). The declaration is measured, not
+// guessed: embedded interfaces expand nothing, and no edge to an implementation
+// is fabricated. TS interfaces share the missing-member shape but not the
+// defect: without type inference the TS extractor never resolves a call target
+// to dir.Iface.method, so emitting the members would add facts no edge can
+// ground on. Ruby has no interface construct — a module's methods are real
+// definitions and already emit symbols.
+// v202: three census-named vocabulary gaps closed. The TS extractor claims and
+// parses .mjs — the file is the same ESM the extractor already reads in .js,
+// only the extension differed, so a Node project's native-ESM half was
+// excluded-by-kind — and .mjs joins the module-resolution extension order so
+// an extensionless import can land on it. Jbuilder views (.jbuilder) go
+// through the Ruby template reference pass with the whole file as the Ruby
+// region: a Jbuilder template IS plain Ruby (the json builder DSL), so helpers
+// and decorators called only from a JSON view stop reading as dead, while the
+// reference-only shape keeps views out of the symbol set. And the Ruby
+// extractor's FileOwner now claims what its Extract already reads — ERB/Slim/
+// HAML templates and Jbuilder views — which both moves those files out of the
+// census's excluded-by-kind bucket (they were parsed while reading as a
+// vocabulary gap) and fixes a real cache defect: a template edit did not
+// invalidate the extractor's cache key even though its facts carry the
+// template's references.
+//
+// v203: TypeScript class members carry their decorators, and get accessors become
+// their own symbol kind. Every decorated class member (method, getter, field) and
+// every decorated class gains a `decorators` prop — the sorted, deduped decorator
+// names with arguments stripped (`cached`, `tracked`, `action`, `service`,
+// `Controller`, …), space-joined in the set-valued string form the constraint
+// evaluator's prop containment and the prop-implication miner both read (the
+// columns/fk_constraints precedent) — read from the same nodes the route/service
+// passes already walk, so a convention like "expensive getters carry @cached"
+// becomes a mechanically checkable prop instead of prose. A `get` accessor emits
+// symbol_kind getter (a new vocabulary value beside function/method; consumers
+// that treated methods as callable members treat getters the same) with a
+// getter_calls prop counting its distinct outgoing call edges — emitted even at
+// 0, so measured-cheap and unmeasured never look the same. Set accessors stay
+// methods: only the read path is a getter. Template read fan-in is deliberately
+// NOT emitted — no template->member edge exists to derive it from (the .hbs
+// scanner refuses bare {{name}} as ambiguous, and strict-mode .gts tokens
+// resolve against imports only), and a guessed fan-in is worse than an absent
+// one.
+const cacheVersion = "v203"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

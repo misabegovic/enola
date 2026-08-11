@@ -100,6 +100,42 @@ func TestBind_CandidatePropIsRemovedEitherWay(t *testing.T) {
 	}
 }
 
+func TestBind_SharedIdentityKeepsEarliestSiteRegardlessOfStoreOrder(t *testing.T) {
+	caller := func(pkg, file string, line int) facts.Fact {
+		f := withCandidates(symbol("k8s", pkg+".cmd", "internal/metrics.Grab"),
+			"internal/metrics.Grab\x00/metrics\x00GET")
+		f.File, f.Line = file, line
+		return f
+	}
+
+	for name, lateFirst := range map[string]bool{"early-first": false, "late-first": true} {
+		seam := symbol("k8s", "internal/metrics.Grab", "net/http.NewRequestWithContext")
+		early := caller("internal/aa", "internal/aa/cmd.go", 5)
+		late := caller("internal/zz", "internal/zz/cmd.go", 371)
+		order := []facts.Fact{seam, early, late}
+		if lateFirst {
+			order = []facts.Fact{seam, late, early}
+		}
+		store := facts.NewStore()
+		store.Add(order...)
+		if err := New().Bind(context.Background(), store); err != nil {
+			t.Fatalf("%s: Bind: %v", name, err)
+		}
+		var routes []facts.Fact
+		for _, f := range store.All() {
+			if f.Kind == facts.KindRoute {
+				routes = append(routes, f)
+			}
+		}
+		if len(routes) != 1 {
+			t.Fatalf("%s: want one deduped route, got %d", name, len(routes))
+		}
+		if routes[0].File != "internal/aa/cmd.go" || routes[0].Line != 5 {
+			t.Errorf("%s: winner is %s:%d, want internal/aa/cmd.go:5", name, routes[0].File, routes[0].Line)
+		}
+	}
+}
+
 // Two repos with the same package layout must not share a seam. The reachability
 // walk is keyed by repo for that reason, and a cluster snapshot routinely holds
 // several Go services whose internal package paths are identical.

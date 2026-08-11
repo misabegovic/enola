@@ -362,6 +362,44 @@ func TestExplain_TestSupportSymbolExcluded(t *testing.T) {
 	}
 }
 
+// TestExplain_CapsInsightCount: more qualifying pinch points than maxInsights
+// yields exactly maxInsights findings, cut deterministically — equal scores
+// break by name, so the same repository reports the same set on every run.
+func TestExplain_CapsInsightCount(t *testing.T) {
+	s := facts.NewStore()
+	hubs := maxInsights + 5
+	for h := 0; h < hubs; h++ {
+		name := fmt.Sprintf("hub%02d.Hub", h)
+		calls := make([]facts.Relation, 0, minDegree)
+		for i := 0; i < minDegree; i++ {
+			tgt := fmt.Sprintf("hub%02d/t%d.Fn", h, i)
+			calls = append(calls, facts.Relation{Kind: facts.RelCalls, Target: tgt})
+			s.Add(facts.Fact{Kind: facts.KindSymbol, Name: tgt, File: fmt.Sprintf("hub%02d/t.go", h)})
+		}
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: name, File: fmt.Sprintf("hub%02d/h.go", h), Relations: calls})
+		for i := 0; i < minDegree; i++ {
+			s.Add(facts.Fact{Kind: facts.KindSymbol, Name: fmt.Sprintf("hub%02d/c%d.Fn", h, i),
+				File:      fmt.Sprintf("hub%02d/c.go", h),
+				Relations: []facts.Relation{{Kind: facts.RelCalls, Target: name}}})
+		}
+	}
+	s.BuildGraph()
+
+	insights, err := New().Explain(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) != maxInsights {
+		t.Fatalf("expected output capped at %d, got %d", maxInsights, len(insights))
+	}
+	for i, in := range insights {
+		want := fmt.Sprintf("hub%02d.Hub", i)
+		if !strings.Contains(in.Title, want) {
+			t.Errorf("insight %d: equal scores should cut by name order, want %s in %q", i, want, in.Title)
+		}
+	}
+}
+
 // A ubiquitous DATA struct constructed at many sites (RelInstantiates fan-in
 // only, no calls) is not a call-graph hotspot — instantiate edges are excluded
 // from fan-in, so its score drops below threshold.

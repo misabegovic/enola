@@ -26,6 +26,15 @@ const (
 	stdDevK = 2.0
 	// maxNeighbors caps how many in/out neighbors are listed as evidence.
 	maxNeighbors = 5
+	// maxInsights caps how many pinch points are reported, highest score first.
+	// This explainer dominates finding volume — roughly 80% of all findings
+	// across the upstream corpus are hotspots (docs/EXPLAINERS.md) — and an
+	// uncapped listing buries every other explainer's signal under one
+	// explainer's ranking. 20 matches the largest sibling cap (exported-surface);
+	// the outlier threshold already keeps the set small on most repositories, so
+	// the cap only bites where the volume was pure noise. Ties beyond the cap
+	// cut deterministically: the sort below breaks equal scores by name.
+	maxInsights = 20
 )
 
 // HotspotExplainer detects degree-centrality pinch points.
@@ -124,6 +133,9 @@ func (e *HotspotExplainer) Explain(ctx context.Context, store *facts.Store) ([]f
 		}
 		return candidates[i].fact.Name < candidates[j].fact.Name
 	})
+	if len(candidates) > maxInsights {
+		candidates = candidates[:maxInsights]
+	}
 
 	var insights []facts.Insight
 	for _, c := range candidates {
