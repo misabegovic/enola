@@ -1505,6 +1505,7 @@ import (
 //     explainer attributes a symbol to a package. A Dart class also declares its
 //     members, so the first member name was being read as a package — 1,746 phantom
 //     packages on drift against 199 real modules, the .NET failure in Dart's clothing.
+//
 // v194: TypeScript tsconfig `paths` entries with no `*` are honoured. The parser
 // required a wildcard on BOTH sides and silently dropped the exact form — which is how
 // a monorepo names a sibling package:

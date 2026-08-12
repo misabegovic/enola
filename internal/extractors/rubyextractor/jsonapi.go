@@ -341,7 +341,6 @@ func eachCall(path string, visit func(method string, args *sitter.Node, src []by
 		}
 	}
 	walk(tree.RootNode())
-	return
 }
 
 // jsonapiRelationshipRoutes describes the routes one relationship serves. The

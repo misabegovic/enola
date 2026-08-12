@@ -74,7 +74,7 @@ func (r *Runner) ConstraintsMine(args []string) {
 		MaxExceptions:      *maxExceptions,
 		IncludeTautologies: *includeTautologies,
 	})
-	fmt.Fprintf(os.Stdout, "Snapshot: %s\n", outDir)
+	_, _ = fmt.Fprintf(os.Stdout, "Snapshot: %s\n", outDir)
 	report.WriteText(os.Stdout, *top)
 
 	if *jsonlPath != "" {
@@ -83,13 +83,13 @@ func (r *Runner) ConstraintsMine(args []string) {
 			r.constraintsFatal("writing %s: %v", *jsonlPath, err)
 		}
 		if err := report.WriteJSONL(f); err != nil {
-			f.Close()
+			_ = f.Close()
 			r.constraintsFatal("writing %s: %v", *jsonlPath, err)
 		}
 		if err := f.Close(); err != nil {
 			r.constraintsFatal("writing %s: %v", *jsonlPath, err)
 		}
-		fmt.Fprintf(os.Stdout, "\nJSONL artifact: %s\n", *jsonlPath)
+		_, _ = fmt.Fprintf(os.Stdout, "\nJSONL artifact: %s\n", *jsonlPath)
 	}
 	os.Exit(0)
 }

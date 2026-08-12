@@ -131,9 +131,9 @@ func TestFileCensus_ClaimedButNotRunNamesTheIdleExtractor(t *testing.T) {
 // repository.
 type stubOwner struct{}
 
-func (stubOwner) Name() string                    { return "rust" }
-func (stubOwner) Detect(string) (bool, error)     { return false, nil }
-func (stubOwner) OwnsFile(relFile string) bool    { return strings.HasSuffix(relFile, ".rs") }
+func (stubOwner) Name() string                 { return "rust" }
+func (stubOwner) Detect(string) (bool, error)  { return false, nil }
+func (stubOwner) OwnsFile(relFile string) bool { return strings.HasSuffix(relFile, ".rs") }
 func (stubOwner) Extract(_ context.Context, _ string, _ []string) ([]facts.Fact, error) {
 	return nil, nil
 }

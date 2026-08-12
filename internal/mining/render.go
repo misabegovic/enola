@@ -67,8 +67,9 @@ func yamlQuote(s string) string {
 }
 
 func (r *Report) WriteText(w io.Writer, top int) {
-	fmt.Fprintf(w, "Mined %d candidate constraints over %d facts — proposals for operator review, never self-adopting law.\n", len(r.Candidates), r.FactCount)
-	fmt.Fprintf(w, "Thresholds: support >= %d, confidence >= %.2f, exceptions <= %d per candidate. Ranked by confidence x support.\n",
+	var b strings.Builder
+	fmt.Fprintf(&b, "Mined %d candidate constraints over %d facts — proposals for operator review, never self-adopting law.\n", len(r.Candidates), r.FactCount)
+	fmt.Fprintf(&b, "Thresholds: support >= %d, confidence >= %.2f, exceptions <= %d per candidate. Ranked by confidence x support.\n",
 		r.Config.MinSupport, r.Config.MinConfidence, r.Config.MaxExceptions)
 
 	shown := r.Candidates
@@ -76,13 +77,13 @@ func (r *Report) WriteText(w io.Writer, top int) {
 		shown = shown[:top]
 	}
 	for i, c := range shown {
-		fmt.Fprintf(w, "\n%3d. %.3f x %-6d [%s", i+1, c.Confidence, c.Denominator, c.Family)
+		fmt.Fprintf(&b, "\n%3d. %.3f x %-6d [%s", i+1, c.Confidence, c.Denominator, c.Family)
 		if c.Kind != "" {
-			fmt.Fprintf(w, " %s", c.Kind)
+			fmt.Fprintf(&b, " %s", c.Kind)
 		}
-		fmt.Fprintf(w, "] %s\n", c.Statement)
+		fmt.Fprintf(&b, "] %s\n", c.Statement)
 		if len(c.Exceptions) == 0 {
-			fmt.Fprintf(w, "     exceptions: none in the mined snapshot\n")
+			fmt.Fprintf(&b, "     exceptions: none in the mined snapshot\n")
 		} else {
 			names := make([]string, len(c.Exceptions))
 			for j, e := range c.Exceptions {
@@ -92,27 +93,28 @@ func (r *Report) WriteText(w io.Writer, top int) {
 					names[j] = e.Name
 				}
 			}
-			fmt.Fprintf(w, "     exceptions (%d): %s\n", len(c.Exceptions), strings.Join(names, ", "))
+			fmt.Fprintf(&b, "     exceptions (%d): %s\n", len(c.Exceptions), strings.Join(names, ", "))
 		}
-		fmt.Fprintf(w, "     would-be rule (adopt by hand: copy into enola/constraints/, rewrite because:, review mode):\n")
+		fmt.Fprintf(&b, "     would-be rule (adopt by hand: copy into enola/constraints/, rewrite because:, review mode):\n")
 		for _, line := range strings.Split(strings.TrimRight(c.YAML, "\n"), "\n") {
-			fmt.Fprintf(w, "       %s\n", line)
+			fmt.Fprintf(&b, "       %s\n", line)
 		}
 	}
 	if len(r.Candidates) > len(shown) {
-		fmt.Fprintf(w, "\n... and %d more candidates below rank %d — raise --top or read the --jsonl artifact.\n", len(r.Candidates)-len(shown), len(shown))
+		fmt.Fprintf(&b, "\n... and %d more candidates below rank %d — raise --top or read the --jsonl artifact.\n", len(r.Candidates)-len(shown), len(shown))
 	}
 
-	fmt.Fprintf(w, "\nSuppressed below the floors (counted, never silent):\n")
+	fmt.Fprintf(&b, "\nSuppressed below the floors (counted, never silent):\n")
 	tautological := 0
 	for _, sc := range r.Suppressed {
-		fmt.Fprintf(w, "  %-17s %d would-be candidates under the support floor of %d; %d over the exception ceiling of %d; %d tautological\n",
+		fmt.Fprintf(&b, "  %-17s %d would-be candidates under the support floor of %d; %d over the exception ceiling of %d; %d tautological\n",
 			sc.Family+":", sc.BelowSupportFloor, r.Config.MinSupport, sc.OverExceptionCeiling, r.Config.MaxExceptions, sc.Tautological)
 		tautological += sc.Tautological
 	}
 	if tautological > 0 {
-		fmt.Fprintf(w, "%d tautological candidate(s) suppressed — the statement holds by construction; --include-tautologies prints them\n", tautological)
+		fmt.Fprintf(&b, "%d tautological candidate(s) suppressed — the statement holds by construction; --include-tautologies prints them\n", tautological)
 	}
+	_, _ = io.WriteString(w, b.String())
 }
 
 func (r *Report) WriteJSONL(w io.Writer) error {

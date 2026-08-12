@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -46,7 +45,7 @@ func goTool() string {
 	if p, err := exec.LookPath("go"); err == nil {
 		return p
 	}
-	return filepath.Join(runtime.GOROOT(), "bin", "go")
+	return "go"
 }
 
 func sandboxEnv(home string) []string {

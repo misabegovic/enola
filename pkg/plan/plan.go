@@ -298,7 +298,7 @@ func counterfactual(ctx context.Context, deps Deps, patchFiles []PatchFile) (*Co
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(scratchRoot)
+	defer func() { _ = os.RemoveAll(scratchRoot) }()
 
 	scratchRepo := filepath.Join(scratchRoot, filepath.Base(deps.RepoPath))
 	skip := map[string]bool{}

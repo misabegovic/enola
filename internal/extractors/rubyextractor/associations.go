@@ -31,7 +31,6 @@ type modelAssociation struct {
 	via         string
 	through     string
 	source      string
-	sourceType  string
 	polymorphic bool
 }
 
@@ -217,18 +216,6 @@ func modelClassName(relFile string) string {
 		parts[i] = camelizeClass(part)
 	}
 	return strings.Join(parts, "::")
-}
-
-// inheritanceFacts records, for each model that descends from another model,
-// which one. Single-table inheritance means a subclass answers for every
-// association its parent declares, and the runtime enumerates them per subclass
-// — 314 STI subclasses on the monolith. Emitting each inherited association
-// again, once per subclass, would multiply one declaration into hundreds of
-// facts describing the same line of Ruby. The declaration is emitted once and
-// the chain is published, so a consumer that wants the per-subclass view can
-// walk it and one that does not is not paying for it.
-func inheritanceFacts(index *modelIndex) map[string]string {
-	return index.parents
 }
 
 // extractAssociations emits one fact per association whose target can be named,
