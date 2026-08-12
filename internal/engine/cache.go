@@ -1628,7 +1628,64 @@ import (
 // scanner refuses bare {{name}} as ambiguous, and strict-mode .gts tokens
 // resolve against imports only), and a guessed fan-in is worse than an absent
 // one.
-const cacheVersion = "v203"
+//
+// v204: a Rails namespace's declared table_name_prefix corrects the models nested
+// under it. `def self.table_name_prefix` on a module records its literal on that
+// module's symbol fact (a plain string only — an interpolated or computed prefix
+// states nothing), and a whole-repo pass prepends it to the table of every model
+// storage fact whose root namespace declares one and whose table_source is
+// derived. A declared table is left exactly as the source states it: Rails does
+// not prefix a `self.table_name`, so prefixing one would replace a stated fact
+// with a derived guess. The correction runs before the structure.sql fold, so the
+// dump's column census lands on the model that reads the prefixed relation rather
+// than on whichever model the unprefixed name collided with.
+//
+// The same version carries finding 0007's method-level residual. A Stimulus
+// data-action no longer loses the method after the `#`: the binding fact carries
+// the sorted `stimulus_handlers` set the view invokes on that controller (action
+// options like `:prevent` are not part of a method name), and the new
+// stimulus-resolver binder grounds each one on the member the controller file
+// declares, reporting the rest as `stimulus_unresolved` beside a
+// stimulus:actions coverage fact. Nothing is derived from a class name — an
+// identifier that grounded no file grounds no handler either. The controller
+// file itself now also resolves outside app/javascript/controllers: the
+// conventional root wins outright, and failing it the single file in the tree
+// whose path ends with the identifier's relative path grounds it, so an app
+// registering controllers from app/components stops being name-only. Two
+// candidates are an ambiguity and ground nothing.
+//
+// And the TypeScript gRPC stub index grows the ambiguity guard its Go sibling
+// has carried since finding 0003. Both of its keys are short names, so a service
+// declared in two proto packages collides; the name is now dropped the moment a
+// service with a DIFFERING fully-qualified name claims it, stickily, and the
+// conventional "<Service>Client" / "<Service>" names go through the same gate so
+// a derived name cannot put back what a collision dropped. Re-registration under
+// the same fq is not a collision — a split _pb/_connect pair, a barrel
+// re-export and a checked-in dist/ copy all do it — so no edge that resolves
+// today stops resolving. Emitting nothing is the whole point: an edge to one of
+// two API versions is wrong half the time, and the ambiguity is not published as
+// a fact property, which is the settled answer on the Go side.
+// v205: the Rails default schema dump joins the SQL one. db/schema.rb is read
+// into exactly the census db/structure.sql already produces — the sorted
+// `columns` set and the sorted `from_column->to_table` `fk_constraints` set,
+// through the same fold onto whichever model claims the table — so a constraint
+// written against either prop verdicts identically whichever format a project
+// keeps, and the half of the Rails world that never opted into structure.sql
+// stops producing no schema facts at all. Where both files exist structure.sql
+// wins outright and schema.rb is not read: opting into the SQL format is what
+// makes it the authoritative dump, and one database read twice would fold two
+// censuses onto one storage identity. The reader is a bounded line parser
+// rather than a Ruby grammar for the reason the pg_dump one is not a SQL
+// grammar — SchemaDumper writes one statement per line in a handful of stable
+// shapes, and a line outside them contributes nothing. The implicit primary key
+// is synthesized (`id`, the declared `primary_key:`, or none under `id: false`)
+// because it is a column the SQL dump would have written out. An
+// add_foreign_key without an explicit `column:` does not invent the name
+// ActiveSupport's inflector would derive: it CHOOSES the single `<stem>_id`
+// column the table declares that the referenced table is a plural of, and
+// states nothing where none or several match — the silence a composite key
+// already gets on the SQL side.
+const cacheVersion = "v205"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

@@ -189,9 +189,16 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 		allFacts = append(allFacts, extractBroadcasts(repoPath, files)...)
 	}
 
+	// A namespace's declared table_name_prefix corrects the models nested under
+	// it, before the dump is folded in: the fold matches a model to a table by
+	// the name the model claims, so a claim corrected afterwards would take the
+	// wrong table's column census with it and leave its own table looking
+	// unclaimed.
+	applyTableNamePrefixes(allFacts)
+
 	// Schema facts from the database's own dump, folded after the model pass so
 	// a table a model already claims lands its census on that model's fact.
-	allFacts = append(allFacts, applyStructureSQL(repoPath, allFacts)...)
+	allFacts = append(allFacts, applySchemaDump(repoPath, allFacts)...)
 
 	resolvedCalls, unresolvedCalls := countResolvedCalls(allFacts)
 	if fact, ok := callCoverageFact(repoPath, resolvedCalls, unresolvedCalls); ok {
@@ -207,6 +214,7 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 			tmplFiles = append(tmplFiles, relFile)
 		}
 	}
+	controllers := newStimulusControllerIndex(files)
 	tmplFacts := parallel.MapFiles(ctx, tmplFiles, func(relFile string) []facts.Fact {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
@@ -214,7 +222,7 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 			return nil
 		}
 		ff := extractTemplateRefs(src, relFile)
-		ff = append(ff, extractStimulusBindings(repoPath, relFile, src)...)
+		ff = append(ff, extractStimulusBindings(repoPath, relFile, src, controllers)...)
 		ff = append(ff, extractRenderTargets(repoPath, relFile, src)...)
 		return append(ff, extractTurboFrames(relFile, src)...)
 	})

@@ -138,7 +138,7 @@ func TestPresentFrameworks(t *testing.T) {
 	s.Add(frameworkFact("react"))
 	s.Add(facts.Fact{Kind: facts.KindModule, Name: "x"}) // no framework prop
 
-	fw := presentFrameworks(s)
+	fw := presentFrameworks(s.FactsRef())
 	if !fw["nextjs"] || !fw["react"] {
 		t.Errorf("presentFrameworks = %v, want nextjs and react", fw)
 	}

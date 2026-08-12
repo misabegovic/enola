@@ -88,6 +88,54 @@ func (w *rubyWalker) setModelTable(table string) {
 	}
 }
 
+// setModuleTableNamePrefix records on the enclosing module's symbol fact the
+// literal its `def self.table_name_prefix` returns. Only a module carries one —
+// Rails reads it off the namespace a model is nested in — and only a body that
+// is a single plain string is read: a computed or interpolated prefix is a value
+// this pass cannot know, and it states nothing rather than a guess.
+func (w *rubyWalker) setModuleTableNamePrefix(node *sitter.Node) {
+	s := w.cur()
+	if s == nil || s.kind != "module" || s.symFactIdx < 0 {
+		return
+	}
+	if prefix := plainStringBody(node.ChildByFieldName("body"), w.src); prefix != "" {
+		w.out[s.symFactIdx].Props["table_name_prefix"] = prefix
+	}
+}
+
+// plainStringBody returns the literal a method body consists of when that body is
+// exactly one plain string — one statement, no interpolation. Every other shape
+// returns "", so a prefix assembled at runtime never becomes a fact.
+func plainStringBody(body *sitter.Node, src []byte) string {
+	if body == nil {
+		return ""
+	}
+	node := body
+	if node.Kind() == "body_statement" {
+		var only *sitter.Node
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			child := node.NamedChild(i)
+			if child.Kind() == "comment" {
+				continue
+			}
+			if only != nil {
+				return ""
+			}
+			only = child
+		}
+		node = only
+	}
+	if node == nil || node.Kind() != "string" {
+		return ""
+	}
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		if node.NamedChild(i).Kind() != "string_content" {
+			return ""
+		}
+	}
+	return stringLiteralContent(node, src)
+}
+
 func (w *rubyWalker) ensureFileRefFact() int {
 	if w.fileRefIdx < 0 {
 		w.out = append(w.out, facts.Fact{
@@ -644,6 +692,14 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	name := rubyText(node.ChildByFieldName("name"), w.src)
 	if name == "" {
 		return
+	}
+
+	// `def self.table_name_prefix` states what Rails puts in front of every table
+	// name derived under this namespace. The models it governs live in other
+	// files, so the literal belongs on the module's own fact, where the whole-repo
+	// pass that corrects them can read it.
+	if isClassMethod && name == "table_name_prefix" {
+		w.setModuleTableNamePrefix(node)
 	}
 
 	// An instance method (`def foo`, not `def self.x`) directly in a module body

@@ -413,7 +413,9 @@ space-separated set prop — `columns contains company_id` is never
 satisfied by `parent_company_id` — and a member whose gated prop was
 never measured is out of the rule's scope, not in breach of it. The
 census props the company-FK example reads (`columns`,
-`fk_constraints`) are measured from `db/structure.sql` when present.
+`fk_constraints`) are measured from whichever schema dump the project
+keeps — `db/structure.sql` or `db/schema.rb`, the SQL one winning where
+both exist — in the same shape either way.
 
 A breach is a decided-rule finding at confidence `1.0` — the rule is
 declared and both memberships are exact, so it is proof-class, never a

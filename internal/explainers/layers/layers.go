@@ -309,29 +309,73 @@ type archPattern struct {
 	Modules     map[string]string // module -> layer name
 }
 
-// Explain analyzes the fact store and detects architectural patterns.
+// Explain analyzes the fact store and detects architectural patterns, one
+// repository at a time.
+//
+// A layer taxonomy is a property of one codebase, and every input this explainer
+// gates on — the dominant language, the frameworks present, which directories
+// exist — is a per-repository measurement. Read across a union the signals mix:
+// the monolith's `rails` framework fact admitted the Rails taxonomy for every
+// other repository in the snapshot, its module names collided with theirs, and
+// the violations reported against one repository were built from another's
+// imports. Single-repo snapshots are unaffected — every fact carries the one
+// label, so the loop below runs once over exactly what it used to see.
 func (e *LayerExplainer) Explain(ctx context.Context, store *facts.Store) ([]facts.Insight, error) {
+	scopes := store.RepoLabels()
+	sort.Strings(scopes)
+	// Facts carrying no label are one more scope rather than a scope each: they
+	// cannot be attributed to a repository, so the only honest grouping is
+	// "everything unattributed", analysed together and never mixed with a
+	// repository that named itself.
+	scopes = append(scopes, "")
+
+	var insights []facts.Insight
+	for _, scope := range scopes {
+		insights = append(insights, e.explainRepo(store, scope)...)
+	}
+	return insights, nil
+}
+
+// scopeFacts returns the facts carrying the given repo label. The store indexes
+// only non-empty labels, so the unlabelled scope is collected by scan.
+func scopeFacts(store *facts.Store, repo string) []facts.Fact {
+	if repo != "" {
+		return store.ByRepo(repo)
+	}
+	var out []facts.Fact
+	// FactsRef, not All: this only reads, and the facts do not outlive the pass.
+	for _, f := range store.FactsRef() {
+		if f.Repo == "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// explainRepo runs the whole detection over one repository's facts.
+func (e *LayerExplainer) explainRepo(store *facts.Store, repo string) []facts.Insight {
+	scoped := scopeFacts(store, repo)
+
 	// Test scaffolding is not architecture, and it is load-bearing here rather than
 	// cosmetic: len(modules) is the denominator of the pattern's coverage confidence,
 	// that confidence breaks ties in bestPattern, and a signature-layer gate can be
 	// satisfied purely by test trees (src/test/…/adapter plus src/test/…/application
 	// is enough to claim hexagonal). common.IsTestModule rather than a path test,
 	// because `module_role` from a build file outranks what a path looks like.
-	all := store.ByKind(facts.KindModule)
-	modules := make([]facts.Fact, 0, len(all))
-	for _, m := range all {
-		if common.IsTestModule(m) {
+	modules := make([]facts.Fact, 0, len(scoped))
+	for _, m := range scoped {
+		if m.Kind != facts.KindModule || common.IsTestModule(m) {
 			continue
 		}
 		modules = append(modules, m)
 	}
 	if len(modules) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	// Derive language/framework signals used to gate pattern detection.
 	lang := dominantLanguage(modules)
-	frameworks := presentFrameworks(store)
+	frameworks := presentFrameworks(scoped)
 
 	// Detect which architecture patterns match
 	patterns := e.detectPatterns(modules, lang, frameworks)
@@ -342,7 +386,7 @@ func (e *LayerExplainer) Explain(ctx context.Context, store *facts.Store) ([]fac
 	// is verdicted against its declaration at confidence 1.0 by the same
 	// violation machinery, and the heuristics below skip nothing — they still
 	// serve every repo without a declaration.
-	for _, dp := range declaredPatterns(store) {
+	for _, dp := range declaredPatterns(store, repo) {
 		mods := make([]string, 0, len(dp.Modules))
 		for mod := range dp.Modules {
 			mods = append(mods, mod)
@@ -359,7 +403,7 @@ func (e *LayerExplainer) Explain(ctx context.Context, store *facts.Store) ([]fac
 			Evidence:    evidence,
 			Actions:     []string{"Keep the declaration beside the code it governs"},
 		})
-		violations := e.detectViolations(store, dp)
+		violations := e.detectViolations(scoped, dp)
 		for i := range violations {
 			violations[i].Confidence = 1.0
 		}
@@ -396,11 +440,11 @@ func (e *LayerExplainer) Explain(ctx context.Context, store *facts.Store) ([]fac
 		})
 
 		// Detect layer violations
-		violations := e.detectViolations(store, best)
+		violations := e.detectViolations(scoped, best)
 		insights = append(insights, violations...)
 	}
 
-	return insights, nil
+	return insights
 }
 
 func (e *LayerExplainer) detectPatterns(modules []facts.Fact, lang string, frameworks map[string]bool) []*archPattern {
@@ -544,15 +588,15 @@ func dominantLanguage(modules []facts.Fact) string {
 	return best
 }
 
-// presentFrameworks collects the set of frameworks present anywhere in the fact
-// store, using the Props["framework"] attribute extractors set on routes,
-// symbols and modules (e.g. nextjs, rails, django, android, spring).
-func presentFrameworks(store *facts.Store) map[string]bool {
+// presentFrameworks collects the set of frameworks present in the given facts,
+// using the Props["framework"] attribute extractors set on routes, symbols and
+// modules (e.g. nextjs, rails, django, android, spring). The caller passes one
+// repository's facts: a framework is a property of the repository that uses it,
+// and read across a union one repository's `rails` opened the Rails taxonomy to
+// every other repository in the snapshot.
+func presentFrameworks(ff []facts.Fact) map[string]bool {
 	out := make(map[string]bool)
-	// FactsRef, not All: this only reads, and retains nothing past the loop. All
-	// would copy the whole fact set (and now every relation slice with it) to
-	// collect a handful of framework names.
-	for _, f := range store.FactsRef() {
+	for _, f := range ff {
 		if fw, ok := f.Props["framework"].(string); ok && fw != "" {
 			out[fw] = true
 		}
@@ -568,8 +612,11 @@ func presentFrameworks(store *facts.Store) map[string]bool {
 // way the shared module-graph builder does, so JS/TS-style relative imports match
 // a classified layer instead of silently missing. Output is sorted for
 // determinism.
-func (e *LayerExplainer) detectViolations(store *facts.Store, pattern *archPattern) []facts.Insight {
-	projectOf := moduleProjects(store)
+//
+// The facts passed in are one repository's, so an import can only ever be
+// verdicted against the taxonomy of the repository it was measured in.
+func (e *LayerExplainer) detectViolations(scoped []facts.Fact, pattern *archPattern) []facts.Insight {
+	projectOf := moduleProjects(scoped)
 	type violation struct {
 		sourceModule, targetModule string
 		sourceLayer, targetLayer   string
@@ -587,7 +634,10 @@ func (e *LayerExplainer) detectViolations(store *facts.Store, pattern *archPatte
 	seen := make(map[string]bool)
 	var violations []violation
 
-	for _, dep := range store.ByKind(facts.KindDependency) {
+	for _, dep := range scoped {
+		if dep.Kind != facts.KindDependency {
+			continue
+		}
 		// Test code is not architecture. Gate on the file rather than the module:
 		// resolveLayerModule walks UP to the nearest classified module, so a test or
 		// mock nested inside a production module (Sources/Foo/Mocks/X.swift) would
@@ -783,9 +833,12 @@ func matchesLayerIn(modulePath string, patterns []string, dotted bool) bool {
 // moduleProjects maps each module to the assembly it compiles into, from the
 // `project` prop the MSBuild pass sets. Empty for languages that have no such
 // unit, which leaves their violation behaviour unchanged.
-func moduleProjects(store *facts.Store) map[string]string {
+func moduleProjects(ff []facts.Fact) map[string]string {
 	out := map[string]string{}
-	for _, m := range store.ByKind(facts.KindModule) {
+	for _, m := range ff {
+		if m.Kind != facts.KindModule {
+			continue
+		}
 		if p, ok := m.Props["project"].(string); ok && p != "" {
 			out[m.Name] = p
 		}

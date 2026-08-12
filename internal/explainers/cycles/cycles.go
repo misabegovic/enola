@@ -47,7 +47,24 @@ func (e *CycleExplainer) Explain(ctx context.Context, store *facts.Store) ([]fac
 	// excluded: has_many/belongs_to pairs are inherently bidirectional domain
 	// relationships, not load-order dependencies, and would otherwise manufacture
 	// spurious two-module cycles between associated models.
-	graph := common.BuildModuleGraphExcluding(store, facts.CouplingAssociation)
+	//
+	// Constant references are excluded for the same reason one step further out.
+	// An autoloaded constant reference is a COUPLING claim, not a LOAD-ORDER
+	// claim: under Zeitwerk `Billing::Invoice.call` inside app/models resolves
+	// when the line runs, so the two directories can reference each other freely
+	// and nothing about the boot sequence is at stake. Grading them here made the
+	// finding say a thing that is not true of the codebase — and made it useless
+	// besides, since every app/* directory calls every other by design, so a flat
+	// Rails app reports one blob spanning nearly its whole tree and no cycle a
+	// team could act on. What survives the exclusion is the load-order claim
+	// proper: inheritance and mixins, which the class body evaluates at
+	// definition time, `require`, which is a load instruction, and a packwerk
+	// dependency, which the app declared itself. Nothing is deleted by this: the
+	// reference edges stay in the fact store, the depth explainer still builds
+	// the whole graph from them, and anything asking what couples to what still
+	// gets the same answer. What narrows is only the graph the gated finding is
+	// derived from.
+	graph := common.BuildModuleGraphExcluding(store, facts.CouplingAssociation, facts.CouplingReference)
 
 	// Which build unit each module compiles into, where the language models one.
 	// See facts.CompilationUnitProps: a cycle confined to a single unit is not a

@@ -40,17 +40,23 @@ type parsedTable struct {
 }
 
 // applyStructureSQL parses db/structure.sql when present and returns storage
-// facts for the tables it declares. A table an ActiveRecord/Sequel model
-// already claims (a storage fact whose table prop names it) gets its census
-// ADDED to the model's fact instead of a second fact — one table, one storage
-// identity, whichever pass saw it first. Model facts in allFacts are mutated
-// in place for exactly that case.
+// facts for the tables it declares.
 func applyStructureSQL(repoPath string, allFacts []facts.Fact) []facts.Fact {
 	data, err := os.ReadFile(filepath.Join(repoPath, filepath.FromSlash(structureSQLPath)))
 	if err != nil {
 		return nil
 	}
-	tables := parseStructureSQL(string(data))
+	return foldTables(parseStructureSQL(string(data)), allFacts, structureSQLPath)
+}
+
+// foldTables turns a parsed dump into storage facts, and is what both dump
+// formats reach: the census a rule reads must not be able to tell which format
+// declared it. A table an ActiveRecord/Sequel model already claims (a storage
+// fact whose table prop names it) gets its census ADDED to the model's fact
+// instead of a second fact — one table, one storage identity, whichever pass
+// saw it first. Model facts in allFacts are mutated in place for exactly that
+// case.
+func foldTables(tables map[string]*parsedTable, allFacts []facts.Fact, dumpPath string) []facts.Fact {
 	if len(tables) == 0 {
 		return nil
 	}
@@ -82,6 +88,9 @@ func applyStructureSQL(repoPath string, allFacts []facts.Fact) []facts.Fact {
 			}
 			continue
 		}
+		// A table is a database object whichever dump declared it, so the
+		// language stays sql even when the declaring file is Ruby: the two
+		// formats must not sort into different buckets for the same table.
 		props := map[string]any{
 			"storage_kind": "table",
 			"table":        name,
@@ -91,7 +100,7 @@ func applyStructureSQL(repoPath string, allFacts []facts.Fact) []facts.Fact {
 		out = append(out, facts.Fact{
 			Kind:  facts.KindStorage,
 			Name:  name,
-			File:  structureSQLPath,
+			File:  dumpPath,
 			Line:  t.line,
 			Props: props,
 		})
