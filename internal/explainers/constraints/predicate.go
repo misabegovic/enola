@@ -128,9 +128,7 @@ func propTokens(f facts.Fact, prop string) []string {
 	case []any:
 		out := make([]string, 0, len(v))
 		for _, element := range v {
-			for _, token := range propTokens(facts.Fact{Props: map[string]any{prop: element}}, prop) {
-				out = append(out, token)
-			}
+			out = append(out, propTokens(facts.Fact{Props: map[string]any{prop: element}}, prop)...)
 		}
 		return out
 	}
