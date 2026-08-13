@@ -245,6 +245,7 @@ components:
     name_pattern: Billing        # optional: exactly one fact, by exact name
     service: billing             # optional: one repo of a multi-repo snapshot,
                                  # by exact repo label
+    where: { framework: rails }  # optional: a predicate over measured fact props
 ```
 
 `match` speaks the same bounded glob dialect declared layers use: an
@@ -266,6 +267,250 @@ then it also contains the synthetic service node the cross-repo
 linker emits, so service-to-service `depends_on` edges are walkable
 like any other. A fact with no repo label matches no service, fail
 closed.
+
+#### Selecting by concept: `where`
+
+`where` selects members by what the measured facts **carry** instead of
+by where their files sit, so a rule can name an enforceable concept
+rather than a directory. It is a **membership** selector and only that:
+the forms that read a member's own props take it, the forms that walk
+edges refuse it at declaration time — see *`where` is membership-only*
+below for why, and for the two things that would change it.
+
+```yaml
+components:
+  - name: view-components
+    where: { superclass: "ViewComponent::Base" }
+  - name: ember-components
+    where: { framework: ember, symbol_kind: class }
+  - name: models
+    where: { kind: storage, storage_kind: model }
+  - name: hairy-methods
+    where: { symbol_kind: method, cyclomatic: ">=20" }
+```
+
+Every key names something the extractors measured. That is the whole
+vocabulary: **a predicate can only reach a concept the facts already
+carry**. Two worked examples of the limit, both measured on a
+production Rails+Ember monolith (153,252 facts, 2026-08-13):
+
+- `{ framework: ember, symbol_kind: class }` selects 2,200 Ember
+  component classes. It works because the TypeScript extractor puts
+  `framework: ember` on the class.
+- There is **no predicate in this vocabulary that names a Stimulus
+  controller.** `framework: stimulus` is set on the `static
+  targets`/`values` field members, never on the class
+  (`tsextractor/ts.go`), so it returns 52 method facts and
+  `{ framework: stimulus, symbol_kind: class }` returns 0. Selecting on
+  the base class instead depends on what the TypeScript extractor emits
+  in the snapshot you are reading, which is a moving target and not a
+  property of this vocabulary: ask the snapshot
+  (`query_facts kind=symbol prop=superclass`) rather than this page.
+  What does not move is that 42 of the 50 controllers are written
+  `export default class extends Controller`, anonymously, so a
+  name-based selector reaches at most 8 of them however the base class
+  is measured.
+
+- **Conjunction only.** Every pair must hold. There is no `or` and no
+  negation: a disjunction is two components, which reads better than a
+  nested boolean, and a negation asks the snapshot to answer for facts
+  it may simply never have measured.
+- **`kind` is the one reserved key**; every other key is a fact property
+  name. `kind` narrows the fact kind, the same narrowing the component's
+  own `kind:` field carries — declaring both spellings is an error
+  rather than a silent precedence rule.
+- **`superclass:` is one level, and only one.** The extractor records
+  `superclass` exactly as the source wrote it, so
+  `superclass: ViewComponent::Base` selects the classes that name that
+  parent *directly* and nothing written underneath them: on the monolith
+  that is 269 of the 357 classes whose ancestry reaches it, 310 of 531
+  for `ApplicationRecord`. This vocabulary has no transitive spelling —
+  a rule that must cover a hierarchy names each level, or widens the
+  component another way.
+
+  A component whose members are named as the parent by classes it does
+  not contain gets a 0.4 advisory carrying the count and the classes —
+  the case neither the dead-selector nor the unmeasured-property
+  advisory could see, because the selector worked and simply reached
+  less than the concept it names. Its witnesses are lexical, like the
+  property, and the count is **neither a floor nor a ceiling**. It
+  misses: a subclass that spelled its parent relatively — the
+  unqualified `Base` inside a module — writes text no member's fact name
+  equals. It over-attributes: the index is keyed on the parent as
+  written and read by the member's resolved fact name, so a
+  module-scoped `Base` and a top-level `Base` are one key, and
+  `Widgets::Card < Base` is named as a subclass of a member it does not
+  inherit from. Both are the same fact about `superclass` — it is source
+  text, and no reading of it is transitive or namespace-aware without a
+  resolution pass the extractor did not make.
+- **Values match one whole member at a time**, the same containment the
+  `require` form's `when_prop_contains` reads set props with. For the
+  space-joined set props (`columns`, `fk_constraints`, `decorators`)
+  that is containment; for a scalar prop — which decomposes into a
+  single token — it is exactly equality. One semantic, not two, and
+  never a substring: `company_id` is not satisfied by
+  `parent_company_id`.
+- **Numeric props take thresholds**: `">=20"`, `"<=2"`, `">0"`,
+  `"<3.5"`. Quote them — a bare `>=` opens a folded scalar in YAML.
+
+  The grammar is one ASCII comparator and one decimal number: an
+  optional `-`, digits, an optional fractional part. Nothing else
+  parses, and everything else is a named error rather than a literal
+  string nothing will ever equal. `"=>30"`, the hash-rocket
+  transposition, is rejected. So are Go's other numeric literal forms,
+  each of which meant something no reader of the YAML would guess:
+  `"<=Inf"` validated clean and selected every fact carrying the
+  property as a number, `">=1_0"` means ten, `">=0x1fp0"` means
+  thirty-one. So are the comparators a rendered document leaves behind —
+  `"≥30"`, `"≤30"`, `"≫30"`, `"﹥30"`, `"⇒30"`, `"❯30"` — which arrive
+  by exactly the route `"=>30"` does and select nothing. That screen is
+  an **allowlist**, not a list of named runes: enumerating the ones that
+  look like a relation has no edge, and every one left off compiled to a
+  literal token. A value may open with any ASCII rune, or with a letter,
+  a digit or a combining mark — the alphabets an identifier is written
+  in. A non-ASCII symbol or punctuation rune opens nothing this grammar
+  can mean.
+
+  A threshold against a property no measured fact carries as a number is
+  a 1.0 finding for the same reason an unmeasured property is — it can
+  never hold.
+- **A value carries no whitespace, of any kind.** The screen reads the
+  same alphabet the decoder splits on, so a non-breaking space pasted
+  out of a rendered document is refused exactly as a plain one is. The
+  compiled form percent-escapes whitespace so the round trip is
+  lossless, and a compiled predicate that does not decode back into
+  property tests selects nothing and says so. A declaration never
+  compiles to a predicate different from what it says — in either
+  direction.
+- **`where` ANDs with `match`, `service`, `kind` and `name_pattern`**,
+  for the same reason every field on a component narrows and none
+  widens: a component carrying both a path scope and a predicate is
+  their intersection, which is how a path scope you trust gets
+  sharpened rather than replaced. A `where` alone needs no `match`: the
+  predicate is the selector.
+
+  The AND holds wherever a component is joined to a file, including the
+  edge TARGET join: a file-granular import target names no fact, so it
+  is resolved against the component's `match` globs, and for a
+  predicate component that join additionally requires the component to
+  have measured a member in the resolved file. A path component keeps
+  the plain glob join — its globs ARE its claim about files. The edge
+  target join is unreachable for a predicate component today, because
+  an edge form naming one is refused at declaration time (below); the
+  AND is written where the join is defined rather than where it is
+  called, so relaxing that refusal cannot silently widen it.
+- **An unmeasured property fails closed and loudly.** A `where` naming
+  a property no measured fact in the snapshot carries is a validation
+  problem in `constraints lint` (exit 1, with near-miss suggestions)
+  and a 1.0 finding from the explainer, and every rule naming that
+  component emits **no verdict** — because an empty component makes
+  every rule over it hold, and that reads exactly like compliance. This
+  is distinct from the 0.4 dead-selector advisory, which covers a
+  measured property whose value happens to match nothing.
+
+  The census is scoped to the component's **own service**: a component
+  reading `service: billing` is judged against billing's facts, never
+  against the union's. A component naming a service the snapshot does
+  not contain is unasked before the question is asked — the 0.4
+  absent-service advisory, never a 1.0 measurement claim about a repo
+  that was never loaded.
+- **A constraint finding is never incidental.** The gate's ratchet
+  files a finding as incidental when the change touched nothing it
+  cites, which is right for a moving mean+2σ threshold and wrong for a
+  declared rule: the fail-closed findings cite the COMPONENT, and a
+  component is exactly what does not change when the code moves out
+  from under its selector. Constraint findings are graded on their own
+  terms, so the 1.0 "selector cannot be evaluated" finding fails
+  `check` when a snapshot stops measuring what a declaration reads.
+- **A breach that stopped being reported is not automatically a breach
+  that was fixed.** `check` prints two further sections rather than
+  folding either into "Resolved by this change". *No longer verdicted* —
+  the code the breach named is still measured and no longer selected by
+  the component its rule binds; changing a class's superclass silences
+  every rule that named it exactly this way. *No longer declared* — the
+  rule was deleted, re-formed under a preserved id, or the witness was
+  carved out by an exemption, with the breaching code untouched.
+  Neither is graded, both are legitimate acts, and neither reads as good
+  news.
+
+  A third section, *not attributable to this change*, covers what the
+  pair of snapshots has no standing to judge at all: the repository a
+  witness was measured in left a union snapshot (which reads exactly
+  like deleted code, and which `WarnDifferentRepo` cannot see because it
+  keys on the snapshot's own identity rather than on the union's
+  members — there is a `union_membership` warning for it now), or the
+  baseline carried the finding without the declaration that produced it.
+
+  The inverse matters as much and is more ordinary, because it steals
+  credit for work someone did. A rule's declaration identity now
+  excludes its bookkeeping — `source`, `recipe`, `instance` and
+  `because` — so moving a rule between constraints files or relabelling
+  a recipe instance no longer files every breach the same change fixed
+  under "the law stopped asking". Exemptions are compared **per
+  witness** rather than as one blob, so adding a carve-out for witness X
+  and fixing witness Y in one change credits Y to the change that fixed
+  it.
+
+#### `where` is membership-only: no edge form takes a predicate
+
+A predicate selects the facts that CARRY a property, and every property
+this vocabulary can test — `superclass`, `symbol_kind`, `storage_kind`,
+`framework`, `cyclomatic`, `decorators` — is measured on the **class**.
+The call graph connects **methods**. In Ruby a class's calls ride its
+`Owner#method` facts, which carry none of those props and therefore
+cannot be members of the component; on the monolith all 39,601 `imports`
+edges ride dependency facts, which carry none of them either, and whose
+targets are paths rather than fact names. So a rule that resolves a
+predicate component against a measured edge resolves it against nothing
+— on the source side because the edge sits on a fact the predicate
+cannot select, and on the target side because the edge names a path.
+
+**Therefore a component carrying a `where:` may not be party to an edge
+form at all.** It is refused at declaration time — a validation problem
+naming the component, the rule, the role and what to use instead, which
+`constraints lint` reports (exit 1) and which every config-load path
+rejects, so no such rule ever compiles into a fact:
+
+| refused | accepted |
+| --- | --- |
+| the subject of `forbid`, `forbid_reach`, `allow`, `protect`, `private`, `require_edge`, `protocol` | the subject of `forbid_fact`, `cap`, `require`, `require_defines`, `require_name`, `guide` |
+| a `to:`, `owners:`, `only:`, `except:` or `steps:` value of any rule | |
+
+The accepted column is the whole of what reads a member's own props, and
+those forms are exactly where a concept earns its keep: cap the surface,
+require a column, require a method, require a name, guide an editor. The
+refused column is the whole of what reads an edge. The two are
+enumerated from the schema's own form table, so a form added later
+without a decision about it fails a test rather than defaulting into
+either column.
+
+**Why a refusal rather than a narrower rule.** Four earlier rounds tried
+to make the edge forms honest position by position — refuse the
+file-level carrier, then the target join, then the roles whose empty
+resolution manufactures breaches — and each round left the roles nobody
+had thought of silently wrong, because "resolved to nothing" and
+"resolved to nothing that breaches" are rendered identically by every
+surface. Refusing at authoring time is total instead of nearly total: a
+declaration that cannot be right does not load.
+
+**What would make the edge forms honest** is two things this vocabulary
+does not have, and both are real work rather than a patch. `Graph.methodOwner`
+has to learn the `#` separator so a method fact can be attributed to the
+class that owns it (PR #92, not merged). And there has to be a DECLARED
+notion of member ownership — that a class's methods' edges count as the
+class's edges — because that is a semantic choice about what a component
+means, not an implementation detail. Until both land, an edge-walking
+rule over a concept is a question the snapshot cannot answer, and the
+honest answer to a question you cannot answer is to refuse it.
+
+Edge reach and the `inherits:` closure are held out (PR #94, not
+merged) with those two blockers named.
+
+The pre-edit contract answers for a raw path when the snapshot carries
+a member in it — the arm `plan --paths` needs, since a `where`-only
+component has no match patterns for a path to join. A file nobody has
+written yet is still refused: nothing has been measured about it, and
+that is exactly what a predicate cannot answer for.
 
 ### The eleven rule forms
 
@@ -418,10 +663,11 @@ keeps — `db/structure.sql` or `db/schema.rb`, the SQL one winning where
 both exist — in the same shape either way.
 
 A breach is a decided-rule finding at confidence `1.0` — the rule is
-declared and both memberships are exact, so it is proof-class, never a
-heuristic — with the rule's `because` in the description. Target
-resolution fails closed: an edge whose target names nothing measured
-is skipped, never guessed into a violation.
+declared and each membership is either an exact fact name or a target
+grounded on the measured file it names, and the verdict says which —
+with the rule's `because` in the description. Target resolution fails
+closed: an edge whose target names nothing measured is skipped, never
+guessed into a violation.
 
 ### Decorator discipline — the cached-getter example
 
@@ -444,7 +690,7 @@ rules:
     when_prop_contains: {prop: symbol_kind, value: getter}
     must_prop_contain: {prop: decorators, value: cached}
     mode: advisory
-    because: "mined 2026-08-11 over the teamtailor monolith: 106 of 10283
+    because: "mined 2026-08-11 over a large Rails monolith: 106 of 10283
       getters carry @cached (60 of 6992 in components), and even of getters
       with >=5 outgoing calls only 7 of 290 carry it — while every one of the
       106 @cached getters skews expensive (52% loop vs 17% of the uncached).
@@ -642,8 +888,13 @@ rules:
 
 **Instantiations** live in the existing `enola/constraints/*.yaml`
 files, as `use_recipe:` entries binding each role to a real component
-selector (the same `match`/`service`/`kind`/`name_pattern` narrowings
-a component takes):
+selector (the same `match`/`service`/`kind`/`name_pattern`/`where`
+narrowings a component takes, so a role a recipe only reads the props
+of can be bound to a concept — `surface: { where: { superclass:
+StandardError } }` — as readily as to a directory; a role some rule in
+the recipe resolves against an edge cannot, and binding a `where:` to
+one is refused on the EXPANDED declaration, naming the expanded
+component):
 
 ```yaml
 use_recipe:
@@ -657,7 +908,7 @@ use_recipe:
     exempt:
       - rule: events-consumed
         witness: "LegacyOrderMigratedEvent has no inbound calls edge from orders-events/handlers"
-        owner: "muhamed"
+        owner: "dana"
         because: "Fired only by the migration backfill, consumed manually."
         since: "2026-08-11"
 ```
@@ -978,7 +1229,7 @@ collector for runtime-observed facts. It reads capture files from
 `.enola-runtime/*.json` in the target repository — captures an
 operator produced by running the app, never something the snapshot
 produces — and emits them through the seam. Two capture schemas are
-recognized: the booted-Rails capture (`source: "tt-enola runtime"`,
+recognized: the booted-Rails capture (`source: "enola runtime"`,
 the final route table plus reflected associations and table bindings,
 which only exist after boot) and the query-counter capture
 (`source: "activesupport-notifications"`, database queries per

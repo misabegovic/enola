@@ -77,7 +77,7 @@ func (r *Runner) Constraints(args []string) {
 		problems += r.lintRepoDeclaration(tgt.engine.Config().Intent[filepath.Base(repoPath)], repoPath, declared)
 	}
 
-	r.lintResolveComponents(tgt.engine, tgt.repoPaths[0], declared)
+	problems += r.lintResolveComponents(tgt.engine, tgt.repoPaths[0], declared)
 
 	if problems > 0 {
 		fmt.Printf("\nFAIL — %s.\n", plural(problems, "validation problem", "validation problems"))
@@ -238,16 +238,22 @@ func (r *Runner) lintRepoDeclaration(clusterDecl *intent.Declaration, repoPath s
 // disk, if any: measured facts from the snapshot, component and rule facts
 // from the declarations as they stand NOW — the file being edited, not the
 // copy compiled into the snapshot — so the counts answer for the author's
-// working tree.
-func (r *Runner) lintResolveComponents(eng *bootstrap.Engine, anchor string, declared *facts.Store) {
+// working tree. It returns the number of problems the join found. A selector
+// naming a property the snapshot does not measure is one, because a predicate
+// nothing can evaluate is a broken declaration rather than an empty component.
+// It fails here, at authoring time, rather than being read as law from its own
+// silence. A predicate component in an edge-walking role needs no snapshot to
+// refuse: it is a defect of the declaration alone, and the validation pass
+// above has already reported it.
+func (r *Runner) lintResolveComponents(eng *bootstrap.Engine, anchor string, declared *facts.Store) int {
 	if len(declared.ByKind(facts.KindIntent)) == 0 {
-		return
+		return 0
 	}
 	outDir := eng.OutputDir(anchor)
 	snap, err := bootstrap.LoadSnapshotDir(outDir)
 	if err != nil {
 		fmt.Printf("\nComponent resolution: no snapshot at %s - validation only.\n", outDir)
-		return
+		return 0
 	}
 	store := facts.NewStore()
 	for _, f := range snap.Facts {
@@ -258,13 +264,38 @@ func (r *Runner) lintResolveComponents(eng *bootstrap.Engine, anchor string, dec
 	}
 	store.Add(declared.ByKind(facts.KindIntent)...)
 
+	unevaluableList := constraints.UnevaluableSelectors(store)
+	unevaluable := map[string]bool{}
+	for _, u := range unevaluableList {
+		unevaluable[u.Component] = true
+	}
+	unasked := constraints.UnaskedComponents(store)
+
 	fmt.Printf("\nComponent resolution against the snapshot at %s:\n", outDir)
 	for _, c := range constraints.MemberCounts(store) {
 		note := ""
-		if c.Members == 0 {
+		switch {
+		case unasked[c.Component] != "":
+			note = "  <- names service " + unasked[c.Component] + ", absent from this snapshot; unasked, never failed"
+		case unevaluable[c.Component]:
+			note = "  <- selector cannot be evaluated against this snapshot"
+		case c.Members == 0:
 			note = "  <- matches nothing; every rule naming it holds vacuously"
 		}
 		fmt.Printf("  %-24s %d member(s)%s\n", c.Component, c.Members, note)
+		if c.Selector != "" {
+			fmt.Printf("  %-24s   %s\n", "", c.Selector)
+		}
+	}
+	if len(unevaluableList) > 0 {
+		fmt.Printf("\nSelectors this snapshot cannot evaluate:\n")
+		for _, u := range unevaluableList {
+			suggestion := ""
+			if len(u.NearMiss) > 0 {
+				suggestion = fmt.Sprintf(" (measured properties with similar names: %s)", strings.Join(u.NearMiss, ", "))
+			}
+			fmt.Printf("  %s: %s%s — declared in %s\n", u.Component, u.Problem(), suggestion, u.Source)
+		}
 	}
 	if absent := constraints.AbsentExemplars(store); len(absent) > 0 {
 		fmt.Printf("\nGuidance exemplars the snapshot cannot resolve (a note, not an error):\n")
@@ -272,6 +303,7 @@ func (r *Runner) lintResolveComponents(eng *bootstrap.Engine, anchor string, dec
 			fmt.Printf("  %s: %s\n", n.Rule, n.Exemplar)
 		}
 	}
+	return len(unevaluableList)
 }
 
 func exemptionCount(rules []intent.ConstraintRule) int {

@@ -51,7 +51,7 @@ func TestEvaluateCurrent_BaselinedExemptedFindingStillReports(t *testing.T) {
 
 func TestEvaluateCurrent_InstancePrefixedExemptionLandsInTheExemptedBucket(t *testing.T) {
 	in := insight("constraints", "Exempted from constraint orders-events/events-consumed: LegacyOrderMigratedEvent has no inbound calls edge from orders-events/handlers", 0.9)
-	in.Evidence = []facts.Evidence{{Fact: "rule: orders-events/events-consumed", Detail: "exempted by muhamed since 2026-08-11 — fired only by the migration backfill, consumed manually"}}
+	in.Evidence = []facts.Evidence{{Fact: "rule: orders-events/events-consumed", Detail: "exempted by dana since 2026-08-11 — fired only by the migration backfill, consumed manually"}}
 	d := &diff.SnapshotDiff{
 		Comparability: diff.Comparability{Comparable: true},
 		FindingsNew:   []facts.Insight{in},
@@ -76,5 +76,49 @@ func TestEvaluate_ExemptedFindingNeverFailsUnderAnyPolicy(t *testing.T) {
 	}
 	if len(v.Exempted) != 1 {
 		t.Fatalf("exempted = %+v, want the entry bucketed from the delta path too", v.Exempted)
+	}
+}
+
+// A breach whose witness this delta carves out is reported once, as excused.
+// It reaches the undeclared bucket honestly — an exemption IS a declaration
+// change — but the gate printed the same witness under two headings, and one
+// of them said nothing the other did not.
+func TestEvaluateCurrent_AnExemptedBreachIsNotAlsoReportedAsUndeclared(t *testing.T) {
+	carveOut := insight("constraints", "Exempted from constraint errors-are-recognisable: Failed does not match *Error", 0.9)
+	breach := insight("constraints", "Constraint errors-are-recognisable violated: Failed does not match *Error", 1.0)
+	other := insight("constraints", "Constraint errors-are-recognisable violated: Broken does not match *Error", 1.0)
+	d := &diff.SnapshotDiff{
+		Comparability:      diff.Comparability{Comparable: true},
+		FindingsNew:        []facts.Insight{carveOut},
+		FindingsUndeclared: []facts.Insight{breach, other},
+	}
+	v := EvaluateCurrent(d, Policy{}, []facts.Insight{carveOut})
+	if len(v.Exempted) != 1 {
+		t.Fatalf("exempted = %+v, want the carve-out", v.Exempted)
+	}
+	if len(v.Undeclared) != 1 || v.Undeclared[0].Title != other.Title {
+		t.Fatalf("undeclared = %+v, want only the breach nobody excused", v.Undeclared)
+	}
+	rendered := v.Render()
+	if strings.Count(rendered, "Failed does not match *Error") != 1 {
+		t.Errorf("the excused witness is printed more than once:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "No longer declared (1)") {
+		t.Errorf("the unexcused breach must still be reported as undeclared:\n%s", rendered)
+	}
+}
+
+// A delta whose only content is a breach that stopped being declared is not
+// "no architectural change": the headline is the line a reader skims, and it
+// contradicted the section printed under it.
+func TestEvaluateCurrent_UndeclaredBreachChangesTheHeadline(t *testing.T) {
+	breach := insight("constraints", "Constraint errors-are-recognisable violated: Failed does not match *Error", 1.0)
+	d := &diff.SnapshotDiff{
+		Comparability:      diff.Comparability{Comparable: true},
+		FindingsUndeclared: []facts.Insight{breach},
+	}
+	rendered := EvaluateCurrent(d, Policy{}, nil).Render()
+	if strings.Contains(rendered, "no architectural change") {
+		t.Errorf("headline claims no architectural change above a no-longer-declared breach:\n%s", rendered)
 	}
 }

@@ -1,12 +1,13 @@
 // Package clientseam turns a repo's own HTTP helper into client routes.
 //
 // A Go service that wraps net/http in one project-local function disappears from
-// the cross-repo graph. aboard-cli is the measured case: every call it makes is
-// `api.Request[Task]("/me/tasks", …)`, the net/http call is two packages away
-// inside a generic helper, and the per-file client extractor is gated on the file
-// importing net/http — which the command files do not. The repo emitted ZERO
-// client routes and the cluster reported "service aboard appears isolated", while
-// 14 of its 14 distinct literal paths match an aboard server route exactly.
+// the cross-repo graph. A Go CLI in this estate is the measured case: every call
+// it makes is `api.Request[Task]("/me/tasks", …)`, the net/http call is two
+// packages away inside a generic helper, and the per-file client extractor is
+// gated on the file importing net/http — which the command files do not. The
+// repo emitted ZERO client routes and the cluster reported that the service it
+// calls appears isolated, while 14 of its 14 distinct literal paths match a
+// server route in that service exactly.
 //
 // The work splits across two passes because neither half can be done alone. The
 // extractor sees one package and records a CANDIDATE for every call passing a
@@ -116,7 +117,7 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 // constructor, keyed by repo so two repos with the same package layout cannot
 // bleed into each other.
 //
-// Transitively, and that is the whole point: aboard-cli's `api.Request` does not
+// Transitively, and that is the whole point: that CLI's `api.Request` does not
 // call net/http itself, it calls `api.doRequest` which does. A one-hop rule would
 // find the seam nobody calls and miss the one everybody does.
 func reachesHTTP(all []facts.Fact) map[string]bool {

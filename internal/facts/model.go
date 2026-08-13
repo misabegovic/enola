@@ -267,10 +267,11 @@ type SnapshotMeta struct {
 	Git          *GitInfo `json:"git,omitempty"`           // repo VCS state, nil when not a git repo
 	ConfigHash   string   `json:"config_hash,omitempty"`   // hash of the effective config (extractors, explainers, renderers, globs, output) — a superset of IgnoreGlobHash
 
-	// ExtractorVersion identifies the EXTRACTION BEHAVIOUR that produced this graph:
+	// ExtractorVersion identifies the BEHAVIOUR that produced this graph:
 	// internal/engine.cacheVersion, the constant bumped whenever an extractor starts
-	// reading something differently (and guarded by internal/cachecov, which refuses a
-	// bump without a covering test).
+	// reading something differently — or whenever the same facts start producing a
+	// different graph, which moves findings on an unedited tree just as surely (and
+	// guarded by internal/cachecov, which refuses a bump without a covering test).
 	//
 	// It is provenance EnolaVersion cannot supply. A released binary carries a version
 	// that moves with every release, so an upgrade is visible; a local build carries the

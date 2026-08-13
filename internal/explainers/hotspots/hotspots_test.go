@@ -430,3 +430,91 @@ func TestExplain_ExcludesInstantiateFanIn(t *testing.T) {
 		}
 	}
 }
+
+// A class whose out-degree is almost entirely its own methods is not a pinch point.
+// Imports::BaseImporter on a large Rails monolith is 449 lines of one-line
+// delegations: 102 methods, and exactly ONE call out. Counting the has_method edges
+// wiring it to those methods gave it out-degree 104 and put it in the top 20 as
+// "it calls out to 104 others" — a finding manufactured out of the class's size,
+// where a class with only a hundred methods and one call is precisely what this
+// explainer is not for.
+func TestExplain_ExcludesOwnedMethodsFromFanOut(t *testing.T) {
+	s := facts.NewStore()
+	const delegator = "Imports::BatchDelegator"
+	s.Add(facts.Fact{Kind: facts.KindSymbol, Name: delegator, File: "lib/imports/batch_delegator.rb",
+		Props:     map[string]any{"symbol_kind": facts.SymbolClass},
+		Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "Imports::Runner.run_in_batch"}}})
+	s.Add(facts.Fact{Kind: facts.KindSymbol, Name: "Imports::Runner", File: "lib/imports/runner.rb",
+		Props: map[string]any{"symbol_kind": facts.SymbolClass}})
+	s.Add(facts.Fact{Kind: facts.KindSymbol, Name: "Imports::Runner.run_in_batch", File: "lib/imports/runner.rb",
+		Props: map[string]any{"symbol_kind": facts.SymbolFunc}})
+	for i := 0; i < 102; i++ {
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: fmt.Sprintf("%s#import_%d", delegator, i),
+			File:  "lib/imports/batch_delegator.rb",
+			Props: map[string]any{"symbol_kind": facts.SymbolMethod}})
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: fmt.Sprintf("app/jobs/j%d.Job", i),
+			File:      fmt.Sprintf("app/jobs/j%d.rb", i),
+			Props:     map[string]any{"symbol_kind": facts.SymbolClass},
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: delegator}}})
+	}
+	s.BuildGraph()
+
+	if got, want := s.Graph().FanOut(delegator), 103; got != want {
+		t.Fatalf("precondition: raw FanOut(%s) = %d, want %d (one call plus 102 owned methods)", delegator, got, want)
+	}
+
+	insights, err := New().Explain(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	for _, ins := range insights {
+		if strings.Contains(ins.Title, delegator) {
+			t.Errorf("a class whose out-degree is its own methods must not be a hotspot; got %q", ins.Title)
+		}
+	}
+}
+
+// Whatever a hotspot's reported fan-out is, the description states it as calls, so it
+// has to count what the symbol reaches out to and never its own members.
+func TestExplain_ReportedFanOutCountsOnlyOutgoingCoupling(t *testing.T) {
+	s := facts.NewStore()
+	const hub = "core.Hub"
+	calls := make([]facts.Relation, 0, 5)
+	for i := 0; i < 5; i++ {
+		target := fmt.Sprintf("dep/t%d.Fn", i)
+		calls = append(calls, facts.Relation{Kind: facts.RelCalls, Target: target})
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: target, File: "dep/t.go"})
+	}
+	s.Add(facts.Fact{Kind: facts.KindSymbol, Name: hub, File: "core/hub.go",
+		Props: map[string]any{"symbol_kind": facts.SymbolStruct}, Relations: calls})
+	for i := 0; i < 5; i++ {
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: fmt.Sprintf("%s.M%d", hub, i), File: "core/hub.go",
+			Props: map[string]any{"symbol_kind": facts.SymbolMethod}})
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: fmt.Sprintf("caller/c%d.Fn", i), File: "caller/c.go",
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: hub}}})
+	}
+	s.BuildGraph()
+
+	if got, want := s.Graph().FanOut(hub), 10; got != want {
+		t.Fatalf("precondition: raw FanOut(%s) = %d, want %d (five calls plus five owned methods)", hub, got, want)
+	}
+
+	insights, err := New().Explain(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) != 1 {
+		t.Fatalf("expected 1 hotspot insight, got %d: %+v", len(insights), insights)
+	}
+	if got := insights[0].Title; !strings.Contains(got, "fan-out 5") {
+		t.Errorf("title %q should report fan-out 5 — the five calls, not the five methods", got)
+	}
+	if got := insights[0].Description; !strings.Contains(got, "calls out to 5 others") {
+		t.Errorf("description %q should say it calls out to 5 others", got)
+	}
+	for _, ev := range insights[0].Evidence {
+		if strings.HasPrefix(ev.Symbol, hub+".M") {
+			t.Errorf("evidence lists an owned method %q as something the hub calls", ev.Symbol)
+		}
+	}
+}

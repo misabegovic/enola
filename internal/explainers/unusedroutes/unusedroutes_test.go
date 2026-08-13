@@ -199,8 +199,9 @@ func TestExplain_SingleRepoNoServiceNodesYieldsNothing(t *testing.T) {
 }
 
 // TestExplain_ThinClientCoverageDescribesTheSnapshot pins the case the estate
-// actually hit: teamtailor reported 3,392 of 3,732 routes unmatched, because its
-// callers are browsers and third-party integrators rather than repositories.
+// actually hit: a large Rails monolith reported 3,392 of 3,732 routes unmatched,
+// because its callers are browsers and third-party integrators rather than
+// repositories.
 // Presenting that as a list of dead-endpoint candidates is how a finding earns
 // being ignored wholesale.
 func TestExplain_ThinClientCoverageDescribesTheSnapshot(t *testing.T) {

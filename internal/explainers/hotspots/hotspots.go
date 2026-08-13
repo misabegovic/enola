@@ -59,10 +59,14 @@ func (e *HotspotExplainer) Explain(ctx context.Context, store *facts.Store) ([]f
 	// the graph: the graph stores its adjacency as CSR, and the map form used to
 	// build a full filtered copy of the reverse index on every call.
 	//
-	// Architectural fan-in only: reference-only facts (test_ref/file_ref) are not
-	// symbols, so counting their RelCalls edges inflates the centrality score and
-	// the outlier distribution (GAP-XL-15). Fan-out is unaffected — a symbol never
-	// calls a reference node.
+	// Architectural degree on both sides. Fan-in: reference-only facts
+	// (test_ref/file_ref) are not symbols, so counting their RelCalls edges inflates
+	// the centrality score and the outlier distribution (GAP-XL-15). Fan-out: the
+	// has_method edges wiring a type to the methods it declares are containment, not
+	// calls, and this explainer says out loud that they are calls — so counting them
+	// reports a class as a pinch point for being large. Raw out-degree put
+	// BaseImporter, whose 449 lines are 102 one-line delegations and exactly one call
+	// out, in the monolith's top 20 as "it calls out to 104 others".
 	symbols := store.ByKind(facts.KindSymbol)
 	if len(symbols) == 0 {
 		return nil, nil
@@ -87,7 +91,7 @@ func (e *HotspotExplainer) Explain(ctx context.Context, store *facts.Store) ([]f
 	values := make([]float64, 0, len(distinct))
 	for _, s := range distinct {
 		in := graph.ArchitecturalFanIn(s.Name)
-		out := graph.FanOut(s.Name)
+		out := graph.ArchitecturalFanOut(s.Name)
 		score := in * out
 		scores[s.Name] = score
 		values = append(values, float64(score))
@@ -117,7 +121,7 @@ func (e *HotspotExplainer) Explain(ctx context.Context, store *facts.Store) ([]f
 			continue
 		}
 		in := graph.ArchitecturalFanIn(s.Name)
-		out := graph.FanOut(s.Name)
+		out := graph.ArchitecturalFanOut(s.Name)
 		if in < minDegree || out < minDegree {
 			continue
 		}
@@ -147,7 +151,7 @@ func (e *HotspotExplainer) Explain(ctx context.Context, store *facts.Store) ([]f
 		for _, edge := range firstN(graph.ArchitecturalReverseEdges(c.fact.Name), maxNeighbors) {
 			evidence = append(evidence, facts.Evidence{Symbol: edge.Target, Detail: "calls into " + c.fact.Name})
 		}
-		for _, edge := range firstN(graph.ForwardEdges(c.fact.Name), maxNeighbors) {
+		for _, edge := range firstN(graph.ArchitecturalForwardEdges(c.fact.Name), maxNeighbors) {
 			evidence = append(evidence, facts.Evidence{Symbol: edge.Target, Detail: "called by " + c.fact.Name})
 		}
 

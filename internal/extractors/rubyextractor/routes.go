@@ -371,8 +371,9 @@ func jsonapiRouteFormat(repoPath string, files []string) (string, string) {
 // as its parent does — that is what inheritance means, and reading the class
 // body is reading the source rather than reasoning about it. A subclass that
 // does override is running Ruby this extractor cannot, and no amount of reading
-// the override changes that: `aboard`'s is provably harmless for resource
-// segments and there is nothing in that repository able to check the result.
+// the override changes that: one measured application's is provably harmless
+// for resource segments and there is nothing in that repository able to check
+// the result.
 func classifyFormatter(src []byte) (string, string) {
 	declaration := formatterDeclaration.FindSubmatch(src)
 	if declaration == nil {

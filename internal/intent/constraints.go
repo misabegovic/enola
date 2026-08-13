@@ -17,12 +17,23 @@ import (
 // label: members are facts of that repo, and every other narrowing ANDs with
 // it. A component may carry a service with no match patterns — that is the
 // whole service — where a serviceless component still needs at least one.
+//
+// Where selects by what the facts CARRY instead of where they sit: a
+// conjunction of property tests over the props the extractors measured, so a
+// component can name "the view components" or "the storage models" without a
+// directory appearing anywhere. It ANDs with every other narrowing for the
+// same reason service does — every field on this struct narrows, none widens —
+// so a component carrying both a match and a where is the path scope
+// intersected with the predicate, which is how a trusted path scope gets
+// sharpened without being replaced. A where alone is legal and needs no match:
+// the predicate IS the selector.
 type ConstraintComponent struct {
-	Name        string   `yaml:"name"`
-	Service     string   `yaml:"service"`
-	Match       []string `yaml:"match"`
-	Kind        string   `yaml:"kind"`
-	NamePattern string   `yaml:"name_pattern"`
+	Name        string         `yaml:"name"`
+	Service     string         `yaml:"service"`
+	Match       []string       `yaml:"match"`
+	Kind        string         `yaml:"kind"`
+	NamePattern string         `yaml:"name_pattern"`
+	Where       map[string]any `yaml:"where"`
 
 	// SourceFile is the repo-relative enola/constraints file that declared
 	// this component, stamped at load time; empty means declared inline. It
@@ -272,6 +283,16 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 	}
 	componentNames := map[string]bool{}
 	componentSource := map[string]string{}
+	// Which components carry a predicate, read the same way the evaluator reads
+	// it: the COMPILED predicate, so a where declaring only the reserved kind key
+	// — which compiles to no property test — is not one, exactly as
+	// component.predicated() in the explainer is not.
+	predicated := map[string]bool{}
+	for _, c := range components {
+		if len(c.Predicate()) > 0 {
+			predicated[c.Name] = true
+		}
+	}
 	for _, c := range components {
 		var loc string
 		if c.Recipe != "" {
@@ -285,8 +306,8 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		if c.Service != "" && !validToken(c.Service) {
 			problems = append(problems, fmt.Sprintf("%s (%s): service %q must be a lowercase token", loc, c.Name, c.Service))
 		}
-		if len(c.Match) == 0 && c.Service == "" {
-			problems = append(problems, fmt.Sprintf("%s (%s): needs at least one match pattern or a service", loc, c.Name))
+		if !c.Selects() {
+			problems = append(problems, fmt.Sprintf("%s (%s): needs at least one match pattern, a service, or a where predicate", loc, c.Name))
 		}
 		for j, m := range c.Match {
 			if !validConstraintMatch(m) {
@@ -296,6 +317,7 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		if c.Kind != "" && !AllowedComponentKinds[c.Kind] {
 			problems = append(problems, fmt.Sprintf("%s: kind %q is not a measured fact kind (allowed: %s)", loc, c.Kind, allowedComponentKinds()))
 		}
+		problems = append(problems, whereProblems(loc, c)...)
 		// A name collision is flagged whenever a constraints file is involved,
 		// naming both declaring files: a merged set with two definitions of
 		// one component has no single answer for what the name selects.
@@ -330,6 +352,7 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		}
 		ruleIDs[r.ID] = true
 		problems = append(problems, ruleFormProblems(loc, r, componentNames, "component")...)
+		problems = append(problems, predicateRoleProblems(loc, r, predicated, "component")...)
 		if r.Guide != "" && len(r.Exempt) > 0 {
 			problems = append(problems, fmt.Sprintf("%s (%s): exempt belongs to the law forms — guidance emits no violations to exempt", loc, r.ID))
 		}
@@ -341,32 +364,22 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun string) []string {
 	var problems []string
 	forms := 0
-	for _, selector := range []string{r.Forbid, r.ForbidReach, r.Allow, r.Protect, r.Private, r.ForbidFact, r.Cap, r.Require, r.RequireEdge, r.RequireDefines, r.RequireName, r.Protocol, r.Guide} {
-		if selector != "" {
+	for _, form := range RuleForms {
+		if form.Subject(r) != "" {
 			forms++
 		}
 	}
 	if forms != 1 {
-		problems = append(problems, fmt.Sprintf("%s (%s): exactly one of forbid, forbid_reach, allow, protect, private, forbid_fact, cap, require, require_edge, require_defines, require_name, protocol, guide selects the rule form (%d given)", loc, r.ID, forms))
+		problems = append(problems, fmt.Sprintf("%s (%s): exactly one of %s selects the rule form (%d given)", loc, r.ID, ruleFormKeys(), forms))
 	}
 	component := func(field, name string) {
 		if name != "" && !names[name] {
 			problems = append(problems, fmt.Sprintf("%s (%s): %s %q names no declared %s", loc, r.ID, field, name, noun))
 		}
 	}
-	component("forbid", r.Forbid)
-	component("forbid_reach", r.ForbidReach)
-	component("allow", r.Allow)
-	component("protect", r.Protect)
-	component("private", r.Private)
-	component("forbid_fact", r.ForbidFact)
-	component("cap", r.Cap)
-	component("require", r.Require)
-	component("require_edge", r.RequireEdge)
-	component("require_defines", r.RequireDefines)
-	component("require_name", r.RequireName)
-	component("protocol", r.Protocol)
-	component("guide", r.Guide)
+	for _, form := range RuleForms {
+		component(form.Key, form.Subject(r))
+	}
 	edgeForm := r.Forbid != "" || r.Allow != "" || r.Protect != ""
 	switch {
 	case r.Forbid != "":

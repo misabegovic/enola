@@ -21,6 +21,18 @@ import (
 
 // cacheVersion is mixed into every cache key. Bump it whenever the fact schema or
 // an extractor's output format changes in a way that invalidates stored facts.
+//
+// Bump it also when the same facts would produce a different GRAPH or different
+// findings, even though nothing cached is stale. This constant is two things: the
+// cache key, and — through ExtractorVersion below — the provenance marker a receipt
+// records and `enola check` compares. The cache argument and the provenance argument
+// are separate arguments about one value, and they disagree exactly here: a
+// derivation change makes every cached fact still valid and every pinned baseline
+// incomparable. One constant can serve both only by widening what its changelog
+// covers, which is what v207 does; the price of NOT bumping is a "PASS — no
+// architectural change" over 30 findings the user did not touch, which is the failure
+// this marker exists to prevent. The price of bumping is one re-extraction per
+// repository, which reproduces the same facts.
 // v2: Swift URLSession extractor precision (file-URL exclusion, interpolation fix).
 // v3: Python route facts use method/role/bare-path Name (was http_method, verb-in-name).
 // v4: Java HTTP client detection (RestTemplate call sites + @FeignClient interfaces).
@@ -1685,7 +1697,49 @@ import (
 // column the table declares that the referenced table is a plural of, and
 // states nothing where none or several match — the silence a composite key
 // already gets on the SQL side.
-const cacheVersion = "v205"
+//
+// v206: a JavaScript class says which base class it extends, and which module
+// that name came from. The class fact carries `superclass` — the identifier as
+// written, one level, the same meaning rubyextractor gives the prop — and
+// `superclass_module`, read from the file's own import table. The second prop is
+// what JavaScript needs and Ruby does not: a Ruby superclass token is a globally
+// resolvable constant, while a JavaScript one is bound by an import, so the bare
+// `Controller` is @hotwired/stimulus' base class on 150 of one production Ember
+// frontend's classes and @ember/controller's on 259 others, and a prop carrying
+// only the identifier fuses two unrelated hierarchies. The module is the same
+// string the file's own dependency fact already records as its imports target —
+// the specifier for a package, the repo-relative path for a file, resolved through
+// tsconfig aliases where the project declares them — and it is never derived
+// from the identifier's spelling or the file's location: a base class the file
+// declares itself or a global like Error or HTMLElement carries the name and no
+// module at all.
+//
+// Only an identifier names a base class. `extends Base<T>` is one (the type
+// arguments are applied to the base, not a second reading of it), while
+// `extends Service.extend(Mixin)`, `extends Turbo.navigator.view.snapshot.
+// constructor`, a ternary, a subscript and `extends new Factory()` reach their
+// base through a value the source never states, so they emit nothing rather than
+// name the mixin factory or the namespace object — the seven such classes in
+// that frontend are exactly the forms where a nearest-identifier answer
+// would have been wrong. No inheritance relation accompanies the props: the
+// identifier alone is not a symbol identity when a repository writes the same
+// `Controller` 409 times against two different base classes, and the local name a
+// default or aliased import binds is not the name the exporting file declares, so
+// an edge built from either would be a resolution nothing measured. The Ember
+// component/service/model classifier now reads its heritage through the same
+// single reader, and .vue and .svelte script blocks resolve theirs through the
+// same import table.
+// v207: NOT an extractor change — the first entry here that is not. Owner resolution
+// wires a Ruby class to its instance methods ("Owner#method"), which no split on the
+// last "." ever reached: 23,127 has_method edges appear on the monolith out of the
+// same facts, and the two outlier explainers stop counting a type's own methods as
+// calls out of it. facts.jsonl is byte-identical across the change (cmp, monolith and
+// a third repository in this estate), so nothing cached is stale — but a baseline
+// pinned by a v206 build and graded by this one reports 30 moved findings over an
+// unedited tree, and without a bump prints "PASS — no architectural change" while
+// doing it. The constant is the provenance marker as well as the cache key; this line
+// is what widening it costs.
+const cacheVersion = "v207"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

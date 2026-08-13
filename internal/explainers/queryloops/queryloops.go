@@ -3,19 +3,19 @@
 //
 // It reports the shape it can prove and deliberately not the one everybody
 // means by "N+1". The pitched detector was `record.association` inside a loop,
-// and the funnel on teamtailor ends at zero: 1,698 association-name reads in
-// unbounded loops, 62 once bare `self.assoc` reads are dropped (Rails memoises
-// those), 8 once thread-local receivers like `Current.company` are dropped,
-// 7 after eager-loading — and all seven false. `Requisition#send_pusher_event!`
-// reads `channel.trigger` where `channel` is a `PusherChannel`, matched only
-// because `belongs_to :trigger` exists on an unrelated model. The graph has no
-// receiver type inference for Ruby, so `candidate.posts` and `client.post` are
-// the same string to it.
+// and the funnel on a large Rails monolith ends at zero: 1,698 association-name
+// reads in unbounded loops, 62 once bare `self.assoc` reads are dropped (Rails
+// memoises those), 8 once thread-local receivers like `Current.company` are
+// dropped, 7 after eager-loading — and all seven false.
+// `Requisition#send_pusher_event!` reads `channel.trigger` where `channel` is a
+// `PusherChannel`, matched only because `belongs_to :trigger` exists on an
+// unrelated model. The graph has no receiver type inference for Ruby, so
+// `candidate.posts` and `client.post` are the same string to it.
 //
 // A class-level query has no such problem: the receiver IS the type. When
 // `AccessLevel.find_by` appears inside an unbounded loop, `AccessLevel` is a
 // model this graph already knows and `find_by` is a query — nothing is
-// inferred. 97 of these on teamtailor.
+// inferred. 97 of these on that monolith.
 //
 // It also needs no eager-load suppression, and that is a property of the shape
 // rather than a shortcut: `includes` cannot help a class-level `find_by`.

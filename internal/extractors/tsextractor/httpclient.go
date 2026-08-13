@@ -263,9 +263,9 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 		// that line — test files are excluded from normal indexing and emit
 		// reference-only facts so explainers keying off routes are unaffected —
 		// and a mock is the same claim in a directory the exclusion does not
-		// cover. Tagged rather than dropped: 192 of teamtailor's 298 client route
-		// facts are Mirage, and a population nobody counts is the failure this
-		// estate keeps finding.
+		// cover. Tagged rather than dropped: 192 of one monolith's 298 client
+		// route facts are Mirage, and a population nobody counts is the failure
+		// this estate keeps finding.
 		if testDoublePath(relFile) {
 			props["test_double"] = true
 		}

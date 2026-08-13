@@ -60,7 +60,7 @@ func isHbsFile(path string) bool {
 //
 // It used to check only the TypeScript root and the repository root, which
 // misses the shape this estate actually has: an Ember application nested inside
-// a backend repository. Teamtailor's `ember_app/package.json` declares
+// a backend repository. One monolith's `ember_app/package.json` declares
 // ember-source and the repository root's does not — and because the root has a
 // package.json at all, findTSRoot returns the root and the fallback branch
 // never fires. The flag stayed false, and everything gated on it produced
@@ -206,15 +206,24 @@ func emberExpressionPosition(src []byte, start int) bool {
 // external imports to their module specifier. Default and named imports both
 // bind — Ember components are overwhelmingly default exports, which is exactly
 // the case buildImportSymbols skips for the general call-resolution path.
+//
+// modules is the third reading of the same statement, and the one a consumer
+// outside Ember asks for: the module a name came from, whichever kind of import
+// bound it — the specifier for a package, the repo-relative path for a file.
+// That is the string this file's own dependency fact already carries as its
+// imports target, so a name's origin and the module the file declares it imports
+// are the same value rather than two spellings of it.
 type emberImportBindings struct {
 	internal map[string]string
 	external map[string]string
+	modules  map[string]string
 }
 
 func buildEmberImportBindings(root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) emberImportBindings {
 	b := emberImportBindings{
 		internal: make(map[string]string),
 		external: make(map[string]string),
+		modules:  make(map[string]string),
 	}
 	fileDir := filepath.Dir(relFile)
 	for i := range root.ChildCount() {
@@ -238,6 +247,7 @@ func buildEmberImportBindings(root *sitter.Node, src []byte, relFile string, ali
 			if local == "" {
 				return
 			}
+			b.modules[local] = resolved
 			if isExternal {
 				b.external[local] = importPath
 			} else {
@@ -407,7 +417,7 @@ func collectEmberClasses(root *sitter.Node, src []byte, bindings emberImportBind
 		if name := findChildByKind(node, "type_identifier"); name != nil {
 			info.name = nodeText(name, src)
 		}
-		if super := emberSuperclassName(node, src); super != "" {
+		if super := tsSuperclassName(node, src); super != "" {
 			if mod, ok := bindings.external[super]; ok {
 				info.isComponent = emberComponentModules[mod]
 				info.isModel = emberModelModules[mod]
@@ -738,30 +748,6 @@ func emberModelRelationships(classBody *sitter.Node, src []byte, decorators map[
 	}
 	sort.Strings(rels)
 	return rels
-}
-
-func emberSuperclassName(classNode *sitter.Node, src []byte) string {
-	for i := range classNode.ChildCount() {
-		c := classNode.Child(i)
-		if c.Kind() != "class_heritage" {
-			continue
-		}
-		for j := range c.ChildCount() {
-			h := c.Child(j)
-			if h.Kind() == "extends_clause" {
-				for k := range h.ChildCount() {
-					t := h.Child(k)
-					if t.Kind() == "identifier" {
-						return nodeText(t, src)
-					}
-				}
-			}
-		}
-		if id := findChildByKind(c, "identifier"); id != nil {
-			return nodeText(id, src)
-		}
-	}
-	return ""
 }
 
 // emberInjectedServices reads @service-decorated class fields. `@service store`

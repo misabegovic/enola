@@ -25,10 +25,11 @@ type Recipe struct {
 }
 
 type RecipeBinding struct {
-	Service     string   `yaml:"service"`
-	Match       []string `yaml:"match"`
-	Kind        string   `yaml:"kind"`
-	NamePattern string   `yaml:"name_pattern"`
+	Service     string         `yaml:"service"`
+	Match       []string       `yaml:"match"`
+	Kind        string         `yaml:"kind"`
+	NamePattern string         `yaml:"name_pattern"`
+	Where       map[string]any `yaml:"where"`
 }
 
 type InstanceExemption struct {
@@ -287,6 +288,7 @@ func expandBindings(rec Recipe, inst RecipeInstantiation, sourceFile string) []C
 			Match:       append([]string(nil), b.Match...),
 			Kind:        b.Kind,
 			NamePattern: b.NamePattern,
+			Where:       b.Where,
 			SourceFile:  sourceFile,
 			Recipe:      rec.Name,
 			Instance:    inst.As,

@@ -195,9 +195,10 @@ func (e *GoExtractor) extractPackage(fset *token.FileSet, pkgDir string, pp *par
 	// same-package generic call from an index into a map of funcs: `doRequest[T]
 	// (...)` and `handlers[name]()` are the same syntax, and only the first is a
 	// call to a function. Without it the conservative rule in flattenSelector
-	// drops both, which cost aboard-cli the FetchPagedList half of its API seam —
-	// api.Request never recorded calling api.doRequest, so the reachability walk
-	// had to find the seam by another route and found only part of it.
+	// drops both, which cost a Go CLI in this estate the FetchPagedList half of
+	// its API seam — api.Request never recorded calling api.doRequest, so the
+	// reachability walk had to find the seam by another route and found only
+	// part of it.
 	pkgFuncs := collectPackageFuncs(pp.parsedFiles)
 
 	for _, relFile := range pp.relFiles {
@@ -890,8 +891,9 @@ func flattenSelector(expr ast.Expr) []string {
 	case *ast.IndexExpr:
 		// An index in the callee chain, which is two different things wearing one
 		// syntax. `api.Request[Task](…)` is a generic instantiation — 30 of
-		// aboard-cli's 35 such sites, the whole of its API seam, invisible while
-		// `fmt.Sprintf` two lines below in the same closure came through fine.
+		// that same Go CLI's 35 such sites, the whole of its API seam, invisible
+		// while `fmt.Sprintf` two lines below in the same closure came through
+		// fine.
 		// `g.facts[i].PropString(…)` is a method on a slice element, and on the
 		// tree of this very repository that is the commoner shape: two symbols
 		// gained loop-call props from it on the first run after this change.

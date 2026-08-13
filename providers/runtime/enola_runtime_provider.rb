@@ -15,7 +15,7 @@ abort "usage: enola_runtime_provider.rb <repo-path>" unless root && File.directo
 
 CAPTURE_DIR = ".enola-runtime"
 RESOLUTION_LEVEL = "runtime-observed"
-BOOT_SOURCE = "tt-enola runtime"
+BOOT_SOURCE = "enola runtime"
 QUERY_SOURCE = "activesupport-notifications"
 
 module RuntimeProvider

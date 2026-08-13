@@ -25,9 +25,10 @@ import (
 const incompleteClientsShare = 0.8
 
 // maxActionableCandidates is how many candidates a person can plausibly triage.
-// Past it the output stops being a list and becomes a census: teamtailor reports
-// 3,392 unmatched at 77% — under the share threshold and still unreadable as
-// "endpoints to consider removing". A finding nobody can act on is telemetry.
+// Past it the output stops being a list and becomes a census: a large Rails
+// monolith reports 3,392 unmatched at 77% — under the share threshold and still
+// unreadable as "endpoints to consider removing". A finding nobody can act on
+// is telemetry.
 const maxActionableCandidates = 200
 
 // maxSamples bounds how many route names an insight lists inline.
@@ -133,11 +134,11 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		}
 
 		// When nearly everything is unmatched, the snapshot is telling you about
-		// its own client set rather than about the endpoints. Teamtailor reports
-		// 3,392 of 3,732 that way — its real callers are a browser, an external
-		// integrator and a mobile app, none of which is a repository. Presenting
-		// that as a list of dead-endpoint candidates is how a finding gets ignored
-		// wholesale, and the ignoring is deserved.
+		// its own client set rather than about the endpoints. The monolith above
+		// reports 3,392 of 3,732 that way — its real callers are a browser, an
+		// external integrator and a mobile app, none of which is a repository.
+		// Presenting that as a list of dead-endpoint candidates is how a finding
+		// gets ignored wholesale, and the ignoring is deserved.
 		if share >= incompleteClientsShare || len(routes) > maxActionableCandidates {
 			insights = append(insights, facts.Insight{
 				Title: fmt.Sprintf("Client coverage for %s is too thin to name unused endpoints (%d of %d unmatched)",

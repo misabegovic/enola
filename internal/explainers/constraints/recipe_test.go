@@ -46,7 +46,7 @@ use_recipe:
     exempt:
       - rule: events-consumed
         witness: "LegacyOrderMigratedEvent has no inbound calls edge from orders-events/handlers"
-        owner: "muhamed"
+        owner: "dana"
         because: "Fired only by the migration backfill, consumed manually."
         since: "2026-08-11"
 `

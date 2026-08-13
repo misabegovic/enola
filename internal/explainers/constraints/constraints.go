@@ -143,11 +143,18 @@ type component struct {
 	match       []string
 	kind        string
 	namePattern string
+	where       []intent.WherePair
 	source      string
 	recipe      string
 	instance    string
 	role        string
 }
+
+// predicated reports whether the component selects by what facts carry rather
+// than only by where they sit. It is the switch on every reading that differs
+// between the two: a path component's file patterns are a claim about a whole
+// file, and a predicate is a claim about one measured fact.
+func (c component) predicated() bool { return len(c.where) > 0 }
 
 type rule struct {
 	id, because, source, mode string
@@ -219,6 +226,7 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				match:       strings.Fields(f.PropString("match")),
 				kind:        f.PropString("kind"),
 				namePattern: f.PropString("name_pattern"),
+				where:       intent.DecodeWhere(f.PropString("where")),
 				source:      f.PropString("source"),
 				recipe:      f.PropString("recipe"),
 				instance:    f.PropString("instance"),
@@ -294,17 +302,21 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 	// component emits nothing, and the absent-service advisory below is the
 	// only trace. "Matches 0 because the repo is not loaded" must never verdict
 	// as anything.
-	present := map[string]bool{}
-	for _, f := range store.All() {
-		if f.Repo != "" {
-			present[f.Repo] = true
-		}
-	}
-	unasked := map[string]bool{}
-	for _, name := range names {
-		if s := components[name].service; s != "" && !present[s] {
-			unasked[name] = true
-		}
+	unasked := unaskedComponents(store, components)
+
+	// The predicate equivalent of the counterparty rule: a where this snapshot
+	// cannot answer — a property nothing measures, a threshold against a
+	// property that is never a number, a compiled field that is no test at all
+	// — leaves the component UNEVALUABLE and every rule naming it emits
+	// nothing. Silence here is the fail-closed reading: an empty membership
+	// would make every rule over it hold, and a rule that holds because its
+	// selector is broken is the one failure this vocabulary must never produce.
+	// The loud finding below is the trace. Unasked wins over unevaluable — a
+	// repo that was never loaded is a different silence, reported as its own.
+	unevaluables := unevaluableSelectors(store, components, unasked)
+	unevaluable := map[string]bool{}
+	for _, u := range unevaluables {
+		unevaluable[u.Component] = true
 	}
 
 	// Membership is a set of canonical fact NAMES, because a name is the only
@@ -332,17 +344,42 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 				carriers[name] = append(carriers[name], f)
 			}
 		}
-		sort.Slice(carriers[name], func(i, j int) bool {
-			if carriers[name][i].Name != carriers[name][j].Name {
-				return carriers[name][i].Name < carriers[name][j].Name
-			}
-			return carriers[name][i].File < carriers[name][j].File
-		})
+		sortFactsByNameThenFile(carriers[name])
+	}
+
+	// Everything a rule may walk edges FROM, resolved once per component: the
+	// members themselves and the dependency facts carrying their files' edges.
+	// A predicate component reaches exactly as far as the facts that
+	// demonstrated the predicate do — no further — and the zero-edge advisory
+	// below is what keeps the resulting silence audible.
+	edgeSources := map[string][]facts.Fact{}
+	for _, name := range names {
+		sources := append(append([]facts.Fact{}, memberFacts[name]...), carriers[name]...)
+		sortFactsByNameThenFile(sources)
+		edgeSources[name] = sources
 	}
 
 	// What each repository measured, indexed once: the subordinate fallback every
-	// target site below reaches for after exact-name membership has failed.
-	ground := newGrounding(store)
+	// target site below reaches for after exact-name membership has failed. It
+	// carries the memberships too, because a predicate component's file join is
+	// only as wide as the files it measured a member in.
+	ground := newGrounding(store, memberFacts)
+
+	// Which files the snapshot measured exported content in — the private form's
+	// file-granular test, asked of the whole store rather than of one component's
+	// members, so a narrowed membership cannot make a file look wholly internal.
+	exportedFiles := map[string]bool{}
+	for _, r := range rules {
+		if r.private == "" {
+			continue
+		}
+		for _, f := range store.FactsRef() {
+			if visible, ok := f.Props["exported"].(bool); ok && visible && f.File != "" {
+				exportedFiles[f.File] = true
+			}
+		}
+		break
+	}
 
 	// Allow-only needs to tell "lands in a component the rule does not allow"
 	// from "does not resolve to anything measured" — only the former is a
@@ -432,21 +469,21 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 
 	var insights []facts.Insight
 	for _, r := range rules {
-		if namesUnasked(r, unasked) {
+		if namesUnasked(r, unasked) || namesUnasked(r, unevaluable) {
 			continue
 		}
 		var verdicts []facts.Insight
 		switch {
 		case r.forbid != "":
-			verdicts = e.verdictForbid(r, memberFacts, carriers, members, components, ground)
+			verdicts = e.verdictForbid(r, edgeSources, members, components, ground)
 		case r.forbidReach != "":
-			verdicts = e.verdictForbidReach(r, graphWalk, memberFacts, carriers, members, components, ground)
+			verdicts = e.verdictForbidReach(r, graphWalk, edgeSources, members, components, ground)
 		case r.allow != "":
-			verdicts = e.verdictAllowOnly(r, memberFacts, carriers, members, resolvable, components, ground)
+			verdicts = e.verdictAllowOnly(r, edgeSources, members, resolvable, components, ground)
 		case r.protect != "":
 			verdicts = e.verdictProtect(r, graphWalk, components, members, ground)
 		case r.private != "":
-			verdicts = e.verdictPrivate(r, graphWalk, components, members, memberFacts, ground)
+			verdicts = e.verdictPrivate(r, graphWalk, components, members, memberFacts, exportedFiles, ground)
 		case r.forbidFact != "":
 			verdicts = e.verdictForbidFact(r, memberFacts, members)
 		case r.cap != "":
@@ -458,7 +495,7 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		case r.requireName != "":
 			verdicts = e.verdictRequireName(r, memberFacts, members)
 		case r.requireEdge != "":
-			verdicts = e.verdictRequireEdge(r, graphWalk, memberFacts, carriers, members, census, components, ground)
+			verdicts = e.verdictRequireEdge(r, graphWalk, memberFacts, carriers, edgeSources, members, census, components, ground)
 		case r.protocol != "":
 			verdicts = e.verdictProtocol(r, memberFacts, carriers, members, census, components, ground)
 		case r.guide != "":
@@ -472,6 +509,12 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		}
 		insights = append(insights, decided...)
 	}
+
+	for _, u := range unevaluables {
+		insights = append(insights, unevaluableSelectorInsight(u, components[u.Component]))
+	}
+
+	insights = append(insights, oneLevelSuperclassAdvisories(store, names, components, members, unasked, unevaluable)...)
 
 	for _, name := range names {
 		c := components[name]
@@ -488,12 +531,15 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			})
 			continue
 		}
+		if unevaluable[name] {
+			continue
+		}
 		if len(members[name]) > 0 {
 			continue
 		}
 		insights = append(insights, facts.Insight{
 			Title:       fmt.Sprintf("Constraint component %s matches nothing", name),
-			Description: fmt.Sprintf("The component's match patterns (%s) select no measured fact, so every rule naming it holds vacuously — a dead selector enforcing nothing. Either the code moved out from under the patterns or the selector never matched; this advisory exists so that silence cannot be read as compliance.%s", strings.Join(c.match, ", "), componentRecipeProvenance(c)),
+			Description: fmt.Sprintf("The component's selector (%s) selects no measured fact, so every rule naming it holds vacuously — a dead selector enforcing nothing. Either the code moved out from under the selector or it never matched; this advisory exists so that silence cannot be read as compliance.%s", selectorSummary(c), componentRecipeProvenance(c)),
 			Confidence:  emptyComponentConfidence,
 			Evidence:    []facts.Evidence{{Fact: "component: " + name, Detail: "declared in " + c.source}},
 			Actions: []string{
@@ -617,11 +663,11 @@ func deadExemptionInsight(r rule, ex intent.ConstraintExemption) facts.Insight {
 
 // verdictForbid emits one violation per measured via-edge from the forbidden
 // component into the to component.
-func (e *Explainer) verdictForbid(r rule, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictForbid(r rule, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
 	var out []facts.Insight
 	toSet := members[r.to]
 	skipped := map[string]bool{}
-	for _, f := range append(append([]facts.Fact{}, memberFacts[r.forbid]...), carriers[r.forbid]...) {
+	for _, f := range edgeSources[r.forbid] {
 		for _, rel := range f.Relations {
 			if rel.Kind != r.via {
 				continue
@@ -634,7 +680,7 @@ func (e *Explainer) verdictForbid(r rule, memberFacts, carriers map[string][]fac
 			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("%s must not reach %s via %s, and the graph measures exactly this edge. The rule is declared, both memberships are exact, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbid, r.to, r.via, r.because),
+				Description: fmt.Sprintf("%s must not reach %s via %s, and the graph measures exactly this edge. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbid, r.to, r.via, membershipBasis(toSet[rel.Target]), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -668,7 +714,7 @@ func (e *Explainer) verdictForbid(r rule, memberFacts, carriers map[string][]fac
 // visible rather than slow. Direct edges are one-hop paths here, so every
 // pair a forbid rule would catch is caught; a rule declaring both forms
 // reports through both, because separate rules are separate.
-func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
 	if len(members[r.forbidReach]) > reachComponentCap || len(members[r.to]) > reachComponentCap {
 		return []facts.Insight{{
 			Title:       fmt.Sprintf("forbid_reach rule %s skipped: component too large for bounded traversal", r.id),
@@ -704,10 +750,10 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, memberFac
 				continue
 			}
 			adjacency[f.Name] = append(adjacency[f.Name], rel.Target)
-			// A file-granular import target names no fact, so it is a leaf of this
-			// walk — but it can still BE the landing the rule forbids, and the
-			// direct form now catches exactly those. Collecting them here keeps
-			// the invariant that every pair forbid catches is within reach's.
+			// A path target names no fact, so it is a leaf of this walk — but it
+			// can still BE the landing the rule forbids, and the direct form now
+			// catches exactly those. Collecting them here keeps the invariant
+			// that every pair forbid catches is within reach's.
 			if !toSet[rel.Target] && ground.inComponent(rel, f, r.to, components) {
 				grounded[rel.Target] = true
 			}
@@ -742,14 +788,14 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, memberFac
 	for _, name := range sources {
 		seenSource[name] = true
 	}
-	for _, f := range carriers[r.forbidReach] {
+	for _, f := range edgeSources[r.forbidReach] {
 		if !seenSource[f.Name] {
 			seenSource[f.Name] = true
 			sources = append(sources, f.Name)
 		}
 	}
 
-	sourceFacts := firstFactByName(append(append([]facts.Fact{}, memberFacts[r.forbidReach]...), carriers[r.forbidReach]...))
+	sourceFacts := firstFactByName(edgeSources[r.forbidReach])
 	viaWords := strings.Join(vias, ", ")
 
 	var out []facts.Insight
@@ -759,7 +805,7 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, memberFac
 			f := sourceFacts[source]
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s reaches %s", source, target)),
-				Description: fmt.Sprintf("%s must not reach %s through any measured path over %s, and the graph measures one: %s. The rule is declared, both memberships are exact, and every hop is a measured edge, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbidReach, r.to, viaWords, strings.Join(path, " -> "), r.because),
+				Description: fmt.Sprintf("%s must not reach %s through any measured path over %s, and the graph measures one: %s. The rule is declared, %s, and every hop is a measured edge, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbidReach, r.to, viaWords, strings.Join(path, " -> "), membershipBasis(!grounded[target]), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -834,7 +880,7 @@ func reachWitnesses(adjacency map[string][]string, source string, toSet map[stri
 // only: would make each rule assert something nobody decided. An edge whose
 // target resolves to nothing measured is skipped — fail closed, never guessed
 // into a breach.
-func (e *Explainer) verdictAllowOnly(r rule, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, resolvable map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictAllowOnly(r rule, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, resolvable map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
 	// Both halves of the question fall back the same way, and in that order: a
 	// file-granular target that lands inside an allowed component is not a
 	// breach, and one that names a measured file at all is resolvable.
@@ -859,7 +905,7 @@ func (e *Explainer) verdictAllowOnly(r rule, memberFacts, carriers map[string][]
 	}
 	var out []facts.Insight
 	skipped := map[string]bool{}
-	for _, f := range append(append([]facts.Fact{}, memberFacts[r.allow]...), carriers[r.allow]...) {
+	for _, f := range edgeSources[r.allow] {
 		for _, rel := range f.Relations {
 			if rel.Kind != r.via {
 				continue
@@ -875,7 +921,7 @@ func (e *Explainer) verdictAllowOnly(r rule, memberFacts, carriers map[string][]
 			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("%s may reach only %s via %s, and the graph measures this edge landing in none of them. The rule is declared, membership is exact, and the target names a measured fact, so this is a decided-rule breach, not a heuristic. Because: %s", r.allow, strings.Join(r.only, ", "), r.via, r.because),
+				Description: fmt.Sprintf("%s may reach only %s via %s, and the graph measures this edge landing in none of them. The rule is declared, membership is exact, and %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.allow, strings.Join(r.only, ", "), r.via, targetBasis(resolvable[rel.Target]), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -922,7 +968,7 @@ func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, components ma
 			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("Only %s may reach members of %s via %s, and the graph measures this edge arriving from outside every owner. The rule is declared, both memberships are exact, so this is a decided-rule breach, not a heuristic. Because: %s", strings.Join(r.owners, ", "), r.protect, r.via, r.because),
+				Description: fmt.Sprintf("Only %s may reach members of %s via %s, and the graph measures this edge arriving from outside every owner. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", strings.Join(r.owners, ", "), r.protect, r.via, membershipBasis(protected[rel.Target]), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -949,16 +995,21 @@ func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, components ma
 // name whose facts disagree about visibility is too, both fail closed. The
 // walk covers every rule-via edge kind at once: privacy is about any measured
 // reach, so the form carries no via of its own.
-func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, components map[string]component, members map[string]map[string]bool, memberFacts map[string][]facts.Fact, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, components map[string]component, members map[string]map[string]bool, memberFacts map[string][]facts.Fact, exported map[string]bool, ground *grounding) []facts.Insight {
 	internal := map[string]bool{}
 	// The same measurement, keyed by file: a file-granular import target names no
-	// member, and reaching a file whose every measured member is non-exported is
-	// reaching non-exported code. One member with no visibility prop, or one
-	// exported member, disqualifies the file exactly as it disqualifies a name.
+	// member, and reaching a file whose every measured fact is non-exported is
+	// reaching non-exported code. The file test reads the SNAPSHOT's facts, not
+	// the component's members, and that is the whole of it: a membership can be a
+	// strict subset of what a file holds — every narrowing on a component makes
+	// it one — so a file marked internal from its member alone gates an import
+	// that reached the file's other, exported content. One exported fact anywhere
+	// in the file disqualifies it; a member with no visibility prop, or a name
+	// whose facts disagree, disqualifies that name, both fail closed.
 	internalFiles := map[string]bool{}
 	for _, f := range memberFacts[r.private] {
-		exported, ok := f.Props["exported"].(bool)
-		if !ok || exported {
+		visible, ok := f.Props["exported"].(bool)
+		if !ok || visible {
 			internal[f.Name] = false
 			if f.File != "" {
 				internalFiles[f.File] = false
@@ -968,7 +1019,7 @@ func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, components ma
 		if _, seen := internal[f.Name]; !seen {
 			internal[f.Name] = true
 		}
-		if _, seen := internalFiles[f.File]; f.File != "" && !seen {
+		if _, seen := internalFiles[f.File]; f.File != "" && !seen && !exported[f.File] {
 			internalFiles[f.File] = true
 		}
 	}
@@ -993,9 +1044,10 @@ func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, components ma
 			if ownedBy(f, inside, components, members) {
 				continue
 			}
+			subject, basis := privateBasis(internal[rel.Target])
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, rel.Kind)),
-				Description: fmt.Sprintf("%s is a non-exported member of %s, reachable only from inside the component%s, and the graph measures this %s edge arriving from outside. The rule is declared, membership is exact, and the visibility is the extractor's own measurement, so this is a decided-rule breach, not a heuristic. Because: %s", rel.Target, r.private, scope, rel.Kind, r.because),
+				Description: fmt.Sprintf("%s %s %s, reachable only from inside the component%s, and the graph measures this %s edge arriving from outside. The rule is declared, %s, and the visibility is the extractor's own measurement, so this is a decided-rule breach, not a heuristic. Because: %s", rel.Target, subject, r.private, scope, rel.Kind, basis, r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -1210,7 +1262,7 @@ func (e *Explainer) verdictRequireName(r rule, memberFacts map[string][]facts.Fa
 // never silently compliant, never falsely violated. A source class that
 // sources no rule-via edges anywhere is no edge source as far as the store
 // can state, so it narrows nothing.
-func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, census map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFacts, carriers, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, census map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
 	memberNames := sortedMemberNames(members[r.requireEdge])
 	if len(memberNames) == 0 {
 		return nil
@@ -1223,7 +1275,7 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 	if r.direction == "inbound" {
 		sourceScope := graphWalk
 		if r.to != "" {
-			sourceScope = append(append([]facts.Fact{}, memberFacts[r.to]...), carriers[r.to]...)
+			sourceScope = edgeSources[r.to]
 		}
 		blind = blindSourceClasses(sourceScope, census, r.via)
 		if len(blind) > 0 {
@@ -1395,16 +1447,22 @@ func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]f
 	}
 
 	touched := map[string]map[int]bool{}
+	groundedStep := map[string]bool{}
 	touch := func(from facts.Fact, rel facts.Relation) {
 		if rel.Kind != r.via {
 			return
 		}
 		for i, step := range r.steps {
-			if members[step][rel.Target] || ground.inComponent(rel, from, step, components) {
-				if touched[from.Name] == nil {
-					touched[from.Name] = map[int]bool{}
-				}
-				touched[from.Name][i] = true
+			exact := members[step][rel.Target]
+			if !exact && !ground.inComponent(rel, from, step, components) {
+				continue
+			}
+			if touched[from.Name] == nil {
+				touched[from.Name] = map[int]bool{}
+			}
+			touched[from.Name][i] = true
+			if !exact {
+				groundedStep[from.Name] = true
 			}
 		}
 	}
@@ -1454,7 +1512,7 @@ func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]f
 		f := first[name]
 		out = append(out, facts.Insight{
 			Title:       r.titled(fmt.Sprintf("%s %s %s without %s", name, r.via, r.steps[highest], r.steps[highestMissing])),
-			Description: fmt.Sprintf("%s is a member of %s and makes a measured %s edge into %s, step %d of the declared order %s — so it must also make %s edges into every earlier step, and the graph measures none into %s. This is structural protocol conformance, not runtime ordering: the verdict says the member references a later step's surface without referencing every prerequisite step's surface, which a static fact graph can decide; whether the steps execute in order at runtime it cannot see and does not claim. The rule is declared, memberships are exact, and facts of this member's file kind demonstrably source %s edges elsewhere in this snapshot, so each absence is measured, never extraction blindness. Because: %s", name, r.protocol, r.via, r.steps[highest], highest+1, strings.Join(r.steps, " -> "), r.via, strings.Join(missing, ", "), r.via, r.because),
+			Description: fmt.Sprintf("%s is a member of %s and makes a measured %s edge into %s, step %d of the declared order %s — so it must also make %s edges into every earlier step, and the graph measures none into %s. This is structural protocol conformance, not runtime ordering: the verdict says the member references a later step's surface without referencing every prerequisite step's surface, which a static fact graph can decide; whether the steps execute in order at runtime it cannot see and does not claim. The rule is declared, %s, and facts of this member's file kind demonstrably source %s edges elsewhere in this snapshot, so each absence is measured, never extraction blindness. Because: %s", name, r.protocol, r.via, r.steps[highest], highest+1, strings.Join(r.steps, " -> "), r.via, strings.Join(missing, ", "), membershipBasis(!groundedStep[name]), r.via, r.because),
 			Confidence:  r.confidence(),
 			Evidence: []facts.Evidence{{
 				File:   f.File,
@@ -1620,7 +1678,10 @@ func matchBoundedName(name, pattern string) bool {
 // extraction and every walk over a membership must not. A service scope is an
 // AND with every other narrowing: members are facts whose repo label equals
 // the declared service exactly — the label multi-repo append mode stamps on
-// every fact — and a fact with no label matches no service, fail closed.
+// every fact — and a fact with no label matches no service, fail closed. A
+// where predicate ANDs in the same place and for the same reason: every
+// narrowing on a component narrows, so a component carrying both a path scope
+// and a predicate selects their intersection.
 func resolveMembership(store *facts.Store, c component) (map[string]bool, []facts.Fact) {
 	names := map[string]bool{}
 	var members []facts.Fact
@@ -1633,6 +1694,9 @@ func resolveMembership(store *facts.Store, c component) (map[string]bool, []fact
 				continue
 			}
 			if c.namePattern != "" && f.Name != c.namePattern {
+				continue
+			}
+			if !matchesWhere(f, c.where) {
 				continue
 			}
 			names[f.Name] = true
@@ -1669,12 +1733,14 @@ func membershipKinds(c component) []string {
 }
 
 // matchMemberFile joins a fact's file against a component's match patterns. A
-// service-scoped component may declare none — the whole service — and then
-// every fact carrying its label qualifies; a serviceless component with no
-// patterns matches nothing, same as before the service field existed.
+// service-scoped component may declare none — the whole service — and a
+// predicate-selected one may declare none either, because the predicate is the
+// selector and a fact's file is not what it is being asked about; a component
+// with neither patterns, service, nor predicate matches nothing, same as before
+// either field existed.
 func matchMemberFile(f facts.Fact, c component) bool {
 	if len(c.match) == 0 {
-		return c.service != ""
+		return c.service != "" || c.predicated()
 	}
 	return matchConstraintFile(f, c.match)
 }
@@ -1685,6 +1751,16 @@ func matchMemberFile(f facts.Fact, c component) bool {
 // name-narrowed component gets no carriers: a file- or repo-level join cannot
 // prove the single named fact made the edge. Service scoping ANDs here exactly
 // as it does in membership, fail closed on an unlabeled fact.
+//
+// A predicate component is carried only by a dependency fact that demonstrates
+// the predicate ITSELF. Sharing a file with a member is not evidence: the
+// property that made the member a member was measured on the member, and no
+// other fact in that file has been asked the question. Measured on the
+// monolith, 39,601 of the imports edges live on dependency facts and none of
+// them carry superclass, symbol_kind, storage_kind or cyclomatic — which is why
+// a predicate component cannot be party to an edge form at all, and why
+// intent.predicateRoleProblems refuses one at declaration time rather than
+// letting this join answer for a reach it does not have.
 func carrierFor(f facts.Fact, c component) bool {
 	if c.namePattern != "" {
 		return false
@@ -1692,7 +1768,118 @@ func carrierFor(f facts.Fact, c component) bool {
 	if c.service != "" && f.Repo != c.service {
 		return false
 	}
-	return matchMemberFile(f, c)
+	if !matchMemberFile(f, c) {
+		return false
+	}
+	if !c.predicated() {
+		return true
+	}
+	return matchesWhere(f, c.where)
+}
+
+// oneLevelSuperclassAdvisories reports a component selecting on the superclass
+// property whose own members are named as the parent by classes it does not
+// contain. `superclass:` is exactly what the extractor wrote down — the parent
+// as the source spelled it, one level — so a rule over it judges the base
+// classes and says nothing about what is written underneath them. Measured on
+// the monolith, `superclass: ViewComponent::Base` names 269 of the 357 classes
+// whose ancestry reaches it. Neither existing advisory can see that: the
+// component is not empty and the property is measured, so the selector looks
+// like it worked.
+//
+// The witnesses are lexical, like the property they read: a class counts here
+// when it wrote a member's fact name as its parent and carries an implements
+// edge to that same text. The count is therefore NEITHER a floor NOR a ceiling,
+// and it errs in both directions. It misses: a subclass that spelled its parent
+// relatively — the unqualified `Base` inside a module — writes text no member's
+// fact name equals. And it over-attributes: the index is keyed on the parent AS
+// WRITTEN and looked up by a member's RESOLVED fact name, so a module-scoped
+// `Base` and a top-level `Base` are one key, and a class inheriting the first
+// is named as a subclass of the second. Both are the same fact about the
+// property — `superclass` is source text — and no reading of it can be
+// transitive or namespace-aware without a resolution pass the extractor did not
+// make. The advisory says so rather than claiming a bound it does not have.
+func oneLevelSuperclassAdvisories(store *facts.Store, names []string, components map[string]component, members map[string]map[string]bool, unasked, unevaluable map[string]bool) []facts.Insight {
+	var selecting []string
+	for _, name := range names {
+		if unasked[name] || unevaluable[name] {
+			continue
+		}
+		for _, pair := range components[name].where {
+			if pair.Prop == superclassProp && len(members[name]) > 0 {
+				selecting = append(selecting, name)
+				break
+			}
+		}
+	}
+	if len(selecting) == 0 {
+		return nil
+	}
+	index := newAncestry(store)
+	var out []facts.Insight
+	for _, name := range selecting {
+		outside := index.outsideChildren(members[name])
+		if len(outside) == 0 {
+			continue
+		}
+		c := components[name]
+		out = append(out, facts.Insight{
+			Title:       fmt.Sprintf("Constraint component %s selects one inheritance level and %d measured subclass(es) fall outside it", name, len(outside)),
+			Description: fmt.Sprintf("The component tests the superclass property, which the extractor records exactly as the source wrote it — one level. The snapshot measures %d class(es) that name a member as their parent and are not members themselves, so every rule naming %s judges the parents and says nothing about them: %s. This is not a dead selector and not an unmeasured property; the selector worked and reaches less than the concept it names. The count is lexical, like the property: it is neither a floor nor a ceiling. It misses a subclass that spelled its parent relatively (the unqualified Base inside a module writes text no member's fact name equals), and it over-attributes when two differently-scoped parents were written with the same text, because the index is keyed on the parent as written and read by the member's resolved name. This vocabulary has no transitive spelling: a rule that must cover the hierarchy has to name each level, or the component has to be widened another way.%s", len(outside), name, strings.Join(cappedNames(outside), ", "), componentRecipeProvenance(c)),
+			Confidence:  emptyComponentConfidence,
+			Evidence: []facts.Evidence{
+				{Fact: "component: " + name, Detail: "declared in " + c.source},
+				{File: c.source, Fact: "component: " + name, Detail: "the declaring file"},
+			},
+			Actions: []string{
+				fmt.Sprintf("Decide in %s whether the rule is about the classes naming that parent directly, or about the whole hierarchy", c.source),
+				"Add the intermediate parents as their own components if the rule must reach the classes below them",
+			},
+		})
+	}
+	return out
+}
+
+// cappedNames bounds a witness list so a finding stays readable on a component
+// with hundreds of subclasses. The count in the sentence is the full one.
+func cappedNames(names []string) []string {
+	const cap = 8
+	if len(names) <= cap {
+		return names
+	}
+	return append(append([]string{}, names[:cap]...), fmt.Sprintf("and %d more", len(names)-cap))
+}
+
+// sortFactsByNameThenFile orders a fact slice so every walk over it — and every
+// verdict that walk produces — is a function of the graph and never of store
+// order.
+func sortFactsByNameThenFile(ff []facts.Fact) {
+	sort.Slice(ff, func(i, j int) bool {
+		if ff[i].Name != ff[j].Name {
+			return ff[i].Name < ff[j].Name
+		}
+		return ff[i].File < ff[j].File
+	})
+}
+
+// unaskedComponents applies the counterparty rule: a component naming a service
+// no loaded fact carries the label of cannot be answered for by this snapshot.
+// Shared between the explainer and `constraints lint` so the authoring loop and
+// the gate silence the same components for the same reason.
+func unaskedComponents(store *facts.Store, components map[string]component) map[string]bool {
+	present := map[string]bool{}
+	for _, f := range store.All() {
+		if f.Repo != "" {
+			present[f.Repo] = true
+		}
+	}
+	unasked := map[string]bool{}
+	for name, c := range components {
+		if c.service != "" && !present[c.service] {
+			unasked[name] = true
+		}
+	}
+	return unasked
 }
 
 // ownedBy reports whether a fact belongs to any of the named components — the
@@ -1722,9 +1909,11 @@ func ownedBy(f facts.Fact, names []string, components map[string]component, memb
 	return false
 }
 
-// namesUnasked reports whether a rule names any component the counterparty
-// rule silenced — one side unasked silences the whole rule, because a verdict
-// about a half-loaded pair would be a guess.
+// namesUnasked reports whether a rule names any component in a silenced set —
+// unasked (the counterparty rule: one side of the pair is a repo the snapshot
+// does not contain) or unevaluable (its predicate names a property nothing
+// measures). Either way one silenced side silences the whole rule, because a
+// verdict about a pair one half of which was never resolved would be a guess.
 func namesUnasked(r rule, unasked map[string]bool) bool {
 	for name := range unasked {
 		if r.names(name) {

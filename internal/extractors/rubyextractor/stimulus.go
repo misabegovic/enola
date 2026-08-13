@@ -58,8 +58,8 @@ var (
 
 // stimulusControllerIndex holds the repository's controller files by basename,
 // so an identifier whose conventional path does not exist can still be grounded
-// when exactly one file in the tree carries its relative path. Teamtailor's
-// controllers live under app/components, registered from there by
+// when exactly one file in the tree carries its relative path. One measured
+// monolith's controllers live under app/components, registered from there by
 // `require.context`, and every binding in that tree was name-only without this.
 type stimulusControllerIndex struct {
 	byBase map[string][]string

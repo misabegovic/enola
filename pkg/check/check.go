@@ -272,6 +272,28 @@ type Verdict struct {
 	// Incidental are findings that moved with no structural cause in this change —
 	// a drifting statistical threshold or a re-ranked top-N. Never graded.
 	Incidental []facts.Insight `json:"incidental,omitempty"`
+	// Silenced are constraint breaches that stopped being reported because the
+	// code they named left the component the rule binds, not because it complied.
+	// Held out of Resolved deliberately: a rule losing its subject printed as a
+	// win is CI reporting a regression as an improvement. Not graded — a member
+	// leaving a component is often exactly the refactor intended — but never
+	// silent, and never counted as good news.
+	Silenced []facts.Insight `json:"silenced,omitempty"`
+	// Undeclared are constraint breaches that stopped being reported because the
+	// declaration changed — the rule deleted, its form swapped under a preserved
+	// id, or the witness exempted — with the breaching code untouched. Held out
+	// of Resolved for the same reason Silenced is: a law that stopped asking the
+	// question is not an answer to it. Not graded; editing a declaration is a
+	// legitimate act, and this section is what keeps it from reading as a fix.
+	Undeclared []facts.Insight `json:"undeclared,omitempty"`
+	// Unattributed are constraint breaches this pair of snapshots has no standing
+	// to judge: the witness's repository left a union snapshot, or the baseline
+	// carried the finding without the declaration that produced it. Held out of
+	// Resolved because "the code is no longer measured" is not "the code was
+	// fixed", and a still-breaching witness printed as good news is the failure
+	// this whole section exists to prevent. Not graded — neither is a regression
+	// in the change — but never silent.
+	Unattributed []facts.Insight `json:"unattributed,omitempty"`
 
 	// Measurements are every count the caller supplied, gated or not. Breaches are the
 	// subset that met a threshold; a fatal one makes the status a regression exactly as
@@ -417,6 +439,9 @@ func EvaluateCurrent(d *diff.SnapshotDiff, p Policy, currentFindings []facts.Ins
 		v.Exempted = append(v.Exempted, in)
 	}
 	v.Resolved = d.FindingsResolved
+	v.Silenced = d.FindingsSilenced
+	v.Undeclared = withoutExempted(d.FindingsUndeclared, v.Exempted)
+	v.Unattributed = withoutExempted(d.FindingsUnattributed, v.Exempted)
 	v.Incidental = append(append([]facts.Insight{}, d.FindingsNewIncidental...), d.FindingsResolvedIncidental...)
 	if len(v.Incidental) == 0 {
 		v.Incidental = nil

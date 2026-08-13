@@ -114,7 +114,7 @@ var gqlTagOpen = regexp.MustCompile("(?:^|[\\s=(,{\\[:;>?])(?:gql|graphql)`")
 // contain their own template literals, and therefore their own backticks.
 //
 // The old pattern was `([^`]*)`, which ends the body at the first inner
-// backtick. Teamtailor's analytics reports interpolate a whole selection —
+// backtick. One frontend's analytics reports interpolate a whole selection —
 // `${inOverview ? `sessionPageviewQuery(…) {…}` : `…`}` — so the captured body
 // was the operation head and half an interpolation, with no closing brace in
 // it. Two consequences, and the quiet one is worse. The visible one: the head

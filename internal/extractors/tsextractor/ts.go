@@ -283,8 +283,9 @@ type extractCtx struct {
 	isSvelteKit bool
 	orms        ormFlags
 	importMap   map[string]string
-	ioBindings  map[string]bool // local names bound to imports from a network module (I/O sinks)
-	knownFiles  map[string]bool // repo-relative (slash) paths of all indexed TS/JS files
+	imports     emberImportBindings // the file's import table, read for the module a superclass identifier came from
+	ioBindings  map[string]bool     // local names bound to imports from a network module (I/O sinks)
+	knownFiles  map[string]bool     // repo-relative (slash) paths of all indexed TS/JS files
 }
 
 func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav bool, orms ormFlags, aliases map[string]tsAlias, knownFiles map[string]bool, grpcStubs *grpcStubIndex) []facts.Fact {
@@ -380,6 +381,7 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 		isSvelteKit: isSvelteKit,
 		orms:        orms,
 		importMap:   buildImportSymbols(root, src, relFile, aliases),
+		imports:     buildEmberImportBindings(root, src, relFile, aliases),
 		ioBindings:  buildIOImportBindings(root, src),
 		knownFiles:  knownFiles,
 	}
@@ -642,6 +644,19 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 		// abstractness, matching Java/Kotlin/Python. Plain classes stay concrete.
 		if node.Kind() == "abstract_class_declaration" {
 			f.Props["abstract"] = true
+		}
+
+		// The base class the source names, and the module the file imported that
+		// name from. No relation accompanies them: the identifier alone is not a
+		// symbol identity (409 classes in one frontend write the same `Controller`
+		// against two unrelated base classes), and the local name a default or
+		// aliased import binds is not the name the exporting file declares, so an
+		// edge built from either would be a resolution nothing measured.
+		if super := tsSuperclassName(node, src); super != "" {
+			f.Props[superclassProp] = super
+			if module := ctx.imports.modules[super]; module != "" {
+				f.Props[superclassModuleProp] = module
+			}
 		}
 
 		// Check for implements clause (nested under class_heritage)

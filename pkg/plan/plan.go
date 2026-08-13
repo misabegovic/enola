@@ -409,6 +409,11 @@ func ruleOf(title string) string {
 			}
 		}
 	}
+	if rest, ok := strings.CutPrefix(title, "Constraint rule "); ok {
+		if id, _, found := strings.Cut(rest, " walked 0 edges"); found {
+			return id
+		}
+	}
 	for _, prefix := range []string{"forbid_reach rule ", "require_edge rule ", "protocol rule "} {
 		if rest, ok := strings.CutPrefix(title, prefix); ok {
 			if id, _, found := strings.Cut(rest, " skipped:"); found {

@@ -67,9 +67,9 @@ func TestDeclaredLayers_GlobDialectIsBounded(t *testing.T) {
 // repo-relative, so two repositories in one union both carry a module called
 // app/domain — and the declaring repo's pattern then classified the OTHER
 // repo's file, verdicting its wrong-direction import at confidence 1.0. That is
-// exactly what the brain's 22-repo union reported: one violation whose only
-// evidence file was teamtailor/app/models/_coupling.rb, under the declaration
-// of a different repository entirely.
+// exactly what a 22-repo union reported: one violation whose only evidence
+// file was monolith/app/models/_coupling.rb, under the declaration of a
+// different repository entirely.
 func TestDeclaredLayers_VerdictsOnlyTheDeclaringRepo(t *testing.T) {
 	store := facts.NewStore()
 	store.Add(

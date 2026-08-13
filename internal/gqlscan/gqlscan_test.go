@@ -65,7 +65,7 @@ func TestOperationHead_SkipsInterpolationInVariableList(t *testing.T) {
 // A directive is not a field, and a fragment spread's name is not either. Both
 // are reached after a newline, which is exactly what resets the scanner to
 // expect a field — so `@connection(key: …)` on the line after its field came
-// back as a root field named connection, on seven ttmobile documents.
+// back as a root field named connection, on seven mobile-client documents.
 func TestRootFields_DirectivesAndSpreadsAreNotFields(t *testing.T) {
 	body := `
     candidatesConnection(first: $first)

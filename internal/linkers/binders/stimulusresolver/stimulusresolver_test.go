@@ -52,9 +52,9 @@ func calls(f facts.Fact) []string {
 }
 
 // TestBindsHandlerToDeclaredMember: the method a data-action names becomes an
-// edge to the member the controller file declares. Without it the 121 aboard
-// handlers invoked only from markup have no inbound edge at all — the residual
-// finding 0007 named.
+// edge to the member the controller file declares. Without it the 121 handlers
+// one measured Rails application invokes only from markup have no inbound edge
+// at all — the residual finding 0007 named.
 func TestBindsHandlerToDeclaredMember(t *testing.T) {
 	ff := bind(t,
 		binding("app/views/x.html.erb", "dropdown", "app/javascript/controllers/dropdown_controller.js", "close toggle"),
@@ -120,10 +120,10 @@ func TestAmbiguousMemberIsSkipped(t *testing.T) {
 // TestRepoPrefixedFilesStillMatch: in a multi-repo snapshot a symbol's File
 // carries its repo label and the markup fact's relation target does not.
 func TestRepoPrefixedFilesStillMatch(t *testing.T) {
-	b := binding("aboard/app/views/x.html.erb", "dropdown", "app/javascript/controllers/dropdown_controller.js", "toggle")
-	b.Repo = "aboard"
-	m := member("app/javascript/controllers.DropdownController.toggle", "aboard/app/javascript/controllers/dropdown_controller.js", "DropdownController")
-	m.Repo = "aboard"
+	b := binding("monolith/app/views/x.html.erb", "dropdown", "app/javascript/controllers/dropdown_controller.js", "toggle")
+	b.Repo = "monolith"
+	m := member("app/javascript/controllers.DropdownController.toggle", "monolith/app/javascript/controllers/dropdown_controller.js", "DropdownController")
+	m.Repo = "monolith"
 	ff := bind(t, b, m)
 	if got := calls(ff[0]); len(got) != 1 {
 		t.Fatalf("the repo label must not stop the join, got %v", got)

@@ -262,13 +262,13 @@ func (s *Store) AnalyzeEndpoint(query string, maxRoutes int) EndpointImpact {
 // frontend screen each belongs to where the file is a route module.
 //
 // The join is by path SUFFIX, not by equality. A client writes the path its
-// base URL does not already carry — tt-agent-cli calls `/candidates` against a
-// host that supplies `/v1` — so an exact match finds nothing across a
+// base URL does not already carry — one CLI client calls `/candidates` against
+// a host that supplies `/v1` — so an exact match finds nothing across a
 // repository boundary. Asking the estate cluster what calls
 // `GET /v1/candidates/:id` returned zero callers while that one client held 245
 // call sites and the cross-repo linker had already resolved 101 of its
-// endpoints to teamtailor. The linker was right and this was re-deriving the
-// join badly.
+// endpoints to the monolith it calls. The linker was right and this was
+// re-deriving the join badly.
 //
 // The screen comes from the Ember convention that app/routes/<name> implements
 // the route declared as <name>, checked against the router's own declarations
@@ -283,8 +283,8 @@ func (s *Store) callersOf(routes []EndpointRoute) []EndpointCaller {
 		}
 	}
 	// Ember route NAMES are what the file layout mirrors, and they are not the
-	// URL: `this.route("aboard-company-linking", { path: "/aboard/company-linking" })`
-	// is served at one and implemented at app/routes/aboard-company-linking.
+	// URL: `this.route("admin-company-linking", { path: "/admin/company-linking" })`
+	// is served at one and implemented at app/routes/admin-company-linking.
 	// Matching on the path's last segment finds nothing whenever a route
 	// overrides its path, which is most of the interesting ones.
 	screens := map[string]string{}

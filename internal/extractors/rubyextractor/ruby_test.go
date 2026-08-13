@@ -2135,8 +2135,8 @@ end
 	}
 }
 
-// TestRoutes_JsonapiResourcesServeNoFormRoutes pins the served set against the
-// Teamtailor monolith's booted route table: JSONAPI::Resources is an API-only
+// TestRoutes_JsonapiResourcesServeNoFormRoutes pins the served set against a
+// production Rails monolith's booted route table: JSONAPI::Resources is an API-only
 // gem, so /new and /edit — which exist in Rails only to render HTML forms — are
 // not served, and reusing the Rails expansion here would invent two routes per
 // declaration.

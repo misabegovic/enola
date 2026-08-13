@@ -223,7 +223,7 @@ func TestLoadRepoFile_TwoInstancesExpandIndependently(t *testing.T) {
 	orders := ordersInstantiation + `    exempt:
       - rule: events-consumed
         witness: "LegacyOrderMigratedEvent has no inbound calls edge from orders-events/handlers"
-        owner: "muhamed"
+        owner: "dana"
         because: "Fired only by the migration backfill, consumed manually."
         since: "2026-08-11"
 `
@@ -242,7 +242,7 @@ func TestLoadRepoFile_TwoInstancesExpandIndependently(t *testing.T) {
 		t.Fatalf("rules = %d, want three per instance: %+v", len(byID), d.Rules)
 	}
 	ordersRule := byID["orders-events/events-consumed"]
-	if len(ordersRule.Exempt) != 1 || ordersRule.Exempt[0].Owner != "muhamed" {
+	if len(ordersRule.Exempt) != 1 || ordersRule.Exempt[0].Owner != "dana" {
 		t.Fatalf("the instance exemption must attach to its instance's rule: %+v", ordersRule.Exempt)
 	}
 	billingRule := byID["billing-events/events-consumed"]
@@ -394,7 +394,7 @@ func TestLoadRepoFile_ExemptionNamingUnknownRuleFails(t *testing.T) {
 	stray := ordersInstantiation + `    exempt:
       - rule: events-are-consumed
         witness: "whatever"
-        owner: "muhamed"
+        owner: "dana"
         because: "typo in the rule name"
         since: "2026-08-11"
 `

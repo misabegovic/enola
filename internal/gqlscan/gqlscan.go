@@ -11,11 +11,12 @@ import "regexp"
 // through its opening brace — at statement position.
 //
 // A `${…}` in the variable list is stepped over rather than treated as that
-// brace. ttmobile declares `$pageviewFilters: [${filterType}!]`, and stopping
-// at the interpolation's brace put the body start INSIDE it: the scanner then
-// read `filterType` as the operation's first root field and every real field
-// after it at the wrong depth. The two ends have to agree — RootFields skips
-// interpolations too — or the fix only moves where the desync begins.
+// brace. A mobile client declares `$pageviewFilters: [${filterType}!]`, and
+// stopping at the interpolation's brace put the body start INSIDE it: the
+// scanner then read `filterType` as the operation's first root field and every
+// real field after it at the wrong depth. The two ends have to agree —
+// RootFields skips interpolations too — or the fix only moves where the desync
+// begins.
 var OperationHead = regexp.MustCompile(`(?m)^\s*(query|mutation|subscription)\b(?:\$\{[^{}]*\}|[^{])*\{`)
 
 // RootFields returns the depth-1 field names of an operation body starting
@@ -36,10 +37,10 @@ func RootFields(body string) []string {
 		switch {
 		case c == '$' && i+1 < len(body) && body[i+1] == '{':
 			// A JavaScript template interpolation, not GraphQL. Its braces are
-			// not selection sets and its identifier is not a field: ttmobile
-			// declares `[${filterType}!]` in a variable list and teamtailor
-			// writes `${inOverview ? '' : '…'}` inside one, and both arrived in
-			// the graph as root fields named Query.filterType and
+			// not selection sets and its identifier is not a field: a mobile
+			// client declares `[${filterType}!]` in a variable list and a web
+			// frontend writes `${inOverview ? '' : '…'}` inside one, and both
+			// arrived in the graph as root fields named Query.filterType and
 			// Query.inOverview. Worse than the two false facts is what counting
 			// `${` as a depth increase does to everything after it — a
 			// `${FRAGMENT}` spread at depth 1 desynchronises the counter, and
@@ -88,7 +89,7 @@ func RootFields(body string) []string {
 			// A directive, not a field. `candidatesConnection(…)\n @connection(…)`
 			// puts a newline between the field and its directive, and a newline
 			// is what resets the scanner to expect a field — so `connection`
-			// was read as a second root field on seven ttmobile documents.
+			// was read as a second root field on seven mobile-client documents.
 			i++
 			for i < len(body) && isIdentChar(body[i]) {
 				i++

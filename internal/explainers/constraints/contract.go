@@ -147,12 +147,43 @@ func exemptionBindings(exempt []intent.ConstraintExemption) []ExemptionBinding {
 // the target and whose membership (the same resolveMembership the explainer
 // verdicts with, so contract and enforcement can never disagree) contains it.
 // Both matches are exact — an unresolvable target is contained by nothing.
+//
+// A predicate component answers for a raw path only when the snapshot already
+// carries a member in that file. The path arm exists so a file that does not
+// exist yet still gets its contract, and that is precisely what a predicate
+// cannot answer for: nothing has been measured about a file nobody has written.
+// Fail closed — no contract is honest, a guessed one is not.
+//
+// The two arms are alternatives rather than a conjunction. Conjoining them made
+// the predicate arm unreachable for the component the vocabulary exists to
+// write: with no service and no match patterns pathInComponent is false, so
+// `plan --paths app/components/x.rb` omitted every rule stated in the new
+// vocabulary while `plan --symbols X` included it. A path scope, where one is
+// declared, is already ANDed into the membership the predicate arm resolves.
 func containsTarget(store *facts.Store, c component, target string) bool {
-	if pathInComponent(c, target) {
+	names, members := resolveMembership(store, c)
+	if names[target] {
 		return true
 	}
-	names, _ := resolveMembership(store, c)
-	return names[target]
+	if c.predicated() {
+		return fileHostsMember(members, target)
+	}
+	return pathInComponent(c, target)
+}
+
+// fileHostsMember reports whether any measured member of the component lives in
+// the named file — the evidence a predicate component needs before it claims a
+// raw path.
+func fileHostsMember(members []facts.Fact, target string) bool {
+	for _, f := range members {
+		if f.File == target {
+			return true
+		}
+		if f.Repo != "" && strings.TrimPrefix(f.File, f.Repo+"/") == target {
+			return true
+		}
+	}
+	return false
 }
 
 // pathInComponent joins a raw path — which may not exist yet; that is the
@@ -298,10 +329,13 @@ func (r rule) statement() string {
 }
 
 // ComponentCount is one declared component's resolution against a measured
-// store: how many facts its selector actually names.
+// store: how many facts its selector actually names, and the selector it named
+// them with — a predicate count with no predicate beside it leaves the author
+// guessing which of several narrowings produced the number.
 type ComponentCount struct {
 	Component string `json:"component"`
 	Members   int    `json:"members"`
+	Selector  string `json:"selector,omitempty"`
 }
 
 // MemberCounts resolves every declared component in the store against the
@@ -320,7 +354,11 @@ func MemberCounts(store *facts.Store) []ComponentCount {
 	var out []ComponentCount
 	for _, name := range names {
 		memberNames, _ := resolveMembership(store, components[name])
-		out = append(out, ComponentCount{Component: name, Members: len(memberNames)})
+		out = append(out, ComponentCount{
+			Component: name,
+			Members:   len(memberNames),
+			Selector:  selectorSummary(components[name]),
+		})
 	}
 	return out
 }

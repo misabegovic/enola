@@ -97,7 +97,10 @@ func TestMemberCounts_ResolvesEveryDeclaredComponent(t *testing.T) {
 		facts.Fact{Kind: facts.KindSymbol, Name: "Billing", File: "app/domain/billing/refund.rb"},
 	)
 	got := MemberCounts(store)
-	want := []ComponentCount{{Component: "domain", Members: 2}, {Component: "ghost", Members: 0}}
+	want := []ComponentCount{
+		{Component: "domain", Members: 2, Selector: "match app/domain/**"},
+		{Component: "ghost", Members: 0, Selector: "match app/ghost/**"},
+	}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("MemberCounts = %+v, want %+v (distinct names, name order, dead selector at 0)", got, want)
 	}
@@ -116,9 +119,9 @@ func TestMemberCounts_ServiceScopedComponents(t *testing.T) {
 	)
 	got := MemberCounts(store)
 	want := []ComponentCount{
-		{Component: "billing-internal", Members: 1},
-		{Component: "frontend", Members: 3},
-		{Component: "payments", Members: 0},
+		{Component: "billing-internal", Members: 1, Selector: "service billing, match internal/**"},
+		{Component: "frontend", Members: 3, Selector: "service frontend"},
+		{Component: "payments", Members: 0, Selector: "service payments"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("MemberCounts = %+v, want %+v", got, want)

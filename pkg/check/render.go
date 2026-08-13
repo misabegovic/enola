@@ -14,7 +14,7 @@ import (
 // says why a baseline is untrustworthy or merely caveated rather than only that it is.
 var kindMeaning = map[diff.WarningKind]string{
 	diff.WarnDifferentRepo:   "the two snapshots are of different repositories, so the delta is not about your change",
-	diff.WarnVersionMismatch: "different enola versions extract differently, so unchanged code can appear as churn",
+	diff.WarnVersionMismatch: "different enola builds extract or derive differently, so unchanged code can appear as churn",
 	diff.WarnExtractorSet:    "a language present on one side only makes all of its facts appear added or removed",
 	diff.WarnProviderSet:     "a provider that ran on one side only makes all of its facts appear added or removed",
 	diff.WarnExplainerSet:    "an explainer present on one side only makes all of its findings appear new or resolved; the facts and coupling in this delta are unaffected",
@@ -85,7 +85,7 @@ func (v Verdict) Render() string {
 			// regression" here would be false, and it is the line a reader skims.
 			fmt.Fprintf(&sb, "%s — %s reported, not failed.\n", warnOnly,
 				plural(len(v.Failures), "structural regression", "structural regressions"))
-		case len(v.Advisories) > 0 || len(v.Suppressed) > 0 || len(v.Exempted) > 0 || v.EdgesAdded > 0 || v.FactsAdded > 0 || v.FactsRemoved > 0:
+		case len(v.Advisories) > 0 || len(v.Suppressed) > 0 || len(v.Exempted) > 0 || len(v.Silenced) > 0 || len(v.Undeclared) > 0 || len(v.Unattributed) > 0 || v.EdgesAdded > 0 || v.FactsAdded > 0 || v.FactsRemoved > 0:
 			fmt.Fprintf(&sb, "%s — %s.\n", pass, graded)
 		case v.Status == StatusPartialClean:
 			fmt.Fprintf(&sb, "%s — no architectural change in the graded intersection.\n", pass)
@@ -163,6 +163,21 @@ func (v Verdict) Render() string {
 	if len(v.Resolved) > 0 {
 		fmt.Fprintf(&sb, "\nResolved by this change (%d):\n", len(v.Resolved))
 		writeFindings(&sb, v.Resolved)
+	}
+
+	if len(v.Silenced) > 0 {
+		fmt.Fprintf(&sb, "\nNo longer verdicted (%d) — the code these breaches named is still measured and\nno longer selected by the component its rule binds. The rule lost its subject;\nnothing was fixed:\n", len(v.Silenced))
+		writeFindings(&sb, v.Silenced)
+	}
+
+	if len(v.Undeclared) > 0 {
+		fmt.Fprintf(&sb, "\nNo longer declared (%d) — the rule that reported these was deleted, re-formed\nunder the same id, or carved out by an exemption. The breaching code is\nunchanged; the law stopped asking:\n", len(v.Undeclared))
+		writeFindings(&sb, v.Undeclared)
+	}
+
+	if len(v.Unattributed) > 0 {
+		fmt.Fprintf(&sb, "\nNot attributable to this change (%d) — the repository these breaches were\nmeasured in is absent from this snapshot, or the baseline carried the finding\nwithout the declaration that produced it. Nothing here was compared; whether\nthe code was fixed is not something these two snapshots can say:\n", len(v.Unattributed))
+		writeFindings(&sb, v.Unattributed)
 	}
 
 	v.writeGuidance(&sb)

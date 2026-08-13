@@ -1042,9 +1042,10 @@ func hasCall(calls []string, want string) bool {
 }
 
 // A generic call's callee is an IndexExpr, not a selector, so every call written
-// `api.Request[Task](…)` was dropped without a signal. aboard-cli routes its whole
-// API surface through two such helpers and emitted no call edge to either — while
-// `fmt.Sprintf` two lines below in the same closure came through.
+// `api.Request[Task](…)` was dropped without a signal. A Go CLI in this estate
+// routes its whole API surface through two such helpers and emitted no call edge
+// to either — while `fmt.Sprintf` two lines below in the same closure came
+// through.
 func TestGoCalls_GenericInstantiationIsACall(t *testing.T) {
 	calls := callsOf(t, map[string]string{
 		"internal/api/api.go": "package api\n\n" +

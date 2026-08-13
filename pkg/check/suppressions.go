@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/enola-labs/enola/internal/explainers/constraints"
 	"github.com/enola-labs/enola/internal/facts"
 )
 
@@ -126,4 +127,35 @@ func strictFinding(in facts.Insight) bool {
 
 func exemptedFinding(in facts.Insight) bool {
 	return in.Source == constraintsSource && strings.HasPrefix(in.Title, ExemptedTitlePrefix)
+}
+
+// withoutExempted drops from the undeclared bucket every breach this delta
+// already reports as exempted. An exemption is a declaration change, so the
+// bucket is right to catch it — but "excused by name, by an owner, since a
+// date" is the more specific and more useful sentence, and printing the same
+// witness twice under two headings is how a reader stops reading either.
+//
+// The join is on the witness the two titles share: a violation is titled
+// "<prefix> <rule> violated: <witness>" and its carve-out
+// "Exempted from constraint <rule>: <witness>".
+func withoutExempted(undeclared, exempted []facts.Insight) []facts.Insight {
+	if len(undeclared) == 0 || len(exempted) == 0 {
+		return undeclared
+	}
+	excused := map[string]bool{}
+	for _, in := range exempted {
+		if rest, cut := strings.CutPrefix(in.Title, ExemptedTitlePrefix); cut {
+			excused[rest] = true
+		}
+	}
+	var out []facts.Insight
+	for _, in := range undeclared {
+		id := constraints.RuleIDFromTitle(in.Title)
+		_, witness, found := strings.Cut(in.Title, " violated: ")
+		if id != "" && found && excused[id+": "+witness] {
+			continue
+		}
+		out = append(out, in)
+	}
+	return out
 }

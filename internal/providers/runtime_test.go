@@ -186,7 +186,7 @@ func writeRuntimeFixture(t *testing.T, captures map[string]string) string {
 
 const bootCapture = `{
   "schema": 1,
-  "source": "tt-enola runtime",
+  "source": "enola runtime",
   "rails_version": "8.0.2",
   "app": "Fixture",
   "unreachable": [],

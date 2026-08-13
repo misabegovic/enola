@@ -77,11 +77,18 @@ func CompileFacts(d *Declaration) []facts.Fact {
 		if c.Service != "" {
 			extra["service"] = c.Service
 		}
-		if c.Kind != "" {
-			extra["kind"] = c.Kind
+		// Both spellings of the kind narrowing compile to the one kind prop —
+		// the predicate's reserved key is the same narrowing, not a second one,
+		// so nothing downstream of compilation has to know which spelling the
+		// author used.
+		if kind := c.FactKind(); kind != "" {
+			extra["kind"] = kind
 		}
 		if c.NamePattern != "" {
 			extra["name_pattern"] = c.NamePattern
+		}
+		if where := EncodeWhere(c.Predicate()); where != "" {
+			extra["where"] = where
 		}
 		if c.Recipe != "" {
 			extra["recipe"] = c.Recipe

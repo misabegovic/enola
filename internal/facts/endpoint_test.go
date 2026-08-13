@@ -95,10 +95,10 @@ func TestAnalyzeEndpointFindsTheFrontendScreen(t *testing.T) {
 	st.Add(
 		Fact{Kind: KindRoute, Name: "/app/api/available_companies", Props: map[string]any{
 			"method": "GET", "handler": "app/api/available_companies#index"}},
-		Fact{Kind: KindRoute, Name: "/aboard/company-linking", Props: map[string]any{
-			"method": "GET", "framework": "ember", "ember_route_name": "aboard-company-linking"}},
+		Fact{Kind: KindRoute, Name: "/admin/company-linking", Props: map[string]any{
+			"method": "GET", "framework": "ember", "ember_route_name": "admin-company-linking"}},
 		Fact{Kind: KindRoute, Name: "/app/api/available_companies",
-			File:  "ember_app/app/routes/aboard-company-linking.ts",
+			File:  "ember_app/app/routes/admin-company-linking.ts",
 			Props: map[string]any{"method": "GET", "role": "client"}},
 		Fact{Kind: KindRoute, Name: "/app/api/available_companies",
 			File:  "ember_app/app/components/picker.ts",
@@ -118,7 +118,7 @@ func TestAnalyzeEndpointFindsTheFrontendScreen(t *testing.T) {
 	for _, caller := range got.Callers {
 		byFile[caller.File] = caller.Screen
 	}
-	if screen := byFile["ember_app/app/routes/aboard-company-linking.ts"]; screen != "/aboard/company-linking" {
+	if screen := byFile["ember_app/app/routes/admin-company-linking.ts"]; screen != "/admin/company-linking" {
 		t.Errorf("route module resolves to its screen, got %q", screen)
 	}
 	// A component may be used by many screens, so claiming one would be a guess.

@@ -1436,3 +1436,15 @@ func TestExplain_GuidanceIsDeterministic(t *testing.T) {
 		t.Errorf("insights are not title-sorted: %+v", first)
 	}
 }
+
+// violationTitles keeps a test's assertion on the verdicts a rule reached,
+// separately from the advisories that report what it could not reach.
+func violationTitles(insights []facts.Insight) []string {
+	var out []string
+	for _, in := range insights {
+		if strings.Contains(in.Title, " violated: ") {
+			out = append(out, in.Title)
+		}
+	}
+	return out
+}
