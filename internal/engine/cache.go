@@ -1739,7 +1739,225 @@ import (
 // unedited tree, and without a bump prints "PASS — no architectural change" while
 // doing it. The constant is the provenance marker as well as the cache key; this line
 // is what widening it costs.
-const cacheVersion = "v207"
+//
+// --- upstream's numbering rejoins ours here -----------------------------------
+//
+// v195 through v197 were assigned INDEPENDENTLY on both sides while this fork and
+// upstream shipped in parallel, so three integers named six different changes. The
+// three that follow are upstream's, renumbered onto free integers above our range;
+// their text is unchanged and each names the upstream number it arrived as.
+//
+// The direction is not a preference. A cache entry on disk is stamped with the
+// integer the binary that wrote it carried, and every such entry in this estate was
+// written by a build of THIS tree — renumbering our lineage would leave a v207 entry
+// meaning one thing to the binary that wrote it and another to the binary reading it,
+// which is exactly the stale-cache-agreeing-with-nothing failure the constant exists
+// to prevent. Upstream's three numbers were never stamped by a binary we ship, so
+// re-assigning them costs nothing on disk. Landing above BOTH lineages also keeps an
+// upstream v0.3.18 build (v197) and this one from ever reading each other's entries as
+// their own, which matters because the merged extractor is neither.
+//
+// The next align faces the same collision, because both projects increment the same
+// counter and the coverage guard requires the contiguous range v2..cacheVersion — a
+// namespaced value would have to fork that guard, and forking upstream's guard to
+// avoid renumbering upstream's entries is the worse trade. So the rule, applied every
+// time: upstream's new `// vN:` lines move to the top of our range in upstream's own
+// order, keeping their text and naming their origin; ours never move.
+// v208: [upstream v195] the Java and Ruby grammars move to their newest releases — tree-sitter-java
+// v0.21.1-20240824 -> v0.23.5 and tree-sitter-ruby v0.21.1-20240818 -> v0.23.1. Both are
+// still tree-sitter ABI 14, which is the ceiling the vendored go-tree-sitter runtime
+// accepts; the C#, Python, Scala and Dart grammars are all held back or regenerated for
+// exactly that reason, and probe_test.go in each of these two packages now guards the
+// same trap here.
+//
+// One version covers both grammars deliberately. Each bump alone would invalidate every
+// cached fact in the tree, so landing them separately would make users pay for a full
+// re-extraction twice to arrive at the same graph.
+//
+// The bump is NOT visible in the goldens — all 37 fixture graphs are byte-identical
+// before and after, and TestDeterminism passes on both. It is versioned anyway because
+// the goldens only speak for the fixture corpus, while the grammar is what turns bytes
+// into facts for every repo: two minor releases of grammar fixes can parse constructs the
+// old parser shredded, and the extractor cache is keyed on cacheVersion plus the file
+// hash alone. Without the bump an upgraded binary would keep serving facts its own parser
+// never produced, and nothing downstream could tell.
+// v209: [upstream v196] the C, C++ and PHP grammars leave the 2024 pre-release pseudo-versions they were
+// stuck on — tree-sitter-c v0.21.5-20240818 -> v0.23.6, tree-sitter-cpp v0.22.4-20240818
+// -> v0.23.4, tree-sitter-php v0.22.9-20240819 -> v0.23.12. Roughly two years of upstream
+// grammar fixes each.
+//
+// They were not stuck for a good reason. Every one of these grammars has since been
+// regenerated at tree-sitter ABI 15, which the vendored runtime refuses, so the only
+// version ever offered was the unusable one and the pins simply never moved. The bounds
+// in .github/dependabot.yml now cap each grammar at its last ABI-14 release, which is what
+// made these three upgrades visible at all.
+//
+// Grouped into one version for the same reason as v208: any grammar change invalidates
+// every cached fact, so landing three separately would charge users three full
+// re-extractions to reach one graph.
+//
+// As with v208 the goldens do not move — all 37 fixture graphs are byte-identical and
+// TestDeterminism passes. The bump is not a formality: the cache is keyed on cacheVersion
+// plus the file hash alone, so without it an upgraded binary would keep serving facts its
+// own parser never produced. What the goldens cannot check is the rest of the world, so
+// probe_test.go in cppextractor and phpextractor now pins every node kind the walkers
+// dispatch on (35 shared C/C++, 17 C++-only, 1 C-only, 38 PHP) — a renamed kind is the
+// failure a two-year grammar jump actually causes, and it degrades extraction without
+// erroring.
+// v210: [upstream v197] Rails route extraction stops being a single-file affair.
+//
+// Three defects, one root cause — the extractor read `config/routes.rb` and treated it
+// as the route table, when in Rails it is only the entry point to one:
+//
+//   - Route-file discovery matched the repository root plus a packwerk `packages/*`
+//     pattern and nothing else. solidus is six mountable engines with NO root config/
+//     at all, so it reported ZERO Rails routes while declaring 195; discourse's 25
+//     plugin route files (386 declarations) and GitLab's 38 ee/config/routes files
+//     (451) were never opened either. The rule is now shape-based — any
+//     `<dir>/config/routes.rb` or `.rb` below a `config/routes/` directory, at any
+//     depth — minus generator templates and dummy apps, which look identical and are
+//     served by nobody.
+//   - `mount` was not implemented at all, in a corpus containing 23 mount sites. An
+//     engine's whole route table is served below its mount path, so the mounted
+//     constant is now resolved to the directory that owns it (by reading the
+//     `lib/**/engine.rb` beside each engine route file) and that file is parsed under
+//     the mount prefix. Same interprocedural prefix-composition shape as Go v125,
+//     Axum v130 and FastAPI v133.
+//   - Routes carried a handler only when written with an explicit `to:`, so every
+//     `resources` declaration — the majority of Rails routes — produced an isolated
+//     graph node. The controller is now derived from the enclosing module namespace
+//     and the resource name, and each route carries a `handled_by` edge to the real
+//     controller-action symbol. Without that edge, impact analysis from a controller
+//     could not reach the endpoints it serves, and a controller reached only through
+//     the route table read as dead code.
+//
+// Also: `concern`/`concerns` (a concern serves nothing where it is DEFINED and
+// everything where it is referenced — the previous default-case descent got this
+// exactly backwards), the `controller do` block form, and Rails detection for
+// engine-only repositories, which have neither of the two root markers.
+//
+// A fourth defect found while measuring the first three: the route walker iterated only
+// direct `call` children, so any route inside plain Ruby control flow was skipped. A
+// route file is Ruby and real ones are full of conditionals — GitLab guards whole files
+// with `unless @organization_scoped_routes`, solidus wraps its admin routes in `if
+// SolidusSupport.admin_available?`, and Rails' own activestorage route file is a `draw`
+// block closed by an `if` MODIFIER. Five route files across the corpus parsed cleanly
+// and produced nothing, which is indistinguishable from a file with no routes. Both
+// branches of a conditional are now walked; which one Rails takes depends on runtime
+// configuration the extractor cannot see.
+//
+// A fifth: the hash-rocket route form `get 'path' => 'ctrl#action'` puts the handler in
+// the pair's VALUE rather than in a `to:` keyword. Discourse and lobsters write nearly
+// every route that way, so reading only `to:` left thousands of routes handler-less even
+// after the derivation above.
+//
+// A sixth, found the same way: `namespace`, `resources` and `resource` accept a symbol
+// OR a string, and only the symbol form was read. `namespace "recaptcha"` made its whole
+// block invisible, taking every route inside it along — four openproject module route
+// files declared 15 routes and produced none.
+//
+// Unrelated to the extractor but found by the same measurement: the ember-octane LAYER
+// pattern claimed the bare path segment `lib` for its level-0 util layer. discourse is a
+// Rails backend beside an Ember frontend, the Ember pattern wins the repo on confidence,
+// and layer matching is by path segment with no notion of language — so every Ruby
+// `lib/` and `plugins/*/lib/*` directory became the innermost layer and each model or
+// service it legitimately called became a violation. 397 of discourse's 426 reported
+// violations were that; removing `lib` takes it to 27. It is wrong on Ember's own terms
+// too: Octane puts utilities in `app/utils/`, while `lib/` holds in-repo addons.
+//
+// Classes also now carry a `rails_component` prop — job, mailer, channel, policy,
+// controller, model, component, concern — derived from the superclass or an included
+// module first and the directory only as a fallback, because `< ApplicationJob` is what
+// Rails dispatches on while `app/services` is a convention with no framework meaning.
+// And `db/migrate` and `lib/tasks` are classified as TOOLING rather than production: a
+// migration is a one-shot script nothing references by design, so calling it production
+// code made every migration in a large Rails app a dead-code candidate.
+//
+// And a second framework: GRAPE, which had no extractor at all. GitLab's entire v4 REST
+// API — 1,033 files, ~1,530 verb sites under 382 `resource` and 318 `namespace` blocks —
+// was invisible, reached from Rails through one `mount ::API::API => '/'`. Grape is
+// identified by transitive inheritance rather than by a route file (GitLab has exactly
+// ONE class inheriting Grape directly and a thousand inheriting that), so the class set
+// is computed as a closure over the `superclass` props the AST pass already emits — no
+// extra I/O on a repository containing no Grape — and only the surviving files are
+// re-parsed for their route bodies. Composition is class-to-class via `mount`, so a
+// route's URL is assembled from a prefix chain that lives in other files.
+//
+// The goldens move: ruby_sample's 13 route facts each gain a handler prop and a
+// handled_by relation. No route is added or lost in the fixture, which is the point —
+// the fixture is a single-file application, the shape that already worked.
+// v211: the hash-rocket mount form whose key builds a Rack app inline names its
+// app again. `mount Flipper::UI.app(Flipper) => "/admin/flipper"` reaches its
+// constant through a call, which parseMount unwraps on the `at:` side and required
+// to be a bare constant on the key side — so the declaration produced no constant,
+// and a mount with no constant is dropped entirely, path and all. One route on the
+// monolith (/admin/flipper) vanished this way, which is how the shape was found:
+// the previous reader here took the pair's VALUE without inspecting its key, so
+// the upgrade to upstream's constant-aware reader lost a form it had covered.
+// Reading the receiver is the same rule the `at:` branch already applies, so no
+// new guess enters: a key that names nothing resolvable still mounts nothing.
+// v212: a Rails route names the controller Rails names, on the rules Rails
+// actually uses rather than one of them everywhere. `Resource#controller` is
+// `options[:controller] || @name`, so a plural `resources` takes its name VERBATIM;
+// `SingletonResource#controller` is `options[:controller] || plural`, so only the
+// singular pluralizes. Applying the singular rule to both turned every plural name
+// that is not the pluralization of its singular into a controller no application
+// has: the monolith declares `resources :meeting_self_schedule` and was reported as
+// served from `meeting_self_schedules`, while the file on disk is
+// `meeting_self_schedule_controller.rb`.
+//
+// The pluralization the singular rule needs is ActiveSupport's, which knows the
+// irregulars — `resource :person` is served by people — and this extractor's
+// inflector answers persons. So a singular resource that does not name its
+// controller now gets NO handler, which is the refusal this file has always made
+// here and the reason it never grew a pluralize-for-Rails rule. A verb inside such
+// a block declines with it rather than inheriting the enclosing resource's
+// controller, which serves different routes.
+//
+// A verb may also name its own controller, and that name wins over the enclosing
+// one: map_match reads `controller:` off the call and only then falls back with
+// `controller ||= @scope[:controller]`. Reading `action:` while leaving that option
+// unread is worse than reading neither, because the route then resolves to the
+// controller enclosing it — one that exists and does not serve it. The monolith
+// writes that shape 36 times in one route table.
+//
+// The namespace is composed where the ROUTE is created, not where the resource is
+// declared — `Mapping.build` captures `scope[:module]` at the route site and
+// `add_controller_module` joins it there — so a `scope module:` entered between a
+// `resources` declaration and a verb inside its block belongs to that verb. The
+// scope carries the bare controller and every route site composes for itself, which
+// puts the `controller ... do` block form on the same rule. add_controller_module
+// has one exception and it is now honoured: a controller written with a leading
+// slash is stripped of the slash and NOT composed.
+//
+// Measured on the monolith at f97ae49, against the binary this branch forked from:
+// routes with no handler 250 -> 210, routes whose handler names a controller file
+// that EXISTS 3,482 -> 3,531, routes whose handler names one that does NOT 6 -> 14.
+// No route moved from having no handler to having a wrong one, and none moved from
+// a controller that exists to one that does not; the 14 are the 5 that were already
+// there, plus 9 the upstream 0.3.18 reader newly reads inside `Avo::Engine.routes.draw`
+// and one of the original 6 now fixed. Upstream 0.3.18 alone puts that count at 57,
+// so what this changelog entry describes removes 43 of the 51 it added. Route
+// handlers naming an action that is not a known symbol: 1,762 before, 1,781 on the
+// align, 1,662 here — fewer than either.
+//
+// The bump is the PROVENANCE argument in the header, not the cache one. The cache
+// argument does not hold: buildIdentity mixes the executable's size and mtime into
+// every entry, so a cache written by a different binary is discarded whether or not
+// this constant moves, and an earlier draft of this entry claimed otherwise. What
+// does not happen without a bump is everything keyed on ExtractorVersion — `enola
+// check` compares it to decide whether a baseline is comparable, and every locally
+// built binary reports the same "dev" EnolaVersion, so this constant is the only
+// signal that 2,533 route->action edges appeared and 156 were withdrawn; and append
+// mode discards prior state on it, without which a multi-repo union carries repos
+// extracted under the old derivation and labels them current.
+//
+// benchmarks/rails-controller-derivation scores all of it, expanded through
+// ActionDispatch::Routing::RouteSet on actionpack 8.1.3 and 8.1.1, which agreed,
+// rather than written from memory. The route cases that existed before scored
+// filters and nesting only, so every one of these derivations could be wrong while
+// the suite read 149/149 — which is what happened.
+const cacheVersion = "v212"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

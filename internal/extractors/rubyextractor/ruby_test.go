@@ -1010,7 +1010,8 @@ func TestRoutes_DrawPrefixSeeding(t *testing.T) {
   draw(:admin_routes)
 end
 `
-	_, draws, _ := parseRouteFile([]byte(main), "config/routes.rb", "", jsonapiRouteDasherized, nil, "")
+	_, res := parseRouteFile([]byte(main), "config/routes.rb", "", jsonapiContext{format: jsonapiRouteDasherized})
+	draws := res.draws
 	if draws["api_core_v3_routes"] != "/api/core/v3" {
 		t.Errorf("api_core_v3_routes prefix = %q, want /api/core/v3", draws["api_core_v3_routes"])
 	}
@@ -1029,7 +1030,7 @@ namespace :event do
   resources :posts, only: [:create]
 end
 `
-	ff, _, _ := parseRouteFile([]byte(sub), "config/routes/api_v2_routes.rb", draws["api_v2_routes"], jsonapiRouteDasherized, nil, "")
+	ff, _ := parseRouteFile([]byte(sub), "config/routes/api_v2_routes.rb", draws["api_v2_routes"], jsonapiContext{format: jsonapiRouteDasherized})
 	names := map[string]bool{}
 	for _, f := range ff {
 		names[f.Name] = true
@@ -2197,7 +2198,8 @@ func TestRoutes_JsonapiUnknownRouteFormatIsCounted(t *testing.T) {
   end
 end
 `
-	ff, _, unhandled := parseRouteFile([]byte(src), "config/routes.rb", "", jsonapiRouteUnknown, nil, "")
+	ff, res := parseRouteFile([]byte(src), "config/routes.rb", "", jsonapiContext{format: jsonapiRouteUnknown})
+	unhandled := res.unresolved
 	if len(ff) != 0 {
 		t.Errorf("an unreadable route formatter must produce no routes, got %d", len(ff))
 	}
@@ -2226,7 +2228,7 @@ end
 		modelFiles:    map[string]string{},
 		modelCache:    map[string]map[string]string{},
 	}
-	ff, _, _ := parseRouteFile([]byte(src), "config/routes.rb", "", jsonapiRouteDasherized, resolver, "")
+	ff, _ := parseRouteFile([]byte(src), "config/routes.rb", "", jsonapiContext{format: jsonapiRouteDasherized, resolver: resolver})
 	routes := routeMethods(ff)
 
 	for _, m := range []string{"POST", "PATCH", "PUT", "DELETE"} {
@@ -2331,5 +2333,38 @@ func TestJsonapiHandlerReadsTheModelAssociation(t *testing.T) {
 	bare := newJsonapiResolver(dir, []string{"app/resources/api/v1/company_resource.rb", "app/models/company.rb"})
 	if got := bare.handlerFor("api/v1", jsonapiRelationship{name: "manager"}, owner, "company"); got != "" {
 		t.Errorf("an undeclared target must resolve to nothing, got %q", got)
+	}
+}
+
+// TestParseMount_HashRocketCallKey covers the mount shape the monolith writes and
+// upstream's reader drops: the hash-rocket form whose KEY builds a Rack app inline.
+//
+// `mount Flipper::UI.app(Flipper) => "/admin/flipper"` names its app through a call,
+// not a bare constant. parseMount unwraps exactly that call on the `at:` side already;
+// on the key side it required a constant, so the declaration yielded no constant, and
+// with no constant the whole mount — path included — was dropped. /admin/flipper
+// disappeared from the monolith's route table.
+func TestParseMount_HashRocketCallKey(t *testing.T) {
+	src := []byte(`Rails.application.routes.draw do
+  mount Flipper::UI.app(Flipper) => "/admin/flipper", :constraints => SuperadminConstraint.new
+  mount Sidekiq::Web => "/admin/sidekiq"
+  mount Coverband::Reporters::Web.new, at: "/coverage"
+end
+`)
+	ff, _ := parseRouteFile(src, "config/routes.rb", "", jsonapiContext{format: jsonapiRouteDasherized})
+	got := map[string]string{}
+	for _, f := range ff {
+		if f.Kind == facts.KindRoute && f.Props["method"] == "MOUNT" {
+			got[f.Name], _ = f.Props["mounts"].(string)
+		}
+	}
+	for path, want := range map[string]string{
+		"/admin/flipper/": "Flipper::UI",
+		"/admin/sidekiq/": "Sidekiq::Web",
+		"/coverage/":      "Coverband::Reporters::Web",
+	} {
+		if got[path] != want {
+			t.Errorf("mount at %s = %q, want %q (got %v)", path, got[path], want, got)
+		}
 	}
 }

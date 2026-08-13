@@ -13,19 +13,41 @@ import (
 // facts. Block boundaries come from the grammar (do_block) rather than counting
 // `do`/`end`, so nested namespaces/resources/scopes are tracked precisely.
 func parseRouteFileAST(src []byte, relFile string) []facts.Fact {
-	ff, _, _ := parseRouteFile(src, relFile, "", jsonapiRouteDasherized, nil, "")
+	ff, _ := parseRouteFile(src, relFile, "", jsonapiContext{format: jsonapiRouteDasherized})
 	return ff
 }
 
+// routeMount records a `mount SomeEngine, at: '/x'` site: the constant that was
+// mounted and the full URL prefix it was mounted under (including any enclosing
+// scope/namespace). extractAllRoutes resolves the constant to the engine directory
+// whose config/routes.rb should be parsed below that prefix.
+type routeMount struct {
+	constant string
+	prefix   string
+}
+
+// routeFileResult is what parsing one route file taught us about the OTHER files that
+// make up the same route table.
+type routeFileResult struct {
+	// draws maps each draw(:pkg) delegation found in this file to the URL prefix it is
+	// scoped under, so the caller can parse config/routes/<pkg>.rb with it.
+	draws map[string]string
+	// mounts lists the engine mount sites found in this file.
+	mounts []routeMount
+	// unresolved counts the route-declaring macros this file used that the walker
+	// could not expand, keyed by macro name, so the coverage fact can account for
+	// them rather than letting the absence read as "no routes here".
+	unresolved map[string]int
+}
+
 // parseRouteFile parses a Rails route file, seeding the scope stack with
-// initialPrefix (the URL prefix a parent routes.rb delegated this file under via
-// draw(:pkg)), and additionally returns the draw(:pkg) -> prefix map discovered in
-// this file, so the caller can inline each delegated file under its real scope.
-func parseRouteFile(src []byte, relFile, initialPrefix, jsonapiFormat string, resolver *jsonapiResolver, refusalCause string) ([]facts.Fact, map[string]string, map[string]int) {
+// initialPrefix (the URL prefix under which a parent routes.rb delegated or mounted
+// this file), and returns what it learned about further route files.
+func parseRouteFile(src []byte, relFile, initialPrefix string, jsonapi jsonapiContext) ([]facts.Fact, routeFileResult) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(ruby.Language())); err != nil {
-		return nil, nil, nil
+		return nil, routeFileResult{}
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
@@ -34,12 +56,17 @@ func parseRouteFile(src []byte, relFile, initialPrefix, jsonapiFormat string, re
 	if initialPrefix != "" {
 		stack = []routeScope{{pathPrefix: initialPrefix}}
 	}
-	rw := &routeWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile),
-		draws: map[string]string{}, concerns: map[string]*sitter.Node{},
-		unhandled: map[string]int{}, jsonapiFormat: jsonapiFormat,
-		jsonapi: resolver, refusalCause: refusalCause}
+	rw := &routeWalker{
+		src:       src,
+		relFile:   relFile,
+		dir:       filepath.Dir(relFile),
+		draws:     map[string]string{},
+		concerns:  map[string]*sitter.Node{},
+		unhandled: map[string]int{},
+		jsonapi:   jsonapi,
+	}
 	rw.walk(tree.RootNode(), stack)
-	return rw.out, rw.draws, rw.unhandled
+	return rw.out, routeFileResult{draws: rw.draws, mounts: rw.mounts, unresolved: rw.unhandled}
 }
 
 type routeWalker struct {
@@ -50,25 +77,24 @@ type routeWalker struct {
 	// draws maps each draw(:pkg) delegation found in this file to the URL prefix it
 	// is scoped under, so the caller can parse config/routes/<pkg>.rb with it.
 	draws map[string]string
-	// concerns holds each `concern :name do ... end` body so a later
-	// `concerns: :name` can replay it in the scope that includes it. Rails
-	// requires the definition to precede its use, so a single forward pass is
-	// enough and a missing name resolves to nothing rather than to a guess.
+	// mounts collects the engine mount sites found in this file.
+	mounts []routeMount
+	// concerns maps a `concern :name do ... end` definition to its block body, so a
+	// later `concerns: :name` can replay it under the scope that referenced it. Rails
+	// requires the definition to precede the reference, so a single forward pass is
+	// enough.
 	concerns map[string]*sitter.Node
+	// concernDepth bounds concern replay. A concern that references itself would
+	// otherwise recurse forever.
+	concernDepth int
 	// unhandled counts route-declaring macros this walker does not know, keyed by
 	// macro name. `jsonapi_resources :companies` declares routes and produces
 	// none here; counting it is what stops that absence reading as "no routes".
 	unhandled map[string]int
-	// jsonapiFormat is how this repository formats JSONAPI::Resources route
-	// segments, which decides whether a jsonapi declaration can be expanded at
-	// all — see jsonapiRouteFormat.
-	jsonapiFormat string
-	// refusalCause names why a jsonapi declaration could not be expanded, when
-	// the reason is the repository's configuration rather than the macro itself.
-	refusalCause string
-	// jsonapi resolves a declaration to its resource class, that class's
-	// relationships, and the controller each related route is served by.
-	jsonapi *jsonapiResolver
+	// jsonapi carries what a JSONAPI::Resources declaration needs to expand: how
+	// this repository formats route segments, why it could not be read when it
+	// could not, and the resolver from declaration to resource class.
+	jsonapi jsonapiContext
 }
 
 // routeWrappers are macros that take a block and *contain* routes rather than
@@ -88,6 +114,19 @@ var routeWrappers = map[string]bool{
 
 // walk iterates the statements of a program / body_statement, dispatching each
 // route-DSL call with the current scope stack.
+//
+// It also descends through plain Ruby control flow, because a route file is Ruby and
+// real ones are full of it: GitLab guards whole files with `unless
+// @organization_scoped_routes` and `if Rails.env.development?`, solidus wraps its admin
+// routes in `if SolidusSupport.admin_available?`, and Rails' own activestorage route
+// file is one `draw do … end` closed by an `if` MODIFIER. Iterating only direct `call`
+// children silently dropped every one of them — five whole route files across the
+// corpus, and the failure is invisible because a file that parses fine and yields
+// nothing looks exactly like a file with no routes.
+//
+// Both branches of a conditional are walked. Which one Rails takes depends on runtime
+// configuration the extractor cannot see, and a route that exists under some
+// configuration is a route.
 func (rw *routeWalker) walk(node *sitter.Node, stack []routeScope) {
 	if node == nil {
 		return
@@ -96,8 +135,44 @@ func (rw *routeWalker) walk(node *sitter.Node, stack []routeScope) {
 		c := node.Child(i)
 		if c.Kind() == "call" {
 			rw.handleCall(c, stack)
+			continue
+		}
+		if isControlFlowNode(c.Kind()) {
+			rw.walkControlFlow(c, stack)
 		}
 	}
+}
+
+// walkControlFlow descends into a conditional or block-structured statement, skipping
+// its CONDITION — `if Rails.env.development?` would otherwise be dispatched as a route
+// DSL call named `development?`.
+func (rw *routeWalker) walkControlFlow(node *sitter.Node, stack []routeScope) {
+	cond := node.ChildByFieldName("condition")
+	for i := uint(0); i < node.ChildCount(); i++ {
+		c := node.Child(i)
+		if cond != nil && c.Id() == cond.Id() {
+			continue
+		}
+		if c.Kind() == "call" {
+			rw.handleCall(c, stack)
+			continue
+		}
+		if isControlFlowNode(c.Kind()) {
+			rw.walkControlFlow(c, stack)
+		}
+	}
+}
+
+// isControlFlowNode reports whether a node kind is Ruby control flow whose body may
+// contain route declarations.
+func isControlFlowNode(kind string) bool {
+	switch kind {
+	case "if", "unless", "elsif", "else", "then", "if_modifier", "unless_modifier",
+		"case", "when", "begin", "ensure", "rescue", "body_statement",
+		"parenthesized_statements", "while", "until", "each":
+		return true
+	}
+	return false
 }
 
 // blockBody returns the body_statement of a call's do/brace block, or nil.
@@ -133,11 +208,6 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
-		// A bare verb directly inside a plural `resources` block nests under the
-		// parent member id (Rails serves `resources :steps do get :status end` at
-		// /steps/:step_id/status), as does `on: :member`; only `on: :collection`
-		// stays at the collection path. Explicit member/collection blocks push
-		// their own scope, whose memberParam is empty, so nothing doubles.
 		// Rails distinguishes three placements inside a `resources` block and
 		// they do not agree on the parameter name. A bare verb nests under the
 		// parent member id (`/steps/:step_id/status`), which buildPrefix has
@@ -155,48 +225,61 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			"framework": "rails",
 			"language":  "ruby",
 		}
-		if handler := pairString(args, "to", rw.src); handler != "" {
-			props["handler"] = qualifyHandler(handler, modulePath(stack))
-		} else if controller := enclosingController(stack); controller != "" {
-			// A bare verb inside a resource block is served by that resource's
-			// controller, with the verb's own name as the action.
-			action := strings.TrimPrefix(path, "/")
-			if idx := strings.Index(action, "/"); idx >= 0 {
-				action = action[:idx]
-			}
-			if act := pairString(args, "action", rw.src); act != "" {
+		handler := pairString(args, "to", rw.src)
+		if handler == "" {
+			// The hash-rocket form `get 'path' => 'ctrl#action'`, where the handler is
+			// the VALUE of the pair whose key is the path. Discourse and lobsters write
+			// nearly every route this way, and reading only `to:` left thousands of
+			// routes with no handler at all.
+			handler = hashRocketHandler(args, rw.src)
+		}
+		if handler != "" {
+			handler = qualifyHandler(handler, buildModule(stack))
+		} else {
+			// Still nothing, so the handler has to be assembled from an action and a
+			// controller named separately.
+			action := firstPositionalName(args, rw.src)
+			// `action:` names the action outright, in either spelling. Reading only
+			// `action: "x"` misses the commoner `action: :x`, and the positional
+			// fallback finds nothing whenever the path is not itself a bare action name
+			// (`get "summary/:period", action: :summary`), so the route was emitted with
+			// no handler at all rather than with the wrong one.
+			if act := pairSymbol(args, "action", rw.src); act != "" {
+				action = act
+			} else if act := pairString(args, "action", rw.src); act != "" {
 				action = act
 			}
-			if action != "" && !strings.Contains(action, ":") {
-				props["handler"] = qualifyHandler(controller, modulePath(stack)) + "#" + action
+			// The verb may name its own controller, and when it does that name wins
+			// over the enclosing one: Rails reads `controller:` off the call
+			// (`map_match(..., controller: nil, ...)`) and only then falls back to the
+			// scope (`controller ||= @scope[:controller]`). Reading the action while
+			// leaving this option unread resolves the route to whichever controller
+			// encloses it, which is a real controller that does not serve this route —
+			// `get :group_analytics, controller: "group_analytics/stage_types",
+			// action: :index` is served by group_analytics/stage_types#index and by
+			// nothing else. Otherwise the enclosing resources/controller block names it
+			// (`resources :posts do get :publish, on: :member end` -> posts#publish),
+			// which is how the majority of non-REST Rails routes are written.
+			//
+			// When neither names one there is nothing to derive from, and the route is
+			// emitted with no handler at all. A route that claims no handler is a gap a
+			// consumer can see; a route that names a controller not serving it cannot be
+			// told apart from one that does.
+			ctrl, absolute, given := controllerOption(args, rw.src)
+			if !given {
+				ctrl, absolute = currentController(stack)
 			}
+			if action != "" && ctrl != "" {
+				handler = composeController(ctrl, buildModule(stack), absolute) + "#" + action
+			}
+		}
+		if handler != "" {
+			props["handler"] = handler
 		}
 		// A Rails optional segment `foo(/:bar)` serves two paths; emit both.
 		for _, p := range expandOptionalSegments(path) {
 			rw.emit(prefix+p, line(call), props)
 		}
-
-	case "mount":
-		// `mount Sidekiq::Web => "/sidekiq"` declares an endpoint: the app serves
-		// that path and hands it to a Rack application. It was listed as a
-		// container the walker descends into, which is what `namespace` is — but
-		// mount takes no block of routes, so descending found nothing and the
-		// path was never emitted. The runtime table records these with
-		// endpoint_kind=rack, which is how the miss became visible.
-		mounted := mountPath(args, rw.src)
-		if mounted == "" {
-			rw.unhandled[method]++
-			return
-		}
-		if !strings.HasPrefix(mounted, "/") {
-			mounted = "/" + mounted
-		}
-		rw.emit(prefix+mounted, line(call), map[string]any{
-			"method":    "ANY",
-			"framework": "rails",
-			"language":  "ruby",
-			"mounted":   true,
-		})
 
 	case "root":
 		handler := pairString(args, "to", rw.src)
@@ -209,12 +292,16 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			"language":  "ruby",
 		}
 		if handler != "" {
-			props["handler"] = qualifyHandler(handler, modulePath(stack))
+			props["handler"] = qualifyHandler(handler, buildModule(stack))
 		}
 		rw.emit(prefix+"/", line(call), props)
 
 	case "resources", "resource", "jsonapi_resources", "jsonapi_resource":
+		// Symbol or string, as for `namespace` above.
 		name := firstSymbolArg(args, rw.src)
+		if name == "" {
+			name = strings.Trim(firstStringArg(args, rw.src), "/")
+		}
 		if name == "" {
 			return
 		}
@@ -222,13 +309,13 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		except, exceptGiven := pairSymbolsPresent(args, "except", rw.src)
 		singular := method == "resource" || method == "jsonapi_resource"
 		jsonapi := method == "jsonapi_resources" || method == "jsonapi_resource"
-		if jsonapi && rw.jsonapiFormat == jsonapiRouteUnknown {
+		if jsonapi && rw.jsonapi.format == jsonapiRouteUnknown {
 			// A repository-supplied route formatter decides the URL segment, and
 			// reading Ruby to find out what it decides is guessing. Count the
 			// declaration against the cause rather than the macro: "29 unread
 			// jsonapi_resources" reads as an extractor limitation, and this is a
 			// located line of configuration.
-			cause := rw.refusalCause
+			cause := rw.jsonapi.refusalCause
 			if cause == "" {
 				cause = method
 			}
@@ -237,12 +324,10 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		}
 
 		// A resource nested inside a *plural* `resources` block nests under the parent
-		// member (`/widgets/:widget_id/...`); the parent supplies that param via the
-		// enclosing scope's memberParam. parentScopePrefix is the parent resource's own
-		// path segment, needed to compute the shallow path below.
-		// buildPrefix has already materialized the enclosing resource's member
-		// param, so the segment must not repeat it. parentNesting is what a
-		// shallow member route strips back off.
+		// member (`/widgets/:widget_id/...`), and buildPrefix has already materialized
+		// that param into the prefix, so this resource's own segment must not repeat
+		// it. parentNesting is the parent's segment and member param together, which
+		// is exactly what a shallow member route strips back off below.
 		parentNesting := ""
 		if len(stack) > 0 {
 			if p := stack[len(stack)-1].memberParam; p != "" {
@@ -253,7 +338,7 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// props and the nested member param (Rails derives `:name_id` from the name).
 		segmentName := name
 		if jsonapi {
-			segmentName = jsonapiSegment(name, rw.jsonapiFormat)
+			segmentName = jsonapiSegment(name, rw.jsonapi.format)
 		}
 		if p := pairString(args, "path", rw.src); p != "" {
 			segmentName = strings.Trim(p, "/")
@@ -275,6 +360,51 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			(pairBool(args, "shallow", rw.src) || inheritedShallow(stack))
 		shallowBase := strings.TrimSuffix(prefix, parentNesting) + "/" + segmentName
 
+		// The controller a resource is served by, unless `controller:` names one
+		// explicitly. Rails spells this rule twice and the two disagree: `Resource`
+		// takes the name verbatim (`@controller = options[:controller] || @name`, so
+		// `resources :people` is served by people), while `SingletonResource`
+		// pluralizes (`@controller = options[:controller] || plural`, so
+		// `resource :profile` is served by profiles). Applying the singular rule to
+		// both turns people into peoples and points at a controller that never exists.
+		//
+		// The pluralization that rule needs is ActiveSupport's, which knows the
+		// irregulars: `resource :person` is served by people. This extractor's
+		// inflector is a handful of suffix rules and answers persons, so a singular
+		// resource that does not name its controller gets NO handler rather than a
+		// guessed one — the same refusal the extractor has always made here, and the
+		// reason it has never grown a pluralize-for-Rails rule. Naming a controller
+		// that does not serve the route cannot be distinguished from naming the one
+		// that does; naming none is a gap that can be seen and closed.
+		controllerName, absolute, given := controllerOption(args, rw.src)
+		switch {
+		case given:
+		case !singular:
+			controllerName = name
+		default:
+			controllerName = ""
+		}
+		mod := buildModule(stack)
+		// The module composes here for this declaration's own RESTful routes, and
+		// again at every route site inside the block — which is why childScope carries
+		// the BARE name below. Rails composes at the route rather than at the
+		// declaration: `Mapping.build` captures `scope[:module]` where the route is
+		// created and `add_controller_module` joins it on there, so a `scope module:`
+		// entered between this declaration and a verb inside its block is part of that
+		// verb's handler and nothing of it belongs to these.
+		//
+		// add_controller_module joins a name that already carries a namespace just as
+		// it joins a bare one: `controller: "candidate/job_offers"` inside a `connect`
+		// module scope is served at connect/candidate/job_offers, which the booted
+		// route table states plainly. Skipping the composition for a namespaced
+		// override is reasoning rather than measurement, and it was wrong for 399 of
+		// the monolith's handlers. Its one exception is the leading slash, which
+		// composeController carries.
+		qualifiedController := ""
+		if controllerName != "" {
+			qualifiedController = composeController(controllerName, mod, absolute)
+		}
+
 		filter := actionFilter{only: only, except: except, onlyGiven: onlyGiven, exceptGiven: exceptGiven}
 		actions := restfulActions(filter)
 		switch {
@@ -286,9 +416,8 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			actions = restfulActionsSingular(filter)
 		}
 		var resourceClass *jsonapiResourceClass
-		mod := modulePath(stack)
-		if jsonapi && rw.jsonapi != nil {
-			resourceClass = rw.jsonapi.resourceClass(mod, name)
+		if jsonapi && rw.jsonapi.resolver != nil {
+			resourceClass = rw.jsonapi.resolver.resourceClass(mod, name)
 		}
 		if resourceClass != nil && resourceClass.immutable {
 			actions = filterActions(actions, writeActions, false)
@@ -299,19 +428,6 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		memberName := "id"
 		if p := pairSymbol(args, "param", rw.src); p != "" {
 			memberName = p
-		}
-		// Every RESTful route names a controller, and it is derivable without a
-		// `to:`: the resource's own name under its module path, unless the
-		// declaration overrode it. 2,688 of the monolith's routes claimed no
-		// handler at all, which is not the same as having none.
-		// A singular resource is served by the PLURAL controller — `resource :eeo`
-		// by eeos — and pluralizing is a rule this extractor has refused to grow
-		// for good reason. Without an explicit controller: it claims nothing.
-		controller := ""
-		if override := pairString(args, "controller", rw.src); override != "" {
-			controller = qualifyHandler(override, modulePath(stack))
-		} else if !singular {
-			controller = joinModule(modulePath(stack), name)
 		}
 		for _, a := range actions {
 			routePath := resourcePath + strings.ReplaceAll(a.suffix, "/:id", "/:"+memberName)
@@ -325,8 +441,8 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 				"resource":  name,
 				"action":    a.name,
 			}
-			if controller != "" {
-				resourceProps["handler"] = controller + "#" + a.name
+			if qualifiedController != "" {
+				resourceProps["handler"] = qualifiedController + "#" + a.name
 			}
 			rw.emit(routePath, line(call), resourceProps)
 		}
@@ -338,27 +454,22 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		if !singular {
 			childMember = singularize(name) + "_id"
 		}
-		childScope := append(stack, routeScope{
+		childScope := routeScope{
 			pathPrefix:         segment,
 			memberParam:        childMember,
+			controller:         controllerName,
+			controllerAbsolute: absolute,
+			controllerUnknown:  controllerName == "",
 			ownParam:           memberName,
 			singularOwner:      singular,
-			resourceName:       controllerName(name, args, rw.src),
-			explicitController: pairString(args, "controller", rw.src),
 			shallow:            pairBool(args, "shallow", rw.src) || inheritedShallow(stack),
-		})
-		// `resources :folders, concerns: :archivable` replays the concern's routes
-		// inside this resource, exactly as if they had been written in its block.
-		// The common spelling carries no block at all, so this must sit outside
-		// the body guard rather than inside it.
-		for _, included := range symbolValues(findPairValue(args, "concerns", rw.src), rw.src) {
-			if defined := rw.concerns[included]; defined != nil {
-				rw.walk(defined, childScope)
-			}
 		}
 		if body != nil {
-			rw.walk(body, childScope)
+			rw.walk(body, append(stack, childScope))
 		}
+		// `resources :posts, concerns: :commentable` replays the named concern's block
+		// inside the resource's own scope, exactly as if it had been written inline.
+		rw.replayConcerns(concernNames(args, rw.src), append(stack, childScope))
 
 	case "match":
 		// `match 'x', via: [:get, :post]` maps one path to several verbs; emit one
@@ -391,7 +502,13 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		}
 
 	case "namespace":
+		// Rails accepts a symbol or a string: `namespace :admin` and
+		// `namespace "recaptcha"` are the same declaration. Reading only the symbol form
+		// made the whole block invisible, taking every route inside it with it.
 		name := firstSymbolArg(args, rw.src)
+		if name == "" {
+			name = firstStringArg(args, rw.src)
+		}
 		if name == "" || body == nil {
 			return
 		}
@@ -442,21 +559,6 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			rw.walk(body, append(stack, ns))
 		}
 
-	case "concern":
-		// `concern :name do ... end` defines routes to be replayed wherever the
-		// concern is included; it declares nothing on its own.
-		if name := firstSymbolArg(args, rw.src); name != "" && body != nil {
-			rw.concerns[name] = body
-		}
-
-	case "concerns":
-		// `concerns :a, :b` includes them at this point in the current scope.
-		for _, name := range positionalSymbols(args, rw.src) {
-			if included := rw.concerns[name]; included != nil {
-				rw.walk(included, stack)
-			}
-		}
-
 	case "member", "collection":
 		memberPrefix := ""
 		if method == "member" {
@@ -467,6 +569,75 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 				pathPrefix: memberPrefix, dropParentMember: true,
 			}))
 		}
+
+	case "controller":
+		// `controller :photos do get 'search' end` fixes the controller for its block
+		// without changing the URL. The name goes onto the scope bare, so each route
+		// inside composes the namespace in force at its own site — the same rule
+		// `resources` follows, which is what stops the two spellings of one route from
+		// disagreeing about who serves it. Rails' add_controller_module joins the
+		// module on whether or not the name already carries a namespace, so skipping
+		// the composition for `controller "audit/exports"` loses the enclosing module
+		// exactly as it did for a namespaced `controller:` override — and the leading
+		// slash escapes it here for the same reason it does there.
+		name := firstSymbolArg(args, rw.src)
+		if name == "" {
+			name = firstStringArg(args, rw.src)
+		}
+		if name == "" || body == nil {
+			return
+		}
+		rw.walk(body, append(stack, routeScope{
+			controller:         strings.TrimPrefix(name, "/"),
+			controllerAbsolute: strings.HasPrefix(name, "/"),
+		}))
+
+	case "concern":
+		// `concern :commentable do ... end` DEFINES a reusable block; it serves nothing
+		// on its own. Record the body so each `concerns: :commentable` reference can
+		// replay it under the scope that referenced it, and do NOT descend here — the
+		// routes inside belong to the referencing scopes, not to this definition site.
+		if name := firstSymbolArg(args, rw.src); name != "" && body != nil {
+			rw.concerns[name] = body
+		}
+
+	case "concerns":
+		// The bare block form: `resources :posts do concerns :commentable end`.
+		rw.replayConcerns(symbolArgs(args, rw.src), stack)
+
+	case "mount":
+		// `mount SomeEngine, at: '/x'` or `mount SomeEngine => '/x'`. The engine's whole
+		// route table is served below the mount path, so record the site for
+		// extractAllRoutes to resolve; the placeholder route below keeps the mount
+		// itself visible in the graph.
+		constant, at := parseMount(args, rw.src)
+		if constant == "" {
+			rw.unhandled[method]++
+			return
+		}
+		if !strings.HasPrefix(at, "/") {
+			at = "/" + at
+		}
+		mountPrefix := strings.TrimSuffix(prefix+at, "/")
+		rw.mounts = append(rw.mounts, routeMount{constant: constant, prefix: mountPrefix})
+		// Method "MOUNT" is inert to the cross-repo linker for the same reason "DRAW"
+		// is: it is a mount point, not an endpoint a client can call.
+		rw.out = append(rw.out, facts.Fact{
+			Kind: facts.KindRoute,
+			Name: mountPrefix + "/",
+			File: rw.relFile,
+			Line: line(call),
+			Props: map[string]any{
+				"method":    "MOUNT",
+				"framework": "rails",
+				"language":  "ruby",
+				"mounts":    constant,
+			},
+			Relations: []facts.Relation{
+				{Kind: facts.RelDeclares, Target: rw.dir},
+				{Kind: facts.RelHandledBy, Target: normalizeConstant(constant)},
+			},
+		})
 
 	case "draw":
 		// `draw do ... end` is the routes wrapper (Rails.application.routes.draw,
@@ -512,16 +683,157 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 	}
 }
 
-// emit appends a route fact with a declares relation to the file's directory.
+// emit appends a route fact with a declares relation to the file's directory, plus a
+// handled_by relation to the controller action serving it when the handler resolves to
+// one. That second edge is what makes a Rails route reachable from its controller:
+// without it a route is an isolated node, impact analysis from a controller cannot see
+// the endpoints it serves, and a controller referenced only by the route table looks
+// like dead code.
 func (rw *routeWalker) emit(name string, lineNum int, props map[string]any) {
+	rels := []facts.Relation{{Kind: facts.RelDeclares, Target: rw.dir}}
+	if h, _ := props["handler"].(string); h != "" {
+		if sym := controllerSymbol(h); sym != "" {
+			rels = append(rels, facts.Relation{Kind: facts.RelHandledBy, Target: sym})
+		}
+	}
 	rw.out = append(rw.out, facts.Fact{
 		Kind:      facts.KindRoute,
 		Name:      name,
 		File:      rw.relFile,
 		Line:      lineNum,
 		Props:     props,
-		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: rw.dir}},
+		Relations: rels,
 	})
+}
+
+// --- mounts and concerns ---
+
+// parseMount reads the two shapes Rails accepts for a mount:
+//
+//	mount Spree::Core::Engine, at: '/'
+//	mount Sidekiq::Web => '/sidekiq'
+//
+// and returns the mounted constant with the path it is mounted at. A Rack app built
+// inline (`mount Coverband::Reporters::Web.new, at: '/coverage'`) yields its receiver
+// constant, which is the thing worth recording. The path defaults to "/" — Rails'
+// own default when `at:` is omitted.
+func parseMount(args *sitter.Node, src []byte) (constant, at string) {
+	if args == nil {
+		return "", ""
+	}
+	at = pairString(args, "at", src)
+	for i := uint(0); i < args.ChildCount(); i++ {
+		c := args.Child(i)
+		switch c.Kind() {
+		case "constant", "scope_resolution":
+			if constant == "" {
+				constant = rubyText(c, src)
+			}
+		case "call":
+			// `Foo::Bar.new` — the receiver is the constant.
+			if r := c.ChildByFieldName("receiver"); r != nil && constant == "" {
+				switch r.Kind() {
+				case "constant", "scope_resolution":
+					constant = rubyText(r, src)
+				}
+			}
+		case "pair":
+			// Hash-rocket form: the KEY names the mounted app, the value the path.
+			k := c.ChildByFieldName("key")
+			if k == nil {
+				continue
+			}
+			named := ""
+			switch k.Kind() {
+			case "constant", "scope_resolution":
+				named = rubyText(k, src)
+			case "call":
+				// A Rack app built inline on the key side —
+				// `mount Flipper::UI.app(Flipper) => "/admin/flipper"`. The `at:`
+				// spelling of the same shape already yields its receiver constant;
+				// reading only a bare constant here dropped the whole declaration,
+				// path included.
+				if r := k.ChildByFieldName("receiver"); r != nil {
+					switch r.Kind() {
+					case "constant", "scope_resolution":
+						named = rubyText(r, src)
+					}
+				}
+			}
+			if named == "" {
+				continue
+			}
+			if constant == "" {
+				constant = named
+			}
+			if v := c.ChildByFieldName("value"); v != nil && at == "" {
+				at = firstStringArg(v, src)
+			}
+		}
+	}
+	if constant == "" {
+		return "", ""
+	}
+	if at == "" {
+		at = "/"
+	}
+	return constant, at
+}
+
+// hashRocketHandler reads the handler out of the hash-rocket route form
+// `get 'path' => 'controller#action'`, where the path is the pair's KEY and the handler
+// its VALUE.
+//
+// Only a plain string value is accepted. `get 'x' => redirect('/y')` and
+// `get 'x' => SomeRackApp` are also legal and name no controller action, so returning
+// their text would produce a handled_by edge to a node that never exists.
+func hashRocketHandler(args *sitter.Node, src []byte) string {
+	if args == nil {
+		return ""
+	}
+	for i := uint(0); i < args.ChildCount(); i++ {
+		c := args.Child(i)
+		if c.Kind() != "pair" {
+			continue
+		}
+		k := c.ChildByFieldName("key")
+		if k == nil || k.Kind() != "string" {
+			continue
+		}
+		v := c.ChildByFieldName("value")
+		if v == nil || v.Kind() != "string" {
+			continue
+		}
+		return firstStringArg(v, src)
+	}
+	return ""
+}
+
+// concernNames returns the names referenced by a `concerns:` option, which takes either
+// a single symbol or an array of them.
+func concernNames(args *sitter.Node, src []byte) []string {
+	return symbolValues(findPairValue(args, "concerns", src), src)
+}
+
+// replayConcerns re-walks each named concern's recorded block under stack, so its routes
+// are emitted once per referencing scope with that scope's prefix and controller.
+//
+// maxConcernDepth bounds the recursion: a concern that references itself, directly or
+// through another, would otherwise never terminate. Two levels covers concerns composed
+// of concerns, which is as deep as the idiom goes in practice.
+const maxConcernDepth = 2
+
+func (rw *routeWalker) replayConcerns(names []string, stack []routeScope) {
+	if len(names) == 0 || rw.concernDepth >= maxConcernDepth {
+		return
+	}
+	rw.concernDepth++
+	defer func() { rw.concernDepth-- }()
+	for _, n := range names {
+		if body := rw.concerns[n]; body != nil {
+			rw.walk(body, stack)
+		}
+	}
 }
 
 // --- keyword-argument helpers ---
@@ -696,7 +1008,7 @@ func firstPositionalString(args *sitter.Node, src []byte) string {
 }
 
 // positionalSymbols returns the direct symbol arguments of a call, ignoring
-// keyword pairs: the `:a, :b` of `concerns :a, :b`.
+// keyword pairs: the `:a, :b` of `validates :a, :b`.
 func positionalSymbols(args *sitter.Node, src []byte) []string {
 	if args == nil {
 		return nil
@@ -723,11 +1035,11 @@ func (rw *routeWalker) emitJsonapiRelationships(call *sitter.Node, resourcePath,
 	if !singular {
 		base += "/:" + singularize(declared) + "_id"
 	}
-	owner := rw.jsonapi.controllerFor(mod, declared)
+	owner := rw.jsonapi.resolver.controllerFor(mod, declared)
 	at := line(call)
 
 	for _, rel := range res.relationships {
-		segment := jsonapiSegment(rel.name, rw.jsonapiFormat)
+		segment := jsonapiSegment(rel.name, rw.jsonapi.format)
 		props := func(action, handler string) map[string]any {
 			p := map[string]any{
 				"method": "", "framework": "rails", "language": "ruby",
@@ -758,30 +1070,10 @@ func (rw *routeWalker) emitJsonapiRelationships(call *sitter.Node, resourcePath,
 		if rel.toMany {
 			related = "get_related_resources"
 		}
-		p := props(related, rw.jsonapi.handlerFor(mod, rel, res, singularize(declared)))
+		p := props(related, rw.jsonapi.resolver.handlerFor(mod, rel, res, singularize(declared)))
 		p["method"] = "GET"
 		rw.emit(base+"/"+segment, at, p)
 	}
-}
-
-// enclosingController is the resource name of the innermost resource scope, or
-// empty when the verb is not inside one.
-func enclosingController(stack []routeScope) string {
-	for i := len(stack) - 1; i >= 0; i-- {
-		if stack[i].resourceName == "" {
-			continue
-		}
-		// A singular resource is served by the PLURAL controller — Rails serves
-		// `resource :session` from sessions — and pluralizing is a rule this
-		// extractor refuses to grow. The RESTful actions already decline to claim
-		// one; a bare verb inside the same block must decline for the same reason,
-		// and the domain explainer caught this the first time it ran.
-		if stack[i].singularOwner && stack[i].explicitController == "" {
-			return ""
-		}
-		return stack[i].resourceName
-	}
-	return ""
 }
 
 // qualifyHandler composes a handler with the controller namespace its scope
@@ -802,35 +1094,38 @@ func qualifyHandler(handler, module string) string {
 	return module + "/" + handler
 }
 
-// controllerName is what a resource declaration's routes are served by: its own
-// name, unless `controller:` named another.
-func controllerName(name string, args *sitter.Node, src []byte) string {
-	if override := pairString(args, "controller", src); override != "" {
-		return override
+// controllerOption reads a `controller:` option in either spelling and reports
+// both the name and whether it escapes the enclosing module.
+//
+// A name beginning with "/" means something specific to Rails, which is why the
+// raw text is inspected here rather than trimmed at each call site:
+// add_controller_module strips the slash and returns the name UNCOMPOSED
+// (`if controller&.start_with?("/") then -controller[1..-1]`), so
+// `controller: "/admin/reports"` inside `namespace :api` is served by
+// admin/reports and not by api/admin/reports. Trimming the slash where the
+// option is read destroys the marker before the composition can see it.
+func controllerOption(args *sitter.Node, src []byte) (string, bool, bool) {
+	// pairStringPresent reports a symbol value as present-but-empty, since the
+	// pair is there and holds no string, so the symbol spelling has to be tried
+	// on an empty name rather than on an absent pair.
+	raw, given := pairStringPresent(args, "controller", src)
+	if raw == "" {
+		if sym := pairSymbol(args, "controller", src); sym != "" {
+			raw, given = sym, true
+		}
 	}
-	return name
+	if !given {
+		return "", false, false
+	}
+	return strings.TrimPrefix(raw, "/"), strings.HasPrefix(raw, "/"), true
 }
 
-// mountPath reads the path a `mount` declaration serves. Rails accepts two
-// spellings — `mount App => "/path"` and `mount App, at: "/path"` — and a
-// declaration whose path is computed is counted rather than guessed at.
-func mountPath(args *sitter.Node, src []byte) string {
-	if at, present := pairStringPresent(args, "at", src); present {
-		return at
+// composeController applies the module composition a controller name asks for:
+// an absolute name — one written with a leading slash — is served exactly as
+// written, and every other name takes the namespace in force at the route site.
+func composeController(name, module string, absolute bool) string {
+	if absolute {
+		return name
 	}
-	if args == nil {
-		return ""
-	}
-	// The hash-rocket form parses as a pair whose key is the mounted class.
-	for i := uint(0); i < args.ChildCount(); i++ {
-		child := args.Child(i)
-		if child.Kind() != "pair" {
-			continue
-		}
-		value := child.ChildByFieldName("value")
-		if value != nil && value.Kind() == "string" {
-			return strings.Trim(rubyText(value, src), `"'`)
-		}
-	}
-	return ""
+	return qualifyHandler(name, module)
 }
