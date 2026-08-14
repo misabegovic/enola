@@ -1957,7 +1957,49 @@ import (
 // rather than written from memory. The route cases that existed before scored
 // filters and nesting only, so every one of these derivations could be wrong while
 // the suite read 149/149 — which is what happened.
-const cacheVersion = "v212"
+// v213: four more constructs Rails reads to answer the same question. `scope
+// controller:` is the one construct other than the `controller ... do` block that
+// writes the @scope[:controller] a verb falls back to (merge_controller_scope keeps
+// the child; map_match's `controller ||= @scope[:controller]` reads it), and leaving
+// it unread did not leave the routes inside without a controller — the search walked
+// outward to the enclosing resource and named one that exists and serves entirely
+// different routes. The leading-slash escape now applies to the controller Rails
+// splits out of a `to:` string as well as to a `controller:` option, because
+// add_controller_module is the same function on both paths; honouring it on one
+// spelling and not the other also joined the module onto a name still carrying its
+// slash. Options are matched in BOTH of Ruby's hash spellings: a hash-rocket key's
+// text carries a LEADING colon, so trimming a trailing one saw `controller: "x"` and
+// missed `:controller => "x"`, `:on => :collection`, `:via => [...]` and every other
+// option written that way. And get_to_from_path's shorthand is implemented: a
+// multi-segment String path that names no endpoint of its own IS the endpoint, and
+// the name it derives is handed on as the `to:`, so it outranks the enclosing
+// controller rather than deferring to it.
+//
+// Measured on the monolith at f97ae49, challenger against current: routes with no
+// handler 1,306 -> 1,306, routes whose handler names a controller file that EXISTS
+// 3,531 -> 3,536, routes whose handler names one that does NOT 30 -> 31. No route
+// moved from having no handler to having a wrong one. The one route that moved into
+// the third column is /companies/:company_id/integrations/widgets, declared
+// `get "/integrations/widgets", as: :integration_widgets` inside `namespace :app`:
+// RouteSet expands it to app/integrations#widgets, this repository contains no
+// app/controllers/app/integrations_controller.rb, and the answer it replaced named
+// an action with a slash in it that no controller defines. 27 routes over the four
+// `scope controller:` sites now name the controller Rails serves them from — 21 of
+// them previously named app/companies or app/api/companies, which exist and serve
+// other routes — and route handled_by edges resolving to a symbol the graph holds
+// go 2,289 -> 2,315.
+//
+// The bump is the PROVENANCE argument in the header, not the cache one, for the same
+// reason v212's was: buildIdentity already mixes the executable into every entry, so
+// a cache written by a different binary is discarded either way, while
+// WarnVersionMismatch and append mode's discard both key on ExtractorVersion — and
+// without a bump a baseline pinned by a v212 build grades this one's 47 moved route
+// facts as no architectural change at all.
+//
+// benchmarks/rails-controller-derivation scores each of the four, expanded through
+// ActionDispatch::Routing::RouteSet on actionpack 8.1.3 and again on 8.1.1, which
+// agreed line for line.
+const cacheVersion = "v213"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

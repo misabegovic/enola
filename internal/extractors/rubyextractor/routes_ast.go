@@ -2,6 +2,7 @@ package rubyextractor
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -232,6 +233,23 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			// nearly every route this way, and reading only `to:` left thousands of
 			// routes with no handler at all.
 			handler = hashRocketHandler(args, rw.src)
+		}
+		if handler == "" && !routeEndpointGiven(args, rw.src) {
+			// Rails' own shorthand: a multi-segment string path that names no endpoint
+			// of its own IS the endpoint. get_to_from_path turns "billing/invoices"
+			// into a `to:` of "billing#invoices" before anything else is read, so the
+			// derived name OUTRANKS the enclosing controller rather than deferring to
+			// it: `get "reports/monthly"` inside `controller :legacy` is served by
+			// reports#monthly. Deriving the action alone and keeping the enclosing
+			// controller names a controller that exists and does not serve this route.
+			// An interpolated path is known only as far as its literal prefix,
+			// and the shorthand derives BOTH names from it, so a prefix would
+			// invent a controller and an action the application never serves.
+			// Declining leaves the route with no handler, which is the honest
+			// answer and the one this extractor already gives elsewhere.
+			if literal, interpolated := firstPositionalStringParts(args, rw.src); !interpolated {
+				handler = matchShorthand(literal)
+			}
 		}
 		if handler != "" {
 			handler = qualifyHandler(handler, buildModule(stack))
@@ -555,6 +573,22 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		if mod != "" {
 			ns.module = mod
 		}
+		// `scope controller: "copilot"` fixes the controller for its block exactly as the
+		// `controller ... do` form does — merge_controller_scope keeps the child and
+		// discards the parent — and it is the only other construct that writes the
+		// @scope[:controller] a verb falls back to. Leaving it unread does not leave the
+		// routes inside without a controller: the search walks outward to the enclosing
+		// resource instead and names one that exists and serves entirely different
+		// routes. The name goes on bare, so the module in force at each route site
+		// composes there rather than here.
+		//
+		// A `controller:` that was written and could not be read stops the search rather
+		// than falling through it, which is the same refusal a singular resource makes.
+		if name, absolute, given := controllerOption(args, rw.src); given {
+			ns.controller = name
+			ns.controllerAbsolute = absolute
+			ns.controllerUnknown = name == ""
+		}
 		if body != nil {
 			rw.walk(body, append(stack, ns))
 		}
@@ -788,25 +822,31 @@ func parseMount(args *sitter.Node, src []byte) (constant, at string) {
 // `get 'x' => SomeRackApp` are also legal and name no controller action, so returning
 // their text would produce a handled_by edge to a node that never exists.
 func hashRocketHandler(args *sitter.Node, src []byte) string {
-	if args == nil {
+	v := hashRocketRouteValue(args)
+	if v == nil || v.Kind() != "string" {
 		return ""
+	}
+	return firstStringArg(v, src)
+}
+
+// hashRocketRouteValue returns the value node of the hash-rocket route form's pair —
+// the one whose key is the path string — whatever that value is. Whether it names a
+// controller action is a separate question from whether Rails saw a `to:` at all,
+// which is what the match shorthand turns on.
+func hashRocketRouteValue(args *sitter.Node) *sitter.Node {
+	if args == nil {
+		return nil
 	}
 	for i := uint(0); i < args.ChildCount(); i++ {
 		c := args.Child(i)
 		if c.Kind() != "pair" {
 			continue
 		}
-		k := c.ChildByFieldName("key")
-		if k == nil || k.Kind() != "string" {
-			continue
+		if k := c.ChildByFieldName("key"); k != nil && k.Kind() == "string" {
+			return c.ChildByFieldName("value")
 		}
-		v := c.ChildByFieldName("value")
-		if v == nil || v.Kind() != "string" {
-			continue
-		}
-		return firstStringArg(v, src)
 	}
-	return ""
+	return nil
 }
 
 // concernNames returns the names referenced by a `concerns:` option, which takes either
@@ -952,7 +992,18 @@ func symbolValues(v *sitter.Node, src []byte) []string {
 	return out
 }
 
-// findPairValue returns the value node of a `key: value` pair in an argument_list.
+// findPairValue returns the value node of a `key: value` pair in an argument_list,
+// in either of Ruby's two spellings of the same hash.
+//
+// The grammar gives a label key (`controller:`) text that a trailing colon has to be
+// trimmed from, and a hash-rocket key (`:controller =>`) text that carries a LEADING
+// one. Trimming only the trailing colon matched the first spelling and left the
+// second invisible — not just `:controller => "x"` but `:on => :collection`,
+// `:only => [...]` and every other option, on route tables that are ordinary Ruby and
+// mix the two freely.
+//
+// A string key is not an option name. It is the path of the hash-rocket ROUTE form
+// (`get "path" => "c#a"`), which hashRocketHandler reads instead.
 func findPairValue(args *sitter.Node, key string, src []byte) *sitter.Node {
 	if args == nil {
 		return nil
@@ -963,7 +1014,10 @@ func findPairValue(args *sitter.Node, key string, src []byte) *sitter.Node {
 			continue
 		}
 		k := c.ChildByFieldName("key")
-		if k != nil && strings.TrimSuffix(rubyText(k, src), ":") == key {
+		if k == nil || k.Kind() == "string" {
+			continue
+		}
+		if strings.TrimPrefix(strings.TrimSuffix(rubyText(k, src), ":"), ":") == key {
 			return c.ChildByFieldName("value")
 		}
 	}
@@ -990,21 +1044,40 @@ func inheritedShallow(stack []routeScope) bool {
 // that names a controller namespace, not a URL segment. Reading it as a path
 // prefixes every route in the block with a segment Rails never serves.
 func firstPositionalString(args *sitter.Node, src []byte) string {
+	text, _ := firstPositionalStringParts(args, src)
+	return text
+}
+
+// firstPositionalStringParts reads the first string argument and reports
+// whether the source spelled it with interpolation. The text is the literal
+// part alone, which is the right answer for a route path — a path assembled at
+// runtime is still worth recording as far as it is known — and the wrong one
+// for anything DERIVED from the path, because deriving from a prefix invents a
+// name the application never serves. Callers that derive ask for the flag.
+func firstPositionalStringParts(args *sitter.Node, src []byte) (string, bool) {
 	if args == nil {
-		return ""
+		return "", false
 	}
 	for i := uint(0); i < args.ChildCount(); i++ {
 		child := args.Child(i)
 		if child.Kind() != "string" {
 			continue
 		}
+		var text string
+		var interpolated bool
 		for j := uint(0); j < child.ChildCount(); j++ {
-			if child.Child(j).Kind() == "string_content" {
-				return rubyText(child.Child(j), src)
+			switch part := child.Child(j); part.Kind() {
+			case "string_content":
+				if text == "" {
+					text = rubyText(part, src)
+				}
+			case "interpolation":
+				interpolated = true
 			}
 		}
+		return text, interpolated
 	}
-	return ""
+	return "", false
 }
 
 // positionalSymbols returns the direct symbol arguments of a call, ignoring
@@ -1076,22 +1149,79 @@ func (rw *routeWalker) emitJsonapiRelationships(call *sitter.Node, resourcePath,
 	}
 }
 
-// qualifyHandler composes a handler with the controller namespace its scope
-// declares. `to: "foo#show"` inside `scope module: "connect"` is served by
-// connect/foo#show, and emitting the bare name points at a controller that does
-// not exist.
+// qualifyHandler composes a handler with the controller namespace in force where the
+// route is created. `to: "foo#show"` inside `scope module: "connect"` is served by
+// connect/foo#show, and emitting the bare name points at a controller that does not
+// exist. A name that already carries a namespace of its own is composed too:
+// `to: "candidate/job_offers#show"` inside a `jobsite` module scope is served by
+// jobsite/candidate/job_offers, which the booted route table says plainly.
 //
-// The composition happens even when the handler already names a namespace:
-// `controller: "candidate/job_offers"` inside a `jobsite` module scope is served
-// by jobsite/candidate/job_offers, which the booted route table says plainly.
-// An earlier version of this function skipped namespaced handlers on the
-// reasoning that Rails would not compose twice — reasoning, not measurement,
-// and wrong for 399 handlers.
+// A leading slash escapes the composition. add_controller_module's first branch
+// strips the slash and RETURNS, uncomposed, so `to: "/admin/exports#index"` inside
+// `namespace :api` is served by admin/exports and not by api/admin/exports. It is
+// applied here rather than only where `controller:` is read because Rails splits a
+// `to:` string into a controller and an action and puts that controller through the
+// same function — reading the marker for one spelling and not the other left the
+// other composing a module Rails never applies.
+//
+// A handler already prefixed by the module in force is composed anyway, because
+// Rails composes it: `namespace :api do get "api/sub/thing" end` is served by
+// api/api/sub#thing. Declining looked safer — the doubled name belongs to no
+// controller most applications have — but it picks the worse of two wrong answers.
+// The doubled name dangles, and a dangling handler is visibly unresolved; the
+// undoubled one names a real controller that serves other routes and cannot be
+// told apart from a correct answer. Skipping the join also contradicted the
+// sibling case it was meant to protect: a two-segment `api/echo` under the same
+// namespace was already composed to api/api#echo, so only the longer spelling
+// diverged.
 func qualifyHandler(handler, module string) string {
-	if module == "" || strings.HasPrefix(handler, module+"/") {
+	if strings.HasPrefix(handler, "/") {
+		return strings.TrimPrefix(handler, "/")
+	}
+	if module == "" {
 		return handler
 	}
 	return module + "/" + handler
+}
+
+// matchShorthandPath is using_match_shorthand?: two or more plain segments, and
+// nothing else. A path parameter, a dot or an optional group all fall outside it, and
+// Rails then has no action to serve the route with unless the call named one.
+var matchShorthandPath = regexp.MustCompile(`^/?[-\w]+/[-\w/]+$`)
+
+// matchShorthand derives the handler Rails reads out of the path itself when a String
+// path names no endpoint of its own: get_to_from_path rewrites "billing/invoices" as
+// "billing#invoices" and hands it on as the `to:`, which is why the derived name wins
+// over an enclosing `controller` scope rather than deferring to it.
+//
+// Only a trailing "(.:format)" is stripped, exactly the group Rails strips before the
+// test. Dashes become underscores across the whole derived name, as `tr` does.
+//
+// An empty action is declined rather than emitted. Rails accepts one — "a/b/" yields
+// "a/b#" and a route with a blank action — and a handler that names no action is a
+// relation to a node the graph will never hold.
+func matchShorthand(path string) string {
+	path = strings.TrimSuffix(path, "(.:format)")
+	if !matchShorthandPath.MatchString(path) {
+		return ""
+	}
+	trimmed := strings.TrimPrefix(path, "/")
+	cut := strings.LastIndex(trimmed, "/")
+	if cut <= 0 || cut == len(trimmed)-1 {
+		return ""
+	}
+	return strings.ReplaceAll(trimmed[:cut]+"#"+trimmed[cut+1:], "-", "_")
+}
+
+// routeEndpointGiven reports whether a verb call already names where it goes, which is
+// the condition get_to_from_path checks before deriving anything from the path
+// (`return to if to || action`). A value this extractor cannot read — `to: redirect(...)`,
+// `to: proc { ... }`, an `action:` naming a constant — still counts: Rails saw one, so
+// the path is a path and not a handler.
+func routeEndpointGiven(args *sitter.Node, src []byte) bool {
+	return findPairValue(args, "to", src) != nil ||
+		findPairValue(args, "action", src) != nil ||
+		hashRocketRouteValue(args) != nil
 }
 
 // controllerOption reads a `controller:` option in either spelling and reports
