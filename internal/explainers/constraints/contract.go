@@ -298,11 +298,8 @@ func (r rule) statement() string {
 	case r.cap != "":
 		return fmt.Sprintf("%s must not exceed %d members", r.cap, r.maxMembers)
 	case r.require != "":
-		if r.whenProp != "" {
-			return fmt.Sprintf("members of %s whose %s contains %s must have %s containing %s",
-				r.require, r.whenProp, r.whenValue, r.mustProp, r.mustValue)
-		}
-		return fmt.Sprintf("members of %s must have %s containing %s", r.require, r.mustProp, r.mustValue)
+		return fmt.Sprintf("members of %s%s must have %s containing %s",
+			r.require, requireScope(r), r.mustProp, r.mustValue)
 	case r.requireDefines != "":
 		return fmt.Sprintf("class members of %s must define %s", r.requireDefines, r.method)
 	case r.requireName != "":

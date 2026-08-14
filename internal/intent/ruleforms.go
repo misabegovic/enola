@@ -107,13 +107,27 @@ func membershipFormKeys() string {
 // compiles into a fact, so no such rule reaches the explainer at all. That is
 // what makes the screen total, rather than a verdict-site patch that has to be
 // right in seven forms and five counterpart roles independently.
-func predicateRoleProblems(loc string, r ConstraintRule, predicated map[string]bool, noun string) []string {
+// The one exemption is the require_edge SUBJECT bound to a symbol-granular
+// component. The refusal's premise is that a predicate names class facts while
+// the call graph connects methods; a component declaring kind: symbol selects
+// the Owner#method facts themselves, so its members ARE the edge carriers and
+// the mismatch the refusal exists for cannot arise. It is scoped to that one
+// role because that is the one whose mechanics this claim was checked against:
+// the outbound verdict reads each member fact's own Relations, so a
+// symbol-granular member answers for itself. Every counterpart role still
+// resolves a component against the far end of a measured edge — a path, not a
+// fact name — and stays refused, as do the subject roles of the forms that read
+// their members as edge TARGETS rather than sources.
+func predicateRoleProblems(loc string, r ConstraintRule, predicated, symbolGranular map[string]bool, noun string) []string {
 	if len(predicated) == 0 {
 		return nil
 	}
 	var problems []string
 	refuse := func(role, name string) {
 		if name == "" || !predicated[name] {
+			return
+		}
+		if symbolGranular[name] && (role == "require_edge" || role == "forbid") {
 			return
 		}
 		problems = append(problems, fmt.Sprintf("%s (%s): %s %q is selected by a where predicate and cannot sit in the %s role — a predicate selects the facts that carry a property, and a class's calls ride its Owner#method facts, so an edge-walking rule resolves it against nothing; bind this role to a match or service %s instead, and keep the predicate for the forms that read a member's own props (%s)",

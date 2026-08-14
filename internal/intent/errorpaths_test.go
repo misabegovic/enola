@@ -68,15 +68,45 @@ func TestParse_HostileInputsErrorByName(t *testing.T) {
 		},
 		"pathological glob star-star bare": {
 			input:   "components:\n  - name: c\n    match: [\"**\"]\n",
-			wantErr: "must be an exact path or a prefix/** subtree",
+			wantErr: "must be an exact path, a prefix/** subtree, or a **/name basename glob",
 		},
 		"pathological glob character class": {
 			input:   "components:\n  - name: c\n    match: [\"app/[a-z]/**\"]\n",
-			wantErr: "must be an exact path or a prefix/** subtree",
+			wantErr: "must be an exact path, a prefix/** subtree, or a **/name basename glob",
 		},
 		"pathological glob brace set": {
 			input:   "components:\n  - name: c\n    match: [\"app/{a,b}\"]\n",
-			wantErr: "must be an exact path or a prefix/** subtree",
+			wantErr: "must be an exact path, a prefix/** subtree, or a **/name basename glob",
+		},
+		"basename glob selecting every name": {
+			input:   "components:\n  - name: c\n    match: [\"**/*\"]\n",
+			wantErr: "at most one * around a non-empty literal",
+		},
+		"basename glob with a second star": {
+			input:   "components:\n  - name: c\n    match: [\"**/*_controller*.js\"]\n",
+			wantErr: "at most one * around a non-empty literal",
+		},
+		"basename glob spanning a directory": {
+			input:   "components:\n  - name: c\n    match: [\"**/controllers/*.js\"]\n",
+			wantErr: "at most one * around a non-empty literal",
+		},
+		"basename glob with a character class": {
+			input:   "components:\n  - name: c\n    match: [\"**/[a-z]_controller.js\"]\n",
+			wantErr: "at most one * around a non-empty literal",
+		},
+		"basename glob with an escape": {
+			input:   "components:\n  - name: c\n    match: [\"**/\\\\*.js\"]\n",
+			wantErr: "at most one * around a non-empty literal",
+		},
+		"basename glob with a subtree tail": {
+			input:   "components:\n  - name: c\n    match: [\"**/controllers/**\"]\n",
+			wantErr: "at most one * around a non-empty literal",
+		},
+		"basename glob is well formed and parses": {
+			input: "components:\n  - name: c\n    match: [\"**/*_controller.js\"]\n",
+		},
+		"basename with no star is well formed and parses": {
+			input: "components:\n  - name: c\n    match: [\"**/Gemfile\"]\n",
 		},
 		"pathological name pattern double star": {
 			input:   "components:\n  - name: c\n    match: [app/**]\nrules:\n  - id: r\n    require_name: c\n    pattern: \"**\"\n    because: x\n",
@@ -153,5 +183,34 @@ func TestResolve_SameRuleIDAcrossFileAndClusterNeverMerges(t *testing.T) {
 	}
 	if problems := resolved.Problems(); len(problems) > 0 {
 		t.Fatalf("the resolved declaration must validate on its own: %v", problems)
+	}
+}
+
+// An exemplar reaches matchConstraintPath without passing validConstraintMatch,
+// so the basename glob would change what a guidance rule points at while the
+// declaration screen said nothing. The prefix is refused rather than honoured.
+func TestExemplarRefusesTheBasenameGlobPrefix(t *testing.T) {
+	d := &Declaration{
+		Components: []ConstraintComponent{{Name: "views", Match: []string{"app/views/**"}}},
+		Rules: []ConstraintRule{{
+			ID: "prefer-the-component", Guide: "views", Message: "reach for the component",
+			Exemplars: []string{"**/*_controller.js"}, Because: "prior art reads better",
+		}},
+	}
+	var found bool
+	for _, p := range d.Problems() {
+		if strings.Contains(p, "names prior art, not a pattern") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("problems = %v, want the exemplar refused for carrying the basename-glob prefix", d.Problems())
+	}
+
+	d.Rules[0].Exemplars = []string{"app/components/card_component.rb"}
+	for _, p := range d.Problems() {
+		if strings.Contains(p, "names prior art, not a pattern") {
+			t.Errorf("a literal exemplar was refused: %s", p)
+		}
 	}
 }

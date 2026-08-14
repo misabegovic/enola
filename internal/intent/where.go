@@ -23,6 +23,23 @@ import (
 // components, which reads better than a nested boolean in YAML; a negation
 // asks the snapshot to answer for facts it may simply not have measured,
 // which is the opposite of failing closed.
+//
+// One value is not a value: WhereAnyValue asks whether the fact carries the
+// property AT ALL, whatever it says. That is the positive half of the thing a
+// negation would ask, and it does not inherit the negation's problem — "this
+// fact carries fields_written" is a claim about something measured, where "this
+// fact does not" cannot be told from "nothing measured writes here". It exists
+// because some conventions are about a property's presence rather than its
+// content: a function derived from tracked state must not write ANY field, and
+// naming the fields it may not write would be a different and much weaker rule.
+
+// WhereAnyValue is the reserved VALUE that asks for the property's presence
+// rather than its content. It is spelled with angle brackets because no
+// measured prop value carries them — a token that could collide with a real
+// value would silently turn an ordinary comparison into an existence test, and
+// the whole point of the bounded dialects in this package is that a
+// declaration cannot mean something other than it says.
+const WhereAnyValue = "<any>"
 
 // WhereReservedKind is the one key inside a where predicate that does not name
 // a fact property: it narrows the fact KIND, the same narrowing the
@@ -397,6 +414,9 @@ func whereProblems(loc string, c ConstraintComponent) []string {
 			continue
 		}
 		switch {
+		// The presence test is a reserved value, not a comparison. It opens with
+		// `<` and would otherwise be read as a malformed threshold.
+		case value == WhereAnyValue:
 		case value == "":
 			problems = append(problems, fmt.Sprintf("%s (%s): where %s has an empty value — a property test with nothing to test for selects nothing", loc, c.Name, key))
 		case strings.IndexFunc(value, unicode.IsSpace) >= 0:

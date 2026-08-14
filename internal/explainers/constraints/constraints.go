@@ -117,8 +117,29 @@ const edgeSkipConfidence = 0.4
 
 const protocolSkipConfidence = 0.4
 
-// memberKinds are the measured fact kinds a component selector ranges over.
+// requireSkipConfidence caps the require form's zero-edge advisory, for the
+// same reason every other skip advisory sits at 0.4: it reports that the edge
+// antecedent could select nobody, and that silence must never read as
+// compliance.
+const requireSkipConfidence = 0.4
+
+// memberKinds are the measured fact kinds a component selector ranges over when
+// it does not name one.
 var memberKinds = []string{facts.KindModule, facts.KindSymbol, facts.KindRoute, facts.KindStorage}
+
+// referenceMemberKinds are kinds a component may select only by naming them.
+// They carry reference edges rather than architectural coupling — a test file
+// referencing a production symbol must not make that symbol look used by
+// production — so the explainers that count dependents exclude them, and a
+// component that did not ask for them must not acquire them either.
+//
+// A rule about tests is the case that needs them: "a component test must not
+// reach a fixture factory" is an ordinary edge rule whose near end is a test
+// file, and while no component could select one the rule could not be written
+// at all, reporting `matches nothing` with both ends of the forbidden edge
+// measured. Naming the kind is the whole opt-in: a declaration that omits
+// `kind:` ranges over memberKinds exactly as before.
+var referenceMemberKinds = []string{facts.KindTestRef, facts.KindFileRef}
 
 // reachVias are the edge kinds the private form walks — the same closed
 // vocabulary a rule's via may name, kept as a sorted slice here because the
@@ -172,10 +193,13 @@ type rule struct {
 	maxMembers                int
 	require                   string
 	whenProp, whenValue       string
+	whenEdgeTo                []string
 	mustProp, mustValue       string
 	requireDefines, method    string
 	requireName, pattern      string
 	requireEdge, direction    string
+	whenVia                   string
+	toName                    []string
 	protocol                  string
 	steps                     []string
 	guide, message            string
@@ -255,6 +279,7 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				require:        f.PropString("require"),
 				whenProp:       f.PropString("when_prop"),
 				whenValue:      f.PropString("when_value"),
+				whenEdgeTo:     strings.Fields(f.PropString("when_edge_to")),
 				mustProp:       f.PropString("must_prop"),
 				mustValue:      f.PropString("must_value"),
 				requireDefines: f.PropString("require_defines"),
@@ -263,6 +288,8 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				pattern:        f.PropString("pattern"),
 				requireEdge:    f.PropString("require_edge"),
 				direction:      f.PropString("direction"),
+				whenVia:        f.PropString("when_via"),
+				toName:         strings.Fields(f.PropString("to_name")),
 				protocol:       f.PropString("protocol"),
 				steps:          strings.Fields(f.PropString("steps")),
 				guide:          f.PropString("guide"),
@@ -608,6 +635,7 @@ func exemptVerdicts(r rule, verdicts []facts.Insight) []facts.Insight {
 	for _, v := range verdicts {
 		if strings.HasPrefix(v.Title, fmt.Sprintf("forbid_reach rule %s skipped:", r.id)) ||
 			strings.HasPrefix(v.Title, fmt.Sprintf("require_edge rule %s skipped:", r.id)) ||
+			strings.HasPrefix(v.Title, fmt.Sprintf("require rule %s skipped:", r.id)) ||
 			strings.HasPrefix(v.Title, fmt.Sprintf("protocol rule %s skipped:", r.id)) {
 			skipped = true
 		}
@@ -672,7 +700,15 @@ func (e *Explainer) verdictForbid(r rule, edgeSources map[string][]facts.Fact, m
 			if rel.Kind != r.via {
 				continue
 			}
-			if !toSet[rel.Target] && !ground.inComponent(rel, f, r.to, components) {
+			// A literal far end is compared against the target the near end
+			// recorded, which is all the graph holds when that end is an
+			// external package or a function imported from one. Nothing is
+			// grounded against a component here, because there is no component.
+			if len(r.toName) > 0 {
+				if !matchesAnyBoundedName(rel.Target, r.toName) {
+					continue
+				}
+			} else if !toSet[rel.Target] && !ground.inComponent(rel, f, r.to, components) {
 				if ground.ungroundable(rel, f) {
 					skipped[rel.Target] = true
 				}
@@ -680,7 +716,7 @@ func (e *Explainer) verdictForbid(r rule, edgeSources map[string][]facts.Fact, m
 			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("%s must not reach %s via %s, and the graph measures exactly this edge. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbid, r.to, r.via, membershipBasis(toSet[rel.Target]), r.because),
+				Description: fmt.Sprintf("%s must not reach %s via %s, and the graph measures exactly this edge. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbid, forbidFarEnd(r), r.via, forbidBasis(r, toSet[rel.Target]), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -714,6 +750,36 @@ func (e *Explainer) verdictForbid(r rule, edgeSources map[string][]facts.Fact, m
 // visible rather than slow. Direct edges are one-hop paths here, so every
 // pair a forbid rule would catch is caught; a rule declaring both forms
 // reports through both, because separate rules are separate.
+// forbidFarEnd renders whichever way the rule named its far end, so a verdict
+// reads the same whether the end resolved to a component or to a literal.
+func forbidFarEnd(r rule) string {
+	if len(r.toName) > 0 {
+		return strings.Join(r.toName, " or ")
+	}
+	return r.to
+}
+
+// forbidBasis states what makes the far end the far end. A literal is matched
+// against the recorded edge target and nothing else, which is a weaker claim
+// than component membership and is stated as one rather than dressed up.
+func forbidBasis(r rule, exactMember bool) string {
+	if len(r.toName) > 0 {
+		return "the edge target the near end recorded matches the named literal"
+	}
+	return membershipBasis(exactMember)
+}
+
+// matchesAnyBoundedName reports whether the target matches any of the literals
+// in the bounded dialect the validator admits.
+func matchesAnyBoundedName(target string, patterns []string) bool {
+	for _, p := range patterns {
+		if intent.MatchBoundedName(target, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
 	if len(members[r.forbidReach]) > reachComponentCap || len(members[r.to]) > reachComponentCap {
 		return []facts.Insight{{
@@ -1123,26 +1189,55 @@ func (e *Explainer) verdictCap(r rule, memberFacts map[string][]facts.Fact, memb
 }
 
 // verdictRequire emits one violation per member of the require component that
-// matches the when clause (or every member, when none is declared) and fails
-// the must clause. Both clauses are whole-member containment over the fact's
-// space-separated set prop — never substring, so "columns contains company_id"
-// cannot be satisfied by parent_company_id. A member whose when-prop is absent
-// simply does not match the when clause: what was never measured is out of the
-// rule's scope, not in breach of it.
+// matches the when clauses (or every member, when none is declared) and fails
+// the must clause. The prop clauses are whole-member containment over the
+// fact's space-separated set prop — never substring, so "columns contains
+// company_id" cannot be satisfied by parent_company_id. A member whose
+// when-prop is absent simply does not match the when clause: what was never
+// measured is out of the rule's scope, not in breach of it.
+//
+// The edge clause reads the member fact's OWN outgoing relations of the rule's
+// via kind and matches their targets against the declared literals. Everything
+// it touches lives on the one fact that made the member a member: no second
+// component is resolved, no edge is followed to whatever sits at its far end,
+// so the form asks no ownership question and stays a property rule that
+// happens to read a relation. Carrier facts are deliberately not folded in —
+// a dependency carrier's edges belong to a FILE, and attributing them to each
+// member of that file would be exactly the attribution this form must not
+// make. That restraint is what the advisory below has to keep audible: where a
+// component's facts are not the facts that carry the edges — a Ruby class,
+// whose calls ride its Owner#method facts — the antecedent selects nobody, and
+// a rule that holds because it looked at nothing is the failure this explainer
+// exists to prevent.
+//
+// The advisory is therefore read off the antecedent's own answers rather than
+// from a second scan beside it: whether any member was selected is counted as
+// the members are selected, on the same representative facts factEdgeTo is
+// called on, so the advisory cannot certify an edge the antecedent never
+// consults. It is counted before the prop clause narrows, so it speaks for the
+// edge antecedent alone.
 func (e *Explainer) verdictRequire(r rule, memberFacts map[string][]facts.Fact, members map[string]map[string]bool) []facts.Insight {
+	memberNames := sortedMemberNames(members[r.require])
 	var out []facts.Insight
+	edgeSelectedAny := false
 	first := firstFactByName(memberFacts[r.require])
-	for _, name := range sortedMemberNames(members[r.require]) {
+	for _, name := range memberNames {
 		f := first[name]
+		witness, selected := factEdgeTo(f, r.via, r.whenEdgeTo)
+		if !selected {
+			continue
+		}
+		edgeSelectedAny = true
 		if r.whenProp != "" && !propSetContains(f, r.whenProp, r.whenValue) {
 			continue
 		}
 		if propSetContains(f, r.mustProp, r.mustValue) {
 			continue
 		}
-		scope := ""
-		if r.whenProp != "" {
-			scope = fmt.Sprintf(" whose %s contains %s", r.whenProp, r.whenValue)
+		scope := requireScope(r)
+		detail := fmt.Sprintf("missing %s %s", r.mustProp, r.mustValue)
+		if witness != "" {
+			detail = fmt.Sprintf("%s edge to %s, missing %s %s", r.via, witness, r.mustProp, r.mustValue)
 		}
 		out = append(out, facts.Insight{
 			Title:       r.titled(fmt.Sprintf("%s must have %s containing %s", name, r.mustProp, r.mustValue)),
@@ -1151,7 +1246,7 @@ func (e *Explainer) verdictRequire(r rule, memberFacts map[string][]facts.Fact, 
 			Evidence: []facts.Evidence{{
 				File:   f.File,
 				Symbol: f.Name,
-				Detail: fmt.Sprintf("missing %s %s", r.mustProp, r.mustValue),
+				Detail: detail,
 			}},
 			Actions: []string{
 				fmt.Sprintf("Add the required %s if the rule stands", r.mustProp),
@@ -1159,7 +1254,90 @@ func (e *Explainer) verdictRequire(r rule, memberFacts map[string][]facts.Fact, 
 			},
 		})
 	}
+	if len(r.whenEdgeTo) > 0 && len(memberNames) > 0 && !edgeSelectedAny {
+		return []facts.Insight{requireEdgeAntecedentSkipInsight(r, len(memberNames))}
+	}
 	return out
+}
+
+// factEdgeTo answers whether the fact makes an outgoing edge of the via kind
+// at one of the declared literal targets, returning the target that witnessed
+// it — the edge a reader opens the finding to see. With no edge antecedent
+// declared every fact is selected and the witness is empty, so the caller
+// reads one answer for both shapes of the form.
+//
+// The target is compared with intent.MatchBoundedName, the same matcher the
+// validator's admission is defined against: an exact name, a prefix*, or a
+// *suffix. The suffix form is what makes the dialect fit real graphs, where a
+// call target arrives qualified — *.reactiveUnwrap matches
+// ember_app/app/utils.reactiveUnwrap without the declaration having to know
+// where the helper lives.
+func factEdgeTo(f facts.Fact, via string, targets []string) (string, bool) {
+	if len(targets) == 0 {
+		return "", true
+	}
+	for _, rel := range f.Relations {
+		if rel.Kind != via {
+			continue
+		}
+		for _, target := range targets {
+			if intent.MatchBoundedName(rel.Target, target) {
+				return rel.Target, true
+			}
+		}
+	}
+	return "", false
+}
+
+// requireScope renders why a member is in the rule's scope, one clause per
+// declared antecedent, so a verdict states the whole reason it was asked of
+// this member and not of its neighbour.
+func requireScope(r rule) string {
+	var clauses []string
+	if r.whenProp != "" {
+		clauses = append(clauses, fmt.Sprintf("whose %s contains %s", r.whenProp, r.whenValue))
+	}
+	if len(r.whenEdgeTo) > 0 {
+		clauses = append(clauses, fmt.Sprintf("that makes a %s edge to %s", r.via, strings.Join(r.whenEdgeTo, " or ")))
+	}
+	if len(clauses) == 0 {
+		return ""
+	}
+	return " " + strings.Join(clauses, " and ")
+}
+
+// requireEdgeAntecedentSkipInsight is the honest degrade for the edge
+// antecedent: it selected no member, so every member would have passed without
+// being asked anything. That is the one way this form can be vacuous, and it
+// is silent by construction — zero selected members is zero violations — so
+// the advisory is the only thing standing between a rule that looked at
+// nothing and a clean report. Two readings reach it and the advisory states
+// both, because the graph cannot tell them apart: nobody makes the call, or
+// the facts that would make it are not the facts this component selects.
+//
+// It fires on nobody selected, never on some, and that boundary is deliberate.
+// A component where one member answers and the next is blind needs a notion of
+// which fact owns which edge before a partial answer can be told from a real
+// absence, and this form makes no ownership claim.
+func requireEdgeAntecedentSkipInsight(r rule, memberCount int) facts.Insight {
+	form, component, via := "require", r.require, r.via
+	if r.requireEdge != "" {
+		form, component, via = "require_edge", r.requireEdge, r.whenVia
+	}
+	return facts.Insight{
+		Title:       fmt.Sprintf("%s rule %s skipped: no member of %s makes a %s edge the antecedent selects", form, r.id, component, via),
+		Description: fmt.Sprintf("The rule selects members by the %s edges they make to %s, and not one of the %d members of %s makes one on the fact the rule reads — so the antecedent selected nobody and the rule reported nothing about anyone. Either no member makes that call, or the component's facts are not the facts that carry its edges: a class's calls ride its own methods' facts, so a component of classes cannot answer an edge antecedent even where the calls are measured. No verdict was reached — skipped, never silently compliant — and this advisory exists so that silence cannot be read as compliance. Where some members answer and others cannot, no advisory fires: telling a blind member from one that simply makes no such call needs a notion of which fact owns which edge that these facts do not carry. Because: %s", via, strings.Join(r.whenEdgeTo, " or "), memberCount, component, r.because),
+		Confidence:  requireSkipConfidence,
+		Evidence: []facts.Evidence{
+			{Fact: "rule: " + r.id, Detail: "declared in " + r.source},
+			{Fact: "component: " + component, Detail: fmt.Sprintf("%d member(s), none selected by the %s edge antecedent", memberCount, via)},
+		},
+		Actions: []string{
+			"Select the facts that carry the edges — the methods rather than the classes that own them — if the rule should verdict here",
+			"Check the targets name the far end as the graph writes it — a call target arrives qualified, so *suffix is the form that usually matches",
+			"State the antecedent as when_prop_contains, over a prop these facts do carry, if their edges are measured elsewhere",
+		},
+	}
 }
 
 // verdictRequireDefines emits one violation per class-kind member of the
@@ -1215,15 +1393,15 @@ func (e *Explainer) verdictRequireDefines(r rule, memberFacts map[string][]facts
 
 // verdictRequireName emits one violation per member of the component whose
 // name fails the declared bounded pattern — prefix*, *suffix, or an exact
-// name, matched with plain string operations because the dialect was bounded
-// at parse time exactly so no matching engine's semantics could leak in. A
+// name, matched with the same intent.MatchBoundedName the validator's
+// admission is defined against, so the two cannot part company. A
 // name always exists on a member, so the form has no unmeasured case: every
 // member is in scope, and the verdict is total over the membership.
 func (e *Explainer) verdictRequireName(r rule, memberFacts map[string][]facts.Fact, members map[string]map[string]bool) []facts.Insight {
 	var out []facts.Insight
 	first := firstFactByName(memberFacts[r.requireName])
 	for _, name := range sortedMemberNames(members[r.requireName]) {
-		if matchBoundedName(name, r.pattern) {
+		if intent.MatchBoundedName(name, r.pattern) {
 			continue
 		}
 		f := first[name]
@@ -1268,6 +1446,18 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 		return nil
 	}
 	first := firstFactByName(memberFacts[r.requireEdge])
+	if len(r.whenEdgeTo) > 0 {
+		var selected []string
+		for _, name := range memberNames {
+			if _, ok := factEdgeTo(first[name], r.whenVia, r.whenEdgeTo); ok {
+				selected = append(selected, name)
+			}
+		}
+		if len(selected) == 0 {
+			return []facts.Insight{requireEdgeAntecedentSkipInsight(r, len(memberNames))}
+		}
+		memberNames = selected
+	}
 
 	satisfied := map[string]bool{}
 	skipped := map[string]bool{}
@@ -1345,7 +1535,7 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 		f := first[name]
 		out = append(out, facts.Insight{
 			Title:       r.titled(requireEdgeWitness(r, name)),
-			Description: fmt.Sprintf("%s is a member of %s, so %s — and the graph measures none. The rule is declared, membership is exact, and %s demonstrably source %s edges elsewhere in this snapshot, so the absence is measured, never extraction blindness. Because: %s", name, r.requireEdge, requireEdgeDemand(r), requireEdgeProvers(r), r.via, r.because),
+			Description: fmt.Sprintf("%s is a member of %s%s, so %s — and the graph measures none. The rule is declared, membership is exact, and %s demonstrably source %s edges elsewhere in this snapshot, so the absence is measured, never extraction blindness. Because: %s", name, r.requireEdge, requireEdgeScope(r), requireEdgeDemand(r), requireEdgeProvers(r), r.via, r.because),
 			Confidence:  r.confidence(),
 			Evidence: []facts.Evidence{{
 				File:   f.File,
@@ -1362,6 +1552,15 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 		out = append(out, requireEdgeSkipInsight(r, skipped, blind, first))
 	}
 	return out
+}
+
+// requireEdgeScope renders the edge antecedent into the verdict, so a finding
+// states why this member was asked and its neighbour was not.
+func requireEdgeScope(r rule) string {
+	if len(r.whenEdgeTo) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" that makes a %s edge to %s", r.whenVia, strings.Join(r.whenEdgeTo, " or "))
 }
 
 func requireEdgeWitness(r rule, member string) string {
@@ -1656,22 +1855,6 @@ func componentRecipeProvenance(c component) string {
 	return fmt.Sprintf(" This component binds role %s of recipe %s, instantiated in %s.", c.role, c.recipe, c.source)
 }
 
-// matchBoundedName applies the naming form's bounded dialect: one trailing *
-// matches a prefix, one leading * matches a suffix, no * matches exactly. The
-// dialect is validated at parse time; matching is plain string comparison so
-// the evaluator can never disagree with the declaration about what a pattern
-// means.
-func matchBoundedName(name, pattern string) bool {
-	switch {
-	case strings.HasPrefix(pattern, "*"):
-		return strings.HasSuffix(name, pattern[1:])
-	case strings.HasSuffix(pattern, "*"):
-		return strings.HasPrefix(name, pattern[:len(pattern)-1])
-	default:
-		return name == pattern
-	}
-}
-
 // resolveMembership selects one component's member facts from the store: the
 // canonical name set (what edge targets match against) and the facts
 // themselves, sorted by name then file because store order reflects concurrent
@@ -1681,7 +1864,11 @@ func matchBoundedName(name, pattern string) bool {
 // every fact — and a fact with no label matches no service, fail closed. A
 // where predicate ANDs in the same place and for the same reason: every
 // narrowing on a component narrows, so a component carrying both a path scope
-// and a predicate selects their intersection.
+// and a predicate selects their intersection. A name pattern ANDs there too,
+// read with intent.MatchBoundedName — the matcher intent.ValidNamePattern
+// screens the declaration for, so the family this walk admits is exactly the
+// family the declaration was allowed to name. Its starless case is string
+// equality, which is what the walk did before the dialect reached it.
 func resolveMembership(store *facts.Store, c component) (map[string]bool, []facts.Fact) {
 	names := map[string]bool{}
 	var members []facts.Fact
@@ -1693,7 +1880,7 @@ func resolveMembership(store *facts.Store, c component) (map[string]bool, []fact
 			if !matchMemberFile(f, c) {
 				continue
 			}
-			if c.namePattern != "" && f.Name != c.namePattern {
+			if c.namePattern != "" && !intent.MatchBoundedName(f.Name, c.namePattern) {
 				continue
 			}
 			if !matchesWhere(f, c.where) {
@@ -1720,6 +1907,11 @@ func resolveMembership(store *facts.Store, c component) (map[string]bool, []fact
 // so a whole-service component must contain it for cross-repo rules to see
 // them. The node's empty file keeps it out of any path-narrowed component.
 func membershipKinds(c component) []string {
+	for _, kind := range referenceMemberKinds {
+		if c.kind == kind {
+			return []string{kind}
+		}
+	}
 	kinds := make([]string, 0, len(memberKinds)+1)
 	for _, kind := range memberKinds {
 		if c.kind == "" || c.kind == kind {
@@ -1748,9 +1940,11 @@ func matchMemberFile(f facts.Fact, c component) bool {
 // carrierFor reports whether a dependency fact's edges walk as sourced from a
 // component: its file joins the component's patterns — or, for a whole-service
 // component, its repo label matches — without the fact becoming a member. A
-// name-narrowed component gets no carriers: a file- or repo-level join cannot
-// prove the single named fact made the edge. Service scoping ANDs here exactly
-// as it does in membership, fail closed on an unlabeled fact.
+// name-narrowed component gets no carriers, whatever its pattern admits: a
+// file- or repo-level join cannot prove that a fact the name selector accepts
+// made the edge, and a prefix or suffix family is no more demonstrable from a
+// file than a single name was. Service scoping ANDs here exactly as it does in
+// membership, fail closed on an unlabeled fact.
 //
 // A predicate component is carried only by a dependency fact that demonstrates
 // the predicate ITSELF. Sharing a file with a member is not evidence: the
@@ -1971,13 +2165,23 @@ func intPropOf(f facts.Fact, key string) (int, bool) {
 	return 0, false
 }
 
-// matchConstraintPath applies the bounded glob dialect: exact path, or
-// `prefix/**` matching the prefix's whole subtree (and the prefix itself).
-// Copied from the declared-layer matcher rather than shared, because that
-// ceiling is each vocabulary's own decision — widening one must not silently
-// widen the other.
+// matchConstraintPath applies the bounded glob dialect: exact path,
+// `prefix/**` matching the prefix's whole subtree (and the prefix itself), or
+// `**/<name>` matching a file by its own name at any depth. Copied from the
+// declared-layer matcher rather than shared, because that ceiling is each
+// vocabulary's own decision — widening one must not silently widen the other.
+//
+// The basename form is read first and exclusively. A pattern opening `**/` is
+// a claim about a name, and the subtree branch below would otherwise read
+// something like `**/a/**` as a prefix whose first segment is literally `**`.
 func matchConstraintPath(path string, patterns []string) bool {
 	for _, g := range patterns {
+		if glob, ok := strings.CutPrefix(g, intent.BasenameGlobPrefix); ok {
+			if matchConstraintBasename(path, glob) {
+				return true
+			}
+			continue
+		}
 		if prefix, ok := strings.CutSuffix(g, "/**"); ok {
 			if path == prefix || strings.HasPrefix(path, prefix+"/") {
 				return true
@@ -1989,6 +2193,32 @@ func matchConstraintPath(path string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// matchConstraintBasename applies a `**/` pattern to the last segment of a
+// path — the whole segment, so `*_controller.js` is a filename ending in that
+// text and never a directory that does. A depth of zero counts: a file at the
+// repository root has a name like any other.
+//
+// A glob outside the declared grammar matches nothing rather than being read
+// some other way. The validator names it an error at declaration time, and a
+// pattern that reached the evaluator by some other road — a hand-edited
+// snapshot, an older declaration — gets the same answer here, never a
+// half-honoured one.
+func matchConstraintBasename(path, glob string) bool {
+	if !intent.ValidBasenameGlob(glob) {
+		return false
+	}
+	name := path
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		name = path[i+1:]
+	}
+	head, tail, starred := strings.Cut(glob, "*")
+	if !starred {
+		return name == glob
+	}
+	return len(name) >= len(head)+len(tail) &&
+		strings.HasPrefix(name, head) && strings.HasSuffix(name, tail)
 }
 
 // matchConstraintFile joins a fact's file against the patterns in both the

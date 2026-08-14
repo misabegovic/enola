@@ -6,17 +6,27 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ConstraintComponent names a set of measured facts by where they live: any
 // fact whose file falls under a match pattern (and, when narrowed, whose kind
-// or exact name agrees) is a member. Components exist so rules can speak about
+// or name agrees) is a member. Components exist so rules can speak about
 // the architecture in the declaration's own vocabulary — "the domain", "the
 // adapters" — instead of repeating path lists per rule. Service scopes the
 // selector to one repository of a multi-repo snapshot, by its exact repo
 // label: members are facts of that repo, and every other narrowing ANDs with
 // it. A component may carry a service with no match patterns — that is the
 // whole service — where a serviceless component still needs at least one.
+//
+// NamePattern narrows to a family of fact names rather than to one name: it
+// speaks the bounded name dialect ValidNamePattern admits and MatchBoundedName
+// applies — an exact name, one prefix*, or one *suffix — which is the same
+// pair require_name's pattern and require's when_edge_to are held to. A
+// starless pattern is exact equality, so what a component selected before the
+// dialect reached it, it selects still. Sharing the validator with the matcher
+// is the point: a name family a declaration may write and a name family the
+// evaluator recognizes cannot come apart.
 //
 // Where selects by what the facts CARRY instead of where they sit: a
 // conjunction of property tests over the props the extractors measured, so a
@@ -63,7 +73,13 @@ type ConstraintComponent struct {
 // component matching WhenPropContains must satisfy MustPropContain — the
 // property form, verdicting what a member fact carries rather than what edges
 // it makes; "every storage member whose columns contain company_id must have
-// fk_constraints containing company_id->companies"), or RequireDefines/Method
+// fk_constraints containing company_id->companies". Its second antecedent,
+// WhenEdgeTo/Via, selects on the member's OWN outgoing edges instead of on a
+// prop it carries — "every getter that calls reactiveUnwrap must carry the
+// cached decorator" — with the far end a literal, never a component, so the
+// form still resolves entirely on the member fact. Both antecedents together
+// narrow, never widen: a member must satisfy each declared one to be in
+// scope), or RequireDefines/Method
 // (every class-kind member symbol must have a measured method symbol of the
 // given name — the protocol form; a class whose definition could ride a
 // mixin, an included module, or a superclass is out of scope, fail closed,
@@ -107,23 +123,61 @@ type ConstraintComponent struct {
 // contract/hook channel only, never a finding) or advisory — because
 // graduation to law means writing a law form, not hardening this one.
 type ConstraintRule struct {
-	ID          string   `yaml:"id"`
-	Forbid      string   `yaml:"forbid"`
-	ForbidReach string   `yaml:"forbid_reach"`
-	To          string   `yaml:"to"`
-	Allow       string   `yaml:"allow"`
-	Only        []string `yaml:"only"`
-	Protect     string   `yaml:"protect"`
-	Owners      []string `yaml:"owners"`
-	Private     string   `yaml:"private"`
-	Except      []string `yaml:"except"`
-	ForbidFact  string   `yaml:"forbid_fact"`
-	Cap         string   `yaml:"cap"`
-	MaxMembers  int      `yaml:"max_members"`
+	ID          string `yaml:"id"`
+	Forbid      string `yaml:"forbid"`
+	ForbidReach string `yaml:"forbid_reach"`
+	To          string `yaml:"to"`
+
+	// ToName is the forbid form's far end named as a LITERAL rather than
+	// resolved as a component, in the same bounded dialect WhenEdgeTo speaks —
+	// an exact name, a prefix*, or a *suffix. It exists because a component
+	// resolves against measured facts, and the far end of an edge is often
+	// something the snapshot never measured a fact for: an external package
+	// (`@ember/render-modifiers`), or a function imported from one, whose call
+	// target is recorded as a name that resolves to nothing. Those edges are
+	// measured on the near side and are exactly what a convention forbids, so
+	// refusing to name them made a whole class of written rules unwritable.
+	// The literal is compared against the edge target the near end recorded,
+	// which is the only thing the graph holds about that end.
+	ToName []string `yaml:"to_name"`
+
+	Allow      string   `yaml:"allow"`
+	Only       []string `yaml:"only"`
+	Protect    string   `yaml:"protect"`
+	Owners     []string `yaml:"owners"`
+	Private    string   `yaml:"private"`
+	Except     []string `yaml:"except"`
+	ForbidFact string   `yaml:"forbid_fact"`
+	Cap        string   `yaml:"cap"`
+	MaxMembers int      `yaml:"max_members"`
 
 	Require          string     `yaml:"require"`
 	WhenPropContains *PropMatch `yaml:"when_prop_contains"`
-	MustPropContain  *PropMatch `yaml:"must_prop_contain"`
+
+	// WhenEdgeTo is the require form's second antecedent: the member's OWN
+	// outgoing edges of the rule's Via kind, matched against literal targets in
+	// the same bounded dialect RequireName speaks — an exact name, a prefix*,
+	// or a *suffix. Every entry is a LITERAL, never a component name: the form
+	// resolves the near end on the member fact and the far end on the string
+	// the declaration wrote, so nothing here resolves a second component
+	// against a measured edge and the require form stays off the edge-walking
+	// list. Present with WhenPropContains, the two antecedents narrow together.
+	// A target carries no whitespace of any kind: the compiled rule holds the
+	// set as one whitespace-separated prop, so the screen is the same
+	// unicode.IsSpace the round trip splits on.
+	WhenEdgeTo []string `yaml:"when_edge_to"`
+
+	// WhenVia names the edge kind the WhenEdgeTo antecedent reads on the
+	// require_edge form, where Via is already spent naming the edge the rule
+	// DEMANDS. The require form has no such collision — its Via is the
+	// antecedent's own kind — so WhenVia is refused there rather than offered
+	// as a second spelling of the same thing. Two positive edges make the
+	// pairing: a member that makes one edge must also make another, which asks
+	// the graph for what it holds in both clauses and never for the absence of
+	// a fact it may have failed to measure.
+	WhenVia string `yaml:"when_via"`
+
+	MustPropContain *PropMatch `yaml:"must_prop_contain"`
 
 	RequireDefines string `yaml:"require_defines"`
 	Method         string `yaml:"method"`
@@ -195,13 +249,21 @@ func DecodeExemptions(encoded string) []ConstraintExemption {
 }
 
 // AllowedComponentKinds is the closed fact-kind vocabulary a component selector
-// may narrow to — the measured kinds the constraints explainer resolves over.
+// may narrow to — the measured kinds the constraints explainer resolves over,
+// plus the two reference kinds it resolves over ONLY when a declaration names
+// one. A component that omits `kind:` never acquires a test_ref or a file_ref:
+// those carry reference edges rather than architectural coupling, and the
+// explainers that count dependents exclude them for that reason. Naming the
+// kind is the opt-in, and it is what lets a rule speak about tests at all —
+// "a component test must not reach a fixture factory" has a test file at its
+// near end, and no component could select one.
 var AllowedComponentKinds = map[string]bool{
 	"module": true, "symbol": true, "route": true, "storage": true,
+	"test_ref": true, "file_ref": true,
 }
 
 func allowedComponentKinds() string {
-	return "module, route, storage, symbol"
+	return "file_ref, module, route, storage, symbol, test_ref"
 }
 
 // AllowedRuleVias is the closed edge vocabulary a rule may forbid — relation
@@ -288,9 +350,13 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 	// — which compiles to no property test — is not one, exactly as
 	// component.predicated() in the explainer is not.
 	predicated := map[string]bool{}
+	symbolGranular := map[string]bool{}
 	for _, c := range components {
 		if len(c.Predicate()) > 0 {
 			predicated[c.Name] = true
+		}
+		if c.Kind == "symbol" {
+			symbolGranular[c.Name] = true
 		}
 	}
 	for _, c := range components {
@@ -311,11 +377,14 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		}
 		for j, m := range c.Match {
 			if !validConstraintMatch(m) {
-				problems = append(problems, fmt.Sprintf("%s.match[%d]: %q must be an exact path or a prefix/** subtree (no other glob forms)", loc, j, m))
+				problems = append(problems, fmt.Sprintf("%s.match[%d]: %q must be an exact path, a prefix/** subtree, or a **/name basename glob carrying at most one * around a non-empty literal (no other glob forms)", loc, j, m))
 			}
 		}
 		if c.Kind != "" && !AllowedComponentKinds[c.Kind] {
 			problems = append(problems, fmt.Sprintf("%s: kind %q is not a measured fact kind (allowed: %s)", loc, c.Kind, allowedComponentKinds()))
+		}
+		if c.NamePattern != "" && !ValidNamePattern(c.NamePattern) {
+			problems = append(problems, fmt.Sprintf("%s (%s): name_pattern %q must be an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, c.Name, c.NamePattern))
 		}
 		problems = append(problems, whereProblems(loc, c)...)
 		// A name collision is flagged whenever a constraints file is involved,
@@ -352,7 +421,7 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		}
 		ruleIDs[r.ID] = true
 		problems = append(problems, ruleFormProblems(loc, r, componentNames, "component")...)
-		problems = append(problems, predicateRoleProblems(loc, r, predicated, "component")...)
+		problems = append(problems, predicateRoleProblems(loc, r, predicated, symbolGranular, "component")...)
 		if r.Guide != "" && len(r.Exempt) > 0 {
 			problems = append(problems, fmt.Sprintf("%s (%s): exempt belongs to the law forms — guidance emits no violations to exempt", loc, r.ID))
 		}
@@ -383,8 +452,8 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 	edgeForm := r.Forbid != "" || r.Allow != "" || r.Protect != ""
 	switch {
 	case r.Forbid != "":
-		if r.To == "" {
-			problems = append(problems, fmt.Sprintf("%s (%s): forbid needs a to component", loc, r.ID))
+		if r.To == "" && len(r.ToName) == 0 {
+			problems = append(problems, fmt.Sprintf("%s (%s): forbid needs a far end — a to component, or a to_name literal where the far end is something the snapshot measures no fact for", loc, r.ID))
 		}
 		component("to", r.To)
 	case r.ForbidReach != "":
@@ -427,7 +496,7 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 			problems = append(problems, fmt.Sprintf("%s (%s): require_defines needs a method — one whitespace-free method name the class members must define", loc, r.ID))
 		}
 	case r.RequireName != "":
-		if !validNamePattern(r.Pattern) {
+		if !ValidNamePattern(r.Pattern) {
 			problems = append(problems, fmt.Sprintf("%s (%s): require_name needs a pattern that is an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, r.ID))
 		}
 	case r.Protocol != "":
@@ -452,13 +521,36 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 		if r.WhenPropContains != nil && (r.WhenPropContains.Prop == "" || r.WhenPropContains.Value == "") {
 			problems = append(problems, fmt.Sprintf("%s (%s): when_prop_contains needs both prop and value; omit it to require of every member", loc, r.ID))
 		}
+		if len(r.WhenEdgeTo) > 0 && !AllowedRuleVias[r.Via] {
+			problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to needs a via (allowed: %s) — the antecedent reads one kind of the member's own outgoing edges, and which kind is never defaulted", loc, r.ID, allowedRuleVias()))
+		}
+		for j, target := range r.WhenEdgeTo {
+			switch {
+			case strings.IndexFunc(target, unicode.IsSpace) >= 0:
+				problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to[%d] %q must carry no whitespace — the compiled rule holds the targets as one whitespace-separated set, and the split that reads it back is unicode.IsSpace's, so a target carrying any space rune at all would validate as one name and evaluate as another", loc, r.ID, j, target))
+			case !ValidNamePattern(target):
+				problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to[%d] %q must be a literal edge target — an exact name, a prefix*, or a *suffix (no other pattern forms) — never a component name", loc, r.ID, j, target))
+			}
+		}
 	case r.Guide != "":
 		if r.Message == "" {
 			problems = append(problems, fmt.Sprintf("%s (%s): guide needs a message — the advice is what a guidance rule delivers", loc, r.ID))
 		}
+		// An exemplar names prior art — one file or one fact somebody can open
+		// and read — and its existence check runs through the same matcher a
+		// component's match uses. That matcher now speaks a basename glob, and
+		// an exemplar is its one caller that never passes through
+		// validConstraintMatch, so the two would part company here: `**/x`
+		// would resolve against whatever the glob reached rather than failing
+		// closed as a name nothing carries. Refuse the prefix rather than teach
+		// exemplars a pattern dialect they have no use for.
 		for j, ex := range r.Exemplars {
 			if ex == "" || strings.ContainsAny(ex, " \t") {
 				problems = append(problems, fmt.Sprintf("%s (%s): exemplars[%d] %q must be a non-empty whitespace-free file path or fact name", loc, r.ID, j, ex))
+				continue
+			}
+			if strings.HasPrefix(ex, BasenameGlobPrefix) {
+				problems = append(problems, fmt.Sprintf("%s (%s): exemplars[%d] %q names prior art, not a pattern — give the file or fact a reader should open", loc, r.ID, j, ex))
 			}
 		}
 		if r.Mode != "" && !AllowedGuidanceModes[r.Mode] {
@@ -473,8 +565,8 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 	if r.ForbidReach != "" && r.Via != "" && !AllowedRuleVias[r.Via] {
 		problems = append(problems, fmt.Sprintf("%s (%s): via %q is not a rule edge kind (allowed: %s)", loc, r.ID, r.Via, allowedRuleVias()))
 	}
-	if !edgeForm && r.ForbidReach == "" && r.RequireEdge == "" && r.Protocol == "" && r.Via != "" {
-		problems = append(problems, fmt.Sprintf("%s (%s): via belongs to the edge forms (forbid, forbid_reach, allow, require_edge, protocol), not this one", loc, r.ID))
+	if !edgeForm && r.ForbidReach == "" && r.RequireEdge == "" && r.Protocol == "" && len(r.WhenEdgeTo) == 0 && r.Via != "" {
+		problems = append(problems, fmt.Sprintf("%s (%s): via belongs to the edge forms (forbid, forbid_reach, allow, require_edge, protocol) and to require's when_edge_to antecedent, not this one", loc, r.ID))
 	}
 	if r.Forbid == "" && r.ForbidReach == "" && r.RequireEdge == "" && r.To != "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): to belongs to the forbid, forbid_reach and require_edge forms", loc, r.ID))
@@ -499,6 +591,38 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 	}
 	if r.Require == "" && (r.WhenPropContains != nil || r.MustPropContain != nil) {
 		problems = append(problems, fmt.Sprintf("%s (%s): when_prop_contains/must_prop_contain belong to the require form", loc, r.ID))
+	}
+	if len(r.ToName) > 0 {
+		switch {
+		case r.Forbid == "":
+			problems = append(problems, fmt.Sprintf("%s (%s): to_name belongs to the forbid form — the other edge forms resolve their far end against a component's members, and naming a literal there has not been given a meaning", loc, r.ID))
+		case r.To != "":
+			problems = append(problems, fmt.Sprintf("%s (%s): to and to_name both name the far end; declare exactly one, because a component resolves against measured facts and a literal against the recorded edge target", loc, r.ID))
+		}
+		for j, target := range r.ToName {
+			switch {
+			case strings.IndexFunc(target, unicode.IsSpace) >= 0:
+				problems = append(problems, fmt.Sprintf("%s (%s): to_name[%d] %q must carry no whitespace — the compiled rule holds the targets as one whitespace-separated set, and the split that reads it back is unicode.IsSpace's", loc, r.ID, j, target))
+			case !ValidNamePattern(target):
+				problems = append(problems, fmt.Sprintf("%s (%s): to_name[%d] %q must be a literal edge target — an exact name, a prefix*, or a *suffix (no other pattern forms) — never a component name", loc, r.ID, j, target))
+			}
+		}
+	}
+	if r.Require == "" && r.RequireEdge == "" && len(r.WhenEdgeTo) > 0 {
+		problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to belongs to the require and require_edge forms", loc, r.ID))
+	}
+	if r.WhenVia != "" {
+		switch {
+		case r.RequireEdge == "":
+			problems = append(problems, fmt.Sprintf("%s (%s): when_via belongs to the require_edge form, whose via names the edge the rule demands — every other form reads its antecedent on via itself", loc, r.ID))
+		case len(r.WhenEdgeTo) == 0:
+			problems = append(problems, fmt.Sprintf("%s (%s): when_via names the edge kind the when_edge_to antecedent reads, and no antecedent is declared", loc, r.ID))
+		case !AllowedRuleVias[r.WhenVia]:
+			problems = append(problems, fmt.Sprintf("%s (%s): when_via %q is not a measured edge kind (allowed: %s)", loc, r.ID, r.WhenVia, allowedRuleVias()))
+		}
+	}
+	if r.RequireEdge != "" && len(r.WhenEdgeTo) > 0 && r.WhenVia == "" {
+		problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to on the require_edge form needs a when_via (allowed: %s) — via already names the edge this rule demands, so the kind the antecedent reads is never defaulted from it", loc, r.ID, allowedRuleVias()))
 	}
 	if r.RequireDefines == "" && r.Method != "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): method belongs to the require_defines form", loc, r.ID))
@@ -543,13 +667,20 @@ func exemptionProblems(loc, ruleID string, exempt []ConstraintExemption) []strin
 	return problems
 }
 
-// validNamePattern enforces the naming form's bounded dialect: an exact name,
-// a prefix followed by one trailing *, or one leading * followed by a suffix —
-// never a general glob or regex, for the same reason match patterns are
-// bounded: a convention the evaluator would silently mis-apply must be
-// impossible to declare. The literal part must be non-empty and carry no
-// pattern metacharacters.
-func validNamePattern(pattern string) bool {
+// ValidNamePattern enforces the bounded name dialect: an exact name, a prefix
+// followed by one trailing *, or one leading * followed by a suffix — never a
+// general glob or regex, for the same reason match patterns are bounded: a
+// convention the evaluator would silently mis-apply must be impossible to
+// declare. The literal part must be non-empty and carry no pattern
+// metacharacters.
+//
+// Three declaration sites speak it — require_name's pattern, which matches a
+// member's own name; require's when_edge_to, which matches the literal far end
+// of a member's outgoing edge; and a component's name_pattern, which narrows
+// membership to a family of fact names — and MatchBoundedName below is the one
+// matcher all three are evaluated with, so what a declaration may say and what
+// the evaluator does with it cannot drift apart.
+func ValidNamePattern(pattern string) bool {
 	literal := pattern
 	switch {
 	case strings.HasPrefix(pattern, "*"):
@@ -563,15 +694,60 @@ func validNamePattern(pattern string) bool {
 	return !strings.ContainsAny(literal, "*?[]{}")
 }
 
-// validConstraintMatch enforces the same bounded glob dialect declared layers
-// match with (see layers' matchDeclaredLayerPath): an exact repo-relative path,
-// or a `prefix/**` subtree — nothing more. Any other glob metacharacter is
-// rejected at parse time, so a selector the evaluator would silently fail to
-// match is an error the declaration's author sees instead.
+// MatchBoundedName applies the dialect ValidNamePattern admits: one trailing *
+// matches a prefix, one leading * matches a suffix, no * matches exactly.
+// Plain string comparison, deliberately — the dialect was bounded at parse
+// time exactly so no matching engine's semantics could leak in.
+func MatchBoundedName(name, pattern string) bool {
+	switch {
+	case strings.HasPrefix(pattern, "*"):
+		return strings.HasSuffix(name, pattern[1:])
+	case strings.HasSuffix(pattern, "*"):
+		return strings.HasPrefix(name, pattern[:len(pattern)-1])
+	default:
+		return name == pattern
+	}
+}
+
+// validConstraintMatch enforces the bounded glob dialect: an exact
+// repo-relative path, a `prefix/**` subtree, or a `**/<name>` basename glob —
+// nothing more. Any other glob metacharacter is rejected at parse time, so a
+// selector the evaluator would silently fail to match is an error the
+// declaration's author sees instead. Declared layers keep the first two forms
+// and not the third (see layers' matchDeclaredLayerPath): a layer is a place,
+// and a filename that appears in several places is not one.
 func validConstraintMatch(pattern string) bool {
+	if glob, ok := strings.CutPrefix(pattern, BasenameGlobPrefix); ok {
+		return ValidBasenameGlob(glob)
+	}
 	prefix, _ := strings.CutSuffix(pattern, "/**")
 	if prefix == "" {
 		return false
 	}
 	return !strings.ContainsAny(prefix, "*?[]{}")
+}
+
+// BasenameGlobPrefix opens the one match form that is about a file's name
+// rather than its place. It reads as "at any depth", and it is the only
+// position `**` may take on the left: a `**` between segments would be a
+// second axis of freedom the evaluator does not have.
+const BasenameGlobPrefix = "**/"
+
+// ValidBasenameGlob reports whether glob is one path segment carrying at most
+// one `*` around a non-empty literal — `*_controller.js`, `Gemfile`,
+// `schema.*`. The literal must survive the star's removal and carry no
+// metacharacter of its own, which is what keeps the dialect small enough for
+// the evaluator to implement exactly: no `?`, no character class, no brace
+// set, no escape, and no second star whose backtracking the author would have
+// to reason about. `**/*` is therefore malformed rather than a spelling of
+// "everything", for the same reason `name_pattern: *` is.
+//
+// Shared with the evaluator rather than restated there, so what a declaration
+// is allowed to say and what the matcher will do with it cannot drift apart.
+func ValidBasenameGlob(glob string) bool {
+	literal := strings.Replace(glob, "*", "", 1)
+	if literal == "" || strings.Contains(literal, "/") {
+		return false
+	}
+	return !strings.ContainsAny(literal, `*?[]{}\`)
 }

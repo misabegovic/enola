@@ -123,8 +123,14 @@ func CompileFacts(d *Declaration) []facts.Fact {
 		switch {
 		case r.Forbid != "":
 			extra["forbid"] = r.Forbid
-			extra["to"] = r.To
 			extra["via"] = r.Via
+			if len(r.ToName) > 0 {
+				targets := append([]string(nil), r.ToName...)
+				sort.Strings(targets)
+				extra["to_name"] = strings.Join(targets, " ")
+			} else {
+				extra["to"] = r.To
+			}
 		case r.ForbidReach != "":
 			extra["forbid_reach"] = r.ForbidReach
 			extra["to"] = r.To
@@ -166,6 +172,12 @@ func CompileFacts(d *Declaration) []facts.Fact {
 			if r.To != "" {
 				extra["to"] = r.To
 			}
+			if len(r.WhenEdgeTo) > 0 {
+				targets := append([]string(nil), r.WhenEdgeTo...)
+				sort.Strings(targets)
+				extra["when_edge_to"] = strings.Join(targets, " ")
+				extra["when_via"] = r.WhenVia
+			}
 		case r.Protocol != "":
 			extra["protocol"] = r.Protocol
 			extra["steps"] = strings.Join(r.Steps, " ")
@@ -192,6 +204,12 @@ func CompileFacts(d *Declaration) []facts.Fact {
 			if r.WhenPropContains != nil {
 				extra["when_prop"] = r.WhenPropContains.Prop
 				extra["when_value"] = r.WhenPropContains.Value
+			}
+			if len(r.WhenEdgeTo) > 0 {
+				targets := append([]string(nil), r.WhenEdgeTo...)
+				sort.Strings(targets)
+				extra["when_edge_to"] = strings.Join(targets, " ")
+				extra["via"] = r.Via
 			}
 		}
 		if len(r.Exempt) > 0 {

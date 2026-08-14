@@ -277,3 +277,64 @@ func refusals(problems []string) []string {
 	}
 	return out
 }
+
+// The refusal's premise is that a predicate names class facts while the call
+// graph connects methods. A component declaring kind: symbol selects the
+// Owner#method facts themselves, so its members ARE the edge carriers and that
+// mismatch cannot arise — the require_edge subject is exempt, and nothing else
+// is, because that is the one role whose mechanics the claim was checked
+// against.
+func TestForms_ASymbolGranularPredicateMaySitInTheRequireEdgeSubject(t *testing.T) {
+	symbolPredicate := ConstraintComponent{Name: predicateComponent, Kind: "symbol",
+		Where: map[string]any{"symbol_kind": "getter"}}
+	path := ConstraintComponent{Name: pathComponent, Match: []string{"app/utils/**"}}
+
+	allowed := &Declaration{
+		Components: []ConstraintComponent{symbolPredicate, path},
+		Rules: []ConstraintRule{base(ConstraintRule{RequireEdge: predicateComponent, To: pathComponent,
+			Via: "calls", Direction: "outbound"})},
+	}
+	if got := refusals(allowed.Problems()); len(got) != 0 {
+		t.Fatalf("problems = %v, want none: a symbol-granular component's members carry their own edges", got)
+	}
+	if err := allowed.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a clean declaration", err)
+	}
+
+	// The counterpart role resolves the component against the FAR end of a
+	// measured edge, which is a path rather than a fact name whatever the
+	// component's granularity. It stays refused.
+	counterpart := &Declaration{
+		Components: []ConstraintComponent{symbolPredicate, path},
+		Rules: []ConstraintRule{base(ConstraintRule{RequireEdge: pathComponent, To: predicateComponent,
+			Via: "calls", Direction: "outbound"})},
+	}
+	if got := refusals(counterpart.Problems()); len(got) != 1 {
+		t.Fatalf("problems = %v, want the refusal on the to role", counterpart.Problems())
+	}
+
+	// The forbid subject reads each member's own Relations exactly as the
+	// require_edge one does, so the same argument exempts it and nothing more.
+	forbidSubject := &Declaration{
+		Components: []ConstraintComponent{symbolPredicate, path},
+		Rules:      []ConstraintRule{base(ConstraintRule{Forbid: predicateComponent, ToName: []string{"*.trackedFunction"}, Via: "calls"})},
+	}
+	if got := refusals(forbidSubject.Problems()); len(got) != 0 {
+		t.Fatalf("problems = %v, want none: a symbol-granular component's members carry their own edges", got)
+	}
+	if err := forbidSubject.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a clean declaration", err)
+	}
+
+	// A class-granular predicate in the same subject role is the case the
+	// refusal was written for and keeps failing.
+	classGranular := &Declaration{
+		Components: []ConstraintComponent{
+			{Name: predicateComponent, Where: map[string]any{"superclass": "Component"}}, path},
+		Rules: []ConstraintRule{base(ConstraintRule{RequireEdge: predicateComponent, To: pathComponent,
+			Via: "calls", Direction: "outbound"})},
+	}
+	if got := refusals(classGranular.Problems()); len(got) != 1 {
+		t.Fatalf("problems = %v, want the refusal: a class predicate names facts the call graph does not connect", classGranular.Problems())
+	}
+}

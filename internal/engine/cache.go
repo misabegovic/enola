@@ -1999,7 +1999,49 @@ import (
 // benchmarks/rails-controller-derivation scores each of the four, expanded through
 // ActionDispatch::Routing::RouteSet on actionpack 8.1.3 and again on 8.1.1, which
 // agreed line for line.
-const cacheVersion = "v213"
+// v214: a TypeScript constructor is a fact. The member walk skipped `#`-private
+// members and `constructor` in one condition, and the two are not alike: a private
+// member has no callers to measure, while a constructor runs on every instantiation
+// and what it calls is the whole of "this class fetches when it is built". Measured
+// on a large Ember application, 323 constructors, 306 of which call something, and
+// the finding count did not move at all — 503 before and after, with no finding
+// naming a constructor, so the dead-symbol reasoning does not mistake a member
+// invoked by `new` for an uncalled one. It is bumped on the provenance argument the
+// header states rather than on cache staleness: a baseline pinned by a v213 build
+// must not grade a tree that now carries constructors as unchanged.
+// v215: a TypeScript method records the fields it assigns on itself, as the Ruby
+// extractor already did. `this.args.user.name = x` records `args` — the outermost
+// property after `this`, because that is what a convention speaks about and the
+// path beyond it varies per call site without changing the answer. Only `this` is
+// followed: an assignment to a local or to another object is not a claim about the
+// member's own state. It is what makes "data flows down and actions flow up"
+// enforceable — 212 methods on a large Ember application write through their own
+// arguments — and the finding count did not move, 503 before and after.
+// v216: a TypeScript member records whether it declares a parameter at all. A
+// modifier is handed the element it is attached to, so a modifier declaring no
+// parameter is not modifying anything — it is a side effect fired by render,
+// which is the convention the prop exists to make selectable. The answer is
+// "yes"/"no" on every member rather than a prop present only when true, because
+// a rule matches a VALUE and a prop that is absent on the compliant half would
+// select nobody to verdict. A rest parameter counts as one: the member still
+// receives what it is handed. Measured on a large Ember application, 21,689
+// members carry it, 6,341 of them declaring parameters, and the finding count
+// did not move — 503 before and after. It is bumped on the provenance argument
+// the header states rather than on cache staleness: a baseline pinned by a v215
+// build must not grade a tree whose members now carry this prop as unchanged.
+// v217: takes_parameters reaches the module-level function symbols it always
+// meant to cover. v216 emitted it only from the class-member walk, so the
+// dominant Ember modifier form — `export default modifier((element, ...) => ...)`
+// at module scope — carried no answer at all, and a rule demanding "yes" read
+// the silence as a breach rather than as an unmeasured member. Measured on a
+// large Ember application, all eight members such a rule named were
+// module-level modifiers that do take their element: 8 false verdicts, 0 true
+// ones. The prop is now emitted wherever a callable symbol is, function
+// declarations and arrow-bound consts included, which takes the estate from
+// 21,689 members carrying it to 22,963 and drops those eight verdicts to zero.
+// Absence stops being ambiguous for this prop, which is what the rule form
+// needs: it cannot tell "measured, declares none" from "never looked".
+const cacheVersion = "v217"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

@@ -195,7 +195,12 @@ func LoadRepoFile(repoPath string) (*Declaration, error) {
 	merged, expandProblems := ApplyRecipes(merged, files, recipes)
 	problems = append(problems, expandProblems...)
 	if len(problems) > 0 {
-		return nil, fmt.Errorf("%s: %s", repoPath, strings.Join(problems, "; "))
+		// Every path that rejects a declaration says so in the same words, so a
+		// reader downstream — the benchmark oracle among them — can tell a
+		// declaration this build cannot read from a generation that failed for
+		// any other reason. The problems this path collects are declaration
+		// problems and nothing else.
+		return nil, fmt.Errorf("%s: invalid intent declaration: %s", repoPath, strings.Join(problems, "; "))
 	}
 	if merged == nil {
 		return nil, nil

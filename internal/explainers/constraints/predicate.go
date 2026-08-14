@@ -90,6 +90,9 @@ func matchesWherePair(f facts.Fact, pair intent.WherePair) bool {
 	if pair.Unsatisfiable || pair.Prop == "" {
 		return false
 	}
+	if pair.Value == intent.WhereAnyValue {
+		return len(propTokens(f, pair.Prop)) > 0
+	}
 	if op, declared, ok := intent.ParseThreshold(pair.Value); ok {
 		measured, numeric := propNumber(f, pair.Prop)
 		return numeric && intent.SatisfiesThreshold(op, measured, declared)

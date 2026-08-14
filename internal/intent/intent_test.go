@@ -218,6 +218,36 @@ func TestDeclarationValidate_ConstraintVocabulary(t *testing.T) {
 		"undeclared to on require_edge rejected": {
 			[]ConstraintComponent{good, adapters},
 			[]ConstraintRule{{ID: "r", RequireEdge: "domain", To: "ghost", Via: "calls", Direction: "inbound", Because: "x"}}, "names no declared component"},
+		"to_name off the forbid form rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", RequireEdge: "domain", Via: "calls", Direction: "outbound", ToName: []string{"*.task"}, Because: "x"}}, "to_name belongs to the forbid form"},
+		"to and to_name together rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", ToName: []string{"*.task"}, Via: "calls", Because: "x"}}, "declare exactly one"},
+		"forbid with neither far end rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", Via: "calls", Because: "x"}}, "forbid needs a far end"},
+		"to_name speaks the bounded dialect": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", ToName: []string{"*mid*"}, Via: "calls", Because: "x"}}, "must be a literal edge target"},
+		"to_name carries no whitespace": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", ToName: []string{"two names"}, Via: "calls", Because: "x"}}, "must carry no whitespace"},
+		"when_edge_to on require_edge needs a when_via": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", RequireEdge: "domain", To: "adapters", Via: "calls", Direction: "outbound", WhenEdgeTo: []string{"*.load"}, Because: "x"}}, "needs a when_via"},
+		"when_via off the require_edge form rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Require: "domain", WhenEdgeTo: []string{"*.load"}, Via: "calls", WhenVia: "calls", MustPropContain: &PropMatch{Prop: "columns", Value: "id"}, Because: "x"}}, "when_via belongs to the require_edge form"},
+		"when_via without an antecedent rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", RequireEdge: "domain", To: "adapters", Via: "calls", Direction: "outbound", WhenVia: "calls", Because: "x"}}, "no antecedent is declared"},
+		"when_via vocabulary is closed": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", RequireEdge: "domain", To: "adapters", Via: "calls", Direction: "outbound", WhenEdgeTo: []string{"*.load"}, WhenVia: "uses", Because: "x"}}, "calls, depends_on, implements, imports"},
+		"when_edge_to off the require and require_edge forms rejected": {
+			[]ConstraintComponent{good, adapters},
+			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", Via: "calls", WhenEdgeTo: []string{"*.load"}, Because: "x"}}, "when_edge_to belongs to the require and require_edge forms"},
 		"direction rejected off the require_edge form": {
 			[]ConstraintComponent{good, adapters},
 			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", Via: "calls", Direction: "inbound", Because: "x"}}, "direction belongs"},
