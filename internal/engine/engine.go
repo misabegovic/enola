@@ -308,7 +308,32 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 		return nil, fmt.Errorf("resolving repo path: %w", err)
 	}
 
-	repoLabel := filepath.Base(absRepo)
+	// Captured ONCE, here, because two things need it and they must agree: the repo
+	// label every fact is tagged with (below) and the snapshot's own git provenance
+	// (Meta.Git, further down). Deriving the label from a second `git remote` read
+	// would let the two drift apart on a repository whose remote changed mid-run.
+	git := gitInfo(absRepo, e.cfg.Output.Dir)
+	var remote string
+	if git != nil {
+		remote = git.Remote
+	}
+	// The repository NAME, not the directory it happens to sit in — see facts.RepoLabel.
+	repoLabel := repoLabelFor(absRepo, remote)
+	// A cluster can hold two repositories whose NAMES agree and whose owners do not
+	// (acme/web and other-org/web). Labels are how facts from different repos stay
+	// apart, and graph nodes are name-keyed, so a collision would silently MERGE two
+	// repositories into one — worse than the directory-derived label this replaced,
+	// which at least differed whenever the checkouts did. Fall back to the directory
+	// for the second arrival: it keeps them separate and it is what enola labelled
+	// them before.
+	if appendMode {
+		if prev := e.current.Load(); prev != nil {
+			if taken, ok := prev.repoPaths[repoLabel]; ok && taken != absRepo {
+				repoLabel = filepath.Base(absRepo)
+				log.Printf("[engine] repo label from remote collides with %q; using directory name %q", taken, repoLabel)
+			}
+		}
+	}
 
 	// Resolve this repo's declared intent: its own enola-intent.yaml, the
 	// cluster config's entry, or the cluster entry overriding the file
@@ -382,7 +407,13 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 		// Retroactively tag facts from a prior single-repo snapshot so they
 		// are filterable by repo alongside the newly appended facts.
 		if prev.snapshot != nil && work.Count() > 0 {
-			prevLabel := filepath.Base(prev.snapshot.Meta.RepoPath)
+			// The label those facts actually carry, which since RepoLabel came from the
+			// remote is no longer the directory name. Older snapshots recorded none, and
+			// for them the directory IS what tagged the facts.
+			prevLabel := prev.snapshot.Meta.RepoLabel
+			if prevLabel == "" {
+				prevLabel = filepath.Base(prev.snapshot.Meta.RepoPath)
+			}
 			if _, alreadyTracked := workRepoPaths[prevLabel]; !alreadyTracked {
 				tagged := work.TagUntagged(prevLabel, prevLabel+"/")
 				if tagged > 0 {
@@ -422,7 +453,12 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	var cache *extractorCache
 	cachePath := extractorCachePath(filepath.Join(absRepo, e.cfg.Output.Dir))
 	if e.cfg.IncrementalEnabled() {
-		cache = loadExtractorCache(cachePath)
+		cache = loadExtractorCache(cachePath, e.persistCache)
+		// The cache now holds an open temp file from the moment it is created, so
+		// every path out of this function has to close it. discard is a no-op after
+		// a successful save; without it, a snapshot that fails during extraction
+		// leaves the spool behind.
+		defer cache.discard()
 	}
 	preCount := e.store.Count()
 	usedExtractors, shadowedExtractors, parseErrs, err := e.runExtractors(ctx, absRepo, files, currentHashes, cache)
@@ -432,12 +468,10 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	e.reportShadowed(absRepo, shadowedExtractors)
 	if cache != nil {
 		log.Printf("[engine] extractor cache: %d reused", cache.hits)
-		if e.persistCache {
-			if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-				log.Printf("[engine] could not create cache dir: %v", err)
-			} else if err := cache.save(cachePath); err != nil {
-				log.Printf("[engine] could not write extractor cache: %v", err)
-			}
+		// save is a no-op when this cache was opened non-persisting, and it creates
+		// its own directory, so neither condition is repeated here.
+		if err := cache.save(); err != nil {
+			log.Printf("[engine] could not write extractor cache: %v", err)
 		}
 	}
 	// Reference-only extraction over test/spec files. Runs every snapshot (not
@@ -556,8 +590,13 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 			// say — see facts.SnapshotMeta.ExtractorVersion.
 			ExtractorVersion: cacheVersion,
 			SnapshotID:       finishSnapshotID(idHasher, version.Version, configHash),
-			Git:              gitInfo(absRepo, e.cfg.Output.Dir),
+			Git:              git,
 			ConfigHash:       configHash,
+			// The label the facts in this snapshot actually carry. Recorded rather than
+			// re-derived on read: a baseline outlives the build that wrote it, and a
+			// reader that recomputed the label would apply TODAY's rule to YESTERDAY's
+			// facts and conclude they match when their keys do not.
+			RepoLabel: repoLabel,
 
 			Providers: provRecords,
 
@@ -731,6 +770,23 @@ func (e *Engine) linkCrossRepo(repoPaths map[string]string) {
 		}
 		return f.Props["synthetic"] == crossrepo.SyntheticMarker
 	})
+
+	// A cross-repo edge needs two repos, and ComputeLinks says so itself — but only
+	// after newInput has walked the copy it was handed. Asking the store first makes
+	// the single-repo case, which is most snapshots, free: RepoLabels is O(repos) off
+	// the byRepo index, where e.store.All() below is a deep copy of every fact
+	// (Props map and Relations slice included) built solely to be counted and
+	// dropped.
+	//
+	// The two conditions cannot disagree in the direction that would matter.
+	// ComputeLinks counts labels after NormalizeRepoLabel folds case, '-' and '_';
+	// RepoLabels counts them raw. Folding can only merge labels, never split them,
+	// so distinct-raw < 2 implies distinct-normalized < 2. The reverse case (two raw
+	// labels that normalize to one) skips this early-out and is caught by
+	// ComputeLinks exactly as before — a missed saving, never a missed link.
+	if len(e.store.RepoLabels()) < 2 {
+		return
+	}
 
 	// An invalid `linking:` overlay is reported once and the run continues on the
 	// built-in defaults: config validation belongs at load, and failing the whole

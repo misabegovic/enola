@@ -2,6 +2,8 @@ package tsextractor
 
 import (
 	sitter "github.com/tree-sitter/go-tree-sitter"
+
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 )
 
 // superclassProp is the base class a class extends, exactly as the source writes
@@ -26,20 +28,20 @@ const (
 // class extends nothing. A class_heritage also carries the implements clause,
 // whose type names are a different relation and never a base class, and the
 // clause admits a leading comment before the value.
-func tsExtendsValue(classNode *sitter.Node) *sitter.Node {
+func tsExtendsValue(kinds *tsutil.KindTable, classNode *sitter.Node) *sitter.Node {
 	for i := range classNode.ChildCount() {
 		heritage := classNode.Child(i)
-		if heritage.Kind() != "class_heritage" {
+		if kindOf(kinds, heritage) != "class_heritage" {
 			continue
 		}
 		for j := range heritage.ChildCount() {
 			clause := heritage.Child(j)
-			if clause.Kind() != "extends_clause" {
+			if kindOf(kinds, clause) != "extends_clause" {
 				continue
 			}
 			for k := range clause.ChildCount() {
 				value := clause.Child(k)
-				if value.IsNamed() && value.Kind() != "comment" {
+				if value.IsNamed() && kindOf(kinds, value) != "comment" {
 					return value
 				}
 			}
@@ -58,9 +60,9 @@ func tsExtendsValue(classNode *sitter.Node) *sitter.Node {
 // state, and a class built by a mixin factory has no static base class to name.
 // Answering those from the nearest identifier would name the factory, the
 // namespace, or the condition, so they name nothing.
-func tsSuperclassName(classNode *sitter.Node, src []byte) string {
-	value := tsExtendsValue(classNode)
-	if value == nil || value.Kind() != "identifier" {
+func tsSuperclassName(kinds *tsutil.KindTable, classNode *sitter.Node, src []byte) string {
+	value := tsExtendsValue(kinds, classNode)
+	if value == nil || kindOf(kinds, value) != "identifier" {
 		return ""
 	}
 	return nodeText(value, src)

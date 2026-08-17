@@ -6,27 +6,28 @@ import (
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/facts"
 )
 
-func ownDecoratorNames(node *sitter.Node, src []byte) []string {
+func ownDecoratorNames(kinds *tsutil.KindTable, node *sitter.Node, src []byte) []string {
 	var names []string
 	for i := range node.ChildCount() {
 		c := node.Child(i)
-		if c.Kind() != "decorator" {
+		if kindOf(kinds, c) != "decorator" {
 			continue
 		}
-		if name, _ := decoratorNameArgs(c, src); name != "" {
+		if name, _ := decoratorNameArgs(kinds, c, src); name != "" {
 			names = append(names, name)
 		}
 	}
 	return names
 }
 
-func classDecoratorNames(classNode *sitter.Node, src []byte) string {
-	names := ownDecoratorNames(classNode, src)
-	if parent := classNode.Parent(); parent != nil && parent.Kind() == "export_statement" {
-		names = append(names, ownDecoratorNames(parent, src)...)
+func classDecoratorNames(kinds *tsutil.KindTable, classNode *sitter.Node, src []byte) string {
+	names := ownDecoratorNames(kinds, classNode, src)
+	if parent := classNode.Parent(); parent != nil && kindOf(kinds, parent) == "export_statement" {
+		names = append(names, ownDecoratorNames(kinds, parent, src)...)
 	}
 	return decoratorSetProp(names)
 }
@@ -50,8 +51,8 @@ func decoratorSetProp(names []string) string {
 	return strings.Join(out, " ")
 }
 
-func isGetterDefinition(member *sitter.Node) bool {
-	if member.Kind() != "method_definition" {
+func isGetterDefinition(kinds *tsutil.KindTable, member *sitter.Node) bool {
+	if kindOf(kinds, member) != "method_definition" {
 		return false
 	}
 	name := member.ChildByFieldName("name")
@@ -60,7 +61,7 @@ func isGetterDefinition(member *sitter.Node) bool {
 		if name != nil && c.StartByte() >= name.StartByte() {
 			break
 		}
-		if c.Kind() == "get" {
+		if kindOf(kinds, c) == "get" {
 			return true
 		}
 	}

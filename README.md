@@ -5,23 +5,52 @@
 [![Release](https://img.shields.io/github/v/release/enola-labs/enola)](https://github.com/enola-labs/enola/releases)
 [![License](https://img.shields.io/github/license/enola-labs/enola)](LICENSE)
 
-**enola indexes your repository into a dependency graph, pins that graph before a change, and exits `1` if the change left two modules importing each other** - a **dependency cycle**. Tree-sitter parsers and Tarjan's algorithm - no model, no embeddings, nothing leaves your machine.
+**enola indexes your repository into a dependency graph, pins that graph before a change, and reports exactly what the change did to the structure - then exits `1` on the parts you said should fail.** What counts as worse is yours to state: out of the box nothing fails, and one flag turns a violated layer order, an undeclared cross-repo seam, or a change that spread outside the area you named into a broken build. Tree-sitter parsers and graph algorithms - no model, no embeddings, nothing leaves your machine.
 
 Your agent reads the same graph over **MCP** - the protocol Claude Code, Cursor and Copilot use to plug in tools - so it knows what depends on what *before* it edits, and gets the verdict *after*, in time to fix its own regression.
 
 Go · TypeScript/JavaScript · Python · Java · Kotlin · Scala · Swift · Ruby · Rust · C/C++ · .NET · PHP · Dart · Vue · Svelte · Ember · Terraform · Ansible · gRPC · OpenAPI · GraphQL - [full list](#supported-languages)
 
-Your agent adds a helper, and `billing` and `invoice` now import each other. You run `enola check`:
+Your agent adds a helper to `storage`, and the innermost layer of your app now reaches out to the outermost one to send an email. You run `enola check --fail-on=layers`:
 
 ```
-FAIL - 1 structural regression introduced.
+FAIL — 1 structural regression introduced.
 
 Regressions (fail):
-  - [cycles] 1.00 - Cyclic dependency detected (2 modules)
-      module "billing" is part of the cycle
+  - [layers] 1.00 — Layer violation: storage -> delivery
+      import of notify
+
+Policy: fail on new findings from [layers] at confidence >= 1.00.
 ```
 
-Exit code `1`, so a commit hook or a CI job can stop there. The [full output](#what-the-verdict-tells-you) names every symbol and every edge the change added.
+Exit code `1`, so a commit hook or a CI job can stop there. That last line is the part worth reading twice: it is the policy **this run** enforced, not a fixed rule. enola shipped holding no opinion about your layers - it graded that crossing because you declared the order it crosses:
+
+```yaml
+# enola-intent.yaml
+layers:                          # outermost first
+  - {name: delivery, paths: ["web/**", "notify/**"]}
+  - {name: api,      paths: ["api/**"]}
+  - {name: storage,  paths: ["storage/**"]}
+```
+
+Bound the *scope* as well - `--target=storage --max-spillover=0` - and the same command grades that too. The author said this change was about `storage`; it also edited `telemetry`, and that second regression has no finding behind it at all:
+
+```
+FAIL — 2 structural regressions introduced.
+
+Measurements over threshold:
+  - [fail] 1 package(s) reached outside the declared scope
+
+Regressions (fail):
+  - [layers] 1.00 — Layer violation: storage -> delivery
+      import of notify
+
+Policy: fail on new findings from [layers] at confidence >= 1.00.
+```
+
+Both runs are [`examples/layers-gate/`](examples/layers-gate/) - five packages, one `./run.sh`, and the output above is what it prints.
+
+[What fails the build](#what-fails-the-build) is the full set and how to choose it. The [full output](#what-the-verdict-tells-you) names the symbols and edges the change added.
 
 ## Quickstart
 
@@ -88,12 +117,13 @@ A report, not a gate - it always exits `0`. It is the fastest way to find out th
 The gate is a plain CLI. No MCP, no hooks, no config file:
 
 ```bash
-enola baseline pin      # freeze the architecture before you edit
+enola baseline pin              # freeze the architecture before you edit
 #   …make your change…
-enola check             # grade it - exit 1 on a structural regression
+enola check                     # report what it did - always exit 0
+enola check --fail-on=layers    # …and exit 1 on the part you named
 ```
 
-Same command and same exit code in CI, on every pull request. Every flag and all four exit codes: **[docs/CLI.md](docs/CLI.md)**.
+Same commands and same exit codes in CI, on every pull request. Every flag and all four exit codes: **[docs/CLI.md](docs/CLI.md)**.
 
 ## Try it on your own repo, right now
 
@@ -103,32 +133,34 @@ One read-only command, no baseline, no setup, nothing written to disk:
 enola --explain /path/to/your/repo
 ```
 
-On this repository that takes 292ms and prints, among other sections:
+On this repository that takes 252ms and prints, among other sections:
 
 ```
 Architecture
-  Pattern:             go-standard (95% confidence)
+  Pattern:             declared (enola) (100% confidence)
   cyclic dependencies         0
   layer violations            0
 
 Impact analysis (hotspots)
-  coupled modules            36
-    high criticality         20
+  coupled modules            38
+    high criticality         22
     medium criticality       16
   Top hotspots (by coupling):
     module                            fan-in  fan-out crit     blast radius
-    internal/facts                       152        0 high     68
-    pkg/bootstrap                          8       49 high     4
-    pkg/command                            1       42 high     1
+    internal/facts                       157        0 high     69
+    pkg/bootstrap                          8       50 high     4
+    pkg/command                            1       43 high     1
     internal/engine                        7       27 high     7
 
 Code health
-  deep dependency chains      8
-    cmd/enola                                    depth 10
-    pkg/command                                  depth 9
-  complexity outliers        15
-    internal/server.Server.registerTools         complexity 177
+  god classes (high fan-in)     25
+    internal/extractors/dotnetextractor.kindOf   51 dependents
+    internal/extractors/tsextractor.kindOf       46 dependents
+  call-graph hotspots        88
+    internal/extractors/kotlinextractor.astWalk… fan-in 8 / out 31
 ```
+
+`declared (enola)` rather than a guess: this repository states its layer order in [`enola-intent.yaml`](enola-intent.yaml), so the report names the architecture you wrote down. On a repo that declares nothing you get the pattern enola recognised instead, at whatever confidence it earned.
 
 Reading that table: **fan-in** is how many imports point at a module, **fan-out** how many point out of it, and **blast radius** how many distinct modules a change there could reach, following imports backwards up to three hops. Ten files in one module importing yours is ten imports but one module, which is why fan-in is often the larger number.
 
@@ -140,36 +172,55 @@ If those numbers look right for your codebase, the rest of enola is the same mea
 
 ## What the verdict tells you
 
-A verdict you can't act on is just a red light. Here is the `billing`/`invoice` run from the top of this page in full - verbatim output, nothing trimmed:
+A verdict you can't act on is just a red light. Here is the `storage`/`notify` run from the top of this page in full - verbatim output, nothing trimmed:
 
 ```
-FAIL - 1 structural regression introduced.
+FAIL — 1 structural regression introduced.
 
 Regressions (fail):
-  - [cycles] 1.00 - Cyclic dependency detected (2 modules)
-      module "billing" is part of the cycle
+  - [layers] 1.00 — Layer violation: storage -> delivery
+      import of notify
 
-Policy: fail on new findings from [cycles] at confidence >= 1.00.
+Policy: fail on new findings from [layers] at confidence >= 1.00.
 
 What changed
   symbols      +1
-  dependencies +2
-  edges        +5  (imports +2, calls +2, declares +1)
+  dependencies +1
+  edges        +4  (imports +1, calls +2, declares +1)
 
-Added (3):
-  symbol     invoice.Retry                                invoice/invoice.go:7
-  dependency billing -> acme/shop/invoice                 billing/billing.go:3
-  dependency invoice -> acme/shop/billing                 invoice/invoice.go:3
+Added (2):
+  symbol     storage.LoadPrice                            storage/storage.go:11
+  dependency storage -> layersgate/notify                 storage/storage.go:3
 
-New coupling (5):
-  billing                                      --imports--> invoice
-  invoice                                      --imports--> billing
-  billing.Charge                               --calls--> invoice.Render
-  invoice.Retry                                --calls--> billing.Charge
-  invoice.Retry                                --declares--> invoice
+New coupling (4):
+  storage                                      --imports--> notify
+  storage.LoadPrice                            --calls--> notify.SendReceipt
+  storage.LoadPrice                            --calls--> storage.ReadPrice
+  storage.LoadPrice                            --declares--> storage
+
+New coupling is reported, not failed: an added call edge is what ordinary work
+looks like. Inspect the list above if it is more than you expected.
 ```
 
-Every line is the change, and nothing else. Two packages here, for readability - but on a 68,000-fact repository already carrying 268 findings it behaves identically, reporting the one thing this change introduced and none of the other 268.
+Every line is the change, and nothing else. Five packages here, for readability - but on a 68,000-fact repository already carrying 268 findings it behaves identically, reporting the one thing this change introduced and none of the other 268. Long lists are capped at twelve entries with a `… N more` line; `--detail` prints all of them, `--json` emits the whole delta.
+
+Note what the compiler had to say about that import: nothing. `go build ./...` is perfectly happy, `go vet` is silent, and no test fails - the file that introduces it looks entirely reasonable on its own. The defect is the edge, not the line, and the only thing it contradicts is an order you wrote down somewhere else.
+
+Run the same change without naming a policy and you get the other half of the contract - the finding, and an explicit statement that nothing was enforced:
+
+```
+PASS — 1 new finding reported, nothing enforced: no policy set.
+
+New findings (reported — no failure policy set):
+  - [layers] 1.00 — Layer violation: storage -> delivery
+      import of notify
+
+No --fail-on policy is set, so nothing in this run could fail the build. These are
+reported for you to judge. Enforce the ones you want enforced: --fail-on=layers
+(`enola check --help` lists all fifteen).
+```
+
+A gate that enforces nothing has to *say* it enforces nothing. Silence there is indistinguishable from an all-clear, and that is the one failure mode a green exit code cannot report on its own.
 
 ## The loop
 
@@ -181,61 +232,108 @@ It runs in three places, each usable on its own:
 
 | | |
 |---|---|
-| **In your agent** | a hook grades each session and hands the verdict back, so the agent fixes its own regression before telling you it's done |
-| **In your shell** | `enola check` - exits `1` on a structural regression |
+| **In your agent** | a hook grades each session and hands the verdict back, so the agent reports what it moved - or fixes its own regression - before telling you it's done |
+| **In your shell** | `enola check` - reports the delta, and exits `1` on whatever `--fail-on` names |
 | **In CI** | the same command, same exit code, on every pull request - or [`enola-action`](https://github.com/enola-labs/enola-action), which wires it to the pull-request base for you |
 
 Add the CI gate from **[Enola Architecture Check on the GitHub Actions Marketplace](https://github.com/marketplace/actions/enola-architecture-check)**,
 or start from the [complete workflow example](examples/ci/architecture-gate.yml).
 
-The whole loop on this repository, unedited - a helper is added, the check fails on the cycle it closed, the diff shows what has to change, and the same command lets it through once it's fixed:
+The whole loop, unedited - the change is reported and nothing fails, the same run under a stated policy fails on the layer it crossed, and the fix lets it through:
 
-![enola check on its own repository: a helper added to pkg/facts closes a dependency cycle, enola fails the change, the diff replaces the import with an injected interface, and the re-run passes](docs/images/story2-gate.gif)
+![enola check on the layers-gate example: a helper added to storage imports the delivery layer, the default run reports it and exits 0, --fail-on=layers fails the same change, and after the fix the re-run passes](docs/images/layers-gate.gif)
 
-<sub>121 findings already in this repository. The check names the one the change added - and `&& echo` never fires while the gate is red.</sub>
+<sub>Three runs of one command on the same change. `&& echo` never fires while the gate is red - and in the first run there is no gate to be red, which the output says out loud. Recorded from [`examples/layers-gate/`](examples/layers-gate/) with [`docs/images/layers-gate.tape`](docs/images/layers-gate.tape).</sub>
 
 ## What fails the build
 
-By default, one thing: a **dependency cycle** that your change just created.
+Two separate things decide that, and confusing them is the fastest way to be surprised by this tool: **what enola finds**, and **what your policy fails on**. enola runs all eleven of its checks - it calls them **explainers** - on every single run. The policy picks which of their findings are allowed to set the exit code.
 
-A cycle is when two modules end up depending on each other. `billing` imports `invoice`, and `invoice` imports `billing` - either directly, as in the example above, or the long way round through five other modules. Once that happens, neither one can be built, tested, or read on its own any more, and every future change to one of them drags the other along. It is easy to create by accident and almost invisible in review, because no single file looks wrong.
+**Out of the box that policy is empty.** Every finding is reported, the run exits `0`, and the output says in as many words that nothing was enforced. Nothing breaks until you name what should break:
 
-**Everything else enola finds is reported, but never fails your build:**
-
+- code reaching across a layer order you declared, like storage talking straight to the delivery layer (`layers`)
+- two modules that ended up depending on each other (`cycles`)
+- a cross-repo seam nobody declared, or a declared one the graph never measured (`intent`)
 - a single function or type that a large part of the codebase depends on (`god-class`)
 - a function that nearly everything calls (`hotspots`)
 - an import chain ten modules deep (`dependency-depth`)
-- code reaching across a layer it shouldn't, like a UI file talking straight to the database (`layers`)
 - a function far more complicated than the rest of your code (`complexity-outliers`)
 - a package that exports almost everything it contains, instead of a small surface (`exported-surface`)
 - API routes that nothing in the code you loaded ever calls (`unused-routes`)
+- outbound calls enola could not match to any route it loaded (`coverage`)
+- which repositories in a cluster ended up depending on which (`crossrepo`)
 
-**Why the line is there.** A cycle is a fact - the loop is either in the import graph or it isn't (Tarjan's SCC algorithm, confidence `1.00`). The rest are estimates, measured against your own repository: "this file has unusually many dependents *for this codebase*." An estimate that breaks the build is an estimate people learn to switch off, so enola enforces the facts and reports the estimates.
+**enola holds itself to this.** This repository declares its own layer order in [`enola-intent.yaml`](enola-intent.yaml) - six layers, entrypoint down to the fact model - and its CI runs `enola check --fail-on=layers` against it. Not `--fail-on=cycles`: enola is written in Go, where the compiler already refuses an import cycle between packages, so gating on one would enforce a rule the toolchain enforces first. The layer order is the part the compiler cannot see. Nothing but that file stops `internal/upgrade` importing `pkg/cli` today, and the build is green either way until something says otherwise.
+
+**Why nothing is on by default.** enola used to fail on a new dependency cycle out of the box. A cycle is exactly measurable - Tarjan's SCC algorithm, no estimate anywhere - and that made it a tempting default. But *exactly measurable* is not the same as *unwanted*: Go's compiler forbids import cycles between packages outright, so a Go team's answer to the finding is usually "the compiler already has this covered"; a Rails app wires most of its graph at runtime, and two `app/` directories referencing each other is not something that community reads as a defect at all. A tool that arrives asserting otherwise spends its first impression being argued with, and the first thing those teams learn about it is which flag turns it off.
+
+So enola states what it measured and stops there. The exception it makes for itself is the one above: an unenforced run must say it enforced nothing, because a silent green is exactly what a broken gate looks like.
+
+**Any of the eleven can fail the build.** `--fail-on` takes the names above as a comma-separated list, and `--min-confidence` sets the floor within them. Two more things can fail it that are not findings at all:
+
+- **scope spillover** - packages your change reached outside the area you declared with `--target`, gated with `--max-spillover=N`. A change can trip this with zero failing findings.
+- **a gate that could not run.** A missing baseline or a bad flag exits `2`; a baseline that isn't comparable to the current code exits `3` and enola declines to grade rather than blaming your change. Neither is a judgement about the code, and neither is suppressed by `--warn-only`.
+
+**Which of them can actually fail at the default floor: three.** `cycles`, `intent`, and `layers` when the order is declared in `enola-intent.yaml` are the ones enola computes with certainty, so only they reach `1.00`. Everything else is an estimate measured against your own repository - "this file has unusually many dependents *for this codebase*" - and caps below `1.00` by design ([`MaxHeuristicConfidence`](internal/explainers/common/common.go) is `0.95`). Naming an inferred explainer in `--fail-on` and nothing else therefore changes nothing at all; it needs `--min-confidence` too.
 
 ### Changing what counts
 
 | You want | Run |
 |---|---|
-| The default: fail only on new cycles | `enola check` |
-| Also fail on layer violations | `enola check --fail-on=cycles,layers` |
-| ...but only when enola is quite sure | `enola check --fail-on=cycles,layers --min-confidence=0.8` |
-| Report everything, fail nothing | `enola check --warn-only` |
+| The default: report everything, fail nothing | `enola check` |
+| Fail on violations of a layer order you declared | `enola check --fail-on=layers` |
+| Also fail on a cross-repo seam nobody declared, and on new cycles | `enola check --fail-on=layers,intent,cycles` |
+| Everything above, plus the eight explainers enola infers rather than proves | `enola check --fail-on=layers,intent,cycles,crossrepo,coverage,unused-routes,god-class,hotspots,dependency-depth,exported-surface,complexity-outliers --min-confidence=0.8` |
 | Fail if the change spread outside the area you named | `enola check --target=internal/auth --max-spillover=0` |
+| Enforce a policy you set, but only warn this time | `enola check --fail-on=layers --warn-only` |
 
-The names in brackets above are enola's individual checks - it calls them **explainers**, one per kind of finding - and they are exactly what `--fail-on` accepts, along with `cycles`, `coverage`, `crossrepo` and `intent`.
-
-That last row is a different question from the others. `--target` is you saying *"this change is about `internal/auth`"*; enola works out which packages depend on it, then reports any package your change touched that isn't in that group - something you edited that your own description didn't cover. Two snapshots can tell you what changed; only you can say what you meant to change.
+That fifth row is a different question from the others. `--target` is you saying *"this change is about `internal/auth`"*; enola works out which packages depend on it, then reports any package your change touched that isn't in that group - something you edited that your own description didn't cover. Two snapshots can tell you what changed; only you can say what you meant to change.
 
 <details>
-<summary><b>Three things that will bite you</b></summary>
+<summary><b>Four things that will bite you</b></summary>
 
-- **`--fail-on` replaces the default, it doesn't add to it.** `--fail-on=layers` stops failing on cycles. Write `--fail-on=cycles,layers` if you want both.
+- **A run with no `--fail-on` cannot fail.** That is the default, and it is deliberate - but it means a CI job that pins a baseline, runs `enola check` and reports green has enforced nothing. The output says so in a line; a job that only reads the exit code will not see it.
+- **`--min-confidence` lowers the bar; it doesn't raise it.** The default floor is `1.00`, which is already the strictest setting there is. `--min-confidence=0.8` makes the gate fail on *more*, not less.
+- **Confidence is per finding, not per explainer.** `layers` is the one that catches people: violations of a layer order you *declared* score `1.00`, violations of a pattern it *recognised* score `0.80`. So on a repo with no declared layer order, `--fail-on=layers` changes nothing until you also pass `--min-confidence=0.8`.
 - **A misspelled name is not an error.** It just never matches anything, so the gate goes quiet instead of complaining. `enola check --json` prints the policy that actually ran - compare it against what you typed.
-- **`--warn-only` silences findings, not problems.** enola still exits non-zero if the check couldn't run at all (`2`), or if the baseline isn't comparable to the current code (`3`). Only findings are downgraded to warnings.
 
 The policy lives in flags, not in `mcp-arch.yaml`, so a pre-commit hook and a CI job can deliberately hold you to different standards.
 
 </details>
+
+### A failure with no failing finding
+
+Scope is graded separately from findings, so a change can break the build having violated nothing at all. This run names no `--fail-on` whatsoever - the layer violation is reported and explicitly not enforced - and it still exits `1`, because the change touched a package its author never said it was about:
+
+```
+## Scope
+
+**Reached beyond the declared scope.** 1 of 2 package(s) touched were predicted or declared, match ratio 0.5.
+
+Spillover — touched but neither predicted nor declared:
+  - telemetry
+
+A package here was changed by something the declaration did not describe.
+That is worth reading even when every finding is clean.
+
+Predicted but not touched (usually fine — the change was narrower than its blast radius):
+  - api
+  - web
+FAIL — 1 structural regression introduced.
+
+Measurements over threshold:
+  - [fail] 1 package(s) reached outside the declared scope
+
+New findings (reported — no failure policy set):
+  - [layers] 1.00 — Layer violation: storage -> delivery
+      import of notify
+
+No --fail-on policy is set, so no FINDING could fail this run — only the threshold
+above grades it. These are reported for you to judge; enforce the ones you want
+enforced: --fail-on=layers (`enola check --help` lists all eleven).
+```
+
+The `--target` you declare is a claim about intent, and this is the gate holding you to it. Nothing here is a judgement about `telemetry` - the code may be perfectly good. It is a report that the change did something its own description didn't cover.
 
 ## Why not CodeGraph, graphify, or codebase-memory-mcp?
 
@@ -262,15 +360,15 @@ A benchmark-backed teardown of all four - storage engines, memory profiles, what
 | **Code review** | whatever a human notices, after the work is finished |
 | **`enola check`** | **what the change did to the structure of the system** |
 
-A dependency cycle spans files, breaks no test, and is easy for a reviewer to miss. AI agents can write more code than you can carefully review; that gap is where structural damage accumulates, and it usually surfaces months later when the package is too tangled to refactor.
+A layer crossed the wrong way, an endpoint no client calls any more, a change that quietly reached three packages further than its author described: each one spans files, breaks no test, and is easy for a reviewer to miss. AI agents can write more code than you can carefully review; that gap is where structural damage accumulates, and it usually surfaces months later when the package is too tangled to refactor.
 
 ## How it works
 
 enola parses your source with tree-sitter and language-specific extractors, normalizes it into a typed fact model, links it into a directed graph, and runs graph algorithms over it: Tarjan's SCC to find groups of modules that can all reach each other (a cycle), cycle-safe longest-path for the deepest import chain, and mean+2σ outlier tests to flag what sits two standard deviations above your own repository's average. No language model, no embeddings. Terms enola uses in its own output are defined in **[docs/GLOSSARY.md](docs/GLOSSARY.md)**.
 
-**Deterministic.** The same commit yields the same answer, every time: across 72 open-source repositories indexed three times each, all 72 produced a byte-identical snapshot ID and a byte-identical fact file, over 6.8 million facts with zero parse errors ([BENCHMARKS.md](docs/BENCHMARKS.md)). Every snapshot carries a **receipt**: enola's version, the git ref and whether the tree was dirty, the extractors used, and a snapshot ID that's a `sha256` fingerprint of the facts rather than a random UUID. Before comparing two snapshots, enola checks they were built the same way - a different extractor set or changed ignore rules makes a diff meaningless, and it reports that instead of treating the mismatch as your change.
+**Deterministic.** The same commit yields the same answer, every time: across 81 open-source repositories indexed three times each, all 81 produced a byte-identical snapshot ID and a byte-identical fact file, over 7.0 million facts with zero parse errors ([BENCHMARKS.md](docs/BENCHMARKS.md)). Every snapshot carries a **receipt**: enola's version, the git ref and whether the tree was dirty, the extractors used, and a snapshot ID that's a `sha256` fingerprint of the facts rather than a random UUID. Before comparing two snapshots, enola checks they were built the same way - a different extractor set or changed ignore rules makes a diff meaningless, and it reports that instead of treating the mismatch as your change.
 
-**Fast enough for every commit.** On that same corpus, a warm re-index of an unchanged tree took 6.8s for grafana (10,313 files, 167,987 facts) and 49.6s for the Linux kernel (55,399 files, 1.9M facts). Full per-repository numbers, cold and warm, are in [BENCHMARKS.md](docs/BENCHMARKS.md).
+**Fast enough for every commit.** On that same corpus, a warm re-index of an unchanged tree took 7.5s for grafana (10,313 files, 167,987 facts) and 52.6s for the Linux kernel (55,408 files, 1.9M facts). Full per-repository numbers, cold and warm, are in [BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **Local.** enola runs as a local binary reading local files. Nothing leaves your machine, and there is no license check anywhere in this repository.
 
@@ -290,7 +388,7 @@ It joins the two sides wherever they meet: a web client's `fetch()` to the route
 r.HandleFunc("/courses", listCourses)
 ```
 
-The `/api` was attached somewhere else entirely - in whatever function set this router up, quite possibly in another package. Compare the two strings literally and you find nothing, so enola follows that prefix across function and package boundaries (*interprocedurally*) and files the route under the address it actually answers on: `/api/courses`. Same story for Axum's `.nest()`, Rails' `scope` and `namespace`, and a Swift endpoint enum whose version prefix lives three files away in a protocol extension.
+The `/api` was attached somewhere else entirely - in whatever function set this router up, quite possibly in another package. Compare the two strings literally and you find nothing, so enola follows that prefix across function and package boundaries (*interprocedurally*) and files the route under the address it actually answers on: `/api/courses`. Same story for an Express router declared in `routes/webhooks.js` and mounted in `index.js`, Axum's `.nest()`, Rails' `scope` and `namespace`, and a Swift endpoint enum whose version prefix lives three files away in a protocol extension.
 
 Once both ends line up, `enola check` grades a change spanning two repos exactly the way it grades one that doesn't.
 
@@ -311,7 +409,7 @@ That reports, per service, how many outbound calls it found, how many it matched
 | Go         | `go.mod` (gorilla/mux + chi route composition / gRPC clients / Kafka topics aware) |
 | Java       | `pom.xml` (Maven) or `.java` sources (Spring routes / JPA / Lombok DI / Dubbo SPI aware) |
 | JavaScript | `tsconfig.json` / `package.json` with TypeScript (parsed by the TypeScript extractor) |
-| TypeScript | `tsconfig.json` / `package.json` with TypeScript (Next.js, React Navigation & monorepo aware) |
+| TypeScript | `tsconfig.json` / `package.json` with TypeScript (Next.js, React Navigation & monorepo aware; Express sub-router mounts composed across files) |
 | Vue        | `package.json` with `vue` dependency (Nuxt / Vue Router / Composition API aware) |
 | Svelte     | `package.json` with `svelte` dependency (SvelteKit routing / `$lib` alias aware) |
 | Ember      | `package.json` with `ember-source` dependency (`.gts`/`.gjs` template tags, `.hbs` templates, router map, ember-data) |
@@ -346,15 +444,15 @@ It is silent for builds from source, never runs when `CI` is set, and turns off 
 ## Learn more
 
 - **[docs/CLI.md](docs/CLI.md)** - setup, every command and flag, the exit codes, and the `--explain` report.
-- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** - reproducibility, delta precision, cross-repo coverage and scale, measured on 72 public repositories.
+- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** - reproducibility, delta precision, cross-repo coverage and scale, measured on 81 public repositories.
 - **[docs/SNAPSHOTS.md](docs/SNAPSHOTS.md)** - why enola computes a graph on demand and keeps it as an addressable snapshot, rather than maintaining one continuously-updated graph, and where the opposite choice is the right one.
 - **[docs/GLOSSARY.md](docs/GLOSSARY.md)** - the words enola uses in its own output - finding, baseline, receipt, coverage gap, incidental shift - defined in one place.
-- **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)** - what the eleven explainers compute, why a derived finding you can trust is still not a verdict, and how a delta turns 29,633 findings about a corpus into the one that is about your change.
+- **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)** - what the fifteen explainers compute, why a derived finding you can trust is still not a verdict, and how a delta turns 9,131 findings about a corpus into the one that is about your change.
 - **[docs/extraction/](docs/extraction/)** - per language, what specific code produces which facts, from committed fixtures, and what each extractor deliberately does not resolve.
 - **[docs/EXTENDING.md](docs/EXTENDING.md)** - teaching enola a connection it does not know: binders, cross-repo signals, and the `linking:` vocabulary that fixes a wrong edge from config rather than a patch.
 - **[docs/INTENT.md](docs/INTENT.md)** - declared intent: the `enola-intent.yaml` / cluster / `enola_intent:` frontmatter carriers, the full vocabulary (via, relations, origin channels), what compiles, how verdicts behave, and the working rules for keeping declarations truthful.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - the concept, the fact model, the pipeline, the MCP tool reference, and the value model.
-- **[examples/](examples/)** - ready-made per-language and multi-repo configs, plus a pre-commit hook and a CI workflow.
+- **[examples/](examples/)** - [`layers-gate/`](examples/layers-gate/) is the gate on five packages in one command; [`cross-repo/`](examples/cross-repo/) is the two-service demo. Plus ready-made per-language and multi-repo configs, a pre-commit hook and a CI workflow.
 - **[enola-action](https://github.com/enola-labs/enola-action)** - the GitHub Action: the same check on every pull request, as source annotations and an architecture delta in the job summary, with no baseline artifact to manage.
 
 ## Found it useful?

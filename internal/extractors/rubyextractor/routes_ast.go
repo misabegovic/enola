@@ -134,11 +134,11 @@ func (rw *routeWalker) walk(node *sitter.Node, stack []routeScope) {
 	}
 	for i := uint(0); i < node.ChildCount(); i++ {
 		c := node.Child(i)
-		if c.Kind() == "call" {
+		if kindOf(c) == "call" {
 			rw.handleCall(c, stack)
 			continue
 		}
-		if isControlFlowNode(c.Kind()) {
+		if isControlFlowNode(kindOf(c)) {
 			rw.walkControlFlow(c, stack)
 		}
 	}
@@ -154,11 +154,11 @@ func (rw *routeWalker) walkControlFlow(node *sitter.Node, stack []routeScope) {
 		if cond != nil && c.Id() == cond.Id() {
 			continue
 		}
-		if c.Kind() == "call" {
+		if kindOf(c) == "call" {
 			rw.handleCall(c, stack)
 			continue
 		}
-		if isControlFlowNode(c.Kind()) {
+		if isControlFlowNode(kindOf(c)) {
 			rw.walkControlFlow(c, stack)
 		}
 	}
@@ -758,7 +758,7 @@ func parseMount(args *sitter.Node, src []byte) (constant, at string) {
 	at = pairString(args, "at", src)
 	for i := uint(0); i < args.ChildCount(); i++ {
 		c := args.Child(i)
-		switch c.Kind() {
+		switch kindOf(c) {
 		case "constant", "scope_resolution":
 			if constant == "" {
 				constant = rubyText(c, src)
@@ -766,7 +766,7 @@ func parseMount(args *sitter.Node, src []byte) (constant, at string) {
 		case "call":
 			// `Foo::Bar.new` — the receiver is the constant.
 			if r := c.ChildByFieldName("receiver"); r != nil && constant == "" {
-				switch r.Kind() {
+				switch kindOf(r) {
 				case "constant", "scope_resolution":
 					constant = rubyText(r, src)
 				}
@@ -778,7 +778,7 @@ func parseMount(args *sitter.Node, src []byte) (constant, at string) {
 				continue
 			}
 			named := ""
-			switch k.Kind() {
+			switch kindOf(k) {
 			case "constant", "scope_resolution":
 				named = rubyText(k, src)
 			case "call":
@@ -788,7 +788,7 @@ func parseMount(args *sitter.Node, src []byte) (constant, at string) {
 				// reading only a bare constant here dropped the whole declaration,
 				// path included.
 				if r := k.ChildByFieldName("receiver"); r != nil {
-					switch r.Kind() {
+					switch kindOf(r) {
 					case "constant", "scope_resolution":
 						named = rubyText(r, src)
 					}
@@ -823,7 +823,7 @@ func parseMount(args *sitter.Node, src []byte) (constant, at string) {
 // their text would produce a handled_by edge to a node that never exists.
 func hashRocketHandler(args *sitter.Node, src []byte) string {
 	v := hashRocketRouteValue(args)
-	if v == nil || v.Kind() != "string" {
+	if v == nil || kindOf(v) != "string" {
 		return ""
 	}
 	return firstStringArg(v, src)
@@ -839,10 +839,10 @@ func hashRocketRouteValue(args *sitter.Node) *sitter.Node {
 	}
 	for i := uint(0); i < args.ChildCount(); i++ {
 		c := args.Child(i)
-		if c.Kind() != "pair" {
+		if kindOf(c) != "pair" {
 			continue
 		}
-		if k := c.ChildByFieldName("key"); k != nil && k.Kind() == "string" {
+		if k := c.ChildByFieldName("key"); k != nil && kindOf(k) == "string" {
 			return c.ChildByFieldName("value")
 		}
 	}
@@ -938,7 +938,7 @@ func pairStringPresent(args *sitter.Node, key string, src []byte) (string, bool)
 
 // pairSymbol returns the symbol name of a `key: :value` pair.
 func pairSymbol(args *sitter.Node, key string, src []byte) string {
-	if v := findPairValue(args, key, src); v != nil && v.Kind() == "simple_symbol" {
+	if v := findPairValue(args, key, src); v != nil && kindOf(v) == "simple_symbol" {
 		return strings.TrimPrefix(rubyText(v, src), ":")
 	}
 	return ""
@@ -973,12 +973,12 @@ func symbolValues(v *sitter.Node, src []byte) []string {
 	if v == nil {
 		return nil
 	}
-	if v.Kind() == "simple_symbol" {
+	if kindOf(v) == "simple_symbol" {
 		return []string{strings.TrimPrefix(rubyText(v, src), ":")}
 	}
 	var out []string
 	for i := uint(0); i < v.ChildCount(); i++ {
-		switch c := v.Child(i); c.Kind() {
+		switch c := v.Child(i); kindOf(c) {
 		case "simple_symbol":
 			out = append(out, strings.TrimPrefix(rubyText(c, src), ":"))
 		case "bare_symbol", "bare_string":
@@ -1010,11 +1010,11 @@ func findPairValue(args *sitter.Node, key string, src []byte) *sitter.Node {
 	}
 	for i := uint(0); i < args.ChildCount(); i++ {
 		c := args.Child(i)
-		if c.Kind() != "pair" {
+		if kindOf(c) != "pair" {
 			continue
 		}
 		k := c.ChildByFieldName("key")
-		if k == nil || k.Kind() == "string" {
+		if k == nil || kindOf(k) == "string" {
 			continue
 		}
 		if strings.TrimPrefix(strings.TrimSuffix(rubyText(k, src), ":"), ":") == key {
@@ -1060,13 +1060,13 @@ func firstPositionalStringParts(args *sitter.Node, src []byte) (string, bool) {
 	}
 	for i := uint(0); i < args.ChildCount(); i++ {
 		child := args.Child(i)
-		if child.Kind() != "string" {
+		if kindOf(child) != "string" {
 			continue
 		}
 		var text string
 		var interpolated bool
 		for j := uint(0); j < child.ChildCount(); j++ {
-			switch part := child.Child(j); part.Kind() {
+			switch part := child.Child(j); kindOf(part) {
 			case "string_content":
 				if text == "" {
 					text = rubyText(part, src)
@@ -1089,7 +1089,7 @@ func positionalSymbols(args *sitter.Node, src []byte) []string {
 	var out []string
 	for i := uint(0); i < args.ChildCount(); i++ {
 		child := args.Child(i)
-		if child.Kind() == "simple_symbol" {
+		if kindOf(child) == "simple_symbol" {
 			out = append(out, strings.TrimPrefix(rubyText(child, src), ":"))
 		}
 	}

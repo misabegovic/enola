@@ -88,7 +88,7 @@ func mdintentPair(extraCurrentInsights ...facts.Insight) (*facts.Snapshot, *fact
 
 func TestRegradeIntersection_BaselineLacksExtractorGradesSharedSet(t *testing.T) {
 	base, current := mdintentPair()
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if v.Status != StatusPartialClean {
 		t.Fatalf("status = %q, want %q", v.Status, StatusPartialClean)
@@ -139,7 +139,7 @@ func TestRegradeIntersection_SharedFamilyRegressionStillFails(t *testing.T) {
 	})
 	current.Facts = append(current.Facts, goModuleFact("app/pkg/c", "pkg/c/c.go"))
 
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if v.Status != StatusPartialRegression {
 		t.Fatalf("status = %q, want %q", v.Status, StatusPartialRegression)
@@ -175,7 +175,7 @@ func TestRegradeIntersection_ExcludedFamilyRegressionIsNotGradedAndSaysSo(t *tes
 		},
 	)
 
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if v.Status != StatusPartialClean {
 		t.Fatalf("status = %q, want %q: an excluded family's violations cannot be graded", v.Status, StatusPartialClean)
@@ -206,7 +206,7 @@ func TestRegradeIntersection_CurrentLacksProviderGradesSharedSet(t *testing.T) {
 		Facts: sharedFacts,
 	}
 
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if v.Status != StatusPartialClean {
 		t.Fatalf("status = %q, want %q", v.Status, StatusPartialClean)
@@ -231,7 +231,7 @@ func TestRegradeIntersection_VersionMismatchStillDeclines(t *testing.T) {
 	base, current := mdintentPair()
 	current.Meta.ExtractorVersion = "sha256:extract-2"
 
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if v.Status != StatusIncomparable {
 		t.Fatalf("status = %q, want %q: identity-corrupting mismatches must keep the hard decline", v.Status, StatusIncomparable)
@@ -249,7 +249,7 @@ func TestRegradeIntersection_UnattributableExtractorKeepsDecline(t *testing.T) {
 	owners := testOwnership()
 	delete(owners, "mdintent")
 
-	v := regrade(t, base, current, Policy{}, owners)
+	v := regrade(t, base, current, legacyDefault(), owners)
 
 	if v.Status != StatusIncomparable {
 		t.Fatalf("status = %q, want %q when the disputed extractor cannot be attributed", v.Status, StatusIncomparable)
@@ -269,7 +269,7 @@ func TestRegradeIntersection_DifferentRepoIsUntouched(t *testing.T) {
 	base, current := mdintentPair()
 	base.Meta.RepoPath = "/repo/other"
 
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if v.Status != StatusIncomparable || v.Intersection != nil {
 		t.Fatalf("status = %q intersection = %v, want the unchanged decline", v.Status, v.Intersection)
@@ -285,7 +285,7 @@ func TestRegradeIntersection_WarnOnlyKeepsPartialHeadline(t *testing.T) {
 	})
 	current.Facts = append(current.Facts, goModuleFact("app/pkg/c", "pkg/c/c.go"))
 
-	v := regrade(t, base, current, Policy{WarnOnly: true}, testOwnership())
+	v := regrade(t, base, current, Policy{FailExplainers: []string{"cycles"}, WarnOnly: true}, testOwnership())
 
 	if v.Status != StatusPartialClean {
 		t.Fatalf("status = %q, want %q", v.Status, StatusPartialClean)
@@ -300,7 +300,7 @@ func TestRegradeIntersection_WarnOnlyKeepsPartialHeadline(t *testing.T) {
 
 func TestRegradeIntersection_JSONNamesThePartialVerdict(t *testing.T) {
 	base, current := mdintentPair()
-	v := regrade(t, base, current, Policy{}, testOwnership())
+	v := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	raw, err := v.JSON()
 	if err != nil {
@@ -323,8 +323,8 @@ func TestRegradeIntersection_JSONNamesThePartialVerdict(t *testing.T) {
 
 func TestRegradeIntersection_OutputIsDeterministic(t *testing.T) {
 	base, current := mdintentPair()
-	first := regrade(t, base, current, Policy{}, testOwnership())
-	second := regrade(t, base, current, Policy{}, testOwnership())
+	first := regrade(t, base, current, legacyDefault(), testOwnership())
+	second := regrade(t, base, current, legacyDefault(), testOwnership())
 
 	if first.Render() != second.Render() {
 		t.Error("render differs across identical regrades")

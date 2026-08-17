@@ -98,7 +98,7 @@ func TestInteractionMatrix_ModeSuppressionBaseline(t *testing.T) {
 			}
 			currentFindings := []facts.Insight{finding}
 
-			policy := Policy{}
+			policy := legacyDefault()
 			if tc.suppressed {
 				policy.Suppressions = []Suppression{{Rule: ruleID, Owner: "o", Reason: "r", Date: "2026-08-10"}}
 			}

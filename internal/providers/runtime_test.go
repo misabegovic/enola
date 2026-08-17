@@ -160,7 +160,7 @@ func TestLinkRuntimeObservations_StaysInsideTheWindow(t *testing.T) {
 
 func runtimeScript(t *testing.T) string {
 	t.Helper()
-	path, err := filepath.Abs(filepath.Join("..", "..", "providers", "runtime", "enola_runtime_provider.rb"))
+	path, err := filepath.Abs(filepath.Join("..", "..", "examples", "providers", "ruby", "runtime", "enola_runtime_provider.rb"))
 	if err != nil {
 		t.Fatal(err)
 	}

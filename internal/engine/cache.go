@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,18 +22,6 @@ import (
 
 // cacheVersion is mixed into every cache key. Bump it whenever the fact schema or
 // an extractor's output format changes in a way that invalidates stored facts.
-//
-// Bump it also when the same facts would produce a different GRAPH or different
-// findings, even though nothing cached is stale. This constant is two things: the
-// cache key, and — through ExtractorVersion below — the provenance marker a receipt
-// records and `enola check` compares. The cache argument and the provenance argument
-// are separate arguments about one value, and they disagree exactly here: a
-// derivation change makes every cached fact still valid and every pinned baseline
-// incomparable. One constant can serve both only by widening what its changelog
-// covers, which is what v207 does; the price of NOT bumping is a "PASS — no
-// architectural change" over 30 findings the user did not touch, which is the failure
-// this marker exists to prevent. The price of bumping is one re-extraction per
-// repository, which reproduces the same facts.
 // v2: Swift URLSession extractor precision (file-URL exclusion, interpolation fix).
 // v3: Python route facts use method/role/bare-path Name (was http_method, verb-in-name).
 // v4: Java HTTP client detection (RestTemplate call sites + @FeignClient interfaces).
@@ -1535,235 +1524,7 @@ import (
 // Measured before/after on excalidraw, supabase and bitwarden-clients; the exact match
 // mode is carried on the alias rather than inferred, because a bare `@acme/common` used
 // as a prefix would also swallow `@acme/common-utils`.
-// v195: Ruby reads db/structure.sql when present — the database's own account of the
-// schema, which model-derived storage facts can only infer. Each pg_dump CREATE TABLE
-// yields a storage fact (or, for a table an ActiveRecord/Sequel model already claims,
-// a census folded onto the model's existing fact — one table, one storage identity)
-// carrying sorted `columns` and single-column `fk_constraints` ("column->reftable")
-// props, which is what lets a declared require-rule verdict schema discipline (every
-// company_id column carries its companies FK) from measured facts. Line/regex-based on
-// the pg_dump shapes only; composite FKs and unrecognized lines are skipped, never
-// guessed.
-// v196: Stimulus markup bindings become named facts. A `data-controller="x"` or
-// `data-action="click->x#y"` attribute in an .html.erb view emits one dependency-style
-// fact per declared controller identifier ("stimulus-binding: <file> -> <x>", with a
-// `binding` prop naming the declaring attributes) at resolution_level
-// "markup-declared" — the honest level: the binding is stated in markup, not resolved
-// through code. The fact links to app/javascript/controllers/<x>_controller.(js|ts)
-// only when that conventional file exists; otherwise it stays name-only. Identifiers
-// that are not plain Stimulus tokens (ERB interpolations) declare nothing — fail
-// closed, never a guessed edge.
-// v197: finding 0007's next markup slice, fail-closed at every shape. Literal Turbo
-// frame ids (`turbo_frame_tag :post_1`, `data-turbo-frame="results"`) in view
-// templates become dependency facts named "turbo-frame: <file> -> <id>" at
-// markup-declared — the frame id is an identity two markup sites share, so it is
-// recorded without resolution; dom_id calls, interpolation and the reserved `_top`
-// target emit nothing. Model-side `broadcasts_to` with a literal symbol/string
-// stream becomes "broadcast: <Model> -> <stream>" at literal-declared; the common
-// lambda form computes its stream per record at runtime and emits nothing. And the
-// TS extractor tags the static targets/values fields it already parses on
-// conventionally-placed Stimulus controllers with classification props
-// (framework=stimulus, stimulus_static=targets|values) — props only, on symbols
-// that already exist, so a consumer can finally ask which controllers declare
-// which magic accessors.
-// v198: importmap-rails apps are detected as JavaScript projects. The TS extractor
-// claimed every .js file (its FileOwner glob) but Detect knew only package.json and
-// tsconfig shapes, so a Rails app whose pins live in config/importmap.rb — which
-// ships no package.json at all — never ran the extractor: on the census that was
-// 74 of the 8-repo sample's 100 skipped-with-cause files (once-campfire), every one
-// of them a claimed, parseable, unparsed source file. config/importmap.rb presence
-// now switches the extractor on; vendored minified bundles under vendor/javascript
-// are still skipped by the existing minified gate, which is the honest account.
-// v199: the rest of the view-composition surface, fail-closed at every shape. A
-// hand-written `<turbo-frame id="composer">` element declares its frame id exactly
-// as turbo_frame_tag does — it is the helper's rendered output, and the shape a
-// helper-free view writes — so it now emits the same "turbo-frame:" fact; an id
-// carrying ERB still fails the id gate. And a literal render target (`render
-// "accounts/help_contact"`, quoted, with or without partial:) becomes a dependency
-// fact "render: <view> -> <target>" at literal-declared, linked to the partial file
-// only when Rails' underscore lookup finds it on disk — `render @post`,
-// interpolation and variables emit nothing, so view-to-view composition enters the
-// graph without a single guessed edge.
-// v200: CommonJS export assignments declare symbols. `exports.name = function` and
-// `module.exports.name = function` are the whole public surface of a classic Node
-// module, and no declaration-shaped case ever fired on them — an Express
-// controller written that way emitted nothing, which the census surfaced as
-// "claimed by typescript, no facts emitted". The member-assignment-of-a-function
-// shape now yields an exported function symbol; plain values, re-exported
-// identifiers and whole-object `module.exports = {…}` still emit nothing, because
-// there is no member name to carry or no declaration to classify without guessing.
-// v201: Go interface methods declare symbols. An interface declaration's named
-// methods each emit a symbol fact (pkgDir.Iface.Method, symbol_kind method,
-// exported per the method name's own Go case, receiver carrying the interface
-// name) beside the interface fact that was already emitted. The constraints
-// evaluator resolves edge targets by exact fact name, fail closed, and a call
-// through an interface value targets exactly that name — so a declared forbid
-// rule over a dependency visibly in the source yielded zero verdicts (finding
-// 0009, gin's c.engine.HTMLRender.Instance). The declaration is measured, not
-// guessed: embedded interfaces expand nothing, and no edge to an implementation
-// is fabricated. TS interfaces share the missing-member shape but not the
-// defect: without type inference the TS extractor never resolves a call target
-// to dir.Iface.method, so emitting the members would add facts no edge can
-// ground on. Ruby has no interface construct — a module's methods are real
-// definitions and already emit symbols.
-// v202: three census-named vocabulary gaps closed. The TS extractor claims and
-// parses .mjs — the file is the same ESM the extractor already reads in .js,
-// only the extension differed, so a Node project's native-ESM half was
-// excluded-by-kind — and .mjs joins the module-resolution extension order so
-// an extensionless import can land on it. Jbuilder views (.jbuilder) go
-// through the Ruby template reference pass with the whole file as the Ruby
-// region: a Jbuilder template IS plain Ruby (the json builder DSL), so helpers
-// and decorators called only from a JSON view stop reading as dead, while the
-// reference-only shape keeps views out of the symbol set. And the Ruby
-// extractor's FileOwner now claims what its Extract already reads — ERB/Slim/
-// HAML templates and Jbuilder views — which both moves those files out of the
-// census's excluded-by-kind bucket (they were parsed while reading as a
-// vocabulary gap) and fixes a real cache defect: a template edit did not
-// invalidate the extractor's cache key even though its facts carry the
-// template's references.
-//
-// v203: TypeScript class members carry their decorators, and get accessors become
-// their own symbol kind. Every decorated class member (method, getter, field) and
-// every decorated class gains a `decorators` prop — the sorted, deduped decorator
-// names with arguments stripped (`cached`, `tracked`, `action`, `service`,
-// `Controller`, …), space-joined in the set-valued string form the constraint
-// evaluator's prop containment and the prop-implication miner both read (the
-// columns/fk_constraints precedent) — read from the same nodes the route/service
-// passes already walk, so a convention like "expensive getters carry @cached"
-// becomes a mechanically checkable prop instead of prose. A `get` accessor emits
-// symbol_kind getter (a new vocabulary value beside function/method; consumers
-// that treated methods as callable members treat getters the same) with a
-// getter_calls prop counting its distinct outgoing call edges — emitted even at
-// 0, so measured-cheap and unmeasured never look the same. Set accessors stay
-// methods: only the read path is a getter. Template read fan-in is deliberately
-// NOT emitted — no template->member edge exists to derive it from (the .hbs
-// scanner refuses bare {{name}} as ambiguous, and strict-mode .gts tokens
-// resolve against imports only), and a guessed fan-in is worse than an absent
-// one.
-//
-// v204: a Rails namespace's declared table_name_prefix corrects the models nested
-// under it. `def self.table_name_prefix` on a module records its literal on that
-// module's symbol fact (a plain string only — an interpolated or computed prefix
-// states nothing), and a whole-repo pass prepends it to the table of every model
-// storage fact whose root namespace declares one and whose table_source is
-// derived. A declared table is left exactly as the source states it: Rails does
-// not prefix a `self.table_name`, so prefixing one would replace a stated fact
-// with a derived guess. The correction runs before the structure.sql fold, so the
-// dump's column census lands on the model that reads the prefixed relation rather
-// than on whichever model the unprefixed name collided with.
-//
-// The same version carries finding 0007's method-level residual. A Stimulus
-// data-action no longer loses the method after the `#`: the binding fact carries
-// the sorted `stimulus_handlers` set the view invokes on that controller (action
-// options like `:prevent` are not part of a method name), and the new
-// stimulus-resolver binder grounds each one on the member the controller file
-// declares, reporting the rest as `stimulus_unresolved` beside a
-// stimulus:actions coverage fact. Nothing is derived from a class name — an
-// identifier that grounded no file grounds no handler either. The controller
-// file itself now also resolves outside app/javascript/controllers: the
-// conventional root wins outright, and failing it the single file in the tree
-// whose path ends with the identifier's relative path grounds it, so an app
-// registering controllers from app/components stops being name-only. Two
-// candidates are an ambiguity and ground nothing.
-//
-// And the TypeScript gRPC stub index grows the ambiguity guard its Go sibling
-// has carried since finding 0003. Both of its keys are short names, so a service
-// declared in two proto packages collides; the name is now dropped the moment a
-// service with a DIFFERING fully-qualified name claims it, stickily, and the
-// conventional "<Service>Client" / "<Service>" names go through the same gate so
-// a derived name cannot put back what a collision dropped. Re-registration under
-// the same fq is not a collision — a split _pb/_connect pair, a barrel
-// re-export and a checked-in dist/ copy all do it — so no edge that resolves
-// today stops resolving. Emitting nothing is the whole point: an edge to one of
-// two API versions is wrong half the time, and the ambiguity is not published as
-// a fact property, which is the settled answer on the Go side.
-// v205: the Rails default schema dump joins the SQL one. db/schema.rb is read
-// into exactly the census db/structure.sql already produces — the sorted
-// `columns` set and the sorted `from_column->to_table` `fk_constraints` set,
-// through the same fold onto whichever model claims the table — so a constraint
-// written against either prop verdicts identically whichever format a project
-// keeps, and the half of the Rails world that never opted into structure.sql
-// stops producing no schema facts at all. Where both files exist structure.sql
-// wins outright and schema.rb is not read: opting into the SQL format is what
-// makes it the authoritative dump, and one database read twice would fold two
-// censuses onto one storage identity. The reader is a bounded line parser
-// rather than a Ruby grammar for the reason the pg_dump one is not a SQL
-// grammar — SchemaDumper writes one statement per line in a handful of stable
-// shapes, and a line outside them contributes nothing. The implicit primary key
-// is synthesized (`id`, the declared `primary_key:`, or none under `id: false`)
-// because it is a column the SQL dump would have written out. An
-// add_foreign_key without an explicit `column:` does not invent the name
-// ActiveSupport's inflector would derive: it CHOOSES the single `<stem>_id`
-// column the table declares that the referenced table is a plural of, and
-// states nothing where none or several match — the silence a composite key
-// already gets on the SQL side.
-//
-// v206: a JavaScript class says which base class it extends, and which module
-// that name came from. The class fact carries `superclass` — the identifier as
-// written, one level, the same meaning rubyextractor gives the prop — and
-// `superclass_module`, read from the file's own import table. The second prop is
-// what JavaScript needs and Ruby does not: a Ruby superclass token is a globally
-// resolvable constant, while a JavaScript one is bound by an import, so the bare
-// `Controller` is @hotwired/stimulus' base class on 150 of one production Ember
-// frontend's classes and @ember/controller's on 259 others, and a prop carrying
-// only the identifier fuses two unrelated hierarchies. The module is the same
-// string the file's own dependency fact already records as its imports target —
-// the specifier for a package, the repo-relative path for a file, resolved through
-// tsconfig aliases where the project declares them — and it is never derived
-// from the identifier's spelling or the file's location: a base class the file
-// declares itself or a global like Error or HTMLElement carries the name and no
-// module at all.
-//
-// Only an identifier names a base class. `extends Base<T>` is one (the type
-// arguments are applied to the base, not a second reading of it), while
-// `extends Service.extend(Mixin)`, `extends Turbo.navigator.view.snapshot.
-// constructor`, a ternary, a subscript and `extends new Factory()` reach their
-// base through a value the source never states, so they emit nothing rather than
-// name the mixin factory or the namespace object — the seven such classes in
-// that frontend are exactly the forms where a nearest-identifier answer
-// would have been wrong. No inheritance relation accompanies the props: the
-// identifier alone is not a symbol identity when a repository writes the same
-// `Controller` 409 times against two different base classes, and the local name a
-// default or aliased import binds is not the name the exporting file declares, so
-// an edge built from either would be a resolution nothing measured. The Ember
-// component/service/model classifier now reads its heritage through the same
-// single reader, and .vue and .svelte script blocks resolve theirs through the
-// same import table.
-// v207: NOT an extractor change — the first entry here that is not. Owner resolution
-// wires a Ruby class to its instance methods ("Owner#method"), which no split on the
-// last "." ever reached: 23,127 has_method edges appear on the monolith out of the
-// same facts, and the two outlier explainers stop counting a type's own methods as
-// calls out of it. facts.jsonl is byte-identical across the change (cmp, monolith and
-// a third repository in this estate), so nothing cached is stale — but a baseline
-// pinned by a v206 build and graded by this one reports 30 moved findings over an
-// unedited tree, and without a bump prints "PASS — no architectural change" while
-// doing it. The constant is the provenance marker as well as the cache key; this line
-// is what widening it costs.
-//
-// --- upstream's numbering rejoins ours here -----------------------------------
-//
-// v195 through v197 were assigned INDEPENDENTLY on both sides while this fork and
-// upstream shipped in parallel, so three integers named six different changes. The
-// three that follow are upstream's, renumbered onto free integers above our range;
-// their text is unchanged and each names the upstream number it arrived as.
-//
-// The direction is not a preference. A cache entry on disk is stamped with the
-// integer the binary that wrote it carried, and every such entry in this estate was
-// written by a build of THIS tree — renumbering our lineage would leave a v207 entry
-// meaning one thing to the binary that wrote it and another to the binary reading it,
-// which is exactly the stale-cache-agreeing-with-nothing failure the constant exists
-// to prevent. Upstream's three numbers were never stamped by a binary we ship, so
-// re-assigning them costs nothing on disk. Landing above BOTH lineages also keeps an
-// upstream v0.3.18 build (v197) and this one from ever reading each other's entries as
-// their own, which matters because the merged extractor is neither.
-//
-// The next align faces the same collision, because both projects increment the same
-// counter and the coverage guard requires the contiguous range v2..cacheVersion — a
-// namespaced value would have to fork that guard, and forking upstream's guard to
-// avoid renumbering upstream's entries is the worse trade. So the rule, applied every
-// time: upstream's new `// vN:` lines move to the top of our range in upstream's own
-// order, keeping their text and naming their origin; ours never move.
-// v208: [upstream v195] the Java and Ruby grammars move to their newest releases — tree-sitter-java
+// v195: the Java and Ruby grammars move to their newest releases — tree-sitter-java
 // v0.21.1-20240824 -> v0.23.5 and tree-sitter-ruby v0.21.1-20240818 -> v0.23.1. Both are
 // still tree-sitter ABI 14, which is the ceiling the vendored go-tree-sitter runtime
 // accepts; the C#, Python, Scala and Dart grammars are all held back or regenerated for
@@ -1781,7 +1542,7 @@ import (
 // old parser shredded, and the extractor cache is keyed on cacheVersion plus the file
 // hash alone. Without the bump an upgraded binary would keep serving facts its own parser
 // never produced, and nothing downstream could tell.
-// v209: [upstream v196] the C, C++ and PHP grammars leave the 2024 pre-release pseudo-versions they were
+// v196: the C, C++ and PHP grammars leave the 2024 pre-release pseudo-versions they were
 // stuck on — tree-sitter-c v0.21.5-20240818 -> v0.23.6, tree-sitter-cpp v0.22.4-20240818
 // -> v0.23.4, tree-sitter-php v0.22.9-20240819 -> v0.23.12. Roughly two years of upstream
 // grammar fixes each.
@@ -1792,11 +1553,11 @@ import (
 // in .github/dependabot.yml now cap each grammar at its last ABI-14 release, which is what
 // made these three upgrades visible at all.
 //
-// Grouped into one version for the same reason as v208: any grammar change invalidates
+// Grouped into one version for the same reason as v195: any grammar change invalidates
 // every cached fact, so landing three separately would charge users three full
 // re-extractions to reach one graph.
 //
-// As with v208 the goldens do not move — all 37 fixture graphs are byte-identical and
+// As with v195 the goldens do not move — all 37 fixture graphs are byte-identical and
 // TestDeterminism passes. The bump is not a formality: the cache is keyed on cacheVersion
 // plus the file hash alone, so without it an upgraded binary would keep serving facts its
 // own parser never produced. What the goldens cannot check is the rest of the world, so
@@ -1804,7 +1565,7 @@ import (
 // dispatch on (35 shared C/C++, 17 C++-only, 1 C-only, 38 PHP) — a renamed kind is the
 // failure a two-year grammar jump actually causes, and it degrades extraction without
 // erroring.
-// v210: [upstream v197] Rails route extraction stops being a single-file affair.
+// v197: Rails route extraction stops being a single-file affair.
 //
 // Three defects, one root cause — the extractor read `config/routes.rb` and treated it
 // as the route table, when in Rails it is only the entry point to one:
@@ -1886,7 +1647,287 @@ import (
 // The goldens move: ruby_sample's 13 route facts each gain a handler prop and a
 // handled_by relation. No route is added or lost in the fixture, which is the point —
 // the fixture is a single-file application, the shape that already worked.
-// v211: the hash-rocket mount form whose key builds a Rack app inline names its
+// v198: the TS extractor composes Express sub-router mounts ACROSS FILES, the last
+// of the major frameworks still resolving mounts only within one file.
+//
+// serverroutes.go emits a route only when the mount is written in the same file as
+// the router, and deliberately emits NOTHING otherwise: `router.post('/login')` in a
+// module mounted at '/webhooks' elsewhere serves '/webhooks/login', and the fragment
+// would be a wrong fact that can false-match another repo's route. Correct, and also
+// silent on the layout every Express service uses — routes in `src/api/*.ts`, the
+// `app.use('/api', router)` in `src/server.ts`. A four-route service split that way
+// contributed zero route facts, which reads as a backend that serves nothing.
+//
+// tsextractor/routermount.go adds the repo-wide half, the same shape as Go v125,
+// Axum v130, FastAPI v133 and Rails v197: each file reports its routers, the routes
+// held back on them, its mounts, and its imports/exports resolved to files; a
+// fixpoint then propagates prefixes outward from the application roots. It resolves
+// ESM and CommonJS, renamed named exports, a router returned by a factory
+// (`app.use('/api', routes())`), and mounts nested several files deep; a router
+// mounted at N prefixes emits its routes once per prefix. Composed routes carry
+// `mount_composed=true`. Everything unresolvable — a non-literal prefix, an external
+// module, a router nothing mounts — still emits nothing, so the pass can add a route
+// or correct its path but never invent one.
+//
+// Two fixes fall out of the same work. serverroutes.go now requires a mount's PARENT
+// to be mounted before it composes: `apiRouter.use('/orders', orders)` in a file that
+// does not itself mount apiRouter used to emit the fragment '/orders/:id' for a route
+// really serving '/api/orders/:id' — the exact wrong-fact case the pass exists to
+// avoid, reached through the same-file path. And an import written WITH an extension
+// (`./orders.js`, which TypeScript's nodenext resolution makes mandatory) now
+// resolves to the `.ts` file it names, where before it resolved to nothing.
+//
+// The ts_express_multirepo golden gains the two '/webhooks/login' routes it had been
+// suppressing, and the consumer's call to that path stops being an unresolved edge:
+// cross-repo endpoint count 2 → 3, http_client coverage resolved 3 → 4. Cached
+// TypeScript/JavaScript snapshots must re-extract.
+// v199: Ruby reads db/structure.sql when present — the database's own account of the
+// schema, which model-derived storage facts can only infer. Each pg_dump CREATE TABLE
+// yields a storage fact (or, for a table an ActiveRecord/Sequel model already claims,
+// a census folded onto the model's existing fact — one table, one storage identity)
+// carrying sorted `columns` and single-column `fk_constraints` ("column->reftable")
+// props, which is what lets a declared require-rule verdict schema discipline (every
+// company_id column carries its companies FK) from measured facts. Line/regex-based on
+// the pg_dump shapes only; composite FKs and unrecognized lines are skipped, never
+// guessed.
+// v200: Stimulus markup bindings become named facts. A `data-controller="x"` or
+// `data-action="click->x#y"` attribute in an .html.erb view emits one dependency-style
+// fact per declared controller identifier ("stimulus-binding: <file> -> <x>", with a
+// `binding` prop naming the declaring attributes) at resolution_level
+// "markup-declared" — the honest level: the binding is stated in markup, not resolved
+// through code. The fact links to app/javascript/controllers/<x>_controller.(js|ts)
+// only when that conventional file exists; otherwise it stays name-only. Identifiers
+// that are not plain Stimulus tokens (ERB interpolations) declare nothing — fail
+// closed, never a guessed edge.
+// v201: finding 0007's next markup slice, fail-closed at every shape. Literal Turbo
+// frame ids (`turbo_frame_tag :post_1`, `data-turbo-frame="results"`) in view
+// templates become dependency facts named "turbo-frame: <file> -> <id>" at
+// markup-declared — the frame id is an identity two markup sites share, so it is
+// recorded without resolution; dom_id calls, interpolation and the reserved `_top`
+// target emit nothing. Model-side `broadcasts_to` with a literal symbol/string
+// stream becomes "broadcast: <Model> -> <stream>" at literal-declared; the common
+// lambda form computes its stream per record at runtime and emits nothing. And the
+// TS extractor tags the static targets/values fields it already parses on
+// conventionally-placed Stimulus controllers with classification props
+// (framework=stimulus, stimulus_static=targets|values) — props only, on symbols
+// that already exist, so a consumer can finally ask which controllers declare
+// which magic accessors.
+// v202: importmap-rails apps are detected as JavaScript projects. The TS extractor
+// claimed every .js file (its FileOwner glob) but Detect knew only package.json and
+// tsconfig shapes, so a Rails app whose pins live in config/importmap.rb — which
+// ships no package.json at all — never ran the extractor: on the census that was
+// 74 of the 8-repo sample's 100 skipped-with-cause files (once-campfire), every one
+// of them a claimed, parseable, unparsed source file. config/importmap.rb presence
+// now switches the extractor on; vendored minified bundles under vendor/javascript
+// are still skipped by the existing minified gate, which is the honest account.
+// v203: the rest of the view-composition surface, fail-closed at every shape. A
+// hand-written `<turbo-frame id="composer">` element declares its frame id exactly
+// as turbo_frame_tag does — it is the helper's rendered output, and the shape a
+// helper-free view writes — so it now emits the same "turbo-frame:" fact; an id
+// carrying ERB still fails the id gate. And a literal render target (`render
+// "accounts/help_contact"`, quoted, with or without partial:) becomes a dependency
+// fact "render: <view> -> <target>" at literal-declared, linked to the partial file
+// only when Rails' underscore lookup finds it on disk — `render @post`,
+// interpolation and variables emit nothing, so view-to-view composition enters the
+// graph without a single guessed edge.
+// v204: CommonJS export assignments declare symbols. `exports.name = function` and
+// `module.exports.name = function` are the whole public surface of a classic Node
+// module, and no declaration-shaped case ever fired on them — an Express
+// controller written that way emitted nothing, which the census surfaced as
+// "claimed by typescript, no facts emitted". The member-assignment-of-a-function
+// shape now yields an exported function symbol; plain values, re-exported
+// identifiers and whole-object `module.exports = {…}` still emit nothing, because
+// there is no member name to carry or no declaration to classify without guessing.
+// v205: Go interface methods declare symbols. An interface declaration's named
+// methods each emit a symbol fact (pkgDir.Iface.Method, symbol_kind method,
+// exported per the method name's own Go case, receiver carrying the interface
+// name) beside the interface fact that was already emitted. The constraints
+// evaluator resolves edge targets by exact fact name, fail closed, and a call
+// through an interface value targets exactly that name — so a declared forbid
+// rule over a dependency visibly in the source yielded zero verdicts (finding
+// 0009, gin's c.engine.HTMLRender.Instance). The declaration is measured, not
+// guessed: embedded interfaces expand nothing, and no edge to an implementation
+// is fabricated. TS interfaces share the missing-member shape but not the
+// defect: without type inference the TS extractor never resolves a call target
+// to dir.Iface.method, so emitting the members would add facts no edge can
+// ground on. Ruby has no interface construct — a module's methods are real
+// definitions and already emit symbols.
+// v206: three census-named vocabulary gaps closed. The TS extractor claims and
+// parses .mjs — the file is the same ESM the extractor already reads in .js,
+// only the extension differed, so a Node project's native-ESM half was
+// excluded-by-kind — and .mjs joins the module-resolution extension order so
+// an extensionless import can land on it. Jbuilder views (.jbuilder) go
+// through the Ruby template reference pass with the whole file as the Ruby
+// region: a Jbuilder template IS plain Ruby (the json builder DSL), so helpers
+// and decorators called only from a JSON view stop reading as dead, while the
+// reference-only shape keeps views out of the symbol set. And the Ruby
+// extractor's FileOwner now claims what its Extract already reads — ERB/Slim/
+// HAML templates and Jbuilder views — which both moves those files out of the
+// census's excluded-by-kind bucket (they were parsed while reading as a
+// vocabulary gap) and fixes a real cache defect: a template edit did not
+// invalidate the extractor's cache key even though its facts carry the
+// template's references.
+//
+// v207: TypeScript class members carry their decorators, and get accessors become
+// their own symbol kind. Every decorated class member (method, getter, field) and
+// every decorated class gains a `decorators` prop — the sorted, deduped decorator
+// names with arguments stripped (`cached`, `tracked`, `action`, `service`,
+// `Controller`, …), space-joined in the set-valued string form the constraint
+// evaluator's prop containment and the prop-implication miner both read (the
+// columns/fk_constraints precedent) — read from the same nodes the route/service
+// passes already walk, so a convention like "expensive getters carry @cached"
+// becomes a mechanically checkable prop instead of prose. A `get` accessor emits
+// symbol_kind getter (a new vocabulary value beside function/method; consumers
+// that treated methods as callable members treat getters the same) with a
+// getter_calls prop counting its distinct outgoing call edges — emitted even at
+// 0, so measured-cheap and unmeasured never look the same. Set accessors stay
+// methods: only the read path is a getter. Template read fan-in is deliberately
+// NOT emitted — no template->member edge exists to derive it from (the .hbs
+// scanner refuses bare {{name}} as ambiguous, and strict-mode .gts tokens
+// resolve against imports only), and a guessed fan-in is worse than an absent
+// one.
+//
+// v208: a Rails namespace's declared table_name_prefix corrects the models nested
+// under it. `def self.table_name_prefix` on a module records its literal on that
+// module's symbol fact (a plain string only — an interpolated or computed prefix
+// states nothing), and a whole-repo pass prepends it to the table of every model
+// storage fact whose root namespace declares one and whose table_source is
+// derived. A declared table is left exactly as the source states it: Rails does
+// not prefix a `self.table_name`, so prefixing one would replace a stated fact
+// with a derived guess. The correction runs before the structure.sql fold, so the
+// dump's column census lands on the model that reads the prefixed relation rather
+// than on whichever model the unprefixed name collided with.
+//
+// The same version carries finding 0007's method-level residual. A Stimulus
+// data-action no longer loses the method after the `#`: the binding fact carries
+// the sorted `stimulus_handlers` set the view invokes on that controller (action
+// options like `:prevent` are not part of a method name), and the new
+// stimulus-resolver binder grounds each one on the member the controller file
+// declares, reporting the rest as `stimulus_unresolved` beside a
+// stimulus:actions coverage fact. Nothing is derived from a class name — an
+// identifier that grounded no file grounds no handler either. The controller
+// file itself now also resolves outside app/javascript/controllers: the
+// conventional root wins outright, and failing it the single file in the tree
+// whose path ends with the identifier's relative path grounds it, so an app
+// registering controllers from app/components stops being name-only. Two
+// candidates are an ambiguity and ground nothing.
+//
+// And the TypeScript gRPC stub index grows the ambiguity guard its Go sibling
+// has carried since finding 0003. Both of its keys are short names, so a service
+// declared in two proto packages collides; the name is now dropped the moment a
+// service with a DIFFERING fully-qualified name claims it, stickily, and the
+// conventional "<Service>Client" / "<Service>" names go through the same gate so
+// a derived name cannot put back what a collision dropped. Re-registration under
+// the same fq is not a collision — a split _pb/_connect pair, a barrel
+// re-export and a checked-in dist/ copy all do it — so no edge that resolves
+// today stops resolving. Emitting nothing is the whole point: an edge to one of
+// two API versions is wrong half the time, and the ambiguity is not published as
+// a fact property, which is the settled answer on the Go side.
+// v209: the Rails default schema dump joins the SQL one. db/schema.rb is read
+// into exactly the census db/structure.sql already produces — the sorted
+// `columns` set and the sorted `from_column->to_table` `fk_constraints` set,
+// through the same fold onto whichever model claims the table — so a constraint
+// written against either prop verdicts identically whichever format a project
+// keeps, and the half of the Rails world that never opted into structure.sql
+// stops producing no schema facts at all. Where both files exist structure.sql
+// wins outright and schema.rb is not read: opting into the SQL format is what
+// makes it the authoritative dump, and one database read twice would fold two
+// censuses onto one storage identity. The reader is a bounded line parser
+// rather than a Ruby grammar for the reason the pg_dump one is not a SQL
+// grammar — SchemaDumper writes one statement per line in a handful of stable
+// shapes, and a line outside them contributes nothing. The implicit primary key
+// is synthesized (`id`, the declared `primary_key:`, or none under `id: false`)
+// because it is a column the SQL dump would have written out. An
+// add_foreign_key without an explicit `column:` does not invent the name
+// ActiveSupport's inflector would derive: it CHOOSES the single `<stem>_id`
+// column the table declares that the referenced table is a plural of, and
+// states nothing where none or several match — the silence a composite key
+// already gets on the SQL side.
+//
+// v210: a JavaScript class says which base class it extends, and which module
+// that name came from. The class fact carries `superclass` — the identifier as
+// written, one level, the same meaning rubyextractor gives the prop — and
+// `superclass_module`, read from the file's own import table. The second prop is
+// what JavaScript needs and Ruby does not: a Ruby superclass token is a globally
+// resolvable constant, while a JavaScript one is bound by an import, so the bare
+// `Controller` is @hotwired/stimulus' base class on 150 of one production Ember
+// frontend's classes and @ember/controller's on 259 others, and a prop carrying
+// only the identifier fuses two unrelated hierarchies. The module is the same
+// string the file's own dependency fact already records as its imports target —
+// the specifier for a package, the repo-relative path for a file, resolved through
+// tsconfig aliases where the project declares them — and it is never derived
+// from the identifier's spelling or the file's location: a base class the file
+// declares itself or a global like Error or HTMLElement carries the name and no
+// module at all.
+//
+// Only an identifier names a base class. `extends Base<T>` is one (the type
+// arguments are applied to the base, not a second reading of it), while
+// `extends Service.extend(Mixin)`, `extends Turbo.navigator.view.snapshot.
+// constructor`, a ternary, a subscript and `extends new Factory()` reach their
+// base through a value the source never states, so they emit nothing rather than
+// name the mixin factory or the namespace object — the seven such classes in
+// that frontend are exactly the forms where a nearest-identifier answer
+// would have been wrong. No inheritance relation accompanies the props: the
+// identifier alone is not a symbol identity when a repository writes the same
+// `Controller` 409 times against two different base classes, and the local name a
+// default or aliased import binds is not the name the exporting file declares, so
+// an edge built from either would be a resolution nothing measured. The Ember
+// component/service/model classifier now reads its heritage through the same
+// single reader, and .vue and .svelte script blocks resolve theirs through the
+// same import table.
+// v211: NOT an extractor change — the first entry here that is not. Owner resolution
+// wires a Ruby class to its instance methods ("Owner#method"), which no split on the
+// last "." ever reached: 23,127 has_method edges appear on the monolith out of the
+// same facts, and the two outlier explainers stop counting a type's own methods as
+// calls out of it. facts.jsonl is byte-identical across the change (cmp, monolith and
+// a third repository in this estate), so nothing cached is stale — but a baseline
+// pinned by a v210 build and graded by this one reports 30 moved findings over an
+// unedited tree, and without a bump prints "PASS — no architectural change" while
+// doing it. The constant is the provenance marker as well as the cache key; this line
+// is what widening it costs.
+// v212: a TypeScript constructor is a fact. The member walk skipped `#`-private
+// members and `constructor` in one condition, and the two are not alike: a private
+// member has no callers to measure, while a constructor runs on every instantiation
+// and what it calls is the whole of "this class fetches when it is built". Measured
+// on a large Ember application, 323 constructors, 306 of which call something, and
+// the finding count did not move at all — 503 before and after, with no finding
+// naming a constructor, so the dead-symbol reasoning does not mistake a member
+// invoked by `new` for an uncalled one. It is bumped on the provenance argument the
+// header states rather than on cache staleness: a baseline pinned by a v211 build
+// must not grade a tree that now carries constructors as unchanged.
+// v213: a TypeScript method records the fields it assigns on itself, as the Ruby
+// extractor already did. `this.args.user.name = x` records `args` — the outermost
+// property after `this`, because that is what a convention speaks about and the
+// path beyond it varies per call site without changing the answer. Only `this` is
+// followed: an assignment to a local or to another object is not a claim about the
+// member's own state. It is what makes "data flows down and actions flow up"
+// enforceable — 212 methods on a large Ember application write through their own
+// arguments — and the finding count did not move, 503 before and after.
+// v214: a TypeScript member records whether it declares a parameter at all. A
+// modifier is handed the element it is attached to, so a modifier declaring no
+// parameter is not modifying anything — it is a side effect fired by render,
+// which is the convention the prop exists to make selectable. The answer is
+// "yes"/"no" on every member rather than a prop present only when true, because
+// a rule matches a VALUE and a prop that is absent on the compliant half would
+// select nobody to verdict. A rest parameter counts as one: the member still
+// receives what it is handed. Measured on a large Ember application, 21,689
+// members carry it, 6,341 of them declaring parameters, and the finding count
+// did not move — 503 before and after. It is bumped on the provenance argument
+// the header states rather than on cache staleness: a baseline pinned by a v213
+// build must not grade a tree whose members now carry this prop as unchanged.
+// v215: takes_parameters reaches the module-level function symbols it always
+// meant to cover. v214 emitted it only from the class-member walk, so the
+// dominant Ember modifier form — `export default modifier((element, ...) => ...)`
+// at module scope — carried no answer at all, and a rule demanding "yes" read
+// the silence as a breach rather than as an unmeasured member. Measured on a
+// large Ember application, all eight members such a rule named were
+// module-level modifiers that do take their element: 8 false verdicts, 0 true
+// ones. The prop is now emitted wherever a callable symbol is, function
+// declarations and arrow-bound consts included, which takes the estate from
+// 21,689 members carrying it to 22,963 and drops those eight verdicts to zero.
+// Absence stops being ambiguous for this prop, which is what the rule form
+// needs: it cannot tell "measured, declares none" from "never looked".
+// v216: the hash-rocket mount form whose key builds a Rack app inline names its
 // app again. `mount Flipper::UI.app(Flipper) => "/admin/flipper"` reaches its
 // constant through a call, which parseMount unwraps on the `at:` side and required
 // to be a bare constant on the key side — so the declaration produced no constant,
@@ -1896,7 +1937,7 @@ import (
 // the upgrade to upstream's constant-aware reader lost a form it had covered.
 // Reading the receiver is the same rule the `at:` branch already applies, so no
 // new guess enters: a key that names nothing resolvable still mounts nothing.
-// v212: a Rails route names the controller Rails names, on the rules Rails
+// v217: a Rails route names the controller Rails names, on the rules Rails
 // actually uses rather than one of them everywhere. `Resource#controller` is
 // `options[:controller] || @name`, so a plural `resources` takes its name VERBATIM;
 // `SingletonResource#controller` is `options[:controller] || plural`, so only the
@@ -1957,7 +1998,7 @@ import (
 // rather than written from memory. The route cases that existed before scored
 // filters and nesting only, so every one of these derivations could be wrong while
 // the suite read 149/149 — which is what happened.
-// v213: four more constructs Rails reads to answer the same question. `scope
+// v218: four more constructs Rails reads to answer the same question. `scope
 // controller:` is the one construct other than the `controller ... do` block that
 // writes the @scope[:controller] a verb falls back to (merge_controller_scope keeps
 // the child; map_match's `controller ||= @scope[:controller]` reads it), and leaving
@@ -1990,58 +2031,16 @@ import (
 // go 2,289 -> 2,315.
 //
 // The bump is the PROVENANCE argument in the header, not the cache one, for the same
-// reason v212's was: buildIdentity already mixes the executable into every entry, so
+// reason v217's was: buildIdentity already mixes the executable into every entry, so
 // a cache written by a different binary is discarded either way, while
 // WarnVersionMismatch and append mode's discard both key on ExtractorVersion — and
-// without a bump a baseline pinned by a v212 build grades this one's 47 moved route
+// without a bump a baseline pinned by a v217 build grades this one's 47 moved route
 // facts as no architectural change at all.
 //
 // benchmarks/rails-controller-derivation scores each of the four, expanded through
 // ActionDispatch::Routing::RouteSet on actionpack 8.1.3 and again on 8.1.1, which
 // agreed line for line.
-// v214: a TypeScript constructor is a fact. The member walk skipped `#`-private
-// members and `constructor` in one condition, and the two are not alike: a private
-// member has no callers to measure, while a constructor runs on every instantiation
-// and what it calls is the whole of "this class fetches when it is built". Measured
-// on a large Ember application, 323 constructors, 306 of which call something, and
-// the finding count did not move at all — 503 before and after, with no finding
-// naming a constructor, so the dead-symbol reasoning does not mistake a member
-// invoked by `new` for an uncalled one. It is bumped on the provenance argument the
-// header states rather than on cache staleness: a baseline pinned by a v213 build
-// must not grade a tree that now carries constructors as unchanged.
-// v215: a TypeScript method records the fields it assigns on itself, as the Ruby
-// extractor already did. `this.args.user.name = x` records `args` — the outermost
-// property after `this`, because that is what a convention speaks about and the
-// path beyond it varies per call site without changing the answer. Only `this` is
-// followed: an assignment to a local or to another object is not a claim about the
-// member's own state. It is what makes "data flows down and actions flow up"
-// enforceable — 212 methods on a large Ember application write through their own
-// arguments — and the finding count did not move, 503 before and after.
-// v216: a TypeScript member records whether it declares a parameter at all. A
-// modifier is handed the element it is attached to, so a modifier declaring no
-// parameter is not modifying anything — it is a side effect fired by render,
-// which is the convention the prop exists to make selectable. The answer is
-// "yes"/"no" on every member rather than a prop present only when true, because
-// a rule matches a VALUE and a prop that is absent on the compliant half would
-// select nobody to verdict. A rest parameter counts as one: the member still
-// receives what it is handed. Measured on a large Ember application, 21,689
-// members carry it, 6,341 of them declaring parameters, and the finding count
-// did not move — 503 before and after. It is bumped on the provenance argument
-// the header states rather than on cache staleness: a baseline pinned by a v215
-// build must not grade a tree whose members now carry this prop as unchanged.
-// v217: takes_parameters reaches the module-level function symbols it always
-// meant to cover. v216 emitted it only from the class-member walk, so the
-// dominant Ember modifier form — `export default modifier((element, ...) => ...)`
-// at module scope — carried no answer at all, and a rule demanding "yes" read
-// the silence as a breach rather than as an unmeasured member. Measured on a
-// large Ember application, all eight members such a rule named were
-// module-level modifiers that do take their element: 8 false verdicts, 0 true
-// ones. The prop is now emitted wherever a callable symbol is, function
-// declarations and arrow-bound consts included, which takes the estate from
-// 21,689 members carrying it to 22,963 and drops those eight verdicts to zero.
-// Absence stops being ambiguous for this prop, which is what the rule form
-// needs: it cannot tell "measured, declares none" from "never looked".
-const cacheVersion = "v217"
+const cacheVersion = "v218"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
@@ -2062,10 +2061,43 @@ func ExtractorVersion() string { return cacheVersion }
 // Reuse is correct because an extractor is a deterministic function of its inputs
 // (verified: parallel and serial runs produce byte-identical facts), and a key
 // captures every input that can change its output — see computeExtractorKeys.
+// # Write-through
+//
+// Entries are written to disk AS THEY ARE PRODUCED, into a temp file opened when the
+// cache is created and renamed into place by save. Nothing accumulates in memory
+// waiting to be written.
+//
+// Holding them was the single largest allocation in a snapshot. On a kernel-sized
+// repository one extractor produces one 800 MB entry, and both routes retained it
+// for the rest of the run: put marshalled the facts into a buffer (reaching 1.5 GB
+// through bytes.Buffer's doubling — half the live heap at the measured peak), and on
+// a warm run get moved the decoded bytes from prev to next, keeping them alive
+// alongside the facts they had just been decoded into.
+//
+// Writing costs no more than it did — the same bytes reach the same file — it just
+// happens earlier, and each entry becomes collectable the moment it is written.
 type extractorCache struct {
-	prev map[string]json.RawMessage // loaded from disk
-	next map[string]json.RawMessage // to persist (this run's keys only)
+	prev map[string]json.RawMessage // loaded from disk, drained by get
 	hits int
+
+	// noPersist records that save will never be called. Such a cache still SERVES
+	// entries — a read-only mode should reuse a warm cache, that is most of what
+	// makes it fast — but opens no temp file and writes nothing, because there is
+	// nowhere for it to go. `enola --explain` sets it, via SetPersistCache(false).
+	//
+	// Negative form so the ZERO VALUE writes nothing rather than writing to a nil
+	// file. Stated positively, a struct literal that forgot the field would try to
+	// stream into a closed spool.
+	noPersist bool
+
+	// Spool state. dest is the final path; tmp lives beside it so the rename cannot
+	// cross a filesystem boundary (os.Rename returns EXDEV and loses atomicity).
+	dest    string
+	tmp     *os.File
+	w       *bufio.Writer
+	entries int   // entries emitted this run
+	werr    error // first write/encode failure; surfaced by save
+	closed  bool  // save or discard has run; further writes are refused
 }
 
 // buildIdentity identifies the binary that produced a cache entry: the release
@@ -2119,10 +2151,20 @@ var errColdCache = errors.New("cold cache")
 // the decoded entry map — each about that size — alive simultaneously, at the exact
 // point in a run where the fact store is also being built. Decoding entry by entry
 // retains only the entries.
-func loadExtractorCache(path string) *extractorCache {
+func loadExtractorCache(path string, persist bool) *extractorCache {
 	c := &extractorCache{
-		prev: map[string]json.RawMessage{},
-		next: map[string]json.RawMessage{},
+		prev:      map[string]json.RawMessage{},
+		noPersist: !persist,
+		dest:      path,
+	}
+	if persist {
+		// A spool that cannot be opened degrades this run to no caching rather than
+		// failing it: the snapshot is still correct, just cold next time. Reported,
+		// because a repository that silently never caches looks like a slow enola.
+		if err := c.openSpool(); err != nil {
+			log.Printf("[engine] extractor cache not writable (%v); continuing without saving it", err)
+			c.noPersist = true
+		}
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -2248,11 +2290,15 @@ func (c *extractorCache) get(key string) ([]facts.Fact, bool) {
 	if err := json.Unmarshal(raw, &ff); err != nil {
 		return nil, false
 	}
-	c.next[key] = raw // keep the clean, pre-mutation bytes
-	// Hand the bytes over rather than sharing them. Each key is fetched at most once
-	// per run (one lookup per extractor in runExtractors), so leaving it in prev only
-	// pinned a second reference to every reused entry for the rest of the run — on a
-	// fully-warm kernel run, the entire 800 MB twice over.
+	// Write the clean, pre-mutation bytes straight through to the spool. They are
+	// already in memory, so this costs a copy to a buffered file and buys their
+	// release: before write-through they stayed live until save, next to the facts
+	// they had just been decoded into.
+	c.writeEntry(key, raw)
+	// Drop the last reference. Each key is fetched at most once per run (one lookup
+	// per extractor in runExtractors), so keeping it in prev only pinned every
+	// reused entry for the rest of the run — on a fully-warm kernel run, 800 MB of
+	// bytes whose only remaining purpose was to be copied to disk unchanged.
 	delete(c.prev, key)
 	c.hits++
 	return ff, true
@@ -2260,108 +2306,179 @@ func (c *extractorCache) get(key string) ([]facts.Fact, bool) {
 
 // put stores ff for key. It marshals immediately (before the engine tags or
 // otherwise mutates the facts) so the persisted bytes stay clean.
+//
+// A no-op when this cache will never be saved: encoding is the single largest
+// allocation in a snapshot, and doing it for bytes nobody will write is the most
+// expensive way to do nothing. See the noPersist field.
+//
+// The facts are encoded ONE AT A TIME into the spool's buffer rather than through
+// json.Marshal (or json.Encoder, which is no better — it marshals the whole value
+// into an internal buffer before writing a byte). A whole extractor's output is
+// 800 MB on a kernel-sized repository; a single fact is a few hundred bytes, and
+// becomes garbage as soon as it is written.
 func (c *extractorCache) put(key string, ff []facts.Fact) {
-	raw, err := json.Marshal(ff)
-	if err != nil {
+	if c.noPersist || c.closed {
 		return
 	}
-	c.next[key] = raw
+	if !c.beginEntry(key) {
+		return
+	}
+	_, _ = c.w.WriteString("[")
+	for i := range ff {
+		if i > 0 {
+			_, _ = c.w.WriteString(",")
+		}
+		b, err := json.Marshal(ff[i])
+		if err != nil {
+			c.fail(fmt.Errorf("encoding cached fact %q: %w", ff[i].Name, err))
+			return
+		}
+		_, _ = c.w.Write(b)
+	}
+	_, _ = c.w.WriteString("]")
 }
 
-// save writes the keys used this run to path, stamped with the binary that produced
-// them so a later run by a different build discards rather than reuses them.
+// openSpool creates the temp file this run streams into and writes the header.
 //
-// It streams into a temp file and renames, for two reasons. Marshalling the whole
-// cacheFile built one []byte as large as the file — 800 MB on a kernel-sized repo, on
-// top of the entries it was copying from — at the very end of a run, when the fact
-// store and graph are both still live. And the previous os.WriteFile left a truncated
-// file behind if the process died mid-write, which the next run would read as a cold
-// cache: correct, but it silently threw away a whole warm run.
-func (c *extractorCache) save(path string) error {
-	// Staged in the same directory so the rename stays on one filesystem: across a
-	// mount boundary os.Rename fails with EXDEV and the atomicity is lost.
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+// The header goes out FIRST and in this order because decode depends on it: version
+// and build precede entries, which is what lets a stale cache be rejected after a few
+// dozen bytes instead of after parsing 800 MB and throwing it away.
+func (c *extractorCache) openSpool() error {
+	if err := os.MkdirAll(filepath.Dir(c.dest), 0o755); err != nil {
+		return err
+	}
+	// Staged in the destination directory so the rename stays on one filesystem.
+	tmp, err := os.CreateTemp(filepath.Dir(c.dest), "."+filepath.Base(c.dest)+".tmp-")
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer func() {
-		// No-op once the rename has succeeded; cleans up on every failure path.
-		_ = os.Remove(tmpName)
-	}()
+	c.tmp = tmp
+	c.w = bufio.NewWriterSize(tmp, cacheBufSize)
 
-	w := bufio.NewWriterSize(tmp, cacheBufSize)
-	if err := c.encode(w); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := w.Flush(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err // CreateTemp makes 0600; match the mode WriteFile used to produce
-	}
-	return os.Rename(tmpName, path)
-}
-
-// encode writes the cacheFile shape (see that type) entry by entry.
-//
-// Keys are emitted in sorted order because json.Marshal sorts map keys, and the file
-// stayed a pure function of its contents as a result. Nothing hashes the cache, so
-// this is not load-bearing — but a cache file that reorders itself on every write for
-// no reason is a bad thing to hand somebody debugging a stale-facts report.
-//
-// w is a *bufio.Writer rather than an io.Writer so that write errors can be ignored
-// here and collected once at Flush: bufio records the first error and turns every
-// subsequent write into a no-op.
-func (c *extractorCache) encode(w *bufio.Writer) error {
 	ver, err := json.Marshal(cacheVersion)
 	if err != nil {
-		return err
+		return c.abandonSpool(err)
 	}
 	build, err := json.Marshal(buildIdentity())
 	if err != nil {
+		return c.abandonSpool(err)
+	}
+	_, _ = c.w.WriteString(`{"version":`)
+	_, _ = c.w.Write(ver)
+	_, _ = c.w.WriteString(`,"build":`)
+	_, _ = c.w.Write(build)
+	_, _ = c.w.WriteString(`,"entries":{`)
+	return nil
+}
+
+// abandonSpool tears down a half-opened spool and returns err, so openSpool's
+// failure paths cannot leak the temp file.
+func (c *extractorCache) abandonSpool(err error) error {
+	if c.tmp != nil {
+		name := c.tmp.Name()
+		_ = c.tmp.Close()
+		_ = os.Remove(name)
+		c.tmp, c.w = nil, nil
+	}
+	return err
+}
+
+// beginEntry writes the `"key":` prefix (and the separating comma after the first
+// entry), reporting whether the caller should go on to write the value. It returns
+// false once a write has failed, so a broken spool stops accumulating rather than
+// producing a file that is half-valid.
+func (c *extractorCache) beginEntry(key string) bool {
+	if c.noPersist || c.closed || c.werr != nil {
+		return false
+	}
+	kb, err := json.Marshal(key)
+	if err != nil {
+		c.fail(err)
+		return false
+	}
+	if c.entries > 0 {
+		_, _ = c.w.WriteString(",")
+	}
+	c.entries++
+	_, _ = c.w.Write(kb)
+	_, _ = c.w.WriteString(":")
+	return true
+}
+
+// writeEntry emits a whole pre-encoded entry, used for bytes carried forward from a
+// previous run's file (see get). Empty values are skipped: decode never produces one
+// and put never writes one, but emitting `"key":` with no value would make the entire
+// file unparseable, which is worth one branch to prevent.
+func (c *extractorCache) writeEntry(key string, raw json.RawMessage) {
+	if len(raw) == 0 || !c.beginEntry(key) {
+		return
+	}
+	_, _ = c.w.Write(raw)
+}
+
+// fail records the first write or encode error. bufio latches its own errors the same
+// way, so later writes are harmless no-ops and save reports the original cause.
+func (c *extractorCache) fail(err error) {
+	if c.werr == nil {
+		c.werr = err
+	}
+}
+
+// save closes the entries object and renames the spool into place, so a reader either
+// sees the previous cache or this one and never a half-written file. A process that
+// dies mid-run leaves only the temp file, which nothing reads.
+//
+// It writes to the path the cache was opened with. There is no path argument: the temp
+// file has to be created next to its destination for the rename to stay on one
+// filesystem, so the destination is fixed when the cache is created, and a save
+// elsewhere could not honour it.
+//
+// Entries appear in the order they were produced — extractor order — rather than
+// sorted, which is the one observable change from buffering them. That order is still
+// a pure function of the repository and config, so a cache file does not churn between
+// runs; it simply is not sorted. Sorting would mean holding every entry to the end,
+// which is the thing this exists to stop.
+func (c *extractorCache) save() error {
+	if c.noPersist || c.closed {
+		return nil
+	}
+	c.closed = true
+	if c.werr != nil {
+		return c.abandonSpool(c.werr)
+	}
+
+	tmpName := c.tmp.Name()
+	_, _ = c.w.WriteString("}}")
+	if err := c.w.Flush(); err != nil {
+		return c.abandonSpool(err)
+	}
+	if err := c.tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		c.tmp, c.w = nil, nil
 		return err
 	}
-	_, _ = w.WriteString(`{"version":`)
-	_, _ = w.Write(ver)
-	_, _ = w.WriteString(`,"build":`)
-	_, _ = w.Write(build)
-	_, _ = w.WriteString(`,"entries":{`)
-
-	keys := make([]string, 0, len(c.next))
-	for k := range c.next {
-		keys = append(keys, k)
+	c.tmp, c.w = nil, nil
+	// CreateTemp makes 0600; match the mode os.WriteFile used to produce.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		_ = os.Remove(tmpName)
+		return err
 	}
-	sort.Strings(keys)
-
-	first := true
-	for _, k := range keys {
-		raw := c.next[k]
-		if len(raw) == 0 {
-			// put never stores an empty value and decode never produces one, so this
-			// is unreachable — but writing it would emit `"key":` with no value and
-			// make the whole file unparseable, which is worth one branch to prevent.
-			continue
-		}
-		if !first {
-			_, _ = w.WriteString(",")
-		}
-		first = false
-		kb, err := json.Marshal(k)
-		if err != nil {
-			return err
-		}
-		_, _ = w.Write(kb)
-		_, _ = w.WriteString(":")
-		_, _ = w.Write(raw)
+	if err := os.Rename(tmpName, c.dest); err != nil {
+		_ = os.Remove(tmpName)
+		return err
 	}
-	_, _ = w.WriteString("}}")
 	return nil
+}
+
+// discard closes the spool without publishing it. It must be called on every path
+// that does not reach save — a snapshot that fails during extraction, say — or the
+// temp file survives the process. Safe to call after save, and safe to defer.
+func (c *extractorCache) discard() {
+	if c.closed {
+		return
+	}
+	c.closed = true
+	_ = c.abandonSpool(nil)
 }
 
 // computeExtractorKeys returns a cache key for every extractor that implements

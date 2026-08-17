@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
+
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 )
 
 // Stimulus declares its magic accessors through two static class fields —
@@ -20,18 +22,18 @@ import (
 
 // stimulusStaticField reports whether a class member is one of Stimulus's
 // static declaration fields on a controller file.
-func stimulusStaticField(member *sitter.Node, name, relFile string) bool {
+func stimulusStaticField(kinds *tsutil.KindTable, member *sitter.Node, name, relFile string) bool {
 	if name != "targets" && name != "values" {
 		return false
 	}
-	if member.Kind() != "public_field_definition" {
+	if kindOf(kinds, member) != "public_field_definition" {
 		return false
 	}
 	if !stimulusControllerFile(relFile) {
 		return false
 	}
 	for i := uint(0); i < member.ChildCount(); i++ {
-		if member.Child(i).Kind() == "static" {
+		if kindOf(kinds, member.Child(i)) == "static" {
 			return true
 		}
 	}

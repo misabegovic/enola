@@ -9,8 +9,9 @@ searching the web will not tell you.
 
 **Fact** — the unit of the graph, and the only thing enola treats as knowledge. A fact
 is one typed thing that exists in your code: a `module`, a `symbol`, a `route`, a
-`storage` target, a `dependency`, or a `service` (a whole repository, in a multi-repo
-graph). Every fact is derived by a parser or a deterministic algorithm — never guessed
+`storage` target, a `dependency`, an `association` (a model's declared relation to
+another, which is what lets a query walk from a URL to the tables behind it), or a
+`service` (a whole repository, in a multi-repo graph). Every fact is derived by a parser or a deterministic algorithm — never guessed
 by a model, never retrieved by similarity.
 
 **Relation / edge** — a typed link between facts: `imports`, `calls`, `declares`,
@@ -27,7 +28,7 @@ extraction and before any analysis.
 
 ## What enola computes
 
-**Explainer** — an analysis that reads the fact graph and emits findings. There are ten.
+**Explainer** — an analysis that reads the fact graph and emits findings. There are fifteen.
 See [docs/EXPLAINERS.md](EXPLAINERS.md).
 
 **Finding** (also **insight**) — one claim an explainer makes, carrying a title, a
@@ -71,6 +72,14 @@ kept in `.enola/baseline/`). It survives later snapshots, so it stays valid acro
 rounds of edits. `previous/` is the automatic one-step-back baseline, rotated on every
 run.
 
+**Repo label** — the short name every fact is tagged with, naming the repository it came
+from (`internal/facts`, `pkg/command`, … all carry one). It is the repository's own name
+taken from its git remote when the indexed directory is that repository's root, and the
+checkout directory name otherwise. It is an identity, not a display string: a delta
+matches facts on it, so two snapshots of one repository under different labels share
+nothing and enola declines to compare them rather than reporting the whole graph as
+rewritten.
+
 **Append mode / composed graph** — loading more than one repository into a single graph,
 so cross-repo edges can be resolved. Some explainers (`crossrepo`, `coverage`,
 `unused-routes`) only produce findings here, because there is nothing cross-repo to
@@ -92,6 +101,11 @@ touched. This is the only category that can fail a build.
 
 **Improvement** — the mirror: a finding that was there, is gone, and cites something
 your change touched.
+
+**Descriptive finding** — a finding that says what the graph *is* rather than what is
+wrong with it: which architecture pattern was matched, that a cluster config overrode a
+repo's own declaration. Exact, worth reporting, and **never graded** — declaring a layer
+order produces one, and grading it would fail the very change that declared it.
 
 **Incidental shift** — a finding that appeared or cleared without your change touching
 anything it cites. Usually a moving statistical threshold, or a ranked list re-ordering

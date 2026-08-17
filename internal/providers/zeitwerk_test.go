@@ -15,7 +15,7 @@ import (
 // the test exercises the checked-in script rather than a copy.
 func zeitwerkScript(t *testing.T) string {
 	t.Helper()
-	path, err := filepath.Abs(filepath.Join("..", "..", "providers", "zeitwerk", "enola_zeitwerk_provider.rb"))
+	path, err := filepath.Abs(filepath.Join("..", "..", "examples", "providers", "ruby", "zeitwerk", "enola_zeitwerk_provider.rb"))
 	if err != nil {
 		t.Fatal(err)
 	}

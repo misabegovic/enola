@@ -31,6 +31,13 @@ Fixtures: [`ts_sample`](../../internal/engine/testdata/repos/ts_sample/) ·
 | an ember-data `Model` subclass | a model with its dasherized name | `storage` |
 | top-level statements | a `file_ref` carrying the call edges | `file_ref` |
 | `*.test.ts`, `*.spec.tsx` | a reference-only `test_ref` | `test_ref` |
+| `constructor(…)` | a symbol like any other member | `symbol` |
+| `@Input()` on a class member | the member's `decorators` prop | `symbol` |
+| `get total()` | a symbol, not a skipped accessor | `symbol` |
+| `class A extends B` | an `extends` prop naming the base and the module it came from | `symbol` |
+| `exports.name = function` (CommonJS) | a declared symbol | `symbol` |
+| `this.x = …` inside a method | the method's `assigns_fields` prop | `symbol` |
+| any function or method | `takes_parameters`, whether it declares one at all | `symbol` |
 
 ## Routes — NestJS controller prefixes
 
@@ -67,6 +74,44 @@ route  /admin/users/:id/ban server/index.js:20  props: framework=express, method
 `unmatched_by_clients=true` is what the `unused-routes` explainer reports: an endpoint
 this repository serves that no loaded client calls. It is a *candidate* at confidence
 `0.6`, not a verdict — the client may simply not be in the graph.
+
+### Mounts across files
+
+A sub-router is almost never mounted in the file that declares it. The paths written
+there are **fragments** — `router.post('/login')` in `routes/webhooks.js` serves
+`/webhooks/login`, because `index.js` mounts it — so neither file can produce the
+route on its own, and emitting the fragment would be a wrong fact rather than a
+missing one.
+
+A repo-wide pass resolves the two halves, the same way the Go extractor composes
+gorilla/mux subrouters and the Rust one composes Axum's `.nest()`:
+
+```js
+// server/index.js
+const webhookRoutes = require('./routes/webhooks');
+app.use('/webhooks', webhookRoutes);
+```
+
+```js
+// server/routes/webhooks.js
+router.post('/login', handler);
+module.exports = router;
+```
+
+```
+route  /webhooks/login  server/routes/webhooks.js:12  props: framework=express, method=POST,
+                                                             mount_composed=true
+```
+
+`mount_composed=true` marks a path assembled from more than one file. Resolution
+covers ESM and CommonJS, renamed named exports (`export { router as api }`), a router
+returned by a factory (`app.use('/api', routes())`), and mounts nested several files
+deep; a router mounted at two prefixes emits its routes at both.
+
+What it will not do is guess. A non-literal prefix (`app.use(base, router)`), a router
+imported from an external package, and a router nothing mounts all emit **nothing** —
+the same silence as before, on the grounds that a wrong path can false-match another
+repository's route, which is worse than a missing one.
 
 ## Client calls, and how a near-miss is reported
 
@@ -260,7 +305,8 @@ reached from another repository in another language.
 - **Paths without a leading `/`.** A bare `"users"` string is too ambiguous to treat as a
   request path.
 - **Runtime-registered routes** — an Express router assembled in a loop over a config
-  array is not unrolled.
+  array is not unrolled, and a mount whose prefix is a variable rather than a literal
+  is not resolved.
 - **Ember names the default resolver cannot map.** Addon components (they resolve
   into `node_modules`), pods layout, custom resolvers, and engine mount points
   produce no edge; the misses are recorded in `ember_unresolved`, not guessed at.

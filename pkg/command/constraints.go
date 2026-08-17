@@ -80,7 +80,7 @@ func (r *Runner) Constraints(args []string) {
 	problems += r.lintResolveComponents(tgt.engine, tgt.repoPaths[0], declared)
 
 	if problems > 0 {
-		fmt.Printf("\nFAIL — %s.\n", plural(problems, "validation problem", "validation problems"))
+		fmt.Printf("\nFAIL — %s.\n", plural(problems, "validation problem"))
 		os.Exit(1)
 	}
 	fmt.Println("\nOK — every declaration is valid.")
@@ -137,7 +137,7 @@ func (r *Runner) lintRepoDeclaration(clusterDecl *intent.Declaration, repoPath s
 	case clusterDecl != nil:
 		fmt.Printf("\n%s: declared by the cluster config's intent entry.\n", label)
 	case hasFile && hasDir:
-		fmt.Printf("\n%s: declared by %s plus %s under %s/.\n", label, intent.RepoFileName, plural(len(dirFiles), "constraints file", "constraints files"), intent.ConstraintsDirName)
+		fmt.Printf("\n%s: declared by %s plus %s under %s/.\n", label, intent.RepoFileName, plural(len(dirFiles), "constraints file"), intent.ConstraintsDirName)
 	case hasDir:
 		fmt.Printf("\n%s: declared by constraints files under %s/.\n", label, intent.ConstraintsDirName)
 	default:
@@ -170,7 +170,7 @@ func (r *Runner) lintRepoDeclaration(clusterDecl *intent.Declaration, repoPath s
 			if len(binds) > 0 {
 				bound = strings.Join(binds, ", ")
 			}
-			fmt.Printf("    use_recipe %s (recipe %s): binds %s, expands %s\n", inst.As, inst.Recipe, bound, plural(expanded, "rule", "rules"))
+			fmt.Printf("    use_recipe %s (recipe %s): binds %s, expands %s\n", inst.As, inst.Recipe, bound, plural(expanded, "rule"))
 		}
 	}
 	for _, rec := range recipes {
@@ -178,7 +178,7 @@ func (r *Runner) lintRepoDeclaration(clusterDecl *intent.Declaration, repoPath s
 		for _, role := range rec.Roles {
 			roles = append(roles, role.Name)
 		}
-		fmt.Printf("  %s: recipe %s — roles %s, %s\n", rec.Path, rec.Name, strings.Join(roles, ", "), plural(len(rec.Rules), "rule", "rules"))
+		fmt.Printf("  %s: recipe %s — roles %s, %s\n", rec.Path, rec.Name, strings.Join(roles, ", "), plural(len(rec.Rules), "rule"))
 	}
 	report := func(source string, list []string) {
 		for _, p := range list {
@@ -316,13 +316,4 @@ func exemptionCount(rules []intent.ConstraintRule) int {
 
 func (r *Runner) constraintsFatal(format string, args ...any) {
 	r.cmdFatal("constraints", format, args...)
-}
-
-// plural renders a count with the right noun — pkg/check keeps its own copy;
-// neither package should import the other for a formatting helper.
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return fmt.Sprintf("%d %s", n, one)
-	}
-	return fmt.Sprintf("%d %s", n, many)
 }

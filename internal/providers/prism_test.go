@@ -15,7 +15,7 @@ import (
 // test exercises the checked-in script rather than a copy.
 func prismScript(t *testing.T) string {
 	t.Helper()
-	path, err := filepath.Abs(filepath.Join("..", "..", "providers", "prism", "enola_prism_provider.rb"))
+	path, err := filepath.Abs(filepath.Join("..", "..", "examples", "providers", "ruby", "prism", "enola_prism_provider.rb"))
 	if err != nil {
 		t.Fatal(err)
 	}

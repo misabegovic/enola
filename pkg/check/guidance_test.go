@@ -81,17 +81,17 @@ func TestAttachGuidance_NeverAffectsTheExitCodeInAnyMode(t *testing.T) {
 		policy   Policy
 		wantExit int
 	}{
-		"clean stays 0": {guidedDelta(), Policy{}, 0},
+		"clean stays 0": {guidedDelta(), legacyDefault(), 0},
 		"regression stays 1": {&diff.SnapshotDiff{
 			Comparability: diff.Comparability{Comparable: true},
 			FactsAdded:    guidedDelta().FactsAdded,
 			FindingsNew:   []facts.Insight{failing},
-		}, Policy{}, 1},
+		}, legacyDefault(), 1},
 		"warn-only stays 0": {&diff.SnapshotDiff{
 			Comparability: diff.Comparability{Comparable: true},
 			FactsAdded:    guidedDelta().FactsAdded,
 			FindingsNew:   []facts.Insight{failing},
-		}, Policy{WarnOnly: true}, 0},
+		}, Policy{FailExplainers: []string{"cycles"}, WarnOnly: true}, 0},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

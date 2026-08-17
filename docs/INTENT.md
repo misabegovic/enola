@@ -31,6 +31,73 @@ citations, ownership fields), your tooling can *derive* the
 `enola_intent:` block from them — but that derivation is your side of
 the boundary; enola's contract is the block itself.
 
+## The repo and cluster schema
+
+`enola-intent.yaml` at a repo's root and one entry of a cluster
+config's `intent:` block are **the same schema**, which is why an
+entry overrides a repo file wholesale rather than merging into it.
+Every section is optional; declaring nothing is not an error:
+
+```yaml
+service:                   # this repo's declared identity
+  name: backend
+  description: order and payment API
+consumes:                  # seams this repo intends to call
+  - {repo: payments, via: http}
+serves:                    # mechanisms this repo offers its callers
+  - {via: http, description: public REST API}
+layers:                    # this repo's layer order, outermost first
+  - {name: handlers, paths: ["app/handlers/**"]}
+  - {name: domain,   paths: ["app/domain/**"]}
+  - {name: storage,  paths: ["app/storage/**"]}
+```
+
+In a cluster config the same document is nested one level under the
+repo's label, because the file describes an estate rather than a repo:
+
+```yaml
+intent:
+  backend:
+    consumes:
+      - {repo: payments, via: http}
+```
+
+**`layers:` here is a flat, ordered list of `{name, paths}`** — the
+file already knows which repo it is about, so no `repo:` key. That is
+the one place this schema and the page schema below genuinely differ,
+and the difference is not cosmetic: a page can declare layers *for*
+several repos, so its entries name their owner and nest the order
+under `order:`. Getting it backwards is a validation error naming the
+missing field, never a silently ignored section.
+
+Declaring a layer order buys more than documentation. The `layers`
+explainer verdicts a declared order at confidence `1.00` — declared,
+not recognised — where a pattern it inferred for itself caps at
+`0.80`. Since `enola check` gates at a `1.00` floor, only a declared
+order is enforceable with `--fail-on=layers` alone; an inferred one
+also needs `--min-confidence=0.8`.
+
+`--fail-on` is the whole opt-in: enola fails nothing until it is
+passed, so a declared layer order is a rule you wrote down and then
+chose to enforce, in that order.
+
+enola's own [`enola-intent.yaml`](../enola-intent.yaml) is the worked
+example, and its CI runs `--fail-on=layers` against it. Two things in
+it are worth copying: the layers are grouped by ROLE rather than by
+directory tree (`pkg/` and `internal/` both appear at several levels,
+because visibility is not a layer), and the file states in prose why
+each boundary is where it is — a declaration nobody can explain is one
+nobody will maintain. What it deliberately does not declare is anything
+about cycles: Go's compiler already refuses those between packages, and
+a declaration that restates the toolchain earns nothing.
+
+**Declaring an order does not fail the pull request that declares it.**
+The `layers` explainer emits an exact finding announcing the pattern it
+matched, which is a description rather than a violation; the gate
+routes those to a `Descriptive (never graded)` section and never counts
+them. The first thing your new declaration reports is therefore itself,
+harmlessly.
+
 ## The page schema
 
 A page opts in by carrying `enola_intent:` in its frontmatter. Four
@@ -54,8 +121,8 @@ enola_intent:
   consumes:                  # seams: who intends to call whom, and how
     - {repo: mobile, target: backend, via: graphql}
   layers:                    # a repo's declared layer order, outermost first
-    - repo: backend
-      order:
+    - repo: backend          # named here — one page may declare layers for several repos
+      order:                 # (the repo-file form above is a flat list, with no repo:)
         - {name: handlers, paths: ["app/handlers/**"]}
         - {name: domain,   paths: ["app/domain/**"]}
   claims:                    # measurable statements, re-verdicted every snapshot
@@ -1357,7 +1424,7 @@ file census applies to its own walk.
 
 ### The runtime provider
 
-`providers/runtime/enola_runtime_provider.rb` is the reference
+`examples/providers/ruby/runtime/enola_runtime_provider.rb` is the reference
 collector for runtime-observed facts. It reads capture files from
 `.enola-runtime/*.json` in the target repository — captures an
 operator produced by running the app, never something the snapshot
@@ -1392,7 +1459,7 @@ application is not a static route the linker could assess.
 
 ### The RBS/Sorbet provider
 
-`providers/rbs/enola_rbs_provider.rb` brings declared Ruby types into
+`examples/providers/ruby/rbs/enola_rbs_provider.rb` brings declared Ruby types into
 the graph as facts. One provider covers both signature dialects: RBS
 files (`**/*.rbs`), Sorbet interface files (`**/*.rbi`), and inline
 Sorbet `sig { }` blocks in `**/*.rb` — pure-Ruby stdlib parsing (a

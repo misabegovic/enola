@@ -179,7 +179,7 @@ func TestLinkDeclaredContracts_StaysInsideTheWindow(t *testing.T) {
 
 func rbsScript(t *testing.T) string {
 	t.Helper()
-	path, err := filepath.Abs(filepath.Join("..", "..", "providers", "rbs", "enola_rbs_provider.rb"))
+	path, err := filepath.Abs(filepath.Join("..", "..", "examples", "providers", "ruby", "rbs", "enola_rbs_provider.rb"))
 	if err != nil {
 		t.Fatal(err)
 	}
