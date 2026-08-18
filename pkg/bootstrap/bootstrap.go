@@ -485,6 +485,7 @@ func NewServer(eng *Engine, cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 	srv.SetPlanEngineFactory(PlanEngineFactory(cfg))
+	srv.SetReloader(func() map[string]int { return AutoLoadSnapshot(eng, cfg) })
 	// The one place the soft memory limit is worth announcing. ConfigureRuntime is
 	// silent (see its doc) because a working default is not news on every CLI
 	// invocation — but a server is long-lived, holds whole graphs in memory, and its

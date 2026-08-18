@@ -251,6 +251,19 @@ type rubyBodyMetrics struct {
 	// extractor states what it saw and the consumer joins it.
 	blockBindings []string
 	blockSeen     map[string]bool
+	// localChains remembers, per local, the receiver chain it was last assigned
+	// from (`users = company.users.active` -> users: [company users active]), so a
+	// binding on that local names the relation it was built from rather than the
+	// local's name. A local assigned from a chain that starts with itself
+	// (`x = x.includes(:y)`) extends its own chain.
+	localChains map[string][]string
+	// batchLoader marks a body that hands per-element reads to BatchLoader.for:
+	// the loop inside its batch block is batched by construction.
+	batchLoader bool
+	// params are the method's parameter names, emitted only alongside block
+	// bindings, so the consumer of those can tell a collection that arrives as
+	// an argument (typed by nothing but its name) from one the body built.
+	params []string
 
 	// localTypes records `name=Class` for a variable assigned from a constant's
 	// factory or finder. It is the receiver information this graph has never
@@ -263,6 +276,25 @@ type rubyBodyMetrics struct {
 	// seven candidates and zero true findings.
 	localTypes []string
 	localSeen  map[string]bool
+
+	// unpersistedLocals records the names in localTypes whose typing call was
+	// `new`: the receiver is an instance the graph knows the type of, and one
+	// that has never been saved, so reading an association on it builds in
+	// memory and issues no query. `Company.new(...)` followed by
+	// `company.pages.build` in a loop is a mock, not an N+1. Kept apart from
+	// localTypes so consumers that only need the type read nothing new.
+	unpersistedLocals []string
+	unpersistedSeen   map[string]bool
+
+	// preloads records every association name handed to `includes`,
+	// `preload` or `eager_load` in the body, symbols and hash keys and values
+	// alike, so a consumer can tell an association read that hits a preloaded
+	// cache from one that queries per element. Recorded, not resolved: the
+	// extractor cannot see whether the relation that was preloaded is the one
+	// being iterated, so this is a per-method statement of intent that a
+	// consumer weighs, and it errs toward silence.
+	preloads    []string
+	preloadSeen map[string]bool
 }
 
 // typingMethods are the constant-receiver calls whose result is an instance of
@@ -289,6 +321,34 @@ func (m *rubyBodyMetrics) recordLocalType(name, class string) {
 	m.localTypes = append(m.localTypes, entry)
 }
 
+func (m *rubyBodyMetrics) recordUnpersistedLocal(name string) {
+	if m == nil || name == "" {
+		return
+	}
+	if m.unpersistedSeen == nil {
+		m.unpersistedSeen = map[string]bool{}
+	}
+	if m.unpersistedSeen[name] {
+		return
+	}
+	m.unpersistedSeen[name] = true
+	m.unpersistedLocals = append(m.unpersistedLocals, name)
+}
+
+func (m *rubyBodyMetrics) recordPreload(association string) {
+	if m == nil || association == "" {
+		return
+	}
+	if m.preloadSeen == nil {
+		m.preloadSeen = map[string]bool{}
+	}
+	if m.preloadSeen[association] {
+		return
+	}
+	m.preloadSeen[association] = true
+	m.preloads = append(m.preloads, association)
+}
+
 func (m *rubyBodyMetrics) recordBlockBinding(param, collection string) {
 	if m == nil || param == "" || collection == "" {
 		return
@@ -302,6 +362,77 @@ func (m *rubyBodyMetrics) recordBlockBinding(param, collection string) {
 	}
 	m.blockSeen[entry] = true
 	m.blockBindings = append(m.blockBindings, entry)
+}
+
+func (m *rubyBodyMetrics) recordLocalChain(name string, chain []string) {
+	if m == nil || name == "" || len(chain) == 0 {
+		return
+	}
+	if m.localChains == nil {
+		m.localChains = map[string][]string{}
+	}
+	m.localChains[name] = m.spliceChain(chain)
+}
+
+// spliceChain replaces a chain's first segment with the chain that local was
+// assigned from, when there is one, so every chain bottoms out in what the body
+// actually started from.
+func (m *rubyBodyMetrics) spliceChain(chain []string) []string {
+	if m == nil || len(chain) == 0 {
+		return chain
+	}
+	base, ok := m.localChains[chain[0]]
+	if !ok {
+		return chain
+	}
+	out := make([]string, 0, len(base)+len(chain)-1)
+	out = append(out, base...)
+	out = append(out, chain[1:]...)
+	return out
+}
+
+// chainWrappers are receiverless calls whose result is their first argument's
+// relation, narrowed: `policy_scope(candidate.actions)` is still candidate.actions.
+var chainWrappers = map[string]bool{"policy_scope": true, "Array": true}
+
+// receiverChain flattens a receiver expression into the names along it, arguments
+// dropped: `Current.company.users.allowed_to_login.preload(:x)` becomes
+// [Current company users allowed_to_login preload]. Nil when the expression is
+// not a chain of names (an element reference, a literal, a ternary).
+func receiverChain(node *sitter.Node, src []byte) []string {
+	if node == nil {
+		return nil
+	}
+	switch kindOf(node) {
+	case "identifier", "instance_variable", "class_variable", "global_variable", "constant", "scope_resolution", "self":
+		return []string{rubyText(node, src)}
+	case "parenthesized_statements":
+		if node.NamedChildCount() == 1 {
+			return receiverChain(node.NamedChild(0), src)
+		}
+		return nil
+	case "call":
+		meth := node.ChildByFieldName("method")
+		if meth == nil {
+			return nil
+		}
+		name := rubyText(meth, src)
+		recv := node.ChildByFieldName("receiver")
+		if recv == nil {
+			if chainWrappers[name] {
+				if args := node.ChildByFieldName("arguments"); args != nil && args.NamedChildCount() > 0 {
+					return receiverChain(args.NamedChild(0), src)
+				}
+			}
+			return []string{name}
+		}
+		base := receiverChain(recv, src)
+		if base == nil {
+			return nil
+		}
+		return append(base, name)
+	}
+	return nil
 }
 
 // recordFieldAccess notes one instance-variable read or write on the method
@@ -415,6 +546,103 @@ var rubyCheapMethods = map[string]bool{
 	"last": true, "keys": true, "values": true, "key?": true, "include?": true,
 	"is_a?": true, "kind_of?": true, "instance_of?": true, "respond_to?": true,
 	"tap": true, "then": true, "itself": true, "send": true, "public_send": true,
+}
+
+// rubyPreloaders are the ActiveRecord calls that load associations ahead of
+// the reads that follow, so an association read on the elements of that
+// relation is a cache hit rather than a query per element.
+var rubyPreloaders = map[string]bool{"includes": true, "preload": true, "eager_load": true}
+
+// symbolNamesIn collects every symbol in an argument list, descending into
+// arrays and hashes so `includes(:questions, answers: :author)` yields
+// questions, answers and author. Interpolated symbols name nothing.
+// parameterNames lists a method's parameter names in declaration order, the
+// bare identifier of each optional, keyword, splat or block parameter included.
+func parameterNames(params *sitter.Node, src []byte) []string {
+	if params == nil {
+		return nil
+	}
+	var out []string
+	for i := uint(0); i < params.NamedChildCount(); i++ {
+		p := params.NamedChild(i)
+		if p == nil {
+			continue
+		}
+		if kindOf(p) == "identifier" {
+			out = append(out, rubyText(p, src))
+			continue
+		}
+		if name := p.ChildByFieldName("name"); name != nil {
+			out = append(out, rubyText(name, src))
+			continue
+		}
+		for j := uint(0); j < p.NamedChildCount(); j++ {
+			if c := p.NamedChild(j); c != nil && kindOf(c) == "identifier" {
+				out = append(out, rubyText(c, src))
+				break
+			}
+		}
+	}
+	return out
+}
+
+// preloadsIn collects every association named by an includes / preload /
+// eager_load call anywhere under node: the body of a scope lambda, or a
+// relation-returning expression.
+func preloadsIn(node *sitter.Node, src []byte) []string {
+	if node == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if kindOf(n) == "call" {
+			if meth := n.ChildByFieldName("method"); meth != nil && rubyPreloaders[rubyText(meth, src)] {
+				for _, a := range symbolNamesIn(n.ChildByFieldName("arguments"), src) {
+					if !seen[a] {
+						seen[a] = true
+						out = append(out, a)
+					}
+				}
+			}
+		}
+		for i := uint(0); i < n.ChildCount(); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(node)
+	sort.Strings(out)
+	return out
+}
+
+func symbolNamesIn(args *sitter.Node, src []byte) []string {
+	if args == nil {
+		return nil
+	}
+	var out []string
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		switch kindOf(n) {
+		case "simple_symbol":
+			out = append(out, strings.TrimPrefix(rubyText(n, src), ":"))
+			return
+		case "hash_key_symbol":
+			out = append(out, rubyText(n, src))
+			return
+		}
+		for i := uint(0); i < n.ChildCount(); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(args)
+	return out
 }
 
 // --- scope helpers ---
@@ -769,7 +997,7 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	// references. Walk them with metrics off (params are not the body, so they must
 	// not affect the complexity score); seen is shared so body calls still dedup.
 	w.walkForCalls(node.ChildByFieldName("parameters"), ownerIdx, seen, locals)
-	w.metrics = &rubyBodyMetrics{}
+	w.metrics = &rubyBodyMetrics{params: parameterNames(node.ChildByFieldName("parameters"), w.src)}
 	w.loopDepth = 0
 	w.selfName = fullName
 	w.selfShort = name
@@ -795,6 +1023,20 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	if len(w.metrics.blockBindings) > 0 {
 		sort.Strings(w.metrics.blockBindings)
 		props["block_bindings"] = w.metrics.blockBindings
+	}
+	if len(w.metrics.unpersistedLocals) > 0 {
+		sort.Strings(w.metrics.unpersistedLocals)
+		props["unpersisted_locals"] = w.metrics.unpersistedLocals
+	}
+	if len(w.metrics.preloads) > 0 {
+		sort.Strings(w.metrics.preloads)
+		props["preloads"] = w.metrics.preloads
+	}
+	if w.metrics.batchLoader {
+		props["batch_loader"] = true
+	}
+	if len(w.metrics.params) > 0 && len(w.metrics.blockBindings) > 0 {
+		props["params"] = w.metrics.params
 	}
 	if len(w.metrics.localTypes) > 0 {
 		sort.Strings(w.metrics.localTypes)
@@ -995,6 +1237,14 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 	case "call":
 		method := node.ChildByFieldName("method")
 		recv := node.ChildByFieldName("receiver")
+		if method != nil && rubyPreloaders[rubyText(method, w.src)] && w.metrics != nil {
+			for _, association := range symbolNamesIn(node.ChildByFieldName("arguments"), w.src) {
+				w.metrics.recordPreload(association)
+			}
+		}
+		if method != nil && recv != nil && w.metrics != nil && rubyText(method, w.src) == "for" && rubyText(recv, w.src) == "BatchLoader" {
+			w.metrics.batchLoader = true
+		}
 		// Dynamic dispatch by LITERAL name — `obj.try(:foo)`, `send(:bar)`,
 		// `respond_to?(:baz)` — names the target method exactly, so record it as a
 		// call. Safe-nav `&.try` still exposes the `method` child. Distinct from an
@@ -1090,7 +1340,11 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 			// collection whose target the consumer can resolve.
 			if isVarReceiver(recv.Kind()) || recv.Kind() == "call" {
 				if param := blockParamName(block, w.src); param != "" {
-					w.metrics.recordBlockBinding(param, lastSegment(rubyText(recv, w.src)))
+					collection := lastSegment(rubyText(recv, w.src))
+					if chain := receiverChain(recv, w.src); len(chain) > 0 {
+						collection = strings.Join(w.metrics.spliceChain(chain), ".")
+					}
+					w.metrics.recordBlockBinding(param, collection)
 				}
 			}
 		}
@@ -1145,7 +1399,13 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 				if recv != nil && meth != nil && recv.Kind() == "constant" &&
 					typingMethods[rubyText(meth, w.src)] {
 					w.metrics.recordLocalType(rubyText(left, w.src), rubyText(recv, w.src))
+					if rubyText(meth, w.src) == "new" {
+						w.metrics.recordUnpersistedLocal(rubyText(left, w.src))
+					}
 				}
+			}
+			if right := node.ChildByFieldName("right"); right != nil && w.metrics != nil {
+				w.metrics.recordLocalChain(rubyText(left, w.src), receiverChain(right, w.src))
 			}
 		}
 		if left := node.ChildByFieldName("left"); left != nil && left.Kind() == "instance_variable" {
@@ -1838,16 +2098,21 @@ func (w *rubyWalker) handleBodyCall(node *sitter.Node) {
 		if name == "" {
 			return
 		}
+		props := map[string]any{
+			"symbol_kind": facts.SymbolFunc,
+			"language":    "ruby",
+			"scope":       true,
+			"model":       w.cur().name,
+		}
+		if preloads := preloadsIn(args, w.src); len(preloads) > 0 {
+			props["preloads"] = preloads
+		}
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: "scope:" + name,
-			File: w.relFile,
-			Line: line(node),
-			Props: map[string]any{
-				"symbol_kind": facts.SymbolFunc,
-				"language":    "ruby",
-				"scope":       true,
-			},
+			Kind:  facts.KindSymbol,
+			Name:  "scope:" + name,
+			File:  w.relFile,
+			Line:  line(node),
+			Props: props,
 		})
 	}
 }

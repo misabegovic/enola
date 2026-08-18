@@ -138,3 +138,142 @@ func TestANonAssociationMethodOnABoundElementIsNotReported(t *testing.T) {
 		t.Fatalf("a non-association read was reported:\n%s", out)
 	}
 }
+
+// A relation the method preloaded is read from the cache per element, so the
+// association read is not a query. TtGraphql::Queries::CannedResponsesQuery#resolve
+// carried `includes(:questions, ...)` and was reported anyway; the reviewer
+// rejected it, and this is that verdict as a rule.
+func TestAPreloadedAssociationReadIsNotReported(t *testing.T) {
+	f := bound("CannedResponsesQuery#resolve", []string{"r=canned_responses"}, []string{"r.questions", "r.answers"})
+	f.Props["preloads"] = []string{"questions"}
+	out := titles(t, store(
+		assoc("Company", "canned_responses", "CannedResponse"),
+		assoc("CannedResponse", "questions", "Question"),
+		assoc("CannedResponse", "answers", "Answer"),
+		f))
+	if strings.Contains(out, "r.questions") {
+		t.Fatalf("a preloaded association read was reported:\n%s", out)
+	}
+	if !strings.Contains(out, "r.answers") {
+		t.Fatalf("the association that was NOT preloaded must still be reported:\n%s", out)
+	}
+}
+
+// A local typed by `new` was never saved: its association reads build in
+// memory. BlockLayoutsController#mock_company built a Company.new and read its
+// associations in a loop; a rejected finding, now a rule. A persistence call on
+// it is still a round trip and stays reported.
+func TestAssociationReadsOnAnUnpersistedLocalAreNotReported(t *testing.T) {
+	f := facts.Fact{Kind: facts.KindSymbol, Name: "BlockLayoutsController#mock_company", Repo: "app", File: "app/x.rb",
+		Props: map[string]any{"language": "ruby", "loop_depth": 1,
+			"local_types":        []string{"company=Company"},
+			"unpersisted_locals": []string{"company"},
+			"calls_in_loop":      []string{"company.pages", "company.save"}}}
+	out := titles(t, store(model("Company"), assoc("Company", "pages", "Page"), f))
+	if strings.Contains(out, "company.pages") {
+		t.Fatalf("an association read on an unpersisted local was reported:\n%s", out)
+	}
+	if !strings.Contains(out, "company.save") {
+		t.Fatalf("a write on the unpersisted local is still a round trip and must be reported:\n%s", out)
+	}
+}
+
+func scopeFact(model, name string, preloads ...string) facts.Fact {
+	props := map[string]any{"language": "ruby", "scope": true, "model": model}
+	if len(preloads) > 0 {
+		props["preloads"] = preloads
+	}
+	return facts.Fact{Kind: facts.KindSymbol, Name: "scope:" + name, Repo: "app", File: "app/models/x.rb", Props: props}
+}
+
+// The preload sits on the scope the chain passes through, one hop from the
+// loop: `Current.company.users.allowed_to_login.preload(:authorizations)` was
+// the sibling session's enterprise_calendars fix, and a scope carrying the
+// includes is the recent_activity shape once the caller is followed.
+func TestAPreloadStatedByAScopeOnTheChainSilencesTheRead(t *testing.T) {
+	out := titles(t, store(
+		model("Action"), model("Candidate"),
+		assoc("Candidate", "actions", "Action"),
+		assoc("Action", "user", "User"),
+		assoc("Action", "candidate", "Candidate"),
+		assoc("Action", "comments", "Comment"),
+		scopeFact("Action", "activity_stream_for_candidate", "user", "candidate"),
+		bound("Presenter#recent", []string{"action=candidate.actions.activity_stream_for_candidate.where"}, []string{"action.user", "action.comments"})))
+	if strings.Contains(out, "action.user") {
+		t.Fatalf("a read the scope preloaded was reported:\n%s", out)
+	}
+	if !strings.Contains(out, "action.comments") {
+		t.Fatalf("a read the scope did not preload must still be reported:\n%s", out)
+	}
+}
+
+// A class-level relation walks back to the constant: `Action.recent.each`
+// types the element as Action, and the scope's preloads join.
+func TestAClassLevelRelationTypesItsElementsAndJoinsScopePreloads(t *testing.T) {
+	out := titles(t, store(
+		model("Action"),
+		assoc("Action", "user", "User"),
+		assoc("Action", "comments", "Comment"),
+		scopeFact("Action", "recent", "user"),
+		bound("Report#run", []string{"action=Action.recent.limit"}, []string{"action.user", "action.comments"})))
+	if strings.Contains(out, "action.user") || !strings.Contains(out, "action.comments") {
+		t.Fatalf("class-level relation resolution wrong:\n%s", out)
+	}
+}
+
+// `def users; company.users.preload(:authorizations); end` then `users.each`:
+// the preload lives on a same-class method the chain starts from.
+func TestAPreloadStatedByASameClassMethodSilencesTheRead(t *testing.T) {
+	helper := facts.Fact{Kind: facts.KindSymbol, Name: "Exporter#users", Repo: "app", File: "app/x.rb",
+		Props: map[string]any{"language": "ruby", "preloads": []string{"authorizations"}}}
+	out := titles(t, store(
+		model("User"),
+		assoc("Company", "users", "User"),
+		assoc("User", "authorizations", "Authorization"),
+		assoc("User", "roles", "Role"),
+		helper,
+		bound("Exporter#call", []string{"user=users"}, []string{"user.authorizations", "user.roles"})))
+	if strings.Contains(out, "user.authorizations") || !strings.Contains(out, "user.roles") {
+		t.Fatalf("same-class method preload join wrong:\n%s", out)
+	}
+}
+
+// A collection that is nothing but a method parameter is typed by its name
+// alone. The finding stays, at half the confidence, and says why: whether the
+// caller preloaded it is not visible from here.
+func TestACollectionThatIsAParameterIsReportedWeakly(t *testing.T) {
+	f := bound("Presenter#recent_activity", []string{"action=actions"}, []string{"action.user"})
+	f.Props["params"] = []string{"actions"}
+	got, err := New().Explain(context.Background(), store(
+		model("Action"),
+		assoc("Candidate", "actions", "Action"),
+		assoc("Action", "user", "User"),
+		f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want one finding, got %d", len(got))
+	}
+	if got[0].Confidence != 0.5 {
+		t.Fatalf("confidence = %v, want 0.5", got[0].Confidence)
+	}
+	if len(got[0].Evidence) != 2 || !strings.Contains(got[0].Evidence[1].Detail, "parameter") {
+		t.Fatalf("the weak finding must say why in its evidence: %+v", got[0].Evidence)
+	}
+	strong := titles(t, store(model("Action"), assoc("Candidate", "actions", "Action"), assoc("Action", "user", "User"),
+		bound("Presenter#recent_activity", []string{"action=candidate.actions"}, []string{"action.user"})))
+	if !strings.Contains(strong, "action.user") {
+		t.Fatalf("a receiver-typed collection must still be reported at full strength:\n%s", strong)
+	}
+}
+
+// A method that hands its reads to BatchLoader.for is batched by construction.
+func TestReadsInsideABatchLoaderMethodAreNotReported(t *testing.T) {
+	f := bound("Loader#locations", []string{"promotion=Promotion.where"}, []string{"promotion.locations"})
+	f.Props["batch_loader"] = true
+	out := titles(t, store(model("Promotion"), assoc("Promotion", "locations", "Location"), f))
+	if out != "" {
+		t.Fatalf("a batch-loaded read was reported:\n%s", out)
+	}
+}

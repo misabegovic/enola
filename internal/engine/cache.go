@@ -2040,7 +2040,27 @@ import (
 // benchmarks/rails-controller-derivation scores each of the four, expanded through
 // ActionDispatch::Routing::RouteSet on actionpack 8.1.3 and again on 8.1.1, which
 // agreed line for line.
-const cacheVersion = "v218"
+// v219: two Ruby method facts for the query-loops reader, both measured after
+// a reviewer rejected two of the first sixteen findings on the monolith.
+// `preloads` names every association handed to includes / preload / eager_load
+// in the body (symbols, hash keys and values), so an association read on the
+// elements of a preloaded relation stops reading as a query per element
+// (CannedResponsesQuery#resolve). `unpersisted_locals` names the locals in
+// local_types whose typing call was `new`, so association reads on a record
+// that was never saved stop reading as queries while writes on it still do
+// (BlockLayoutsController#mock_company). Recorded, not resolved: the extractor
+// states what the method preloaded and how it typed a local, and the
+// explainer joins.
+// v220: the query-loops reader follows the relation to where it was built.
+// Block bindings carry the receiver chain with arguments dropped and locals
+// spliced (`user=Current.company.users.allowed_to_login.preload`), scope facts
+// carry `model` and the associations their lambda preloads, method facts carry
+// `params` and a `batch_loader` marker. The explainer resolves the chain back
+// to its association or constant, joins preloads stated by scopes on that model
+// and by same-class methods, reports name-only typing at half confidence, and
+// stays quiet inside BatchLoader bodies. Measured on the monolith and the
+// sibling branch that first rejected the reader's blind spots.
+const cacheVersion = "v220"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
