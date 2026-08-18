@@ -392,6 +392,17 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 			work.Add(prev.store.All()...)
 		}
 
+		// A repository the union already holds is replaced, not doubled. Its
+		// prior slice goes before extraction, so what this turn adds is the only
+		// account of it; the linkers then rebuild every cross-repo edge into it
+		// from scratch, as they do on every append. This is what lets one repo
+		// be re-read into an existing union without re-reading the other twenty.
+		if _, present := prev.repoPaths[repoLabel]; present {
+			if dropped := work.RemoveWhere(func(f facts.Fact) bool { return f.Repo == repoLabel }); dropped > 0 {
+				log.Printf("[engine] replacing %q in the union: dropped its %d prior facts", repoLabel, dropped)
+			}
+		}
+
 		// Track repo label -> absolute path for multi-repo resolution.
 		workRepoPaths[repoLabel] = absRepo
 	}
