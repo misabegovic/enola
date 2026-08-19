@@ -1337,8 +1337,9 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		if isIter && recv != nil && w.metrics != nil {
 			// Only a named receiver is worth binding: `[1,2].each` says nothing
 			// about the element's type, while `form_questions.each` names the
-			// collection whose target the consumer can resolve.
-			if isVarReceiver(recv.Kind()) || recv.Kind() == "call" {
+			// collection whose target the consumer can resolve, and
+			// `Company.find_each` names the class the consumer can type from.
+			if isVarReceiver(recv.Kind()) || recv.Kind() == "call" || recv.Kind() == "constant" || recv.Kind() == "scope_resolution" {
 				if param := blockParamName(block, w.src); param != "" {
 					collection := lastSegment(rubyText(recv, w.src))
 					if chain := receiverChain(recv, w.src); len(chain) > 0 {

@@ -114,3 +114,24 @@ end
 		t.Fatalf("batch_loader marks = %v", marked)
 	}
 }
+
+
+// `Company.find_each do |company|` is the most Rails way to walk a table and
+// recorded nothing: the receiver is a constant, neither a variable nor a call.
+// A constant or namespaced receiver binds like any other; whether it names a
+// model is the consumer's question.
+func TestBlockBindings_BindAConstantReceiver(t *testing.T) {
+	got := propsFor(t, `
+class Thing
+  def call
+    Company.find_each { |company| company.users }
+    Billing::Invoice.each { |invoice| invoice.lines }
+    STOP_CHARS.each { |c| c }
+  end
+end
+`, "block_bindings")
+	want := []string{"c=STOP_CHARS", "company=Company", "invoice=Billing::Invoice"}
+	if !reflect.DeepEqual(got["Thing#call"], want) {
+		t.Fatalf("block_bindings = %v, want %v", got["Thing#call"], want)
+	}
+}

@@ -258,7 +258,11 @@ func TestACollectionThatIsAParameterIsReportedWeakly(t *testing.T) {
 	if got[0].Confidence != 0.5 {
 		t.Fatalf("confidence = %v, want 0.5", got[0].Confidence)
 	}
-	if len(got[0].Evidence) != 2 || !strings.Contains(got[0].Evidence[1].Detail, "parameter") {
+	var saysWhy bool
+	for _, e := range got[0].Evidence {
+		saysWhy = saysWhy || strings.Contains(e.Detail, "parameter")
+	}
+	if !saysWhy {
 		t.Fatalf("the weak finding must say why in its evidence: %+v", got[0].Evidence)
 	}
 	strong := titles(t, store(model("Action"), assoc("Candidate", "actions", "Action"), assoc("Action", "user", "User"),
@@ -275,5 +279,72 @@ func TestReadsInsideABatchLoaderMethodAreNotReported(t *testing.T) {
 	out := titles(t, store(model("Promotion"), assoc("Promotion", "locations", "Location"), f))
 	if out != "" {
 		t.Fatalf("a batch-loaded read was reported:\n%s", out)
+	}
+}
+
+func placed(fact facts.Fact, file string) facts.Fact {
+	fact.File = file
+	return fact
+}
+
+// Where the loop runs is read from the file's place in the Rails layout and
+// said in the evidence; a one-off task is informational at half confidence,
+// a spec is no finding at all, and everything else keeps its grade.
+func TestAFindingSaysWhereItRunsAndGradesOneOffTasksInformational(t *testing.T) {
+	mk := func(name, file string) facts.Fact {
+		return placed(bound(name, []string{"q=form_questions"}, []string{"q.form_answers"}), file)
+	}
+	got, err := New().Explain(context.Background(), store(
+		assoc("Company", "form_questions", "FormQuestion"),
+		assoc("FormQuestion", "form_answers", "FormAnswer"),
+		mk("Api::ReportsController#show", "shop/app/controllers/api/reports_controller.rb"),
+		mk("ReportJob#perform", "app/jobs/report_job.rb"),
+		mk("Maintenance::BackfillTask#process", "app/tasks/maintenance/backfill_task.rb"),
+		mk("Development::Seeder#run", "app/services/development/seeder.rb"),
+		mk("ReportService#call", "app/services/report_service.rb"),
+		mk("ReportSpec#example", "spec/services/report_service_spec.rb")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]facts.Insight{}
+	for _, in := range got {
+		byName[in.Evidence[0].Symbol] = in
+	}
+	if _, ok := byName["ReportSpec#example"]; ok {
+		t.Fatalf("a loop in a spec is not a finding")
+	}
+	want := map[string][3]any{
+		"Api::ReportsController#show":       {"request", 0.8, false},
+		"ReportJob#perform":                 {"job", 0.8, false},
+		"ReportService#call":                {"shared", 0.8, false},
+		"Maintenance::BackfillTask#process": {"task", 0.5, true},
+		"Development::Seeder#run":           {"task", 0.5, true},
+	}
+	for name, w := range want {
+		in, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s was not reported", name)
+		}
+		if in.Confidence != w[1].(float64) || in.Informational != w[2].(bool) {
+			t.Fatalf("%s: confidence %v informational %v, want %v %v", name, in.Confidence, in.Informational, w[1], w[2])
+		}
+		if !strings.Contains(in.Evidence[1].Detail, "surface: "+w[0].(string)) {
+			t.Fatalf("%s: evidence %q does not name the surface %s", name, in.Evidence[1].Detail, w[0])
+		}
+	}
+}
+
+// A bare model constant at the base types the element (`Company.find_each do
+// |company| company.users`), a constant that is not a model types nothing.
+func TestAClassLevelIterationOnABareConstantTypesItsElement(t *testing.T) {
+	out := titles(t, store(
+		model("Company"),
+		assoc("Company", "users", "User"),
+		bound("Backfill#run", []string{"company=Company", "c=STOP_CHARS"}, []string{"company.users", "c.users"})))
+	if !strings.Contains(out, "company.users") {
+		t.Fatalf("the class-level iteration was not reported:\n%s", out)
+	}
+	if strings.Contains(out, "c.users") {
+		t.Fatalf("a constant that is not a model typed an element:\n%s", out)
 	}
 }

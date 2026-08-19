@@ -2060,7 +2060,12 @@ import (
 // and by same-class methods, reports name-only typing at half confidence, and
 // stays quiet inside BatchLoader bodies. Measured on the monolith and the
 // sibling branch that first rejected the reader's blind spots.
-const cacheVersion = "v220"
+// v221: a block binding is recorded for a constant or namespaced receiver too
+// (`Company.find_each do |company|`, `Billing::Invoice.in_batches`), so the
+// query-loops reader, which already types a chain from the model at its base,
+// hears the most Rails way to walk a table. A constant that is not a model
+// resolves to nothing and stays silent.
+const cacheVersion = "v221"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
