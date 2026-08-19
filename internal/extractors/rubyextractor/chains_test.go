@@ -115,7 +115,6 @@ end
 	}
 }
 
-
 // `Company.find_each do |company|` is the most Rails way to walk a table and
 // recorded nothing: the receiver is a constant, neither a variable nor a call.
 // A constant or namespaced receiver binds like any other; whether it names a

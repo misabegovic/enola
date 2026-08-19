@@ -34,6 +34,7 @@ import (
 	"github.com/enola-labs/enola/internal/providers"
 	"github.com/enola-labs/enola/internal/renderers"
 	"github.com/enola-labs/enola/internal/version"
+	pkghistory "github.com/enola-labs/enola/pkg/history"
 	"github.com/enola-labs/enola/pkg/plugin"
 )
 
@@ -79,6 +80,18 @@ type Engine struct {
 	// disk after a snapshot. The read path is always active when caching is
 	// enabled; one-shot --explain sets this false so it never touches .enola.
 	persistCache bool
+	// deferLinking makes an append-mode GenerateSnapshot stop after extraction;
+	// see SetDeferLinking.
+	deferLinking bool
+	// lastFacts remembers the facts.jsonl this run last serialized, so the next
+	// output dir that receives the same bundle copies the bytes instead.
+	lastFacts lastFactsWrite
+	// historyRecorded remembers which snapshot id this run recorded into which
+	// history root, so a cluster that writes one union to many repo dirs sharing
+	// a history store appends the revision once.
+	historyRecorded map[string]string
+	// summaries remembers this run's previous/ deltas; see summarizeOnce.
+	summaries map[string]pkghistory.Summary
 }
 
 // New creates a new Engine with the given config.
@@ -109,6 +122,14 @@ func New(cfg *config.Config) (*Engine, error) {
 	e.current.Store(&snapshotBundle{store: st})
 	return e, nil
 }
+
+// SetDeferLinking tells the next GenerateSnapshot calls to stop after
+// extraction: no linking, no graph, no explainers, no renderers. For a cluster
+// walked repo by repo, only the last turn's linked and explained union is ever
+// read, so the caller sets this for every turn but the last (the first turn
+// included) and clears it before the last. Nothing else sets it; the server's
+// generate_snapshot and a single-repo --generate never see it.
+func (e *Engine) SetDeferLinking(defer_ bool) { e.deferLinking = defer_ }
 
 // SetPersistCache controls whether the per-extractor cache is written to disk
 // after a snapshot. One-shot --explain disables this so it leaves .enola
@@ -524,6 +545,46 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	if appendMode {
 		e.store.TagRange(preCount, repoLabel, repoLabel+"/")
 		log.Printf("[engine] prefixed %d facts with repo label %q", newCount-preCount, repoLabel)
+	}
+
+	// A cluster's intermediate turns stop here. Linking, the graph and the
+	// explainers are recomputed from scratch on every append and only the last
+	// turn's result is kept, so running them after each of twenty-two
+	// repositories was twenty-one full passes over a growing union for nothing
+	// anyone read. The caller that walks a cluster sets deferLinking for every
+	// turn but the last; that turn runs the full pipeline once over the whole
+	// union. The bundle published here carries the store, the repo paths and
+	// the intent the next turn needs, and a meta that says what was extracted.
+	if e.deferLinking {
+		work.Freeze()
+		duration := time.Since(start)
+		snapshot := &facts.Snapshot{
+			Meta: facts.SnapshotMeta{
+				RepoPath:           absRepo,
+				GeneratedAt:        time.Now().UTC().Format(time.RFC3339),
+				Duration:           duration.String(),
+				Extractors:         usedExtractors,
+				Renderers:          []string{},
+				FactCount:          e.store.Count(),
+				EnolaVersion:       version.Version,
+				ExtractorVersion:   cacheVersion,
+				Git:                git,
+				RepoLabel:          repoLabel,
+				Providers:          provRecords,
+				FilesSeen:          len(files),
+				FilesSkipped:       skips.count,
+				DirsSkipped:        skips.dirCount,
+				ShadowedExtractors: shadowedExtractors,
+				ParseErrors:        len(parseErrs),
+				ParseErrorSample:   capParseErrors(parseErrs),
+			},
+			Facts: e.store.FactsRef(),
+		}
+		e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent})
+		log.Printf("[engine] %s extracted into the union in %s (%d facts so far); linking and explaining deferred to the cluster's last turn",
+			repoLabel, duration.Round(time.Millisecond), e.store.Count())
+		log.Printf("[engine] timings: walk=%s hash=%s extract=%s", tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond))
+		return snapshot, nil
 	}
 
 	// 3b. Link repos into a cross-repo "graph of graphs": derive service-level
@@ -1219,13 +1280,31 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	// whole file in memory to write and then hash it. On a kernel-sized graph that
 	// buffer was 792 MiB, allocated at the end of a run and never released before the
 	// process went back to idle.
+	// A cluster writes the same published bundle to every repository's output
+	// dir. The first write serializes; the rest copy the bytes of that file,
+	// which is the same serialization by construction and a fraction of the
+	// time (a 1.5M-fact union serializes in seconds, copies in a fraction of
+	// one). The copy is keyed on the frozen store, which every generate replaces
+	// and the receipt republish below keeps, so a new generate never copies a
+	// stale file.
 	factsPath := filepath.Join(outDir, "facts.jsonl")
-	factsHash, err := writeFactsJSONL(b.store, factsPath)
-	if err != nil {
-		return err
+	var factsHash string
+	if e.lastFacts.store == b.store && e.lastFacts.path != factsPath && fileExists(e.lastFacts.path) {
+		if err := copyFile(e.lastFacts.path, factsPath); err != nil {
+			return fmt.Errorf("copying facts.jsonl: %w", err)
+		}
+		factsHash = e.lastFacts.digest
+		log.Printf("[engine] wrote %s (copied from this run's first write)", factsPath)
+	} else {
+		var err error
+		factsHash, err = writeFactsJSONL(b.store, factsPath)
+		if err != nil {
+			return err
+		}
+		e.lastFacts = lastFactsWrite{store: b.store, path: factsPath, digest: factsHash}
+		log.Printf("[engine] wrote %s", factsPath)
 	}
 	outputHashes["facts.jsonl"] = factsHash
-	log.Printf("[engine] wrote %s", factsPath)
 
 	// Write insights.json. A nil slice marshals to `null`, not `[]`, so a repository
 	// with no findings produced a document that breaks any consumer iterating the
@@ -1300,6 +1379,17 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	e.recordHistory(repoPath, meta, b, factsPath)
 
 	return nil
+}
+
+type lastFactsWrite struct {
+	store  *facts.Store
+	path   string
+	digest string
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // writeFactsJSONL serializes the store straight to path, returning the

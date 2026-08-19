@@ -21,6 +21,7 @@ import (
 	"github.com/enola-labs/enola/internal/explainers/coverage"
 	crossrepoexp "github.com/enola-labs/enola/internal/explainers/crossrepo"
 	"github.com/enola-labs/enola/internal/explainers/cycles"
+	"github.com/enola-labs/enola/internal/explainers/deadmethods"
 	"github.com/enola-labs/enola/internal/explainers/depth"
 	"github.com/enola-labs/enola/internal/explainers/domain"
 	"github.com/enola-labs/enola/internal/explainers/entrypoints"
@@ -141,6 +142,10 @@ func (e *Engine) Config() *config.Config {
 }
 
 // GenerateSnapshot runs the full pipeline: walk -> extract -> explain -> render.
+// SetDeferLinking is engine.Engine.SetDeferLinking: a cluster walked repo by
+// repo sets it for every turn but the last.
+func (e *Engine) SetDeferLinking(defer_ bool) { e.eng.SetDeferLinking(defer_) }
+
 func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMode bool) (*facts.Snapshot, error) {
 	return e.eng.GenerateSnapshot(ctx, repoPath, appendMode)
 }
@@ -465,6 +470,7 @@ func registerOSSPlugins(eng *engine.Engine, cfg *config.Config) {
 	eng.RegisterExplainer(unusedroutes.New())
 	eng.RegisterExplainer(domain.New())
 	eng.RegisterExplainer(queryloops.New())
+	eng.RegisterExplainer(deadmethods.New())
 	eng.RegisterExplainer(entrypoints.New())
 	eng.RegisterExplainer(godclass.New())
 	eng.RegisterExplainer(hotspots.New())

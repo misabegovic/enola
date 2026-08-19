@@ -2065,7 +2065,14 @@ import (
 // query-loops reader, which already types a chain from the model at its base,
 // hears the most Rails way to walk a table. A constant that is not a model
 // resolves to nothing and stays silent.
-const cacheVersion = "v221"
+// v222: two more references the Ruby extractor states. A symbol-to-proc block
+// argument (`each(&:destroy_with_publication!)`) records a call to the symbol's
+// method; the class-body DSL that names methods by symbol folds in beside the
+// callbacks: `field`, `helper_method`, `alias_method`'s old name,
+// `rescue_from ... with:`, and the `if:`/`unless:` symbol options of
+// callbacks and validations. Both closed false "dead" readings in the
+// dead-methods explainer's prototype on the monolith.
+const cacheVersion = "v222"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

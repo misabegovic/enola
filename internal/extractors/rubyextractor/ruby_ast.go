@@ -1322,10 +1322,18 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 				// to association facts found exactly zero because of it. With the
 				// receiver, `q.form_answers` joins to `q=form_questions` and resolves.
 				if isVarReceiver(recv.Kind()) {
+					w.addNames(ownerIdx, seen, name)
 					w.recordInLoopCall(rubyText(recv, w.src) + "." + name)
 					break
 				}
 				w.recordInLoopCall(name)
+			case isVarReceiver(kindOf(recv)):
+				// A single-word read on a variable receiver (`parser.usernames`,
+				// `user.email`) is kept out of the call graph on purpose: most are
+				// attribute reads and the coupling metrics would drown in them. It
+				// is still a reference to whatever method carries that name, so it
+				// is recorded by name, which only the dead-code reading consumes.
+				w.addNames(ownerIdx, seen, name)
 			}
 		}
 		// An iterator method with a block (users.each { … }, n.times { … }) is a
@@ -1448,6 +1456,71 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		// descended into, so the qualified path is matched rather than its segments.
 		if name := stripLeadingColons(rubyText(node, w.src)); name != "" && !rubyBuiltinConsts[name] {
 			w.addCall(ownerIdx, seen, name)
+		}
+		return
+	case "argument_list":
+		// A symbol literal handed to a call as a direct argument
+		// (`perform_async(id, :requisitions_done)`, `retry_with(:fallback)`)
+		// usually names a method for something else to dispatch. Recorded as a
+		// reference by name, not a call; hash pairs (`order(created_at: :desc)`)
+		// are not direct children and are not recorded.
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			c := node.NamedChild(i)
+			if c == nil {
+				continue
+			}
+			switch kindOf(c) {
+			case "simple_symbol":
+				w.addNames(ownerIdx, seen, strings.TrimPrefix(rubyText(c, w.src), ":"))
+			case "pair":
+				// `mailer_method: :notify_new_connect`, `with: :render_not_found`:
+				// a symbol handed in as a keyword value names a method as often as a
+				// positional one does. The key is not a name.
+				if v := c.ChildByFieldName("value"); v != nil && kindOf(v) == "simple_symbol" {
+					w.addNames(ownerIdx, seen, strings.TrimPrefix(rubyText(v, w.src), ":"))
+				}
+			case "string":
+				// A string shaped like `Class#method` or `Class.method` names a
+				// method the same way (`batch.on(:success, "Destroy#users_done")`,
+				// Sidekiq batch callbacks, `method_object("Thing#run")`).
+				if name := methodNamedByString(rubyText(c, w.src)); name != "" {
+					w.addNames(ownerIdx, seen, name)
+				}
+			}
+		}
+		for i := uint(0); i < node.ChildCount(); i++ {
+			w.walkForCalls(node.Child(i), ownerIdx, seen, locals)
+		}
+		return
+	case "symbol_array":
+		// `%i[name email]`: each bare symbol is a name, exactly like the bracketed form below.
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			if c := node.NamedChild(i); c != nil && kindOf(c) == "bare_symbol" {
+				w.addNames(ownerIdx, seen, rubyText(c, w.src))
+			}
+		}
+		return
+	case "array":
+		// A symbol array (`ATTRS = %i[name email]`, `[:a, :b].each { |m| send(m) }`)
+		// is the usual source of names fed to send later. Each symbol is a
+		// reference by name, never a call.
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			if c := node.NamedChild(i); c != nil && kindOf(c) == "simple_symbol" {
+				w.addNames(ownerIdx, seen, strings.TrimPrefix(rubyText(c, w.src), ":"))
+			}
+		}
+		for i := uint(0); i < node.ChildCount(); i++ {
+			w.walkForCalls(node.Child(i), ownerIdx, seen, locals)
+		}
+		return
+	case "block_argument":
+		// `each(&:destroy_with_publication!)` sends the symbol's method to every
+		// element. It is a call by any reading, and without this edge a method
+		// used only through symbol-to-proc looked unreferenced.
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			if c := node.NamedChild(i); c != nil && kindOf(c) == "simple_symbol" {
+				w.addCall(ownerIdx, seen, strings.TrimPrefix(rubyText(c, w.src), ":"))
+			}
 		}
 		return
 	case "delimited_symbol":
@@ -1619,6 +1692,43 @@ func (w *rubyWalker) addCall(ownerIdx int, seen map[string]bool, target string) 
 		facts.Relation{Kind: facts.RelCalls, Target: target})
 }
 
+// methodNamedByString returns the method a string literal of the shape
+// "Class#method" or "Class.method" names, or "" for any other string.
+func methodNamedByString(literal string) string {
+	text := strings.Trim(literal, "\"'")
+	if text == "" || text[0] < 'A' || text[0] > 'Z' || strings.ContainsAny(text, " \t\n/") {
+		return ""
+	}
+	sep := strings.LastIndexAny(text, "#.")
+	if sep <= 0 || sep == len(text)-1 {
+		return ""
+	}
+	name := text[sep+1:]
+	for _, r := range name {
+		if !isNameRune(r) {
+			return ""
+		}
+	}
+	if name[0] < 'a' || name[0] > 'z' {
+		return ""
+	}
+	return name
+}
+
+// addNames records that the owner names target by symbol literal, as an
+// argument to a call that is not itself a DSL the extractor reads: the method
+// name is handed to something else to dispatch later. A reference, never a
+// call, so call metrics are untouched.
+func (w *rubyWalker) addNames(ownerIdx int, seen map[string]bool, target string) {
+	key := "names:" + target
+	if target == "" || seen[key] {
+		return
+	}
+	seen[key] = true
+	w.out[ownerIdx].Relations = append(w.out[ownerIdx].Relations,
+		facts.Relation{Kind: facts.RelNames, Target: target})
+}
+
 // addCallToFact appends a RelCalls edge to an arbitrary fact (used for DSL
 // references attached to the enclosing class), skipping exact duplicates.
 func (w *rubyWalker) addCallToFact(idx int, target string) {
@@ -1648,8 +1758,48 @@ var rubyCallbackDSL = map[string]bool{
 	"before_destroy": true, "after_destroy": true, "around_destroy": true,
 	"before_validation": true, "after_validation": true,
 	"after_commit": true, "after_rollback": true, "after_initialize": true,
+	"after_create_commit": true, "after_update_commit": true, "after_destroy_commit": true,
+	"after_save_commit": true, "before_commit": true,
 	"after_find": true, "after_touch": true,
 	"validate": true,
+}
+
+// rubyMethodNamingDSL are class-body methods that name another method by
+// symbol, directly or through an `if:`/`unless:`/`with:` option.
+var rubyMethodNamingDSL = map[string]bool{
+	"field": true, "helper_method": true, "rescue_from": true, "validates": true, "alias_method": true,
+}
+
+// symbolOptionArgs returns the simple_symbol values of the named keyword
+// options in an argument list (`if: :admin?`, `with: :render_not_found`).
+func symbolOptionArgs(args *sitter.Node, src []byte, keys ...string) []string {
+	var out []string
+	if args == nil {
+		return out
+	}
+	wanted := map[string]bool{}
+	for _, k := range keys {
+		wanted[k] = true
+	}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if kindOf(n) == "pair" {
+			key := n.ChildByFieldName("key")
+			value := n.ChildByFieldName("value")
+			if key != nil && value != nil && kindOf(value) == "simple_symbol" && wanted[strings.TrimSuffix(rubyText(key, src), ":")] {
+				out = append(out, strings.TrimPrefix(rubyText(value, src), ":"))
+			}
+			return
+		}
+		for i := uint(0); i < n.ChildCount(); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(args)
+	return out
 }
 
 // rubySerializerDSL are ActiveModel::Serializer class-body methods whose symbol
@@ -1930,8 +2080,37 @@ func (w *rubyWalker) handleBodyCall(node *sitter.Node) {
 			for _, name := range symbolArgs(args, w.src) {
 				w.addCallToFact(cur.symFactIdx, name)
 			}
+			for _, name := range symbolOptionArgs(args, w.src, "if", "unless") {
+				w.addCallToFact(cur.symFactIdx, name)
+			}
 		}
 		return
+	}
+
+	// Other class-body DSL that names a method by symbol: `field :name` (GraphQL
+	// types, Avo resources) is backed by a same-named method, `helper_method
+	// :name` exposes one to views, `rescue_from X, with: :name` and `validates
+	// ..., if: :name` dispatch to one, `alias_method :new, :old` calls the old.
+	// Each is a reference, and without the edge the method it names looked
+	// unreferenced.
+	if rubyMethodNamingDSL[method] {
+		if cur := w.cur(); cur != nil && cur.symFactIdx >= 0 {
+			names := symbolOptionArgs(args, w.src, "if", "unless", "with")
+			switch method {
+			case "field", "helper_method":
+				names = append(names, symbolArgs(args, w.src)...)
+			case "alias_method":
+				if all := symbolArgs(args, w.src); len(all) == 2 {
+					names = append(names, all[1])
+				}
+			}
+			for _, name := range names {
+				w.addCallToFact(cur.symFactIdx, name)
+			}
+		}
+		if method != "validates" {
+			return
+		}
 	}
 
 	// `delegate :a, :b, ..., to: X` generates methods that call each named method on
@@ -2367,4 +2546,8 @@ func blockParamName(block *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
+}
+
+func isNameRune(r rune) bool {
+	return r == '_' || r == '?' || r == '!' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }

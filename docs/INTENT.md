@@ -1583,6 +1583,28 @@ decision), reconcile its components with ones already declared, and
 commit it for review like any other law. Exit `0` when a report was
 produced (even an empty one), `2` when there is no snapshot to mine.
 
+**Rules that belong in the linter start there.** Some regularities
+need the graph (a call edge the linker resolved, a prop implication,
+a method's presence across a cluster) and some are file-local
+syntax: a naming regularity over the classes, functions and
+top-level bindings declared in JavaScript or TypeScript files under
+a directory, or a forbidden `import` from one directory into
+another. `--scaffold-eslint DIR` writes the second kind as ESLint
+rule scaffolds under `DIR`: a rule module per candidate, a
+RuleTester test whose valid cases are the candidate's conforming
+witnesses and whose invalid cases are its named exceptions, and an
+`index.js` registering them, so the directory loads as a plugin and
+each file moves into the repository's own plugin unchanged. The
+TypeScript extractor qualifies a symbol with its module path
+(`src/services.ApiError`) and names members through their class
+(`src/commands/repo.RepoClone.description`); the scaffold cuts both
+down to the declaration the rule can see, and a pattern that is only
+the module path is a tautology the miner no longer ranks. Every
+candidate the scaffolder leaves is listed with the reason it stays
+a constraint proposal. Nothing is written to the repository's plugin
+and no ESLint configuration is touched: the scaffold is a starting
+point the operator reviews, like the would-be declaration.
+
 ### `plan` / `plan_check` — the pre-edit contract
 
 The contract, moved into the planning loop. `enola plan` (and the

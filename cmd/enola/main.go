@@ -213,13 +213,22 @@ func main() {
 		var snapshot *facts.Snapshot
 		for i, repoPath := range repoPaths {
 			// The first repository resets the store; the rest append to it, which is
-			// what makes one process produce one linked graph.
+			// what makes one process produce one linked graph. Linking and the
+			// explainers run once, on the last turn, over the whole union: they are
+			// recomputed from scratch on every append, so running them earlier only
+			// cost time (on a 22-repo cluster, twenty-one passes over a growing
+			// union, and twenty-one writes of it).
+			eng.SetDeferLinking(i < len(repoPaths)-1)
 			snapshot, err = eng.GenerateSnapshot(ctx, repoPath, i > 0)
 			if err != nil {
 				log.Fatalf("snapshot generation failed for %s: %v", repoPath, err)
 			}
-			// In multi-repo mode WriteArtifacts writes the whole store to each
-			// repo's output dir, matching what the MCP server does per generate.
+		}
+		// Every repository's output dir receives the complete linked union, written
+		// once, now that it exists. Before, each received the union as of its own
+		// turn and only the last was complete; a consumer reading any repo's own
+		// artifacts (the CI check, enola plan) now reads the same whole graph.
+		for _, repoPath := range repoPaths {
 			if err := eng.WriteArtifacts(repoPath); err != nil {
 				log.Fatalf("failed to write artifacts for %s: %v", repoPath, err)
 			}
@@ -415,6 +424,7 @@ func runExplain(ctx context.Context, eng *bootstrap.Engine, cfg *config.Config) 
 	eng.SetPersistCache(false)
 	for i, repoPath := range repoPaths {
 		fmt.Fprintf(os.Stderr, "Analyzing %s …\n", repoPath)
+		eng.SetDeferLinking(i < len(repoPaths)-1)
 		if _, err := eng.GenerateSnapshot(ctx, repoPath, i > 0); err != nil {
 			log.Fatalf("snapshot generation failed for %s: %v", repoPath, err)
 		}

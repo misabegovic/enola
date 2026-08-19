@@ -704,6 +704,6 @@ repos:
 enola --generate ci/cluster.yaml
 ```
 
-Entries resolve **relative to the config file**, not to your working directory, so a cluster config can be checked in and means the same thing on a laptop and in CI. (`repo:` is unchanged: a single repository, relative to the working directory.) Order matters - the first entry resets the graph and the rest are added to it.
+Entries resolve **relative to the config file**, not to your working directory, so a cluster config can be checked in and means the same thing on a laptop and in CI. (`repo:` is unchanged: a single repository, relative to the working directory.) Order matters - the first entry resets the graph and the rest are added to it. Linking and the explainers run once, over the whole union, after the last entry; every repository's output dir then receives the complete linked graph (the same bytes, so a consumer reading any one of them reads the whole cluster). Configured fact providers run concurrently within each repository and merge in name order.
 
 ---
