@@ -215,11 +215,7 @@ func summaryKey(current facts.SnapshotMeta, previous *previousSide) string {
 	if prevFacts == "" || prevInsights == "" || curFacts == "" || curInsights == "" {
 		return ""
 	}
-	prevMeta, err := json.Marshal(previous.meta)
-	if err != nil {
-		return ""
-	}
-	return strings.Join([]string{current.SnapshotID, curFacts, curInsights, prevFacts, prevInsights, hashBytes(prevMeta)}, "|")
+	return strings.Join([]string{current.SnapshotID, curFacts, curInsights, prevFacts, prevInsights, previous.meta.SnapshotID}, "|")
 }
 
 // summarize reduces a snapshot pair to the counts a log line needs.

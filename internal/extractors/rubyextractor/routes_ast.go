@@ -1,10 +1,10 @@
 package rubyextractor
 
 import (
-	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
@@ -60,7 +60,7 @@ func parseRouteFile(src []byte, relFile, initialPrefix string, jsonapi jsonapiCo
 	rw := &routeWalker{
 		src:       src,
 		relFile:   relFile,
-		dir:       filepath.Dir(relFile),
+		dir:       factpath.Dir(relFile),
 		draws:     map[string]string{},
 		concerns:  map[string]*sitter.Node{},
 		unhandled: map[string]int{},

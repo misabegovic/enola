@@ -54,6 +54,9 @@ type snapshotBundle struct {
 	// so a reader cannot observe a declaration that disagrees with the snapshot
 	// it is reading: both change in the same atomic swap, or neither does.
 	intent map[string]*intent.Declaration
+	// members holds each repository's own turn meta, keyed by absolute path, so a
+	// cluster's fan-out can write per-repo provenance beside the shared union.
+	members map[string]facts.SnapshotMeta
 }
 
 // Engine orchestrates the snapshot generation pipeline.
@@ -558,6 +561,10 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	if e.deferLinking {
 		work.Freeze()
 		duration := time.Since(start)
+		deferredPrefix := ""
+		if appendMode {
+			deferredPrefix = repoLabel + "/"
+		}
 		snapshot := &facts.Snapshot{
 			Meta: facts.SnapshotMeta{
 				RepoPath:           absRepo,
@@ -565,6 +572,7 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 				Duration:           duration.String(),
 				Extractors:         usedExtractors,
 				Renderers:          []string{},
+				FileHashes:         fileHashesOf(absRepo, currentHashes),
 				FactCount:          e.store.Count(),
 				EnolaVersion:       version.Version,
 				ExtractorVersion:   cacheVersion,
@@ -572,15 +580,20 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 				RepoLabel:          repoLabel,
 				Providers:          provRecords,
 				FilesSeen:          len(files),
+				FilesParsed:        e.store.CountFilesWithFacts(files, deferredPrefix),
+				SourceBytes:        e.store.SourceBytesWithFacts(files, deferredPrefix, absRepo),
 				FilesSkipped:       skips.count,
 				DirsSkipped:        skips.dirCount,
+				SkippedSample:      skips.sample,
 				ShadowedExtractors: shadowedExtractors,
 				ParseErrors:        len(parseErrs),
 				ParseErrorSample:   capParseErrors(parseErrs),
+				Census:             e.fileCensus(files, deferredPrefix, skips, usedExtractors, parseErrs),
 			},
 			Facts: e.store.FactsRef(),
 		}
-		e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent})
+		e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent,
+			members: memberMetas(prev, appendMode, absRepo, snapshot.Meta)})
 		log.Printf("[engine] %s extracted into the union in %s (%d facts so far); linking and explaining deferred to the cluster's last turn",
 			repoLabel, duration.Round(time.Millisecond), e.store.Count())
 		log.Printf("[engine] timings: walk=%s hash=%s extract=%s", tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond))
@@ -613,14 +626,7 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	log.Printf("[engine] produced %d insights using %d explainers", len(allInsights), len(usedExplainers))
 
 	// 5. Build file hashes for the snapshot meta
-	var fileHashes []facts.FileHash
-	for path, hash := range currentHashes {
-		fileHashes = append(fileHashes, facts.FileHash{
-			Path:    path,
-			Hash:    hash,
-			ModTime: fileModTime(filepath.Join(absRepo, path)),
-		})
-	}
+	fileHashes := fileHashesOf(absRepo, currentHashes)
 
 	// 6. Build snapshot.
 	//
@@ -719,7 +725,8 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 
 	// Publish atomically. This single Store() is the linearization point: before it
 	// readers see the prior bundle, after it the new one — never a half-built store.
-	e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent})
+	e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent,
+		members: memberMetas(prev, appendMode, absRepo, snapshot.Meta)})
 	log.Printf("[engine] snapshot generated in %s", duration)
 	log.Printf("[engine] timings: walk=%s hash=%s extract=%s link=%s graph=%s explain=%s render=%s",
 		tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond),
@@ -933,10 +940,19 @@ func (e *Engine) walkRepo(repoPath string) (files, testFiles []string, skips wal
 			return err
 		}
 
-		relPath, err := filepath.Rel(repoPath, path)
+		rawRel, err := filepath.Rel(repoPath, path)
 		if err != nil {
 			return err
 		}
+		// Repo-relative paths become forward-slash HERE, at the one boundary where
+		// the host filesystem enters the pipeline, and stay that way through every
+		// extractor, fact and finding. On Windows filepath.Rel yields
+		// `src\lib\site-blocks.ts`, and everything downstream — module resolution,
+		// layer classification, ignore globs, the declaration dialect — splits on
+		// "/". A backslash path is not a different spelling of the same fact to any
+		// of them; it is a fact that matches nothing. See ARCHITECTURE.md, "Fact
+		// paths are forward-slash on every host".
+		relPath := filepath.ToSlash(rawRel)
 
 		// Skip ignored paths
 		if pattern, ok := e.ignoreMatch(relPath); ok {
@@ -946,7 +962,7 @@ func (e *Engine) walkRepo(repoPath string) (files, testFiles []string, skips wal
 				// first-ever snapshot and every one after it, for no signal.
 				if relPath != e.cfg.Output.Dir {
 					skips.dirCount++
-					skips.record(filepath.ToSlash(relPath)+"/", pattern)
+					skips.record(relPath+"/", pattern)
 				}
 				return filepath.SkipDir
 			}
@@ -957,7 +973,7 @@ func (e *Engine) walkRepo(repoPath string) (files, testFiles []string, skips wal
 				testFiles = append(testFiles, relPath)
 			}
 			skips.count++
-			skips.record(filepath.ToSlash(relPath), pattern)
+			skips.record(relPath, pattern)
 			return nil
 		}
 
@@ -1249,7 +1265,11 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 		return fmt.Errorf("no snapshot generated")
 	}
 
-	outDir := filepath.Join(repoPath, e.cfg.Output.Dir)
+	absRepo, err := filepath.Abs(repoPath)
+	if err != nil {
+		return fmt.Errorf("resolving repo path: %w", err)
+	}
+	outDir := filepath.Join(absRepo, e.cfg.Output.Dir)
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
@@ -1328,8 +1348,15 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	// Record the output hashes on a COPY of the meta rather than mutating the
 	// published (shared, immutable) snapshot in place. SnapshotMeta is a value type,
 	// so this copy shares its slices but overrides only OutputHashes.
-	meta := b.snapshot.Meta
-	meta.OutputHashes = outputHashes
+	// A cluster shares one union and its hashes across every repository dir; the
+	// repository's own provenance (path, git, extractors, walk and parse counts) is
+	// the turn that read it, not the turn that happened to be last.
+	unionMeta := b.snapshot.Meta
+	unionMeta.OutputHashes = outputHashes
+	meta := unionMeta
+	if turn, ok := b.members[absRepo]; ok {
+		meta = withMemberProvenance(unionMeta, turn)
+	}
 
 	// Write snapshot.meta.json (the internal superset, incl. per-file hashes)
 	metaJSON, err := json.MarshalIndent(meta, "", "  ")
@@ -1361,8 +1388,8 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	// just avoids clobbering a newer snapshot in any unexpected interleaving.
 	if e.current.Load() == b {
 		snapCopy := *b.snapshot
-		snapCopy.Meta = meta
-		e.current.CompareAndSwap(b, &snapshotBundle{store: b.store, snapshot: &snapCopy, repoPaths: b.repoPaths, intent: b.intent})
+		snapCopy.Meta = unionMeta
+		e.current.CompareAndSwap(b, &snapshotBundle{store: b.store, snapshot: &snapCopy, repoPaths: b.repoPaths, intent: b.intent, members: b.members})
 	}
 
 	// Record this revision in the architecture history. Last, and non-fatal: it reads
@@ -1483,4 +1510,16 @@ func fileModTime(path string) string {
 		return ""
 	}
 	return info.ModTime().UTC().Format(time.RFC3339)
+}
+
+func fileHashesOf(absRepo string, hashes map[string]string) []facts.FileHash {
+	out := make([]facts.FileHash, 0, len(hashes))
+	for path, hash := range hashes {
+		out = append(out, facts.FileHash{
+			Path:    path,
+			Hash:    hash,
+			ModTime: fileModTime(filepath.Join(absRepo, path)),
+		})
+	}
+	return out
 }

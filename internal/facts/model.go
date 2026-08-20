@@ -85,6 +85,22 @@ const (
 	KindLint = "lint"
 )
 
+// pathShapedName names the kinds whose Name IS a repo-relative path, and which the
+// store therefore normalises to forward slashes on the way in (see Store.Add).
+//
+// The list is short on purpose. Most Names are not paths, and one language makes the
+// distinction load-bearing rather than pedantic: PHP separates namespace segments with
+// a BACKSLASH, so `App\Http\Controllers\UserController` is a correct symbol name and
+// `Illuminate\Support\Facades\Route` a correct dependency target. Normalising Name
+// wholesale — or normalising Relation.Target at all — would rewrite those into paths
+// that name nothing, breaking PHP resolution to fix Windows. Only kinds whose name
+// cannot be anything but a path belong here.
+var pathShapedName = map[string]bool{
+	KindModule:  true,
+	KindFileRef: true,
+	KindTestRef: true,
+}
+
 // Cross-repo dependency-fact "type" prop values. Both the linker that writes these
 // facts and every reader (explainers, renderers, the MCP server) key off them, so they
 // live here rather than being duplicated as literals on each side.
@@ -103,16 +119,17 @@ const (
 
 // Relation kind constants.
 const (
-	RelDeclares     = "declares"
-	RelImports      = "imports"
-	RelCalls        = "calls"
-	RelImplements   = "implements"
-	RelDependsOn    = "depends_on"
-	RelInstantiates = "instantiates" // Source constructs an instance of target via a constructor call.
-	RelInjects      = "injects"      // Source declares target as a DI-injected constructor parameter.
-	RelHasMethod    = "has_method"   // Owner type (struct/interface/class) declares target as a method. Synthesized in NewGraph.
-	RelHandledBy    = "handled_by"   // A route/endpoint is served by target (e.g. a gRPC RPC route → its Go handler method). Added post-extraction.
-	RelNames        = "names"        // Source names target by symbol literal without calling it: a method name passed as data (`perform_async(id, :on_done)`) for something else to dispatch. A reference, not a call; read by dead-code questions, ignored by call metrics.
+	RelDeclares      = "declares"
+	RelImports       = "imports"
+	RelCalls         = "calls"
+	RelImplements    = "implements"
+	RelDependsOn     = "depends_on"
+	RelInstantiates  = "instantiates"   // Source constructs an instance of target via a constructor call.
+	RelInjects       = "injects"        // Source declares target as a DI-injected constructor parameter.
+	RelHasMethod     = "has_method"     // Owner type (struct/interface/class) declares target as a method. Synthesized in NewGraph.
+	RelHandledBy     = "handled_by"     // A route/endpoint is served by target (e.g. a gRPC RPC route → its Go handler method). Added post-extraction.
+	RelImplementedBy = "implemented_by" // A declared contract operation is implemented by a code symbol. Added post-extraction.
+	RelNames         = "names"          // Source names target by symbol literal without calling it: a method name passed as data (`perform_async(id, :on_done)`) for something else to dispatch. A reference, not a call; read by dead-code questions, ignored by call metrics.
 )
 
 // StorageKindTopic is the storage_kind prop value for a KindStorage fact that

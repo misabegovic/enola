@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/extcoverage"
+	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
@@ -513,7 +514,7 @@ type jsonapiContext struct {
 // plausible-looking wrong path is worse than a counted miss.
 func jsonapiRouteFormat(repoPath string, files []string) (string, string) {
 	for _, relFile := range files {
-		if filepath.Dir(relFile) != filepath.Join("config", "initializers") || !isRubyFile(relFile) {
+		if factpath.Dir(relFile) != "config/initializers" || !isRubyFile(relFile) {
 			continue
 		}
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))

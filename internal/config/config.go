@@ -214,8 +214,8 @@ type OutputConfig struct {
 // wanted to gate on looked unsupported. A name added here becomes gateable,
 // documented and validated in the same edit, or it does not exist.
 var KnownExplainers = []string{
-	"cycles", "layers", "crossrepo", "coverage", "unused-routes", "god-class",
-	"hotspots", "dependency-depth", "exported-surface", "complexity-outliers",
+	"cycles", "layers", "crossrepo", "coverage", "unused-routes", "messaging-coverage",
+	"god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers",
 	"intent", "constraints", "domain", "query-loops", "entry-points", "dead-methods",
 }
 
@@ -527,7 +527,7 @@ func Default() *Config {
 			"**/integration_test/**/*.dart",
 			"**/test_driver/**/*.dart",
 		},
-		Extractors: []string{"cpp", "dart", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "scala", "hcl", "ansible", "mdintent"},
+		Extractors: []string{"asyncapi", "cpp", "dart", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "scala", "hcl", "ansible", "mdintent"},
 		Explainers: append([]string(nil), KnownExplainers...),
 		Renderers:  []string{"llm_context"},
 		Output: OutputConfig{
@@ -572,6 +572,7 @@ func Load(path string) (*Config, error) {
 		if decl == nil {
 			continue
 		}
+		decl.Normalize()
 		if err := decl.Validate(); err != nil {
 			return nil, fmt.Errorf("in config %s, intent entry %q: %w", path, label, err)
 		}

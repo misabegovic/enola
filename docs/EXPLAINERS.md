@@ -44,10 +44,10 @@ find*. It is **what happens to a finding after you have found it** — and that 
 entirely on the thing [SNAPSHOTS.md](SNAPSHOTS.md) describes: whether your graph is a
 value you can compare against another one, or a picture of right now.
 
-## Fifteen explainers: three proofs and twelve estimates
+## Seventeen explainers: three proofs and fourteen estimates
 
 An explainer reads the fact graph and emits **findings** — a claim, a confidence, and
-the entities the claim is about. There are fifteen, and they fall into six kinds:
+the entities the claim is about. There are sixteen, and they fall into six kinds:
 
 - **The proofs.** `cycles` runs Tarjan's SCC over the resolved import edges — a cycle
   either exists or it does not. `intent` diffs DECLARED architecture (a repo's
@@ -59,8 +59,8 @@ the entities the claim is about. There are fifteen, and they fall into six kinds
   are capped below 1.0, because each absence can be drift or an extraction miss.
   `constraints` is the third: it verdicts the declared components-and-rules vocabulary
   against the measured graph — a component resolves to the facts its match patterns
-  select, and a rule states one of twelve enforceable forms over components (`forbid`,
-  `forbid_reach`, `allow-only`, `protect`, `private`, and the rest). A breach is set
+  select, and a rule states one of thirteen enforceable forms over components (`forbid`,
+  `forbid_reach`, `allow`, `protect`, `private`, and the rest). A breach is set
   membership over measured edges, so it is proof-class; the one place it estimates is
   a `forbid_reach` membership too large to walk, which degrades to a single `0.4`
   advisory rather than guessing.
@@ -69,7 +69,7 @@ the entities the claim is about. There are fifteen, and they fall into six kinds
 - **Graph shape.** `dependency-depth` measures the longest transitive import chain;
   `exported-surface` flags large modules that export nearly everything.
 - **Convention matching.** `layers` recognises an architecture by matching module paths
-  against eight known taxonomies, then flags imports that run the wrong way through it.
+  against ten known taxonomies, then flags imports that run the wrong way through it.
   A repo that DECLARES its layer order is verdicted against the declaration as well:
   that pattern is stated rather than guessed, so it and its violations are proof-class.
   It sits beside the recognised pattern, not in place of it — recognition scores itself
@@ -77,10 +77,10 @@ the entities the claim is about. There are fifteen, and they fall into six kinds
   as findings that merely NAME the architecture, marked informational and never graded:
   they are exact, and gating on them would fail the change that declared an order for
   saying so. Only the violations under them can fail a build.
-- **Reporters.** `crossrepo`, `coverage` and `unused-routes` compute nothing of their
+- **Reporters.** `crossrepo`, `coverage`, `unused-routes` and `messaging-coverage` compute nothing of their
   own; they summarise what the cross-repo linker already resolved — which repositories
   depend on which, where enola failed to follow a call, and which routes no loaded
-  client calls.
+  client calls, and where messaging contracts and detected Kafka call sites do not match.
 - **The declaration-shaped ones.** Every explainer above keys off symbols, modules and
   their dependency edges, which left the route, storage and association facts the
   extractors emit feeding nothing. `domain` asks the questions those facts answer —
@@ -95,11 +95,15 @@ the entities the claim is about. There are fifteen, and they fall into six kinds
   at all. It stops at marking them: reachability *from* them reports 86% of a
   monolith's symbols unreachable, which is the receiver-typing gap showing through
   rather than a finding about the monolith, so that verdict is not shipped.
+  `dead-methods` asks the narrower question that gap leaves open: it looks a Ruby
+  method's bare name up in every call edge the graph holds and reports the names
+  nothing uses, and the names only specs use. A name-based index under-reports, so
+  what it lists is a candidate to delete, never a verdict.
 
 What each one computes, every threshold it uses and what it deliberately ignores is in
 [ARCHITECTURE.md → Insights](../ARCHITECTURE.md#insights-explainers). The distinction
-that matters here is smaller and blunter: **three of the fifteen prove something. The
-other twelve estimate.** A cycle is a fact about your import graph. A god class is an opinion
+that matters here is smaller and blunter: **three of the seventeen prove something. The
+other fourteen estimate.** A cycle is a fact about your import graph. A god class is an opinion
 about your repository, expressed as a number, and reasonable people can disagree with
 it.
 
@@ -153,7 +157,7 @@ as **exactly one regression, and not one of the 1,395 pre-existing findings was 
 ([BENCHMARKS.md § 2](BENCHMARKS.md#2-delta-precision--the-ratchet)). Revert the change
 and it goes quiet again. The verdict is a function of the tree, not of history.
 
-That is the whole trick, and it is not a smarter explainer. It is the same fifteen
+That is the whole trick, and it is not a smarter explainer. It is the same sixteen
 explainers run twice, over two values that both still exist.
 
 ## Three answers, and the third is the interesting one
@@ -168,7 +172,7 @@ Comparing findings across two snapshots gives three outcomes, not two:
 
 That third bucket is small, unglamorous, and the reason the gate stays switched on.
 
-Most of the fifteen explainers are relative to your repository. `mean + 2σ` moves when the
+Most of the seventeen explainers are relative to your repository. `mean + 2σ` moves when the
 population moves. A ranked top-N list has fixed membership size, so when a worse
 offender is deleted the next module rises into the window — and a finding "appears" for
 a module nobody edited. Both are real effects of statistics, not of your work.
