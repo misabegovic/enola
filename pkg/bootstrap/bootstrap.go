@@ -104,6 +104,14 @@ func (e *Engine) Drift(repoPath string) (Drift, error) {
 	return e.eng.Drift(repoPath)
 }
 
+func (e *Engine) DriftFromMeta(repoPath string, meta facts.SnapshotMeta) (Drift, error) {
+	return e.eng.DriftFromMeta(repoPath, meta)
+}
+
+func (e *Engine) MetaFor(repoPath string) facts.SnapshotMeta {
+	return e.eng.MetaFor(repoPath)
+}
+
 // ActiveRepo returns the absolute repo path of the currently loaded snapshot,
 // or "" if none is loaded. Used to attribute tool usage to the repo a call
 // actually operated on.

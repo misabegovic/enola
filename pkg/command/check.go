@@ -228,11 +228,11 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 	// rather than only the last repo indexed — the same construction diff_snapshot uses,
 	// FactsRef included: diff.Compute reads its inputs and the published bundle is
 	// immutable, so copying the fact set here would buy nothing.
-	current := &facts.Snapshot{Meta: snap.Meta, Facts: eng.Store().FactsRef(), Insights: snap.Insights}
-
 	// The baseline is anchored on the FIRST repo: that is the one whose snapshot reset
-	// the graph, and it is where `enola baseline pin` writes.
+	// the graph, and it is where `enola baseline pin` writes. Its meta carries that
+	// member's provenance, so the current side is read for the same member.
 	anchor := repoPaths[0]
+	current := &facts.Snapshot{Meta: eng.MetaFor(anchor), Facts: eng.Store().FactsRef(), Insights: snap.Insights}
 	baseDir := engine.ResolveBaselineDir(eng.OutputDir(anchor), *baseline)
 	base, err := bootstrap.LoadSnapshotDir(baseDir)
 	if err != nil {
@@ -409,20 +409,29 @@ func (r *Runner) Baseline(args []string) {
 		// two-command ritual whose failure mode ("no snapshot to pin") explained the
 		// mechanism rather than the goal.
 		//
-		// Always regenerating is also the safer semantic: pinning whatever happened to be
-		// on disk could freeze a snapshot from days ago as "the state before my change",
-		// which is precisely the staleness the diff then warns about. Snapshots are
-		// deterministic, so for an unchanged tree this costs a cached re-index and
-		// produces byte-identical facts.
+		// Pinning whatever happened to be on disk could freeze a snapshot from days ago
+		// as "the state before my change", so the reuse below is gated on the on-disk
+		// snapshot proving it describes today's tree under today's build and config.
 		fmt.Fprintf(os.Stderr, r.name()+" baseline: %s\n", tgt.configNote)
-		for i, repoPath := range tgt.repoPaths {
-			if _, err := eng.GenerateSnapshot(context.Background(), repoPath, i > 0); err != nil {
-				r.checkFatal("snapshot generation failed for %s: %v", repoPath, err)
+		// A snapshot that already describes every working tree under this build and
+		// config is the snapshot a regenerate would produce, byte for byte, so it is
+		// pinned as it stands. Anything less (a moved file, another extractor version,
+		// another config, a member with no snapshot) regenerates, with linking and the
+		// explainers deferred to the cluster's last turn the way --generate defers them.
+		if generatedAt, stale := snapshotIsCurrent(eng, tgt.repoPaths); stale == "" {
+			fmt.Fprintf(os.Stderr, r.name()+" baseline: the snapshot written %s matches every working tree under this build and config; pinned without regenerating\n", generatedAt)
+		} else {
+			fmt.Fprintf(os.Stderr, r.name()+" baseline: regenerating, %s\n", stale)
+			for i, repoPath := range tgt.repoPaths {
+				eng.SetDeferLinking(i < len(tgt.repoPaths)-1)
+				if _, err := eng.GenerateSnapshot(context.Background(), repoPath, i > 0); err != nil {
+					r.checkFatal("snapshot generation failed for %s: %v", repoPath, err)
+				}
 			}
-		}
-		for _, repoPath := range tgt.repoPaths {
-			if err := eng.WriteArtifacts(repoPath); err != nil {
-				r.checkFatal("failed to write artifacts for %s: %v", repoPath, err)
+			for _, repoPath := range tgt.repoPaths {
+				if err := eng.WriteArtifacts(repoPath); err != nil {
+					r.checkFatal("failed to write artifacts for %s: %v", repoPath, err)
+				}
 			}
 		}
 		if err := eng.SetBaseline(anchor); err != nil {
