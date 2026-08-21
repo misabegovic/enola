@@ -2142,7 +2142,16 @@ import (
 // v236: convention sets ship with the binary. A repository instantiates
 // rails-conventions without authoring it, and a local recipe of the same name
 // replaces the shipped one with the replacement reported.
-const cacheVersion = "v236"
+// v237: Rust server routes declared by `#[utoipa::path(get, path = "/x")]`,
+// upstream's v224 in 0.4.3, taking the next free number here because this
+// channel had already spent v224 through v236. The utoipa_axum
+// `routes!(handler)` macro registers a handler without repeating its path, so
+// an API declared that way has no `.route("/path", ...)` call to read and its
+// endpoints were absent from the graph entirely: one corpus application stored
+// 8 routes where it serves 74, and every call its own frontend made to them
+// looked like a call to nothing. The attribute is now the second Rust route
+// source.
+const cacheVersion = "v237"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
