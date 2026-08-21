@@ -209,3 +209,29 @@ func firstString(values []string) string {
 	}
 	return values[0]
 }
+
+// literalList reads the string arguments of a law's sentence, which are how a
+// far end or an antecedent names something the graph recorded rather than
+// something this declaration selected. A bare name is a part and is not read
+// here.
+func (r *surfaceReader) literalList(args []*sitter.Node) []string {
+	var out []string
+	for _, arg := range args {
+		switch arg.Kind() {
+		case "string", "bare_string":
+			if v := r.symbolOrString(arg); v != "" {
+				out = append(out, v)
+			}
+		case "array":
+			for i := uint(0); i < arg.NamedChildCount(); i++ {
+				child := arg.NamedChild(i)
+				if child.Kind() == "string" || child.Kind() == "bare_string" {
+					if v := r.symbolOrString(child); v != "" {
+						out = append(out, v)
+					}
+				}
+			}
+		}
+	}
+	return out
+}

@@ -123,7 +123,12 @@ func (r *Runner) lintRepoDeclaration(clusterDecl *intent.Declaration, repoPath s
 	if err != nil {
 		r.constraintsFatal("%v", err)
 	}
+	recipes, builtinNotes := intent.MergeBuiltinRecipes(recipes)
 	recipeProblems, recipeWarnings := intent.RecipeProblems(recipes)
+	// A repository authoring a recipe the binary also ships is exercising the
+	// override, not making a mistake, so the lint surface says which one ran
+	// and nothing fails.
+	recipeWarnings = append(recipeWarnings, builtinNotes...)
 
 	hasFile := fileDecl != nil || len(fileProblems) > 0
 	hasDir := len(dirFiles) > 0 || len(dirProblems) > 0
@@ -310,6 +315,17 @@ func (r *Runner) lintResolveComponents(eng *bootstrap.Engine, anchor string, dec
 				suggestion = fmt.Sprintf(" (measured properties with similar names: %s)", strings.Join(u.NearMiss, ", "))
 			}
 			fmt.Printf("  %s: %s%s — declared in %s\n", u.Component, u.Problem(), suggestion, u.Source)
+		}
+	}
+	unreachable := constraints.UnreachableRoles(store)
+	if len(unreachable) > 0 {
+		fmt.Printf("\nRoles this snapshot resolves against nothing:\n")
+		for _, u := range unreachable {
+			verdict := "the rule emits no verdict"
+			if u.Partial {
+				verdict = "the rule's other edge kinds still verdict"
+			}
+			fmt.Printf("  %s: %s — %s\n", u.Rule, u.Problem(), verdict)
 		}
 	}
 	if absent := constraints.AbsentExemplars(store); len(absent) > 0 {

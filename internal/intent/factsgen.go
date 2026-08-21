@@ -90,6 +90,13 @@ func CompileFacts(d *Declaration) []facts.Fact {
 		if where := EncodeWhere(c.Predicate()); where != "" {
 			extra["where"] = where
 		}
+		// Only a declared ownership fingerprints. An undeclared one is not the
+		// same statement as an explicit nothing — the edge-role screen refuses
+		// the first and admits the second — so compiling a default here would
+		// erase the distinction the declaration turns on.
+		if c.Owns != "" {
+			extra["owns"] = c.Owns
+		}
 		if c.Recipe != "" {
 			extra["recipe"] = c.Recipe
 			extra["instance"] = c.Instance
@@ -217,6 +224,9 @@ func CompileFacts(d *Declaration) []facts.Fact {
 				extra["when_edge_to"] = strings.Join(targets, " ")
 				extra["via"] = r.Via
 			}
+		}
+		if owns := EncodeOwnership(r.Owns); owns != "" {
+			extra["owns"] = owns
 		}
 		if len(r.Exempt) > 0 {
 			extra["exempt"] = EncodeExemptions(r.Exempt)

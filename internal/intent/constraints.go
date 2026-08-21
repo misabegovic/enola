@@ -32,11 +32,23 @@ import (
 // conjunction of property tests over the props the extractors measured, so a
 // component can name "the view components" or "the storage models" without a
 // directory appearing anywhere. It ANDs with every other narrowing for the
-// same reason service does — every field on this struct narrows, none widens —
-// so a component carrying both a match and a where is the path scope
-// intersected with the predicate, which is how a trusted path scope gets
-// sharpened without being replaced. A where alone is legal and needs no match:
-// the predicate IS the selector.
+// same reason service does — every SELECTOR field on this struct narrows — so a
+// component carrying both a match and a where is the path scope intersected
+// with the predicate, which is how a trusted path scope gets sharpened without
+// being replaced. A where alone is legal and needs no match: the predicate IS
+// the selector.
+//
+// Owns is the one field that WIDENS, and it is not a selector — which is why
+// the narrowing rule above is stated of the selectors rather than of the
+// struct. Every other field answers "which facts are members"; Owns answers a
+// different question the selectors cannot: whether facts that are NOT members,
+// because they are a member's methods, count as the member's when a rule walks
+// an edge. Membership is untouched by it — a component's members are exactly what
+// its selectors chose, and `constraints lint`, cap, require and require_name
+// all read the same set they always did. The distinction is what keeps the
+// exception from being licence to widen a selector: a field that changed
+// membership would have to narrow, and this one cannot change membership at
+// all.
 type ConstraintComponent struct {
 	Name        string         `yaml:"name"`
 	Service     string         `yaml:"service"`
@@ -44,6 +56,7 @@ type ConstraintComponent struct {
 	Kind        string         `yaml:"kind"`
 	NamePattern string         `yaml:"name_pattern"`
 	Where       map[string]any `yaml:"where"`
+	Owns        string         `yaml:"owns"`
 
 	// SourceFile is the repo-relative enola/constraints file that declared
 	// this component, stamped at load time; empty means declared inline. It
@@ -197,6 +210,12 @@ type ConstraintRule struct {
 	Message   string   `yaml:"message"`
 	Exemplars []string `yaml:"exemplars"`
 
+	// Owns overrides, for this rule's reach only, what a component it names
+	// owns. The component carries the concept's default; this is where one law
+	// is stricter or more permissive than another over the same concept. The
+	// precedence is stated once, in OwnershipPrecedence.
+	Owns []ComponentOwnership `yaml:"owns"`
+
 	Via     string `yaml:"via"`
 	Mode    string `yaml:"mode"`
 	Because string `yaml:"because"`
@@ -276,12 +295,18 @@ func allowedComponentKinds() string {
 // include/extend/prepend edges the Ruby extractor emits as dependency
 // carriers), which is what makes concern rules — who may include what, and
 // what a concern may reach — compose from the existing edge forms.
-var AllowedRuleVias = map[string]bool{
-	"depends_on": true, "imports": true, "calls": true, "implements": true,
+var AllowedRuleVias = viaSet(AllRuleVias)
+
+func viaSet(vias []string) map[string]bool {
+	out := make(map[string]bool, len(vias))
+	for _, via := range vias {
+		out[via] = true
+	}
+	return out
 }
 
 func allowedRuleVias() string {
-	return "calls, depends_on, implements, imports"
+	return strings.Join(AllRuleVias, ", ")
 }
 
 // AllowedRuleModes is the closed enforcement-mode vocabulary. Ratchet (the
@@ -350,18 +375,14 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 	componentNames := map[string]bool{}
 	componentSelector := map[string]string{}
 	componentSource := map[string]string{}
-	// Which components carry a predicate, read the same way the evaluator reads
-	// it: the COMPILED predicate, so a where declaring only the reserved kind key
-	// — which compiles to no property test — is not one, exactly as
-	// component.predicated() in the explainer is not.
-	predicated := map[string]bool{}
-	symbolGranular := map[string]bool{}
+	// The components indexed by name, read the same way the evaluator reads them
+	// — through the COMPILED predicate, so a where declaring only the reserved
+	// kind key, which compiles to no property test, is not a predicate component
+	// here either, exactly as component.predicated() in the explainer is not.
+	declaredComponents := map[string]ConstraintComponent{}
 	for _, c := range components {
-		if len(c.Predicate()) > 0 {
-			predicated[c.Name] = true
-		}
-		if c.Kind == "symbol" {
-			symbolGranular[c.Name] = true
+		if _, seen := declaredComponents[c.Name]; !seen {
+			declaredComponents[c.Name] = c
 		}
 	}
 	for _, c := range components {
@@ -392,17 +413,22 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 			problems = append(problems, fmt.Sprintf("%s (%s): name_pattern %q must be an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, c.Name, c.NamePattern))
 		}
 		problems = append(problems, whereProblems(loc, c)...)
-		// A name collision is flagged whenever a constraints file is involved,
-		// naming both declaring files: a merged set with two definitions of
-		// one component has no single answer for what the name selects. A
-		// repeat that selects EXACTLY what the first one selects is not that
-		// case: it is the same component said twice, which is what a
-		// repository gets when it keeps one file per convention and two
-		// conventions speak about the same part of the application. Both
-		// readings agree there, so there is nothing to resolve.
-		if componentNames[c.Name] && (c.SourceFile != "" || componentSource[c.Name] != "") &&
-			componentSelector[c.Name] != selectorOf(c) {
-			problems = append(problems, fmt.Sprintf("%s: component %q is already declared by %s with a different selector", loc, c.Name, declaredIn(componentSource[c.Name])))
+		problems = append(problems, componentOwnershipProblems(loc, c)...)
+		// A name collision is a named error wherever the two declarations sit,
+		// naming both declaring files: a merged set with two definitions of one
+		// component has no single answer for what the name selects, and which
+		// of them a reader gets must never depend on which half of the
+		// vocabulary is asking. A repeat that selects EXACTLY what the first
+		// one selects is not that case: it is the same component said twice,
+		// which is what a repository gets when it keeps one file per convention
+		// and two conventions speak about the same part of the application.
+		// Both readings agree there, so there is nothing to resolve.
+		if componentNames[c.Name] && componentSelector[c.Name] != selectorOf(c) {
+			if c.SourceFile == "" && componentSource[c.Name] == "" {
+				problems = append(problems, fmt.Sprintf("%s: component %q is declared twice in this declaration with a different selector", loc, c.Name))
+			} else {
+				problems = append(problems, fmt.Sprintf("%s: component %q is already declared by %s with a different selector", loc, c.Name, declaredIn(componentSource[c.Name])))
+			}
 		}
 		if !componentNames[c.Name] {
 			componentSource[c.Name] = c.SourceFile
@@ -433,7 +459,8 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		}
 		ruleIDs[r.ID] = true
 		problems = append(problems, ruleFormProblems(loc, r, componentNames, "component")...)
-		problems = append(problems, predicateRoleProblems(loc, r, predicated, symbolGranular, "component")...)
+		problems = append(problems, ownershipProblems(loc, r, componentNames, "component")...)
+		problems = append(problems, edgeRoleProblems(loc, r, declaredComponents, "component")...)
 		if r.Guide != "" && len(r.Exempt) > 0 {
 			problems = append(problems, fmt.Sprintf("%s (%s): exempt belongs to the law forms — guidance emits no violations to exempt", loc, r.ID))
 		}
@@ -786,5 +813,5 @@ func selectorOf(c ConstraintComponent) string {
 	}
 	sort.Strings(where)
 	return strings.Join([]string{c.Service, c.Kind, c.NamePattern,
-		strings.Join(match, ","), strings.Join(where, ",")}, "\x00")
+		strings.Join(match, ","), strings.Join(where, ","), string(c.Owns)}, "\x00")
 }

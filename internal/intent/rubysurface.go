@@ -64,6 +64,7 @@ var edgeVerbs = map[string]struct{ form, role string }{
 	"may_only_call":      {"allow", "only"},
 	"is_reached_only_by": {"protect", "owners"},
 	"must_be_reached_by": {"require_edge", "to"},
+	"must_reach":         {"require_edge", "to"},
 	"stays_inside":       {"private", "except"},
 	"must_follow":        {"protocol", "steps"},
 }
@@ -96,7 +97,7 @@ func ParseRubySurface(src []byte, path string) (ConstraintsFile, []string) {
 	r := &surfaceReader{src: src, path: path, parts: map[string]bool{}}
 	r.walkTop(tree.RootNode())
 	sort.Strings(r.problems)
-	return ConstraintsFile{Path: path, Components: r.components, Rules: r.rules}, r.problems
+	return ConstraintsFile{Path: path, Components: r.components, Rules: r.rules, UseRecipe: r.recipes}, r.problems
 }
 
 type surfaceReader struct {
@@ -105,6 +106,7 @@ type surfaceReader struct {
 	components []ConstraintComponent
 	rules      []ConstraintRule
 	parts      map[string]bool
+	recipes    []RecipeInstantiation
 	problems   []string
 }
 
@@ -140,7 +142,13 @@ func (r *surfaceReader) walkTop(node *sitter.Node) {
 
 func (r *surfaceReader) readDeclarations(body *sitter.Node) {
 	for i := uint(0); i < body.NamedChildCount(); i++ {
-		r.readStatement(body.NamedChild(i))
+		stmt := body.NamedChild(i)
+		// A comment is prose about the laws, which is most of why a team would
+		// want to write them in a file they read.
+		if stmt.Kind() == "comment" {
+			continue
+		}
+		r.readStatement(stmt)
 	}
 }
 
@@ -152,6 +160,8 @@ func (r *surfaceReader) readStatement(stmt *sitter.Node) {
 		r.readPart(stmt)
 	case "law":
 		r.readLaw(stmt)
+	case "use_recipe":
+		r.readRecipeUse(stmt)
 	default:
 		r.fail(stmt, "%q is not a declaration; write part, rails or law", r.text(stmt))
 	}
@@ -195,8 +205,12 @@ func (r *surfaceReader) readPart(stmt *sitter.Node) {
 			component.NamePattern = r.symbolOrString(pair.value)
 		case "where":
 			component.Where = r.hash(pair.value)
+		case "owns":
+			// What a predicate-selected part owns is the one thing a rule about
+			// its edges cannot infer, so the surface has to be able to say it.
+			component.Owns = r.symbolOrString(pair.value)
 		default:
-			r.fail(pair.key, "a part takes files, kind, service, named or where, not %q", key)
+			r.fail(pair.key, "a part takes files, kind, service, named, where or owns, not %q", key)
 		}
 	}
 	if len(component.Match) == 0 && component.Where == nil && component.NamePattern == "" {
@@ -221,11 +235,22 @@ func (r *surfaceReader) readLaw(stmt *sitter.Node) {
 	rule := ConstraintRule{ID: slug(sentence), Because: sentence}
 	stated := false
 	for i := uint(0); i < body.NamedChildCount(); i++ {
-		r.readLawLine(body.NamedChild(i), &rule, &stated)
+		line := body.NamedChild(i)
+		if line.Kind() == "comment" {
+			continue
+		}
+		r.readLawLine(line, &rule, &stated)
 	}
 	if !stated {
 		r.fail(stmt, "law %q says nothing: give it a sentence like jobs.must_not_call controllers", sentence)
 		return
+	}
+	// The kind of edge an antecedent reads is spelled once in the sentence and
+	// lands where the form expects it: the existential form's own via already
+	// names the edge it demands, so its antecedent gets a second key, and every
+	// other form reads the antecedent on via itself.
+	if rule.WhenVia != "" && rule.RequireEdge == "" {
+		rule.Via, rule.WhenVia = rule.WhenVia, ""
 	}
 	r.rules = append(r.rules, rule)
 }
@@ -251,6 +276,40 @@ func (r *surfaceReader) readLawLine(line *sitter.Node, rule *ConstraintRule, sta
 	case "mode":
 		rule.Mode = r.symbolOrString(firstOrNil(args))
 		return
+	case "id":
+		// A law's id is derived from its sentence, which is what keeps the two
+		// in step. A team that has to keep an id stable across a rewording —
+		// an exemption file, a dashboard, a suppression comment — says so.
+		if id := r.symbolOrString(firstOrNil(args)); id != "" {
+			rule.ID = id
+			return
+		}
+		r.fail(line, "id takes the token a finding should carry")
+		return
+	case "direction":
+		rule.Direction = r.symbolOrString(firstOrNil(args))
+		return
+	case "exemplar":
+		if text := r.symbolOrString(firstOrNil(args)); text != "" {
+			rule.Exemplars = append(rule.Exemplars, text)
+			return
+		}
+		r.fail(line, "exemplar takes the prior art as a string")
+		return
+	case "when_carrying":
+		r.readPropMatch(line, args, &rule.WhenPropContains, "when_carrying")
+		return
+	case "when_calling":
+		rule.WhenEdgeTo = append(rule.WhenEdgeTo, r.literalList(args)...)
+		for _, pair := range r.keywordPairs(args) {
+			if r.symbolOrString(pair.key) == "via" {
+				rule.WhenVia = r.symbolOrString(pair.value)
+			}
+		}
+		if len(rule.WhenEdgeTo) == 0 {
+			r.fail(line, "when_calling names the literals a member must already reach")
+		}
+		return
 	case "via":
 		rule.Via = r.symbolOrString(firstOrNil(args))
 		return
@@ -275,7 +334,29 @@ func (r *surfaceReader) readSubjectLine(line *sitter.Node, subject, verb string,
 		return
 	}
 	if edge, ok := edgeVerbs[verb]; ok {
+		// A far end is either a part this declaration knows or a literal the
+		// graph recorded: a bare name is the part, a string is the literal.
+		// That is the difference the vocabulary draws between to and to_name,
+		// and it is the difference between naming something we declared and
+		// naming something we merely measured, so the surface keeps it visible
+		// rather than guessing from whether the name happens to resolve.
+		if literals := r.literalList(args); len(literals) > 0 {
+			if edge.role != "to" {
+				r.fail(line, "%s takes parts, not literals; only the forms with a single far end read a literal", verb)
+				return
+			}
+			setForm(rule, edge.form, componentToken(subject))
+			rule.ToName = append(rule.ToName, literals...)
+			if rule.Via == "" && formNeedsVia(edge.form) {
+				rule.Via = "calls"
+			}
+			*stated = true
+			return
+		}
 		targets := r.partList(args)
+		// A role may also be named by the keyword that names it, which is how
+		// the visibility form reads: stays_inside except: handlers.
+		targets = append(targets, r.partsNamedBy(args, edge.role)...)
 		if len(targets) == 0 && edge.form != "private" {
 			r.fail(line, "%s names the part on the other side", verb)
 			return
@@ -298,6 +379,16 @@ func (r *surfaceReader) readSubjectLine(line *sitter.Node, subject, verb string,
 		}
 		if rule.Via == "" && formNeedsVia(edge.form) {
 			rule.Via = "calls"
+		}
+		// The existential form demands an edge in a direction, and the two
+		// verbs are the two directions: being reached is inbound, reaching is
+		// outbound.
+		if edge.form == "require_edge" {
+			if verb == "must_reach" {
+				rule.Direction = "outbound"
+			} else {
+				rule.Direction = "inbound"
+			}
 		}
 		*stated = true
 		return
@@ -333,20 +424,7 @@ func (r *surfaceReader) readMemberArguments(line *sitter.Node, form string, args
 	case "guide":
 		rule.Message = first
 	case "require":
-		match := &PropMatch{}
-		for _, pair := range r.keywordPairs(args) {
-			switch r.symbolOrString(pair.key) {
-			case "prop":
-				match.Prop = r.symbolOrString(pair.value)
-			case "value":
-				match.Value = r.symbolOrString(pair.value)
-			}
-		}
-		if match.Prop == "" || match.Value == "" {
-			r.fail(line, "must_carry names the prop and the value it must contain")
-			return
-		}
-		rule.MustPropContain = match
+		r.readPropMatch(line, args, &rule.MustPropContain, "must_carry")
 	}
 }
 
@@ -438,4 +516,121 @@ func slug(sentence string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+// readPropMatch reads a prop-and-value pair, which is how both the demand and
+// the antecedent of the require form are written.
+func (r *surfaceReader) readPropMatch(line *sitter.Node, args []*sitter.Node, into **PropMatch, verb string) {
+	match := &PropMatch{}
+	for _, pair := range r.keywordPairs(args) {
+		switch r.symbolOrString(pair.key) {
+		case "prop":
+			match.Prop = r.symbolOrString(pair.value)
+		case "value":
+			match.Value = r.symbolOrString(pair.value)
+		}
+	}
+	if match.Prop == "" || match.Value == "" {
+		r.fail(line, "%s names the prop and the value it must contain", verb)
+		return
+	}
+	*into = match
+}
+
+// readRecipeUse instantiates a named recipe: the bundle of laws somebody else
+// wrote, bound to this repository's own parts. It is the one line a team
+// writes to adopt a convention set it did not author.
+//
+//	use_recipe :ember_conventions, as: :app do
+//	  bind :components, files: "app/components/**"
+//	  bind :fetchers, files: "app/services/**", kind: :symbol
+//	end
+func (r *surfaceReader) readRecipeUse(stmt *sitter.Node) {
+	args := argumentNodes(stmt)
+	name := r.symbolOrString(firstOrNil(args))
+	if name == "" {
+		r.fail(stmt, "use_recipe names the recipe to instantiate")
+		return
+	}
+	instance := RecipeInstantiation{Recipe: name, Bind: map[string]RecipeBinding{}}
+	for _, pair := range r.keywordPairs(args) {
+		switch r.symbolOrString(pair.key) {
+		case "as":
+			instance.As = r.symbolOrString(pair.value)
+		case "mode":
+			instance.Mode = r.symbolOrString(pair.value)
+		}
+	}
+	if instance.As == "" {
+		r.fail(stmt, "use_recipe needs an as: naming this instantiation, since a recipe may be instantiated more than once")
+		return
+	}
+	body := blockBody(stmt)
+	if body == nil {
+		r.fail(stmt, "use_recipe binds each role the recipe declares, in a block")
+		return
+	}
+	for i := uint(0); i < body.NamedChildCount(); i++ {
+		bindLine := body.NamedChild(i)
+		if bindLine.Kind() == "comment" {
+			continue
+		}
+		if r.methodName(bindLine) != "bind" {
+			r.fail(bindLine, "only bind lines belong in a use_recipe block")
+			continue
+		}
+		bindArgs := argumentNodes(bindLine)
+		role := r.symbolOrString(firstOrNil(bindArgs))
+		if role == "" {
+			r.fail(bindLine, "bind names the recipe role it fills")
+			continue
+		}
+		binding := RecipeBinding{}
+		for _, pair := range r.keywordPairs(bindArgs) {
+			switch key := r.symbolOrString(pair.key); key {
+			case "files":
+				binding.Match = append(binding.Match, r.stringList(pair.value)...)
+			case "kind":
+				binding.Kind = r.symbolOrString(pair.value)
+			case "service":
+				binding.Service = r.symbolOrString(pair.value)
+			case "named":
+				binding.NamePattern = r.symbolOrString(pair.value)
+			case "where":
+				binding.Where = r.hash(pair.value)
+			default:
+				r.fail(pair.key, "a bind takes files, kind, service, named or where, not %q", key)
+			}
+		}
+		instance.Bind[role] = binding
+	}
+	if len(instance.Bind) == 0 {
+		r.fail(stmt, "use_recipe %q binds no role, so it selects nothing", name)
+		return
+	}
+	r.recipes = append(r.recipes, instance)
+}
+
+// partsNamedBy reads the parts a law names through the keyword that names the
+// role, so a sentence may put its far end after the verb or after the word for
+// the role, whichever reads better.
+func (r *surfaceReader) partsNamedBy(args []*sitter.Node, role string) []string {
+	var out []string
+	for _, pair := range r.keywordPairs(args) {
+		if r.symbolOrString(pair.key) != role {
+			continue
+		}
+		if pair.value != nil && pair.value.Kind() == "array" {
+			for i := uint(0); i < pair.value.NamedChildCount(); i++ {
+				if name := r.symbolOrString(pair.value.NamedChild(i)); name != "" {
+					out = append(out, name)
+				}
+			}
+			continue
+		}
+		if name := r.symbolOrString(pair.value); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }

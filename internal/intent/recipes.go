@@ -30,6 +30,7 @@ type RecipeBinding struct {
 	Kind        string         `yaml:"kind"`
 	NamePattern string         `yaml:"name_pattern"`
 	Where       map[string]any `yaml:"where"`
+	Owns        string         `yaml:"owns"`
 }
 
 type InstanceExemption struct {
@@ -290,6 +291,7 @@ func expandBindings(rec Recipe, inst RecipeInstantiation, sourceFile string) []C
 			Kind:        b.Kind,
 			NamePattern: b.NamePattern,
 			Where:       b.Where,
+			Owns:        b.Owns,
 			SourceFile:  sourceFile,
 			Recipe:      rec.Name,
 			Instance:    inst.As,
@@ -339,6 +341,10 @@ func expandRules(rec Recipe, inst RecipeInstantiation, exemptByRule map[string][
 		n.Steps = bindAll(rr.Steps)
 		n.Guide = bind(rr.Guide)
 		n.Exemplars = append([]string(nil), rr.Exemplars...)
+		n.Owns = nil
+		for _, o := range rr.Owns {
+			n.Owns = append(n.Owns, ComponentOwnership{Component: bind(o.Component), Owns: o.Owns})
+		}
 		if rr.WhenPropContains != nil {
 			when := *rr.WhenPropContains
 			n.WhenPropContains = &when

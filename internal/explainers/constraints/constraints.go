@@ -165,6 +165,7 @@ type component struct {
 	kind        string
 	namePattern string
 	where       []intent.WherePair
+	owns        string
 	source      string
 	recipe      string
 	instance    string
@@ -206,6 +207,7 @@ type rule struct {
 	guide, message            string
 	exemplars                 []string
 	via                       string
+	owns                      map[string]string
 	exempt                    []intent.ConstraintExemption
 }
 
@@ -252,12 +254,21 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				kind:        f.PropString("kind"),
 				namePattern: f.PropString("name_pattern"),
 				where:       intent.DecodeWhere(f.PropString("where")),
+				owns:        f.PropString("owns"),
 				source:      f.PropString("source"),
 				recipe:      f.PropString("recipe"),
 				instance:    f.PropString("instance"),
 				role:        f.PropString("role"),
 			}
-			components[c.name] = c
+			// First declaration wins, which is what the declaration screen's own
+			// index does. A duplicate component name is refused there, so a
+			// second fact for one name reaches this loop only from a store the
+			// screen never passed — and the answer it gets must still be the
+			// screen's, or a declaration compiles under one reading and verdicts
+			// under the other.
+			if _, seen := components[c.name]; !seen {
+				components[c.name] = c
+			}
 		case "rule":
 			r := rule{
 				id:             f.PropString("rule"),
@@ -299,6 +310,7 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				message:        f.PropString("message"),
 				exemplars:      strings.Fields(f.PropString("exemplars")),
 				via:            f.PropString("via"),
+				owns:           intent.DecodeOwnership(f.PropString("owns")),
 				exempt:         intent.DecodeExemptions(f.PropString("exempt")),
 			}
 			if n, ok := intPropOf(f, "max_members"); ok {
@@ -377,16 +389,15 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		sortFactsByNameThenFile(carriers[name])
 	}
 
-	// Everything a rule may walk edges FROM, resolved once per component: the
+	// Everything a rule may walk edges FROM before ownership is read: the
 	// members themselves and the dependency facts carrying their files' edges.
-	// A predicate component reaches exactly as far as the facts that
-	// demonstrated the predicate do — no further — and the zero-edge advisory
-	// below is what keeps the resulting silence audible.
-	edgeSources := map[string][]facts.Fact{}
+	// What a member ENCLOSES is added per rule by the resolver, because a rule
+	// may override what a component owns for its own reach.
+	carried := map[string][]facts.Fact{}
 	for _, name := range names {
 		sources := append(append([]facts.Fact{}, memberFacts[name]...), carriers[name]...)
 		sortFactsByNameThenFile(sources)
-		edgeSources[name] = sources
+		carried[name] = sources
 	}
 
 	// What each repository measured, indexed once: the subordinate fallback every
@@ -394,6 +405,12 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 	// carries the memberships too, because a predicate component's file join is
 	// only as wide as the files it measured a member in.
 	ground := newGrounding(store, memberFacts)
+
+	// One resolver, asked one question per role: how the fact that MADE an edge
+	// resolves onto a component, or how the fact the edge LANDED ON does, never
+	// both of a single role. It reads the declared ownership through the single
+	// statement of precedence, so a rule's reach is the rule's own.
+	resolve := newResolver(store, components, members, memberFacts, carried, ground)
 
 	// Which files the snapshot measured exported content in — the private form's
 	// file-granular test, asked of the whole store rather than of one component's
@@ -497,23 +514,41 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		}
 	}
 
+	// Which roles resolve nothing on the side they use. A rule holding one of
+	// them emits no verdict: the declaration screen refuses what this vocabulary
+	// can never state a basis for, and this refuses what this SNAPSHOT cannot.
+	unreachable := map[string][]UnreachableRole{}
+	refused := map[string]bool{}
+	for _, u := range unreachableRoles(store, rules, resolve, ground, unasked, unevaluable) {
+		unreachable[u.Rule] = append(unreachable[u.Rule], u)
+		if !u.Partial {
+			refused[u.Rule] = true
+		}
+	}
+
 	var insights []facts.Insight
 	for _, r := range rules {
 		if namesUnasked(r, unasked) || namesUnasked(r, unevaluable) {
 			continue
 		}
+		for _, u := range unreachable[r.id] {
+			insights = append(insights, unreachableRoleInsight(u, components[u.Component], r))
+		}
+		if refused[r.id] {
+			continue
+		}
 		var verdicts []facts.Insight
 		switch {
 		case r.forbid != "":
-			verdicts = e.verdictForbid(r, edgeSources, members, components, ground)
+			verdicts = e.verdictForbid(r, resolve, ground)
 		case r.forbidReach != "":
-			verdicts = e.verdictForbidReach(r, graphWalk, edgeSources, members, components, ground)
+			verdicts = e.verdictForbidReach(r, graphWalk, resolve, members)
 		case r.allow != "":
-			verdicts = e.verdictAllowOnly(r, edgeSources, members, resolvable, components, ground)
+			verdicts = e.verdictAllowOnly(r, resolve, resolvable, ground)
 		case r.protect != "":
-			verdicts = e.verdictProtect(r, graphWalk, components, members, ground)
+			verdicts = e.verdictProtect(r, graphWalk, resolve)
 		case r.private != "":
-			verdicts = e.verdictPrivate(r, graphWalk, components, members, memberFacts, exportedFiles, ground)
+			verdicts = e.verdictPrivate(r, graphWalk, resolve, memberFacts, exportedFiles)
 		case r.forbidFact != "":
 			verdicts = e.verdictForbidFact(r, memberFacts, members)
 		case r.cap != "":
@@ -527,9 +562,9 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		case r.forbidName != "":
 			verdicts = e.verdictForbidName(r, memberFacts, members)
 		case r.requireEdge != "":
-			verdicts = e.verdictRequireEdge(r, graphWalk, memberFacts, carriers, edgeSources, members, census, components, ground)
+			verdicts = e.verdictRequireEdge(r, graphWalk, memberFacts, carriers, members, census, resolve, ground)
 		case r.protocol != "":
-			verdicts = e.verdictProtocol(r, memberFacts, carriers, members, census, components, ground)
+			verdicts = e.verdictProtocol(r, memberFacts, carriers, members, census, resolve)
 		case r.guide != "":
 			verdicts = e.verdictGuide(r)
 		}
@@ -696,32 +731,42 @@ func deadExemptionInsight(r rule, ex intent.ConstraintExemption) facts.Insight {
 
 // verdictForbid emits one violation per measured via-edge from the forbidden
 // component into the to component.
-func (e *Explainer) verdictForbid(r rule, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictForbid(r rule, resolve *resolver, ground *grounding) []facts.Insight {
 	var out []facts.Insight
-	toSet := members[r.to]
 	skipped := map[string]bool{}
-	for _, f := range edgeSources[r.forbid] {
+	for _, f := range resolve.sources(r, r.forbid) {
+		from, sourced := resolve.source(r, r.forbid, f)
+		if !sourced {
+			continue
+		}
 		for _, rel := range f.Relations {
 			if rel.Kind != r.via {
 				continue
 			}
 			// A literal far end is compared against the target the near end
 			// recorded, which is all the graph holds when that end is an
-			// external package or a function imported from one. Nothing is
-			// grounded against a component here, because there is no component.
+			// external package or a function imported from one. It resolves
+			// against no component, so it reaches no basis either: the two
+			// ways a rule may name its far end are read here in the order the
+			// declaration wrote them.
+			var onto basis
 			if len(r.toName) > 0 {
 				if !matchesAnyBoundedName(rel.Target, r.toName) {
 					continue
 				}
-			} else if !toSet[rel.Target] && !ground.inComponent(rel, f, r.to, components) {
-				if ground.ungroundable(rel, f) {
-					skipped[rel.Target] = true
+			} else {
+				var landed bool
+				onto, landed = resolve.target(r, r.to, rel, f)
+				if !landed {
+					if ground.ungroundable(rel, f) {
+						skipped[rel.Target] = true
+					}
+					continue
 				}
-				continue
 			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("%s must not reach %s via %s, and the graph measures exactly this edge. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbid, forbidFarEnd(r), r.via, forbidBasis(r, toSet[rel.Target]), r.because),
+				Description: fmt.Sprintf("%s must not reach %s via %s, and the graph measures exactly this edge. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbid, forbidFarEnd(r), r.via, forbidFarBasis(r, from, onto), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -764,16 +809,6 @@ func forbidFarEnd(r rule) string {
 	return r.to
 }
 
-// forbidBasis states what makes the far end the far end. A literal is matched
-// against the recorded edge target and nothing else, which is a weaker claim
-// than component membership and is stated as one rather than dressed up.
-func forbidBasis(r rule, exactMember bool) string {
-	if len(r.toName) > 0 {
-		return "the edge target the near end recorded matches the named literal"
-	}
-	return membershipBasis(exactMember)
-}
-
 // matchesAnyBoundedName reports whether the target matches any of the literals
 // in the bounded dialect the validator admits.
 func matchesAnyBoundedName(target string, patterns []string) bool {
@@ -785,7 +820,17 @@ func matchesAnyBoundedName(target string, patterns []string) bool {
 	return false
 }
 
-func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+// forbidFarBasis states what makes the far end the far end. A literal is
+// matched against the recorded edge target and nothing else, which is a weaker
+// claim than a resolved membership and is stated as one rather than dressed up.
+func forbidFarBasis(r rule, from, onto basis) string {
+	if len(r.toName) > 0 {
+		return "the edge target the near end recorded matches the named literal"
+	}
+	return edgeBasis(from, onto)
+}
+
+func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, resolve *resolver, members map[string]map[string]bool) []facts.Insight {
 	if len(members[r.forbidReach]) > reachComponentCap || len(members[r.to]) > reachComponentCap {
 		return []facts.Insight{{
 			Title:       fmt.Sprintf("forbid_reach rule %s skipped: component too large for bounded traversal", r.id),
@@ -813,8 +858,12 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSourc
 	// deduplicating it afterwards makes the BFS discovery order — and with it
 	// the shortest-path tiebreak — a function of the graph alone.
 	adjacency := map[string][]string{}
-	toSet := members[r.to]
-	grounded := map[string]bool{}
+	toSet := map[string]bool{}
+	targetBasisOf := map[string]basis{}
+	for name := range members[r.to] {
+		toSet[name] = true
+		targetBasisOf[name] = exactBasis
+	}
 	for _, f := range graphWalk {
 		for _, rel := range f.Relations {
 			if !viaSet[rel.Kind] {
@@ -824,21 +873,16 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSourc
 			// A path target names no fact, so it is a leaf of this walk — but it
 			// can still BE the landing the rule forbids, and the direct form now
 			// catches exactly those. Collecting them here keeps the invariant
-			// that every pair forbid catches is within reach's.
-			if !toSet[rel.Target] && ground.inComponent(rel, f, r.to, components) {
-				grounded[rel.Target] = true
+			// that every pair forbid catches is within reach's. A target that is
+			// a member's method lands the same way, on the declaration's terms.
+			if toSet[rel.Target] {
+				continue
+			}
+			if onto, landed := resolve.target(r, r.to, rel, f); landed {
+				toSet[rel.Target] = true
+				targetBasisOf[rel.Target] = onto
 			}
 		}
-	}
-	if len(grounded) > 0 {
-		merged := make(map[string]bool, len(toSet)+len(grounded))
-		for name := range toSet {
-			merged[name] = true
-		}
-		for name := range grounded {
-			merged[name] = true
-		}
-		toSet = merged
 	}
 	for name, targets := range adjacency {
 		sort.Strings(targets)
@@ -854,19 +898,25 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSourc
 	// Sources: the component's member names, plus its dependency carriers —
 	// the same two walks verdictForbid sources from, so a pair the direct form
 	// catches is never out of this form's reach.
+	walked := resolve.sources(r, r.forbidReach)
 	sources := sortedMemberNames(members[r.forbidReach])
-	seenSource := map[string]bool{}
+	sourceBasisOf := map[string]basis{}
 	for _, name := range sources {
-		seenSource[name] = true
+		sourceBasisOf[name] = exactBasis
 	}
-	for _, f := range edgeSources[r.forbidReach] {
-		if !seenSource[f.Name] {
-			seenSource[f.Name] = true
-			sources = append(sources, f.Name)
+	for _, f := range walked {
+		if _, seen := sourceBasisOf[f.Name]; seen {
+			continue
 		}
+		from, sourced := resolve.source(r, r.forbidReach, f)
+		if !sourced {
+			continue
+		}
+		sourceBasisOf[f.Name] = from
+		sources = append(sources, f.Name)
 	}
 
-	sourceFacts := firstFactByName(edgeSources[r.forbidReach])
+	sourceFacts := firstFactByName(walked)
 	viaWords := strings.Join(vias, ", ")
 
 	var out []facts.Insight
@@ -876,7 +926,7 @@ func (e *Explainer) verdictForbidReach(r rule, graphWalk []facts.Fact, edgeSourc
 			f := sourceFacts[source]
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s reaches %s", source, target)),
-				Description: fmt.Sprintf("%s must not reach %s through any measured path over %s, and the graph measures one: %s. The rule is declared, %s, and every hop is a measured edge, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbidReach, r.to, viaWords, strings.Join(path, " -> "), membershipBasis(!grounded[target]), r.because),
+				Description: fmt.Sprintf("%s must not reach %s through any measured path over %s, and the graph measures one: %s. The rule is declared, %s, and every hop is a measured edge, so this is a decided-rule breach, not a heuristic. Because: %s", r.forbidReach, r.to, viaWords, strings.Join(path, " -> "), edgeBasis(sourceBasisOf[source], targetBasisOf[target]), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -951,24 +1001,16 @@ func reachWitnesses(adjacency map[string][]string, source string, toSet map[stri
 // only: would make each rule assert something nobody decided. An edge whose
 // target resolves to nothing measured is skipped — fail closed, never guessed
 // into a breach.
-func (e *Explainer) verdictAllowOnly(r rule, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, resolvable map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
-	// Both halves of the question fall back the same way, and in that order: a
-	// file-granular target that lands inside an allowed component is not a
-	// breach, and one that names a measured file at all is resolvable.
+func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable map[string]bool, ground *grounding) []facts.Insight {
+	// One target question, asked of the allow component and of every allowed
+	// landing in turn — exact name, then a member's method, then the measured
+	// file a path target grounds onto.
 	allowed := func(rel facts.Relation, from facts.Fact) bool {
-		if members[r.allow][rel.Target] {
+		if _, landed := resolve.target(r, r.allow, rel, from); landed {
 			return true
 		}
 		for _, name := range r.only {
-			if members[name][rel.Target] {
-				return true
-			}
-		}
-		if ground.inComponent(rel, from, r.allow, components) {
-			return true
-		}
-		for _, name := range r.only {
-			if ground.inComponent(rel, from, name, components) {
+			if _, landed := resolve.target(r, name, rel, from); landed {
 				return true
 			}
 		}
@@ -976,7 +1018,11 @@ func (e *Explainer) verdictAllowOnly(r rule, edgeSources map[string][]facts.Fact
 	}
 	var out []facts.Insight
 	skipped := map[string]bool{}
-	for _, f := range edgeSources[r.allow] {
+	for _, f := range resolve.sources(r, r.allow) {
+		from, sourced := resolve.source(r, r.allow, f)
+		if !sourced {
+			continue
+		}
 		for _, rel := range f.Relations {
 			if rel.Kind != r.via {
 				continue
@@ -990,9 +1036,13 @@ func (e *Explainer) verdictAllowOnly(r rule, edgeSources map[string][]facts.Fact
 			if allowed(rel, f) {
 				continue
 			}
+			onto := groundedBasis
+			if resolvable[rel.Target] {
+				onto = exactBasis
+			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("%s may reach only %s via %s, and the graph measures this edge landing in none of them. The rule is declared, membership is exact, and %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.allow, strings.Join(r.only, ", "), r.via, targetBasis(resolvable[rel.Target]), r.because),
+				Description: fmt.Sprintf("%s may reach only %s via %s, and the graph measures this edge landing in none of them. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", r.allow, strings.Join(r.only, ", "), r.via, disallowedBasis(from, onto), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -1022,8 +1072,7 @@ func (e *Explainer) verdictAllowOnly(r rule, edgeSources map[string][]facts.Fact
 // join cannot prove the named fact made the edge). An edge from inside the
 // protected component itself is not a breach, by the same reasoning as
 // allow-only's self edges: internal structure is not a reach.
-func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, components map[string]component, members map[string]map[string]bool, ground *grounding) []facts.Insight {
-	protected := members[r.protect]
+func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, resolve *resolver) []facts.Insight {
 	inside := append([]string{r.protect}, r.owners...)
 	var out []facts.Insight
 	for _, f := range graphWalk {
@@ -1031,15 +1080,16 @@ func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, components ma
 			if rel.Kind != r.via {
 				continue
 			}
-			if !protected[rel.Target] && !ground.inComponent(rel, f, r.protect, components) {
+			onto, landed := resolve.target(r, r.protect, rel, f)
+			if !landed {
 				continue
 			}
-			if ownedBy(f, inside, components, members) {
+			if resolve.sourceIn(r, inside, f) {
 				continue
 			}
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, r.via)),
-				Description: fmt.Sprintf("Only %s may reach members of %s via %s, and the graph measures this edge arriving from outside every owner. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", strings.Join(r.owners, ", "), r.protect, r.via, membershipBasis(protected[rel.Target]), r.because),
+				Description: fmt.Sprintf("Only %s may reach members of %s via %s, and the graph measures this edge arriving from outside every owner. The rule is declared, %s, so this is a decided-rule breach, not a heuristic. Because: %s", strings.Join(r.owners, ", "), r.protect, r.via, reverseBasis(onto, "owners:"), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -1066,7 +1116,7 @@ func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, components ma
 // name whose facts disagree about visibility is too, both fail closed. The
 // walk covers every rule-via edge kind at once: privacy is about any measured
 // reach, so the form carries no via of its own.
-func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, components map[string]component, members map[string]map[string]bool, memberFacts map[string][]facts.Fact, exported map[string]bool, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, resolve *resolver, memberFacts map[string][]facts.Fact, exported map[string]bool) []facts.Insight {
 	internal := map[string]bool{}
 	// The same measurement, keyed by file: a file-granular import target names no
 	// member, and reaching a file whose every measured fact is non-exported is
@@ -1109,16 +1159,29 @@ func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, components ma
 			if !reachKind[rel.Kind] {
 				continue
 			}
-			if !internal[rel.Target] && !ground.resolvedPathIn(rel, f, func(path string) bool { return internalFiles[path] }) {
+			// The member behind the target, which is the target itself when it is
+			// one and the declaring member when the declaration owns it: the
+			// visibility the rule reads was measured on the member, so a method is
+			// reached as private exactly when its owner is.
+			onto := groundedBasis
+			member, named := resolve.memberBehind(r, r.private, rel.Target)
+			switch {
+			case named && internal[member]:
+				onto = exactBasis
+				if member != rel.Target {
+					onto = ownedBasis
+				}
+			case named:
+				continue
+			case !resolve.ground.resolvedPathIn(rel, f, func(path string) bool { return internalFiles[path] }):
 				continue
 			}
-			if ownedBy(f, inside, components, members) {
+			if resolve.sourceIn(r, inside, f) {
 				continue
 			}
-			subject, basis := privateBasis(internal[rel.Target])
 			out = append(out, facts.Insight{
 				Title:       r.titled(fmt.Sprintf("%s -> %s via %s", f.Name, rel.Target, rel.Kind)),
-				Description: fmt.Sprintf("%s %s %s, reachable only from inside the component%s, and the graph measures this %s edge arriving from outside. The rule is declared, %s, and the visibility is the extractor's own measurement, so this is a decided-rule breach, not a heuristic. Because: %s", rel.Target, subject, r.private, scope, rel.Kind, basis, r.because),
+				Description: fmt.Sprintf("%s %s %s, reachable only from inside the component%s, and the graph measures this %s edge arriving from outside. The rule is declared, %s, and the visibility is the extractor's own measurement, so this is a decided-rule breach, not a heuristic. Because: %s", rel.Target, privateSubject(onto), r.private, scope, rel.Kind, privateBasisPhrase(onto), r.because),
 				Confidence:  r.confidence(),
 				Evidence: []facts.Evidence{{
 					File:   f.File,
@@ -1490,7 +1553,7 @@ func memberShortName(name string) string {
 // never silently compliant, never falsely violated. A source class that
 // sources no rule-via edges anywhere is no edge source as far as the store
 // can state, so it narrows nothing.
-func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFacts, carriers, edgeSources map[string][]facts.Fact, members map[string]map[string]bool, census map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, census map[string]map[string]bool, resolve *resolver, ground *grounding) []facts.Insight {
 	memberNames := sortedMemberNames(members[r.requireEdge])
 	if len(memberNames) == 0 {
 		return nil
@@ -1515,7 +1578,7 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 	if r.direction == "inbound" {
 		sourceScope := graphWalk
 		if r.to != "" {
-			sourceScope = edgeSources[r.to]
+			sourceScope = resolve.sources(r, r.to)
 		}
 		blind = blindSourceClasses(sourceScope, census, r.via)
 		if len(blind) > 0 {
@@ -1523,14 +1586,16 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 				skipped[name] = true
 			}
 		} else {
-			memberSet := members[r.requireEdge]
 			for _, f := range sourceScope {
 				for _, rel := range f.Relations {
 					if rel.Kind != r.via {
 						continue
 					}
-					if memberSet[rel.Target] {
-						satisfied[rel.Target] = true
+					// The demand is satisfied for the MEMBER the target names,
+					// which is the target itself when it is a member and the
+					// declaring member when the declaration owns its methods.
+					if member, named := resolve.memberBehind(r, r.requireEdge, rel.Target); named {
+						satisfied[member] = true
 						continue
 					}
 					// A file-granular target satisfies the demand for the member the
@@ -1550,18 +1615,32 @@ func (e *Explainer) verdictRequireEdge(r rule, graphWalk []facts.Fact, memberFac
 			if rel.Kind != r.via {
 				return false
 			}
-			return r.to == "" || members[r.to][rel.Target] || ground.inComponent(rel, from, r.to, components)
+			if r.to == "" {
+				return true
+			}
+			_, landed := resolve.target(r, r.to, rel, from)
+			return landed
 		}
 		measurable := map[string]bool{}
 		for _, f := range memberFacts[r.requireEdge] {
 			if census[edgeClassOf(f)][r.via] {
 				measurable[f.Name] = true
 			}
+		}
+		// The member's own edges, and — where the declaration says so — the edges
+		// of its methods, which is where a Ruby class's calls live.
+		for _, f := range resolve.sources(r, r.requireEdge) {
+			member, own := resolve.memberOfSource(r, r.requireEdge, f)
+			if !own {
+				continue
+			}
 			for _, rel := range f.Relations {
 				if accepted(rel, f) {
-					satisfied[f.Name] = true
+					satisfied[member] = true
 				}
 			}
+		}
+		for _, f := range memberFacts[r.requireEdge] {
 			// The carrier shares the member's file, so it shares its repository —
 			// which is the only thing the file-granular fallback reads off the fact.
 			for _, rel := range carrierEdges[f.File] {
@@ -1684,7 +1763,7 @@ func requireEdgeSkipInsight(r rule, skipped map[string]bool, blind []string, fir
 	}
 }
 
-func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, census map[string]map[string]bool, components map[string]component, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]facts.Fact, members map[string]map[string]bool, census map[string]map[string]bool, resolve *resolver) []facts.Insight {
 	memberNames := sortedMemberNames(members[r.protocol])
 	if len(memberNames) == 0 {
 		return nil
@@ -1696,22 +1775,23 @@ func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]f
 	}
 
 	touched := map[string]map[int]bool{}
-	groundedStep := map[string]bool{}
-	touch := func(from facts.Fact, rel facts.Relation) {
+	stepBasis := map[string]basis{}
+	madeBasis := map[string]basis{}
+	touch := func(member string, from facts.Fact, rel facts.Relation) {
 		if rel.Kind != r.via {
 			return
 		}
 		for i, step := range r.steps {
-			exact := members[step][rel.Target]
-			if !exact && !ground.inComponent(rel, from, step, components) {
+			onto, landed := resolve.target(r, step, rel, from)
+			if !landed {
 				continue
 			}
-			if touched[from.Name] == nil {
-				touched[from.Name] = map[int]bool{}
+			if touched[member] == nil {
+				touched[member] = map[int]bool{}
 			}
-			touched[from.Name][i] = true
-			if !exact {
-				groundedStep[from.Name] = true
+			touched[member][i] = true
+			if onto > stepBasis[member] {
+				stepBasis[member] = onto
 			}
 		}
 	}
@@ -1720,13 +1800,24 @@ func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]f
 		if census[edgeClassOf(f)][r.via] {
 			measurable[f.Name] = true
 		}
-		for _, rel := range f.Relations {
-			touch(f, rel)
-		}
 		// The carrier shares the member's file, so it shares its repository — the
 		// only thing the file-granular fallback reads off the fact.
 		for _, rel := range carrierEdges[f.File] {
-			touch(f, rel)
+			touch(f.Name, f, rel)
+		}
+	}
+	// The member's own edges, and the edges of its methods where the
+	// declaration says those are the member's.
+	for _, f := range resolve.sources(r, r.protocol) {
+		member, own := resolve.memberOfSource(r, r.protocol, f)
+		if !own {
+			continue
+		}
+		for _, rel := range f.Relations {
+			touch(member, f, rel)
+			if rel.Kind == r.via && member != f.Name {
+				madeBasis[member] = ownedBasis
+			}
 		}
 	}
 
@@ -1761,7 +1852,7 @@ func (e *Explainer) verdictProtocol(r rule, memberFacts, carriers map[string][]f
 		f := first[name]
 		out = append(out, facts.Insight{
 			Title:       r.titled(fmt.Sprintf("%s %s %s without %s", name, r.via, r.steps[highest], r.steps[highestMissing])),
-			Description: fmt.Sprintf("%s is a member of %s and makes a measured %s edge into %s, step %d of the declared order %s — so it must also make %s edges into every earlier step, and the graph measures none into %s. This is structural protocol conformance, not runtime ordering: the verdict says the member references a later step's surface without referencing every prerequisite step's surface, which a static fact graph can decide; whether the steps execute in order at runtime it cannot see and does not claim. The rule is declared, %s, and facts of this member's file kind demonstrably source %s edges elsewhere in this snapshot, so each absence is measured, never extraction blindness. Because: %s", name, r.protocol, r.via, r.steps[highest], highest+1, strings.Join(r.steps, " -> "), r.via, strings.Join(missing, ", "), membershipBasis(!groundedStep[name]), r.via, r.because),
+			Description: fmt.Sprintf("%s is a member of %s and makes a measured %s edge into %s, step %d of the declared order %s — so it must also make %s edges into every earlier step, and the graph measures none into %s. This is structural protocol conformance, not runtime ordering: the verdict says the member references a later step's surface without referencing every prerequisite step's surface, which a static fact graph can decide; whether the steps execute in order at runtime it cannot see and does not claim. The rule is declared, %s, and facts of this member's file kind demonstrably source %s edges elsewhere in this snapshot, so each absence is measured, never extraction blindness. Because: %s", name, r.protocol, r.via, r.steps[highest], highest+1, strings.Join(r.steps, " -> "), r.via, strings.Join(missing, ", "), edgeBasis(madeBasis[name], stepBasis[name]), r.via, r.because),
 			Confidence:  r.confidence(),
 			Evidence: []facts.Evidence{{
 				File:   f.File,
@@ -2124,33 +2215,6 @@ func unaskedComponents(store *facts.Store, components map[string]component) map[
 		}
 	}
 	return unasked
-}
-
-// ownedBy reports whether a fact belongs to any of the named components — the
-// source-side resolution the reverse-walking forms (protect, private) share.
-// Ownership resolves exactly: a member-kind fact by its canonical name in a
-// component's membership, a dependency carrier by its file joining a
-// component's patterns (never a name-narrowed component's — a file-level join
-// cannot prove the named fact made the edge).
-func ownedBy(f facts.Fact, names []string, components map[string]component, members map[string]map[string]bool) bool {
-	for _, name := range names {
-		if members[name][f.Name] {
-			return true
-		}
-	}
-	if f.Kind != facts.KindDependency {
-		return false
-	}
-	for _, name := range names {
-		c, declared := components[name]
-		if !declared {
-			continue
-		}
-		if carrierFor(f, c) {
-			return true
-		}
-	}
-	return false
 }
 
 // namesUnasked reports whether a rule names any component in a silenced set —

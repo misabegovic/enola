@@ -2135,7 +2135,14 @@ import (
 // repository may keep one file per convention without renaming the pieces of
 // the application each one speaks about. A name reused for a different
 // selector is still the error.
-const cacheVersion = "v234"
+// v235: the Ruby surface says everything the declaration vocabulary says.
+// Explicit ids, literal far ends, the require form's antecedents, direction,
+// guidance exemplars and recipe instantiation all have sentences, and a test
+// walks the schema so a key added later without one fails the build.
+// v236: convention sets ship with the binary. A repository instantiates
+// rails-conventions without authoring it, and a local recipe of the same name
+// replaces the shipped one with the replacement reported.
+const cacheVersion = "v236"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
