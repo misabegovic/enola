@@ -348,6 +348,7 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		return sourceFile
 	}
 	componentNames := map[string]bool{}
+	componentSelector := map[string]string{}
 	componentSource := map[string]string{}
 	// Which components carry a predicate, read the same way the evaluator reads
 	// it: the COMPILED predicate, so a where declaring only the reserved kind key
@@ -393,12 +394,19 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		problems = append(problems, whereProblems(loc, c)...)
 		// A name collision is flagged whenever a constraints file is involved,
 		// naming both declaring files: a merged set with two definitions of
-		// one component has no single answer for what the name selects.
-		if componentNames[c.Name] && (c.SourceFile != "" || componentSource[c.Name] != "") {
-			problems = append(problems, fmt.Sprintf("%s: component %q is already declared by %s", loc, c.Name, declaredIn(componentSource[c.Name])))
+		// one component has no single answer for what the name selects. A
+		// repeat that selects EXACTLY what the first one selects is not that
+		// case: it is the same component said twice, which is what a
+		// repository gets when it keeps one file per convention and two
+		// conventions speak about the same part of the application. Both
+		// readings agree there, so there is nothing to resolve.
+		if componentNames[c.Name] && (c.SourceFile != "" || componentSource[c.Name] != "") &&
+			componentSelector[c.Name] != selectorOf(c) {
+			problems = append(problems, fmt.Sprintf("%s: component %q is already declared by %s with a different selector", loc, c.Name, declaredIn(componentSource[c.Name])))
 		}
 		if !componentNames[c.Name] {
 			componentSource[c.Name] = c.SourceFile
+			componentSelector[c.Name] = selectorOf(c)
 		}
 		componentNames[c.Name] = true
 	}
@@ -764,4 +772,19 @@ func ValidBasenameGlob(glob string) bool {
 		return false
 	}
 	return !strings.ContainsAny(literal, `*?[]{}\`)
+}
+
+// selectorOf renders everything a component selects with, so two declarations
+// of one name are compared as the selectors they are rather than as the text
+// somebody typed.
+func selectorOf(c ConstraintComponent) string {
+	match := append([]string(nil), c.Match...)
+	sort.Strings(match)
+	where := make([]string, 0, len(c.Where))
+	for k, v := range c.Where {
+		where = append(where, fmt.Sprintf("%s=%v", k, v))
+	}
+	sort.Strings(where)
+	return strings.Join([]string{c.Service, c.Kind, c.NamePattern,
+		strings.Join(match, ","), strings.Join(where, ",")}, "\x00")
 }

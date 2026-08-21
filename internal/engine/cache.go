@@ -2131,7 +2131,11 @@ import (
 // reads .rb files through a surface that parses (never executes) them and
 // compiles to the same declaration YAML produces, so both spellings merge,
 // stamp and evaluate identically.
-const cacheVersion = "v233"
+// v234: a part declared identically in two files is the same part, so a
+// repository may keep one file per convention without renaming the pieces of
+// the application each one speaks about. A name reused for a different
+// selector is still the error.
+const cacheVersion = "v234"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
