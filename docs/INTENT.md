@@ -656,7 +656,7 @@ component has no match patterns for a path to join. A file nobody has
 written yet is still refused: nothing has been measured about it, and
 that is exactly what a predicate cannot answer for.
 
-### The thirteen rule forms
+### The fourteen rule forms
 
 Every rule has a lowercase-token `id`, unique per declaration, and a
 mandatory `because:` — the rationale every resulting finding surfaces,
@@ -725,6 +725,12 @@ rules:
     pattern: "*Job"              # prefix*, *suffix, or an exact name — nothing else
     because: "the scheduler discovers jobs by their suffix"
 
+  - id: no-getter-prefixes       # forbid_name: member names must not match a pattern
+    forbid_name: models
+    pattern: "get_*"             # the same dialect require_name speaks
+    surface: exported            # optional: judge exported members only
+    because: "a reader is a noun; get_ says the class is a bag of fields"
+
   - id: every-event-consumed     # require_edge: every member must have an edge
     require_edge: events
     to: handlers                 # optional: omit to accept the edge from anywhere
@@ -759,6 +765,15 @@ match the declared pattern. The dialect is deliberately bounded —
 regex — for the same reason `match` patterns are: a convention the
 evaluator would silently mis-apply must be impossible to declare.
 Every member is in scope; a name always exists.
+
+`forbid_name` is its negative: every member fact's name must *not* match
+the declared pattern, in the same bounded dialect and through the same
+matcher, so a pattern means one thing whichever way it is read; for a
+method the pattern is also tried against the bare method name after its
+owner, so `get_*` reaches `Order#get_total`. With
+`surface: exported` only members whose measured `exported` prop is true
+are judged, because a private helper is not the surface a naming
+convention governs; without it every member is.
 
 `private` verdicts visibility: members of the component whose measured
 `exported` prop is `false` may be reached only from inside the

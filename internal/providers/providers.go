@@ -152,9 +152,13 @@ func Validate(providers []Provider) error {
 // receipt's account of who contributed what, including the providers that
 // contributed nothing and why. taken reports whether an extractor already owns
 // a kind+name identity; colliding provider facts are skipped, never merged.
-// Run never fails the snapshot: every per-provider failure mode is a named
-// skip in the census.
-func Run(ctx context.Context, providers []Provider, repoPath string, taken func(kind, name string) bool) ([]facts.Fact, []facts.ProviderRecord) {
+// ignored reports whether a repo-relative file is excluded by the repository's
+// ignore globs, and a fact about such a file is dropped: a provider walks the
+// tree itself, so it cannot know what the configuration excludes, and a
+// vendored dependency the extractors never read must not enter the graph
+// through the seam instead. Run never fails the snapshot: every per-provider
+// failure mode is a named skip in the census.
+func Run(ctx context.Context, providers []Provider, repoPath string, taken func(kind, name string) bool, ignored func(file string) bool) ([]facts.Fact, []facts.ProviderRecord) {
 	sorted := append([]Provider(nil), providers...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 
@@ -190,8 +194,12 @@ func Run(ctx context.Context, providers []Provider, repoPath string, taken func(
 			continue
 		}
 		kept := accepted[:0]
-		collided := 0
+		collided, excluded := 0, 0
 		for _, f := range accepted {
+			if ignored != nil && f.File != "" && ignored(f.File) {
+				excluded++
+				continue
+			}
 			if taken != nil && taken(f.Kind, f.Name) {
 				collided++
 				continue
@@ -201,6 +209,10 @@ func Run(ctx context.Context, providers []Provider, repoPath string, taken func(
 		if collided > 0 {
 			log.Printf("[providers] %s: skipped %d fact(s) whose name+kind identity an extractor already owns", p.Name, collided)
 		}
+		if excluded > 0 {
+			log.Printf("[providers] %s: dropped %d fact(s) about files this repository's ignore globs exclude", p.Name, excluded)
+		}
+		record.ExcludedByIgnore = excluded
 		record.FactCount = len(kept)
 		records = append(records, record)
 		merged = append(merged, kept...)

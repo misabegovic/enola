@@ -57,7 +57,7 @@ type ConstraintComponent struct {
 }
 
 // ConstraintRule declares one enforcement statement about components. Exactly
-// one of thirteen forms selects what the rule says: Forbid/To (this component must
+// one of fourteen forms selects what the rule says: Forbid/To (this component must
 // not reach that one), ForbidReach/To (this component must not reach that one
 // through ANY measured path — the transitive form, walked breadth-first under
 // a hard depth cap; Via narrows the walked edge kinds and defaults to every
@@ -183,7 +183,9 @@ type ConstraintRule struct {
 	Method         string `yaml:"method"`
 
 	RequireName string `yaml:"require_name"`
+	ForbidName  string `yaml:"forbid_name"`
 	Pattern     string `yaml:"pattern"`
+	Surface     string `yaml:"surface"`
 
 	RequireEdge string `yaml:"require_edge"`
 	Direction   string `yaml:"direction"`
@@ -501,6 +503,13 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 		if !ValidNamePattern(r.Pattern) {
 			problems = append(problems, fmt.Sprintf("%s (%s): require_name needs a pattern that is an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, r.ID))
 		}
+	case r.ForbidName != "":
+		if !ValidNamePattern(r.Pattern) {
+			problems = append(problems, fmt.Sprintf("%s (%s): forbid_name needs a pattern that is an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, r.ID))
+		}
+		if r.Surface != "" && r.Surface != "exported" {
+			problems = append(problems, fmt.Sprintf("%s (%s): surface must be exported or absent (absent means every member)", loc, r.ID))
+		}
 	case r.Protocol != "":
 		if !AllowedRuleVias[r.Via] {
 			problems = append(problems, fmt.Sprintf("%s (%s): via %q is not a rule edge kind (allowed: %s)", loc, r.ID, r.Via, allowedRuleVias()))
@@ -629,8 +638,11 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 	if r.RequireDefines == "" && r.Method != "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): method belongs to the require_defines form", loc, r.ID))
 	}
-	if r.RequireName == "" && r.Pattern != "" {
-		problems = append(problems, fmt.Sprintf("%s (%s): pattern belongs to the require_name form", loc, r.ID))
+	if r.RequireName == "" && r.ForbidName == "" && r.Pattern != "" {
+		problems = append(problems, fmt.Sprintf("%s (%s): pattern belongs to the require_name and forbid_name forms", loc, r.ID))
+	}
+	if r.ForbidName == "" && r.Surface != "" {
+		problems = append(problems, fmt.Sprintf("%s (%s): surface belongs to the forbid_name form", loc, r.ID))
 	}
 	if r.Guide == "" && (r.Message != "" || len(r.Exemplars) > 0) {
 		problems = append(problems, fmt.Sprintf("%s (%s): message/exemplars belong to the guide form", loc, r.ID))

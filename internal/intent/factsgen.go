@@ -189,6 +189,12 @@ func CompileFacts(d *Declaration) []facts.Fact {
 		case r.RequireName != "":
 			extra["require_name"] = r.RequireName
 			extra["pattern"] = r.Pattern
+		case r.ForbidName != "":
+			extra["forbid_name"] = r.ForbidName
+			extra["pattern"] = r.Pattern
+			if r.Surface != "" {
+				extra["surface"] = r.Surface
+			}
 		case r.Guide != "":
 			extra["guide"] = r.Guide
 			extra["message"] = r.Message

@@ -39,6 +39,7 @@ var RuleForms = []RuleForm{
 	{Key: "require_edge", Subject: func(r ConstraintRule) string { return r.RequireEdge }, WalksEdges: true},
 	{Key: "require_defines", Subject: func(r ConstraintRule) string { return r.RequireDefines }},
 	{Key: "require_name", Subject: func(r ConstraintRule) string { return r.RequireName }},
+	{Key: "forbid_name", Subject: func(r ConstraintRule) string { return r.ForbidName }},
 	{Key: "protocol", Subject: func(r ConstraintRule) string { return r.Protocol }, WalksEdges: true},
 	{Key: "guide", Subject: func(r ConstraintRule) string { return r.Guide }},
 }

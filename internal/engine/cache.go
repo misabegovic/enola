@@ -2088,7 +2088,50 @@ import (
 // this release fixes from a binary that no longer contains it. Upstream shipped
 // this change as its v216 in 0.4.2; this channel had already spent v216 through
 // v222, so the same behaviour change takes the next free number here.
-const cacheVersion = "v223"
+// v224: a class owns the members it mixed in. The mixin-owner binder follows
+// each literal include, extend or prepend to the module fact of the same name
+// and writes has_method relations from the includer to the module's members,
+// recording each projected member and its mixin kind on the includer. Ownership
+// moves findings (dead-methods surfaces, god-class fan-in through has_method,
+// constraint member sets), so the version moves with it.
+// v225: where a framework enters the code is a fact. The framework-roots
+// binder sets root on Rails routes and the actions they resolve to, and on the
+// methods a framework invokes on a class the store ties to it (job perform,
+// mailer actions, channel hooks, migration steps, methods a class body names
+// as callbacks), then walks calls from every root and sets reached_from on
+// what it reaches. Entry points and dead-methods read the props.
+// v226: every markdown file in scope is a source. mdintent detects any
+// markdown tree and, for a file declaring no intent, emits a document symbol,
+// a section symbol per heading and a names relation per link that resolves on
+// disk, counting the links that do not on its extraction fact.
+// v227: a client path that reaches the call through a method parameter is
+// derived from the literals the method's callers pass (one hop, same file),
+// marked derived=parameter, with the non-literal and ambiguous cases counted
+// on the ruby:http-client extraction fact.
+// v228: forbid_name, the negative of require_name: a component's members must
+// not match a bounded pattern, optionally judged on exported members only.
+// A new rule form compiles into a new intent fact shape.
+// v229: Ruby records what it constructs. `new` on a literal constant emits an
+// instantiates relation from the calling member to the class, and a
+// construction immediately sent a message names the ceremony under
+// one_shot_call, from the tree-sitter extractor and the Prism provider alike.
+// v230: a fact carries the span its extractor measured (end line, start and
+// end column beside the start line), evidence carries the span of the fact it
+// names, and check prints the offending line with the span underlined.
+// v231: a provider's facts pass the repository's ignore globs. A provider
+// walks the tree itself and cannot know the configuration, so a vendored tree
+// the extractors never read was entering the graph through the seam; the drop
+// is counted on the provider's census.
+// v232: the module layer has the edges its symbols imply. A post-link binder
+// rolls every resolved call, dependency and instantiation up to the modules
+// declaring the two symbols and emits a weighted dependency fact for the
+// pairs no extractor connected, so the readings that walk modules answer on
+// languages without import statements.
+// v233: a repository may write its laws in Ruby. The constraints directory
+// reads .rb files through a surface that parses (never executes) them and
+// compiles to the same declaration YAML produces, so both spellings merge,
+// stamp and evaluate identically.
+const cacheVersion = "v233"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

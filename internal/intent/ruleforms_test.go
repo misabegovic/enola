@@ -99,6 +99,12 @@ var formFixtures = map[string]formFixture{
 			return base(ConstraintRule{RequireName: bind("require_name"), Pattern: "*Event"})
 		},
 	},
+	"forbid_name": {
+		roles: []string{"forbid_name"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{ForbidName: bind("forbid_name"), Pattern: "*Event"})
+		},
+	},
 	"guide": {
 		roles: []string{"guide"},
 		build: func(bind func(string) string) ConstraintRule {

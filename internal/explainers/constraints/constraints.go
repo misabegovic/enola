@@ -197,6 +197,7 @@ type rule struct {
 	mustProp, mustValue       string
 	requireDefines, method    string
 	requireName, pattern      string
+	forbidName, surface       string
 	requireEdge, direction    string
 	whenVia                   string
 	toName                    []string
@@ -285,6 +286,8 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				requireDefines: f.PropString("require_defines"),
 				method:         f.PropString("method"),
 				requireName:    f.PropString("require_name"),
+				forbidName:     f.PropString("forbid_name"),
+				surface:        f.PropString("surface"),
 				pattern:        f.PropString("pattern"),
 				requireEdge:    f.PropString("require_edge"),
 				direction:      f.PropString("direction"),
@@ -521,6 +524,8 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			verdicts = e.verdictRequireDefines(r, memberFacts, members, definedNames, composed)
 		case r.requireName != "":
 			verdicts = e.verdictRequireName(r, memberFacts, members)
+		case r.forbidName != "":
+			verdicts = e.verdictForbidName(r, memberFacts, members)
 		case r.requireEdge != "":
 			verdicts = e.verdictRequireEdge(r, graphWalk, memberFacts, carriers, edgeSources, members, census, components, ground)
 		case r.protocol != "":
@@ -1421,6 +1426,51 @@ func (e *Explainer) verdictRequireName(r rule, memberFacts map[string][]facts.Fa
 		})
 	}
 	return out
+}
+
+// verdictForbidName is require_name's negative: one violation per member of
+// the component whose name matches the declared bounded pattern. The pattern
+// is tried against the member's full name and, for a method, its bare method
+// name after the owner, so `get_*` reaches `Order#get_total` the way a
+// reader means it. With surface: exported only members whose measured
+// exported prop is true are in scope, since a private helper is not the
+// convention's surface; without it every member is. The same bounded dialect
+// and the same matcher, so the two forms cannot disagree about what a
+// pattern means.
+func (e *Explainer) verdictForbidName(r rule, memberFacts map[string][]facts.Fact, members map[string]map[string]bool) []facts.Insight {
+	var out []facts.Insight
+	first := firstFactByName(memberFacts[r.forbidName])
+	for _, name := range sortedMemberNames(members[r.forbidName]) {
+		if !intent.MatchBoundedName(name, r.pattern) && !intent.MatchBoundedName(memberShortName(name), r.pattern) {
+			continue
+		}
+		f := first[name]
+		if r.surface == "exported" && !f.PropBool("exported") {
+			continue
+		}
+		out = append(out, facts.Insight{
+			Title:       r.titled(fmt.Sprintf("%s matches the forbidden %s", name, r.pattern)),
+			Description: fmt.Sprintf("%s is a member of %s, so its name must not match %s — and it does. The rule is declared, membership is exact, and the pattern dialect is bounded, so this is a decided-rule breach, not a heuristic. Because: %s", name, r.forbidName, r.pattern, r.because),
+			Confidence:  r.confidence(),
+			Evidence: []facts.Evidence{{
+				File:   f.File,
+				Symbol: f.Name,
+				Detail: "name inside the forbidden pattern " + r.pattern,
+			}},
+			Actions: []string{
+				"Rename the member out of the pattern if the rule stands",
+				"Amend the pattern on its declaring page if the decision behind it changed",
+			},
+		})
+	}
+	return out
+}
+
+func memberShortName(name string) string {
+	if i := strings.LastIndexAny(name, "#."); i >= 0 && i+1 < len(name) {
+		return name[i+1:]
+	}
+	return name
 }
 
 // verdictRequireEdge emits one violation per member of the component with no

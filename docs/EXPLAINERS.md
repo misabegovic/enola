@@ -59,7 +59,7 @@ the entities the claim is about. There are sixteen, and they fall into six kinds
   are capped below 1.0, because each absence can be drift or an extraction miss.
   `constraints` is the third: it verdicts the declared components-and-rules vocabulary
   against the measured graph — a component resolves to the facts its match patterns
-  select, and a rule states one of thirteen enforceable forms over components (`forbid`,
+  select, and a rule states one of fourteen enforceable forms over components (`forbid`,
   `forbid_reach`, `allow`, `protect`, `private`, and the rest). A breach is set
   membership over measured edges, so it is proof-class; the one place it estimates is
   a `forbid_reach` membership too large to walk, which degrades to a single `0.4`
