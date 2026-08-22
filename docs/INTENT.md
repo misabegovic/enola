@@ -1657,8 +1657,24 @@ file census applies to its own walk.
 
 ### The Rubydex provider
 
-The reference provider at `examples/providers/ruby/rubydex/` requires
-the Rubydex gem, indexes the workspace, resolves it, and emits the three
+Rubydex, the shared Ruby analysis engine, is a provider the binary
+carries itself. A `providers:` entry named `rubydex` with no `command`
+runs it in-process: the engine's C-ABI library, which every platform gem
+ships prebuilt, is loaded at run time (no cgo, no Ruby interpreter, no
+gem in the measured repository's bundle) from enola's cache, where
+`enola providers fetch rubydex` puts it after downloading the pinned
+gem version from rubygems.org and verifying its published digest. A
+configured provider whose library is absent is a named skip in the
+census that says which command installs it; `doctor` reports the same.
+Fetching is the only network access a provider makes, never at snapshot
+time. Dependency gem paths come from the repository's own bundle
+(`bundle list --paths`) when `bundle` is on PATH; without it the
+workspace alone is indexed and the census says so. A reference
+implementation in Ruby stays at `examples/providers/ruby/rubydex/` for
+an installation that prefers an external process; both emit the same
+facts.
+
+The provider indexes the workspace, resolves it, and emits the three
 things enola's own Ruby extractor and the Prism provider do not: constant
 references resolved through Ruby's nesting and inheritance rules
 (`rubydex-ref:`, a `depends_on` edge at `resolved`), method calls whose
