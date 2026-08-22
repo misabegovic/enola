@@ -75,6 +75,11 @@ var RuleForms = []RuleForm{
 	{Key: "forbid_name", Subject: func(r ConstraintRule) string { return r.ForbidName }},
 	{Key: "protocol", Subject: func(r ConstraintRule) string { return r.Protocol }, WalksEdges: true, Side: sourceSide, CensusMeasured: true},
 	{Key: "guide", Subject: func(r ConstraintRule) string { return r.Guide }},
+	{Key: "storage_stays_home", Subject: func(r ConstraintRule) string { return r.StorageStaysHome }},
+	{Key: "cap_runtime", Subject: func(r ConstraintRule) string { return r.CapRuntime }},
+	{Key: "require_consumer", Subject: func(r ConstraintRule) string { return r.RequireConsumer }},
+	{Key: "unique_across", Subject: func(r ConstraintRule) string { return r.UniqueAcross }},
+	{Key: "require_governed", Subject: func(r ConstraintRule) string { return r.RequireGoverned }},
 }
 
 func sourceSide(ConstraintRule) string { return SideSource }

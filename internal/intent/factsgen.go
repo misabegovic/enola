@@ -105,6 +105,7 @@ func CompileFacts(d *Declaration) []facts.Fact {
 			sort.Strings(public)
 			extra["public"] = strings.Join(public, " ")
 		}
+		graphComponentProps(c, extra)
 		if c.Recipe != "" {
 			extra["recipe"] = c.Recipe
 			extra["instance"] = c.Instance
@@ -138,6 +139,7 @@ func CompileFacts(d *Declaration) []facts.Fact {
 		edgeFormProps(r, extra)
 		memberFormProps(r, extra)
 		namingAndGuidanceProps(r, extra)
+		graphFormProps(r, extra)
 		if owns := EncodeOwnership(r.Owns); owns != "" {
 			extra["owns"] = owns
 		}

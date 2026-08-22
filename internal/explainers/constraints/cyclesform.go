@@ -37,6 +37,7 @@ func (e *Explainer) verdictForbidCycles(r rule, store *facts.Store, memberFacts 
 	moduleGraph := common.BuildModuleGraphExcluding(store, facts.CouplingAssociation)
 	contracted := map[string]map[string]bool{}
 	witnesses := map[string][]string{}
+	edgeCount := map[string]int{}
 	for _, part := range parts {
 		contracted[part] = map[string]bool{}
 	}
@@ -52,6 +53,7 @@ func (e *Explainer) verdictForbidCycles(r rule, store *facts.Store, memberFacts 
 			}
 			contracted[from][to] = true
 			key := from + "\x00" + to
+			edgeCount[key]++
 			if len(witnesses[key]) < 3 {
 				witnesses[key] = append(witnesses[key], source+" -> "+target)
 			}
@@ -86,6 +88,7 @@ func (e *Explainer) verdictForbidCycles(r rule, store *facts.Store, memberFacts 
 			Confidence:  r.confidence(),
 			Evidence:    evidence,
 			Actions: []string{
+				cutForCycle(ringEdges(scc, edgeCount)),
 				"Break one edge of the circle so the parts order again",
 				"Amend the rule on its declaring page if the decision behind it changed",
 			},
@@ -165,6 +168,20 @@ func stronglyConnected(adjacency map[string][]string, order []string) [][]string
 	for _, v := range order {
 		if _, seen := indices[v]; !seen {
 			visit(v)
+		}
+	}
+	return out
+}
+
+func ringEdges(scc []string, edgeCount map[string]int) []weightedEdge {
+	var out []weightedEdge
+	for i, a := range scc {
+		b := scc[(i+1)%len(scc)]
+		if n := edgeCount[a+"\x00"+b]; n > 0 {
+			out = append(out, weightedEdge{from: a, to: b, weight: n})
+		}
+		if n := edgeCount[b+"\x00"+a]; n > 0 {
+			out = append(out, weightedEdge{from: b, to: a, weight: n})
 		}
 	}
 	return out

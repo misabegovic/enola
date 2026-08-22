@@ -123,6 +123,36 @@ var formFixtures = map[string]formFixture{
 			return base(ConstraintRule{Guide: bind("guide"), Message: "prior art here used the adapter"})
 		},
 	},
+	"storage_stays_home": {
+		roles: []string{"storage_stays_home"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{StorageStaysHome: bind("storage_stays_home")})
+		},
+	},
+	"cap_runtime": {
+		roles: []string{"cap_runtime"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{CapRuntime: bind("cap_runtime"), Metric: "queries", Max: 20})
+		},
+	},
+	"require_consumer": {
+		roles: []string{"require_consumer"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{RequireConsumer: bind("require_consumer")})
+		},
+	},
+	"unique_across": {
+		roles: []string{"unique_across"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{UniqueAcross: bind("unique_across"), By: "table"})
+		},
+	},
+	"require_governed": {
+		roles: []string{"require_governed"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{RequireGoverned: bind("require_governed")})
+		},
+	},
 }
 
 const (

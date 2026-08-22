@@ -168,6 +168,8 @@ type component struct {
 	owns        string
 	ancestor    string
 	public      []string
+	handles     []string
+	governedBy  string
 	source      string
 	recipe      string
 	instance    string
@@ -178,7 +180,9 @@ type component struct {
 // than only by where they sit. It is the switch on every reading that differs
 // between the two: a path component's file patterns are a claim about a whole
 // file, and a predicate is a claim about one measured fact.
-func (c component) predicated() bool { return len(c.where) > 0 || c.ancestor != "" }
+func (c component) predicated() bool {
+	return len(c.where) > 0 || c.ancestor != "" || len(c.handles) > 0 || c.governedBy != ""
+}
 
 type rule struct {
 	id, because, source, mode string
@@ -214,6 +218,14 @@ type rule struct {
 	guide, message            string
 	exemplars                 []string
 	via                       string
+	storageStaysHome          string
+	capRuntime, metric        string
+	max                       int
+	requireConsumer           string
+	uniqueAcross, by          string
+	requireGoverned           string
+	since                     string
+	growth                    int
 	owns                      map[string]string
 	exempt                    []intent.ConstraintExemption
 }
@@ -285,6 +297,8 @@ func decodeComponent(f facts.Fact) component {
 		owns:        f.PropString("owns"),
 		ancestor:    f.PropString("ancestor"),
 		public:      strings.Fields(f.PropString("public")),
+		handles:     strings.Fields(f.PropString("handles")),
+		governedBy:  f.PropString("governed_by"),
 		source:      f.PropString("source"),
 		recipe:      f.PropString("recipe"),
 		instance:    f.PropString("instance"),
@@ -344,6 +358,20 @@ func decodeRule(f facts.Fact) rule {
 		via:            f.PropString("via"),
 		owns:           intent.DecodeOwnership(f.PropString("owns")),
 		exempt:         intent.DecodeExemptions(f.PropString("exempt")),
+		storageStaysHome: f.PropString("storage_stays_home"),
+		capRuntime:       f.PropString("cap_runtime"),
+		metric:           f.PropString("metric"),
+		requireConsumer:  f.PropString("require_consumer"),
+		uniqueAcross:     f.PropString("unique_across"),
+		by:               f.PropString("by"),
+		requireGoverned:  f.PropString("require_governed"),
+		since:            f.PropString("since"),
+	}
+	if n, ok := intPropOf(f, "max"); ok {
+		r.max = n
+	}
+	if n, ok := intPropOf(f, "growth"); ok {
+		r.growth = n
 	}
 	if n, ok := intPropOf(f, "max_members"); ok {
 		r.maxMembers = n
@@ -599,6 +627,19 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			verdicts = e.verdictProtocol(r, memberFacts, carriers, members, census, resolve)
 		case r.guide != "":
 			verdicts = e.verdictGuide(r)
+		case r.storageStaysHome != "":
+			verdicts = e.verdictStorageStaysHome(r, store, memberFacts, members, resolve)
+		case r.capRuntime != "":
+			verdicts = e.verdictCapRuntime(r, store, members)
+		case r.requireConsumer != "":
+			verdicts = e.verdictRequireConsumer(r, store, memberFacts)
+		case r.uniqueAcross != "":
+			verdicts = e.verdictUniqueAcross(r, memberFacts)
+		case r.requireGoverned != "":
+			verdicts = e.verdictRequireGoverned(r, store, memberFacts)
+		}
+		if r.since != "" {
+			verdicts = stampSince(r, verdicts)
 		}
 		decided := exemptVerdicts(r, verdicts)
 		if r.recipe != "" {
@@ -810,6 +851,7 @@ func (e *Explainer) verdictForbid(r rule, resolve *resolver, ground *grounding) 
 					Detail: "forbidden " + r.via + " edge",
 				}},
 				Actions: []string{
+					cutForEdge(resolve, r.to, f, rel.Target),
 					"Remove or reroute the edge if the rule stands",
 					"Amend the rule on its declaring page if the decision behind it changed",
 				},
@@ -1142,6 +1184,7 @@ func (e *Explainer) verdictProtect(r rule, graphWalk []facts.Fact, resolve *reso
 					Detail: "unowned " + r.via + " edge",
 				}},
 				Actions: []string{
+					cutForEdge(resolve, r.protect, f, rel.Target),
 					"Route the access through an owning component if the rule stands",
 					"Add the source's component to owners: on the declaring page if the decision behind it changed",
 				},
@@ -1243,6 +1286,7 @@ func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, resolve *reso
 					Detail: "reach into a non-exported member via " + rel.Kind,
 				}},
 				Actions: []string{
+					cutForEdge(resolve, r.private, f, rel.Target),
 					"Route the access through the component's exported surface if the rule stands",
 					"Add the source's component to except: on the declaring page if the decision behind it changed",
 				},
@@ -1301,7 +1345,7 @@ func (e *Explainer) verdictCap(r rule, memberFacts map[string][]facts.Fact, memb
 		Title:       r.titled(fmt.Sprintf("%s has %d members over a cap of %d", r.cap, len(names), r.maxMembers)),
 		Description: fmt.Sprintf("%s membership counts %d against a declared cap of %d. The overflow, in name order: %s. The rule is declared and the membership is exact, so this is a decided-rule breach, not a heuristic. Because: %s", r.cap, len(names), r.maxMembers, strings.Join(overflow, ", "), r.because),
 		Confidence:  r.confidence(),
-		Evidence:    evidence,
+		Evidence:    capEvidence(r, evidence, len(names)),
 		Actions: []string{
 			"Shrink the surface back under the cap if the rule stands",
 			"Raise max_members on the declaring page if the decision behind it changed",
@@ -2073,6 +2117,14 @@ func resolveMembership(store *facts.Store, c component) (map[string]bool, []fact
 	if c.ancestor != "" {
 		descendants = newResolvedAncestry(store).descendantsOf(c.ancestor)
 	}
+	var handlers map[string]bool
+	if len(c.handles) > 0 {
+		handlers = routeHandlers(store, c.handles)
+	}
+	var governed map[string]bool
+	if c.governedBy != "" {
+		governed = governedFiles(store, c.governedBy)
+	}
 	for _, kind := range membershipKinds(c) {
 		for _, f := range store.ByKind(kind) {
 			if c.service != "" && f.Repo != c.service {
@@ -2088,6 +2140,12 @@ func resolveMembership(store *facts.Store, c component) (map[string]bool, []fact
 				continue
 			}
 			if descendants != nil && !descendants[f.Name] {
+				continue
+			}
+			if handlers != nil && !handlers[f.Name] {
+				continue
+			}
+			if governed != nil && !governedMember(governed, f) {
 				continue
 			}
 			names[f.Name] = true
@@ -2111,7 +2169,7 @@ func resolveMembership(store *facts.Store, c component) (map[string]bool, []fact
 // so a whole-service component must contain it for cross-repo rules to see
 // them. The node's empty file keeps it out of any path-narrowed component.
 func membershipKinds(c component) []string {
-	if c.ancestor != "" {
+	if c.ancestor != "" || len(c.handles) > 0 {
 		return []string{facts.KindSymbol}
 	}
 	for _, kind := range referenceMemberKinds {
@@ -2498,4 +2556,14 @@ func capturedBase(name, pattern string) (string, bool) {
 	}
 	base := name[len(prefix) : len(name)-len(suffix)]
 	return base, base != ""
+}
+
+// capEvidence carries the count and, when the rule allows growth, the
+// allowance, so check can compare the count to the baseline's.
+func capEvidence(r rule, evidence []facts.Evidence, count int) []facts.Evidence {
+	if r.growth > 0 {
+		evidence = append(evidence, facts.Evidence{Fact: fmt.Sprintf("count: %d", count), Detail: "members of " + r.cap})
+		evidence = append(evidence, facts.Evidence{Fact: fmt.Sprintf("growth: %d", r.growth), Detail: "allowed over the baseline's count"})
+	}
+	return evidence
 }

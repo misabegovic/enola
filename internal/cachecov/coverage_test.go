@@ -186,6 +186,7 @@ var versionCoverage = map[int][]string{
 	236: {"TestBuiltinRecipes_ShipWithTheBinary", "TestMergeBuiltinRecipes_LocalReplacesShipped", "TestBuiltinRecipes_InstantiableWithoutAuthoringOne"},
 	// The extraction itself is unit-covered; TestGolden is what proves a cached
 	// repo re-extracts, since rust_sample now declares a utoipa route.
+	241: {"TestStorageStaysHome_NamesTheTableOutsideThePart", "TestRequireConsumer_RefusesWithoutACounterparty", "TestUniqueAcross_NamesBothOwners", "TestRequireGoverned_NamesTheUnanchoredFile", "TestCapRuntime_RefusesWithoutACapture", "TestRecipeRoleDefaults_BindWithoutSelectors", "TestApplyTime_SinceRatchetsWhatTheRevisionCarried", "TestRubySurface_GraphLawSentences"},
 	240: {"TestRequireName_PairsThroughTheCapturedBase", "TestPrivate_PublicPathsAreVisible", "TestForbidToName_ReceiverNoneMatchesOnlyBareCalls", "TestRubySurface_LastFiveShapes"},
 	239: {"TestForbidCycles_ReportsACircleAmongParts", "TestForbidCycles_ContractsToOneNodePerPart", "TestIndependent_NamesAModuleReachingItsIncluder", "TestIndependent_RefusedWithoutResolvedAncestry", "TestRequireDefines_AnyOfAcceptsEither", "TestRubySurface_NewVocabularySentences"},
 	238: {"TestAncestorKey_SelectsTransitivelyThroughResolvedAncestry", "TestAncestorKey_RefusedWithoutAResolvingProvider", "TestRubySurface_PartTakesAncestor"},

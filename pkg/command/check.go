@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/enola-labs/enola/internal/config"
 	"github.com/enola-labs/enola/internal/conformance"
@@ -18,6 +19,7 @@ import (
 	"github.com/enola-labs/enola/internal/updatecheck"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
+	pkghistory "github.com/enola-labs/enola/pkg/history"
 )
 
 // target is the repository the gate operates on, plus how it was resolved — reported to
@@ -27,6 +29,7 @@ type target struct {
 	repoPaths  []string
 	configNote string
 	cfgPath    string
+	historyDir string
 }
 
 // resolveTarget turns the single positional argument into an engine pointed at the right
@@ -90,7 +93,7 @@ func (r *Runner) resolveTarget(arg string) target {
 	if err != nil {
 		r.checkFatal("failed to resolve repo path: %v", err)
 	}
-	return target{engine: eng, repoPaths: repoPaths, configNote: note, cfgPath: cfgPath}
+	return target{engine: eng, repoPaths: repoPaths, configNote: note, cfgPath: cfgPath, historyDir: cfg.History.Dir}
 }
 
 // parseFailOn splits a --fail-on spec into the explainer names that exist and the ones
@@ -280,6 +283,7 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 	// against the CURRENT snapshot, baselined or not — the one deliberate
 	// exception to delta scoping.
 	verdict := check.EvaluateCurrent(d, policy, current.Insights, measurements...)
+	verdict = check.ApplyTime(verdict, base, r.revisionAt(anchor, tgt.historyDir))
 	verdict = check.RegradeIntersection(verdict, base, current, policy,
 		check.OwnershipFromExtractors(eng.Extractors()), current.Insights, *focus, measurements...)
 	verdict = check.AttachGuidance(verdict, eng.Store())
@@ -497,4 +501,43 @@ func shortCommit(s string) string {
 		return s[:12]
 	}
 	return orUnknown(s)
+}
+
+// revisionAt reads the architecture history for a dated rule: the newest
+// revision at or before the date, reconstructed from its blob, and the first
+// revision's date for a rule that predates the record.
+func (r *Runner) revisionAt(repoPath, historyDir string) check.RevisionAt {
+	return func(date time.Time) (*facts.Snapshot, string, string, bool) {
+		root, err := pkghistory.Root(repoPath, historyDir)
+		if err != nil {
+			return nil, "", "", false
+		}
+		entries, err := pkghistory.Read(root)
+		if err != nil || len(entries) == 0 {
+			return nil, "", "", false
+		}
+		first := ""
+		var chosen *pkghistory.Entry
+		for i := range entries {
+			e := entries[i]
+			at, err := time.Parse(time.RFC3339, e.At)
+			if err != nil || e.Blob == nil {
+				continue
+			}
+			if first == "" || at.Format("2006-01-02") < first {
+				first = at.Format("2006-01-02")
+			}
+			if !at.After(date.Add(24*time.Hour-time.Nanosecond)) && (chosen == nil || e.At > chosen.At) {
+				chosen = &entries[i]
+			}
+		}
+		if chosen == nil {
+			return nil, "", first, false
+		}
+		snap, err := pkghistory.Load(root, *chosen)
+		if err != nil {
+			return nil, "", first, false
+		}
+		return snap, chosen.At[:10], first, true
+	}
 }

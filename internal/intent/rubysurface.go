@@ -82,6 +82,11 @@ var memberVerbs = map[string]string{
 	"at_most":                  "cap",
 	"must_carry":               "require",
 	"advises":                  "guide",
+	"storage_must_stay_home":   "storage_stays_home",
+	"must_keep_budget":         "cap_runtime",
+	"must_have_consumer":       "require_consumer",
+	"must_be_unique_across":    "unique_across",
+	"must_be_governed":         "require_governed",
 }
 
 // ParseRubySurface reads a Ruby declaration file into the same shape the YAML
@@ -216,11 +221,15 @@ func (r *surfaceReader) readPart(stmt *sitter.Node) {
 			component.Ancestor = r.symbolOrString(pair.value)
 		case "public":
 			component.Public = append(component.Public, r.stringList(pair.value)...)
+		case "handles":
+			component.Handles = append(component.Handles, r.stringList(pair.value)...)
+		case "governed_by":
+			component.GovernedBy = r.symbolOrString(pair.value)
 		default:
-			r.fail(pair.key, "a part takes files, kind, service, named, where, owns, ancestor or public, not %q", key)
+			r.fail(pair.key, "a part takes files, kind, service, named, where, owns, ancestor, public, handles or governed_by, not %q", key)
 		}
 	}
-	if len(component.Match) == 0 && component.Where == nil && component.NamePattern == "" && component.Ancestor == "" {
+	if len(component.Match) == 0 && component.Where == nil && component.NamePattern == "" && component.Ancestor == "" && len(component.Handles) == 0 && component.GovernedBy == "" {
 		r.fail(stmt, "part %q selects nothing: give it files, where, named or ancestor", name)
 		return
 	}
@@ -282,6 +291,16 @@ func (r *surfaceReader) readLawLine(line *sitter.Node, rule *ConstraintRule, sta
 		return
 	case "mode":
 		rule.Mode = r.symbolOrString(firstOrNil(args))
+		return
+	case "since":
+		rule.Since = r.symbolOrString(firstOrNil(args))
+		return
+	case "growth":
+		if n, err := strconv.Atoi(strings.TrimSpace(r.symbolOrString(firstOrNil(args)))); err == nil {
+			rule.Growth = n
+		} else {
+			r.fail(line, "growth takes a whole number")
+		}
 		return
 	case "id":
 		// A law's id is derived from its sentence, which is what keeps the two
@@ -439,6 +458,29 @@ func (r *surfaceReader) readMemberArguments(line *sitter.Node, form string, args
 				rule.Requires = r.symbolOrString(pair.value)
 			}
 		}
+	case "cap_runtime":
+		for _, pair := range r.keywordPairs(args) {
+			switch key := r.symbolOrString(pair.key); key {
+			case "metric":
+				rule.Metric = r.symbolOrString(pair.value)
+			case "max":
+				if n, err := strconv.Atoi(strings.TrimSpace(r.symbolOrString(pair.value))); err == nil {
+					rule.Max = n
+				} else {
+					r.fail(pair.value, "max takes a whole number")
+				}
+			default:
+				r.fail(pair.key, "must_keep_budget takes metric: and max:, not %q", key)
+			}
+		}
+	case "unique_across":
+		for _, pair := range r.keywordPairs(args) {
+			if key := r.symbolOrString(pair.key); key == "by" {
+				rule.By = r.symbolOrString(pair.value)
+			} else {
+				r.fail(pair.key, "must_be_unique_across takes by:, not %q", key)
+			}
+		}
 	case "cap":
 		if n, err := strconv.Atoi(strings.TrimSpace(first)); err == nil {
 			rule.MaxMembers = n
@@ -501,6 +543,16 @@ func setForm(rule *ConstraintRule, form, subject string) {
 		rule.RequireName = subject
 	case "forbid_name":
 		rule.ForbidName = subject
+	case "storage_stays_home":
+		rule.StorageStaysHome = subject
+	case "cap_runtime":
+		rule.CapRuntime = subject
+	case "require_consumer":
+		rule.RequireConsumer = subject
+	case "unique_across":
+		rule.UniqueAcross = subject
+	case "require_governed":
+		rule.RequireGoverned = subject
 	case "protocol":
 		rule.Protocol = subject
 	case "guide":

@@ -2167,7 +2167,13 @@ import (
 // the measured exported prop; a forbid with to_name takes receiver: none to
 // match only receiver-less calls; and constraints explain reads membership
 // per file. Verdicts move with the first three.
-const cacheVersion = "v240"
+// v241: laws only a graph can state. Component keys handles (the code behind
+// routes by method) and governed_by (the files a compiled page anchors); forms
+// storage_stays_home, cap_runtime, require_consumer, unique_across and
+// require_governed; since and growth on rules; recipe roles carry selector
+// defaults, so a repository's own recipe binds in one line; every edge and
+// cycle verdict names its smallest cut.
+const cacheVersion = "v241"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

@@ -67,6 +67,14 @@ type ConstraintComponent struct {
 	// visible beside the measured exported prop, so a language without a
 	// visibility keyword can still state a surface by where it keeps it.
 	Public []string `yaml:"public"`
+	// Handles narrows a symbol component to the members a route reaches
+	// through handled_by when the route's method is one of these, so a law
+	// can speak about the code behind mutating routes without naming it.
+	Handles []string `yaml:"handles"`
+	// GovernedBy narrows a component to the measured facts whose files a
+	// compiled page anchors, the page named by path or glob; `status:` and
+	// `supersedes:` suffixes walk the page relations.
+	GovernedBy string `yaml:"governed_by"`
 
 	// SourceFile is the repo-relative enola/constraints file that declared
 	// this component, stamped at load time; empty means declared inline. It
@@ -205,6 +213,29 @@ type ConstraintRule struct {
 	RequireDefines string   `yaml:"require_defines"`
 	Method         string   `yaml:"method"`
 	AnyOf          []string `yaml:"any_of"`
+	// StorageStaysHome holds when every storage fact a member reaches is
+	// itself a member: a part keeps to the tables it owns.
+	StorageStaysHome string `yaml:"storage_stays_home"`
+	// CapRuntime bounds a runtime-observed metric per member frame; Metric
+	// names the observation (queries) and Max the budget.
+	CapRuntime string `yaml:"cap_runtime"`
+	Metric     string `yaml:"metric"`
+	Max        int    `yaml:"max"`
+	// RequireConsumer holds when every member route has a client in the
+	// snapshot, read from the cross-repository route match.
+	RequireConsumer string `yaml:"require_consumer"`
+	// UniqueAcross holds when no two members in different repositories share
+	// the property By (table for storage).
+	UniqueAcross string `yaml:"unique_across"`
+	By           string `yaml:"by"`
+	// RequireGoverned holds when every member file carries an anchor from a
+	// compiled page.
+	RequireGoverned string `yaml:"require_governed"`
+	// Since dates the rule: a breach present in the history revision at or
+	// before the date ratchets, one introduced after it grades. Growth lets
+	// a cap's count exceed the baseline's by this much before it fails.
+	Since  string `yaml:"since"`
+	Growth int    `yaml:"growth"`
 
 	// ForbidCycles names the first of a set of parts that may not depend on
 	// each other in a circle; Among names the rest. The reading contracts the
@@ -444,6 +475,7 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 			problems = append(problems, fmt.Sprintf("%s (%s): name_pattern %q must be an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, c.Name, c.NamePattern))
 		}
 		problems = append(problems, ancestorProblems(loc, c)...)
+		problems = append(problems, graphComponentProblems(loc, c)...)
 		for j, m := range c.Public {
 			if !validConstraintMatch(m) {
 				problems = append(problems, fmt.Sprintf("%s.public[%d]: %q must be an exact path, a prefix/** subtree, or a **/name basename glob", loc, j, m))
@@ -496,6 +528,7 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		}
 		ruleIDs[r.ID] = true
 		problems = append(problems, ruleFormProblems(loc, r, componentNames, "component")...)
+		problems = append(problems, graphRuleProblems(loc, r)...)
 		problems = append(problems, ownershipProblems(loc, r, componentNames, "component")...)
 		problems = append(problems, edgeRoleProblems(loc, r, declaredComponents, "component")...)
 		if r.Guide != "" && len(r.Exempt) > 0 {

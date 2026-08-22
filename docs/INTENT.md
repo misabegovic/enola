@@ -744,7 +744,7 @@ component has no match patterns for a path to join. A file nobody has
 written yet is still refused: nothing has been measured about it, and
 that is exactly what a predicate cannot answer for.
 
-### The sixteen rule forms
+### The 21 rule forms
 
 Every rule has a lowercase-token `id`, unique per declaration, and a
 mandatory `because:` — the rationale every resulting finding surfaces,
@@ -1276,6 +1276,74 @@ structural half of ordered-interaction sequences is expressible and
 verdictable, the runtime half remains future provider work, and the
 parity re-measure belongs to the next harness run.
 
+### Laws only a graph can state
+
+Five forms and two component keys read what only the fact graph holds:
+storage facts, the routes behind code, the seams between repositories,
+the pages compiled from a knowledge base, and the history of every
+snapshot. Each refuses by name when the snapshot cannot answer, so silence
+never reads as compliance.
+
+- `storage_stays_home: <component>` holds when every storage fact a
+  member reaches (`calls` or `depends_on` to a model a storage fact names)
+  is itself a member. The breach names the table and the model, and the
+  first suggested action is the owning part's public member that already
+  reaches the same table. Ruby: `billing.storage_must_stay_home`.
+- `handles: [POST, PUT, PATCH, DELETE]` on a symbol component admits the
+  members a route with one of those methods reaches through `handled_by`,
+  so `require_edge` states "a mutating action reaches a policy" with
+  nothing new. Ruby: `part :mutating_actions, files: "app/controllers/**",
+  handles: [:post, :put, :patch, :delete]`.
+- `cap_runtime: <component>` with `metric: queries` and `max: N` reads the
+  `runtime-queries:` frames a runtime capture measured for files inside
+  the component and names every frame over the budget. A snapshot with no
+  capture makes the rule unevaluable with the cause `no_runtime_capture`.
+  Ruby: `billing.must_keep_budget metric: :queries, max: 20`.
+- `require_consumer: <route component>` breaches for every member route
+  no loaded client calls, read from the cross-repository route match; a
+  single-repository snapshot refuses with `no_counterparty`. Ruby:
+  `api.must_have_consumer`.
+- `unique_across: <component>` with `by: table` (or `name`) breaches when
+  members in two different repositories share the value, naming both
+  owners; members from one repository refuse with `no_counterparty`. Ruby:
+  `tables.must_be_unique_across by: :table`.
+- `governed_by: <page path or glob>` on a component admits the measured
+  facts in files the selected pages anchor; `status:superseded` after the
+  glob keeps the pages with that status, `supersedes:<page>` the pages
+  that supersede it, so "the code of the superseded decision" and "the
+  code of the superseding one" are two components and `forbid` states the
+  law between them. Ruby: `part :old_way, governed_by: "wiki/shop/adrs/*.md
+  status:superseded"`.
+- `require_governed: <component>` breaches for every member file no
+  compiled page anchors; a snapshot with no pages refuses with
+  `no_compiled_pages`. Ruby: `old_way.must_be_governed`.
+
+Two spellings add time. `since: YYYY-MM-DD` on any rule dates it: the
+explainer verdicts as usual and stamps the date, and `check` reads the
+architecture history's newest revision at or before the date, reports a
+breach that revision already carried and grades one it did not; a date
+before the first revision keeps every breach graded and adds a descriptive
+finding naming the first revision's date. `growth: N` on `cap` lets the
+count exceed the baseline's count by N before the cap fails; without a
+baseline the cap alone applies. Ruby: `since "2026-08-01"` and `growth 2`
+inside a law.
+
+Every edge breach (`forbid`, `protect`, `private`) and every cycle breach
+now leads its suggested actions with the smallest cut the graph can see:
+the far part's public member with the same bare name, else its public
+surface, else the part the offender's other edges mostly reach; for a
+cycle, the lightest edge of the circle by module edges. When the facts
+support none, the action says so rather than offering a generic sentence.
+
+Recipe roles may carry selector defaults (`match`, `kind`, `name_pattern`,
+`where`): a binding that gives none inherits the role's, key by key, and a
+defaulted role is never required of the binding. A team's own recipe under
+`enola/recipes/` can therefore carry its conventions with their selectors,
+so the binding in `enola/constraints/` is the recipe's name and the mode
+alone, and every path is overridable where a tree differs. The shipped
+recipes stay framework-general; house conventions belong in the
+repository's recipe, where the team that owns them reviews them.
+
 ### Recipes — named patterns as instantiable bundles
 
 A recurring architectural pattern — event-driven, ports-and-adapters,
@@ -1798,7 +1866,7 @@ Enola.architecture "storefront" do
 end
 ```
 
-Fourteen verbs cover the sixteen rule forms, and a test walks the form
+Nineteen verbs cover the 21 rule forms, and a test walks the form
 table and fails if any form cannot be reached from a verb, so a form
 added later without a way to say it breaks the build rather than
 quietly having no surface.

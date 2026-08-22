@@ -19,6 +19,18 @@ type RecipeRole struct {
 	// lint surface says so, rather than the load failing. A recipe grows a
 	// role this way without breaking every repository that already binds it.
 	Optional bool `yaml:"optional"`
+	// Selector defaults a binding inherits key by key when it gives none of
+	// its own: a role whose members are known by what they carry rather than
+	// by where they sit declares it once here, and a binding that gives only
+	// paths (or nothing, when the default match suffices) still selects them.
+	Match       []string       `yaml:"match"`
+	Kind        string         `yaml:"kind"`
+	NamePattern string         `yaml:"name_pattern"`
+	Where       map[string]any `yaml:"where"`
+}
+
+func (role RecipeRole) defaulted() bool {
+	return len(role.Match) > 0 || role.Kind != "" || role.NamePattern != "" || len(role.Where) > 0
 }
 
 type Recipe struct {
@@ -254,7 +266,7 @@ func ExpandInstantiations(files []ConstraintsFile, recipes []Recipe) ([]Constrai
 			}
 			optional := map[string]bool{}
 			for _, role := range rec.Roles {
-				if role.Optional {
+				if role.Optional || role.defaulted() {
 					optional[role.Name] = true
 				}
 			}
@@ -295,8 +307,20 @@ func expandBindings(rec Recipe, inst RecipeInstantiation, sourceFile string) []C
 	var out []ConstraintComponent
 	for _, role := range rec.Roles {
 		b, bound := inst.Bind[role.Name]
-		if !bound {
+		if !bound && !role.defaulted() {
 			continue
+		}
+		if len(b.Match) == 0 {
+			b.Match = append([]string(nil), role.Match...)
+		}
+		if b.Kind == "" {
+			b.Kind = role.Kind
+		}
+		if b.NamePattern == "" {
+			b.NamePattern = role.NamePattern
+		}
+		if b.Where == nil {
+			b.Where = role.Where
 		}
 		out = append(out, ConstraintComponent{
 			Name:        inst.As + "/" + role.Name,
@@ -412,6 +436,9 @@ func unboundOptionalRole(rec Recipe, inst RecipeInstantiation, r ConstraintRule)
 		if role.Optional {
 			optional[role.Name] = true
 		}
+		if role.defaulted() {
+			delete(optional, role.Name)
+		}
 	}
 	for _, role := range ruleRoleReferences(r) {
 		if _, bound := inst.Bind[role]; !bound && optional[role] {
@@ -452,7 +479,7 @@ func UnboundOptionalRules(recipes []Recipe, files []ConstraintsFile) []string {
 func RequiredRoles(rec Recipe) []string {
 	optional := map[string]bool{}
 	for _, role := range rec.Roles {
-		if role.Optional {
+		if role.Optional || role.defaulted() {
 			optional[role.Name] = true
 		}
 	}
