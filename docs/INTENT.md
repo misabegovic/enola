@@ -491,6 +491,29 @@ production Rails+Ember monolith (153,252 facts, 2026-08-13):
   inherit from. Both are the same fact about `superclass` — it is source
   text, and no reading of it is transitive or namespace-aware without a
   resolution pass the extractor did not make.
+- **`ancestor:` is the transitive spelling, and it is a separate key.**
+  A component declaring `ancestor: ApplicationRecord` holds every class
+  from which a chain of *resolved* `implements` edges reaches that name:
+  the grandchild that spelled its parent as `Base` inside a module, the
+  class that got there through a mixin, all of them with names already
+  qualified. The root itself is not a member, the same as `superclass:`.
+  The chain comes from a resolving provider (the Rubydex provider emits
+  it), so when the snapshot holds no resolved ancestry at all the
+  component is **unevaluable** with a named cause, every rule naming it
+  stays silent, and a 0.4 finding says which provider would settle it.
+  It is a new key rather than a new reading of `superclass:` because the
+  same declaration must not select 269 classes on one machine and 357 on
+  another depending on which gem is installed; the two keys are two
+  claims, and a declaration may carry both.
+
+  ```yaml
+  components:
+    - name: records
+      ancestor: ApplicationRecord
+    - name: view-components
+      match: ["app/components/**"]
+      ancestor: "ViewComponent::Base"
+  ```
 - **Values match one whole member at a time**, the same containment the
   `require` form's `when_prop_contains` reads set props with. For the
   space-joined set props (`columns`, `fk_constraints`, `decorators`)
@@ -1505,7 +1528,11 @@ The `resolution_level` vocabulary is closed, for the same reason the
 kind and relation vocabularies are — a level nothing knows how to
 weigh is a claim nothing can act on: `constant-receiver`,
 `lexical-self`, `name-only`, `literal-declared`, `markup-declared`,
-`convention-derived`, `runtime-observed`, and `declared`.
+`convention-derived`, `runtime-observed`, `declared`, and `resolved`.
+`resolved` states that the provider resolved a name through the
+language's own lookup rules (nesting, inheritance, the locked gems) to
+one declaration: neither a receiver typing, nor a signature-file claim,
+nor a path convention, which is why it is its own word.
 `runtime-observed` is its own level, not a stronger static one: it
 states that a **booted application** reported the fact, and a fact
 carrying it must also carry an **`observed_via`** prop naming the
@@ -1525,6 +1552,24 @@ declarations parsed, constructs skipped with named causes — which the
 seam validates as strictly as the facts and carries into the
 receipt's provider census, the same honesty discipline the engine's
 file census applies to its own walk.
+
+### The Rubydex provider
+
+The reference provider at `examples/providers/ruby/rubydex/` requires
+the Rubydex gem, indexes the workspace, resolves it, and emits the three
+things enola's own Ruby extractor and the Prism provider do not: constant
+references resolved through Ruby's nesting and inheritance rules
+(`rubydex-ref:`, a `depends_on` edge at `resolved`), method calls whose
+receiver resolves to a constant other than the lexical enclosing class
+(`rubydex-call:`, a `calls` edge at `constant-receiver`; the enclosing
+class is the extractor's to say), and each class's linearised ancestor
+chain with mixins in resolution order (`rubydex-ancestor:`, one
+`implements` edge per ancestor at `resolved`, carrying the ancestor's
+distance and whether the workspace declares it). Only facts located in
+the workspace are emitted; built-in ancestors are omitted because every
+class reaches them; unresolved references and Rubydex's own diagnostics
+are counted in the census rather than guessed around. The ancestry edges
+are what the `ancestor:` component key reads.
 
 ### The runtime provider
 
@@ -1752,6 +1797,10 @@ Each law carries its reason because every finding surfaces it: a
 violation says why the rule exists rather than only that it was broken.
 `seen_in` appends the measurement a law was mined from, which is what
 separates a law the estate actually keeps from one somebody wished for.
+
+A part may also be selected by ancestry: `part :records, ancestor:
+"ApplicationRecord"` holds every class whose resolved chain reaches that
+name, and a `bind` takes `ancestor:` the same way.
 
 Beside the verbs, a law may carry `id` (when a finding's token must stay
 stable across a rewording), `why` and `seen_in` (its reason and the

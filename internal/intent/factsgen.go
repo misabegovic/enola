@@ -97,6 +97,9 @@ func CompileFacts(d *Declaration) []facts.Fact {
 		if c.Owns != "" {
 			extra["owns"] = c.Owns
 		}
+		if c.Ancestor != "" {
+			extra["ancestor"] = c.Ancestor
+		}
 		if c.Recipe != "" {
 			extra["recipe"] = c.Recipe
 			extra["instance"] = c.Instance

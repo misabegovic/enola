@@ -209,12 +209,14 @@ func (r *surfaceReader) readPart(stmt *sitter.Node) {
 			// What a predicate-selected part owns is the one thing a rule about
 			// its edges cannot infer, so the surface has to be able to say it.
 			component.Owns = r.symbolOrString(pair.value)
+		case "ancestor":
+			component.Ancestor = r.symbolOrString(pair.value)
 		default:
-			r.fail(pair.key, "a part takes files, kind, service, named, where or owns, not %q", key)
+			r.fail(pair.key, "a part takes files, kind, service, named, where, owns or ancestor, not %q", key)
 		}
 	}
-	if len(component.Match) == 0 && component.Where == nil && component.NamePattern == "" {
-		r.fail(stmt, "part %q selects nothing: give it files, where or named", name)
+	if len(component.Match) == 0 && component.Where == nil && component.NamePattern == "" && component.Ancestor == "" {
+		r.fail(stmt, "part %q selects nothing: give it files, where, named or ancestor", name)
 		return
 	}
 	r.parts[name] = true
@@ -598,8 +600,10 @@ func (r *surfaceReader) readRecipeUse(stmt *sitter.Node) {
 				binding.NamePattern = r.symbolOrString(pair.value)
 			case "where":
 				binding.Where = r.hash(pair.value)
+			case "ancestor":
+				binding.Ancestor = r.symbolOrString(pair.value)
 			default:
-				r.fail(pair.key, "a bind takes files, kind, service, named or where, not %q", key)
+				r.fail(pair.key, "a bind takes files, kind, service, named, where or ancestor, not %q", key)
 			}
 		}
 		instance.Bind[role] = binding

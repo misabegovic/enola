@@ -2151,7 +2151,12 @@ import (
 // 8 routes where it serves 74, and every call its own frontend made to them
 // looked like a call to nothing. The attribute is now the second Rust route
 // source.
-const cacheVersion = "v237"
+// v238: a component may select by ancestry. `ancestor:` names a class every
+// member descends from, read transitively over the resolved implements edges a
+// provider emits, and refused with a named advisory when the store holds no
+// resolved ancestry at all. The selector changes which facts are members, so
+// every constraint verdict can move with it, and the version moves too.
+const cacheVersion = "v238"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

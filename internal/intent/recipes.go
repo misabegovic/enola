@@ -31,6 +31,7 @@ type RecipeBinding struct {
 	NamePattern string         `yaml:"name_pattern"`
 	Where       map[string]any `yaml:"where"`
 	Owns        string         `yaml:"owns"`
+	Ancestor    string         `yaml:"ancestor"`
 }
 
 type InstanceExemption struct {
@@ -292,6 +293,7 @@ func expandBindings(rec Recipe, inst RecipeInstantiation, sourceFile string) []C
 			NamePattern: b.NamePattern,
 			Where:       b.Where,
 			Owns:        b.Owns,
+			Ancestor:    b.Ancestor,
 			SourceFile:  sourceFile,
 			Recipe:      rec.Name,
 			Instance:    inst.As,
