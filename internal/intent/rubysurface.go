@@ -72,13 +72,16 @@ var edgeVerbs = map[string]struct{ form, role string }{
 // memberVerbs are the laws about a component's own members: no counterpart,
 // each carrying its own argument shape.
 var memberVerbs = map[string]string{
-	"must_define":          "require_defines",
-	"names_must_match":     "require_name",
-	"names_must_not_match": "forbid_name",
-	"must_be_empty":        "forbid_fact",
-	"at_most":              "cap",
-	"must_carry":           "require",
-	"advises":              "guide",
+	"must_define":              "require_defines",
+	"must_define_one_of":       "require_defines",
+	"must_not_reach_includers": "independent",
+	"must_not_cycle_with":      "forbid_cycles",
+	"names_must_match":         "require_name",
+	"names_must_not_match":     "forbid_name",
+	"must_be_empty":            "forbid_fact",
+	"at_most":                  "cap",
+	"must_carry":               "require",
+	"advises":                  "guide",
 }
 
 // ParseRubySurface reads a Ruby declaration file into the same shape the YAML
@@ -211,8 +214,10 @@ func (r *surfaceReader) readPart(stmt *sitter.Node) {
 			component.Owns = r.symbolOrString(pair.value)
 		case "ancestor":
 			component.Ancestor = r.symbolOrString(pair.value)
+		case "public":
+			component.Public = append(component.Public, r.stringList(pair.value)...)
 		default:
-			r.fail(pair.key, "a part takes files, kind, service, named, where, owns or ancestor, not %q", key)
+			r.fail(pair.key, "a part takes files, kind, service, named, where, owns, ancestor or public, not %q", key)
 		}
 	}
 	if len(component.Match) == 0 && component.Where == nil && component.NamePattern == "" && component.Ancestor == "" {
@@ -349,6 +354,11 @@ func (r *surfaceReader) readSubjectLine(line *sitter.Node, subject, verb string,
 			}
 			setForm(rule, edge.form, componentToken(subject))
 			rule.ToName = append(rule.ToName, literals...)
+			for _, pair := range r.keywordPairs(args) {
+				if r.symbolOrString(pair.key) == "receiver" {
+					rule.Receiver = r.symbolOrString(pair.value)
+				}
+			}
 			if rule.Via == "" && formNeedsVia(edge.form) {
 				rule.Via = "calls"
 			}
@@ -409,12 +419,24 @@ func (r *surfaceReader) readMemberArguments(line *sitter.Node, form string, args
 	first := r.symbolOrString(firstOrNil(args))
 	switch form {
 	case "require_defines":
-		rule.Method = first
+		if len(args) > 1 {
+			rule.AnyOf = r.symbolList(args)
+		} else {
+			rule.Method = first
+		}
+	case "forbid_cycles":
+		rule.Among = r.symbolList(args)
+		for i := range rule.Among {
+			rule.Among[i] = componentToken(rule.Among[i])
+		}
 	case "require_name", "forbid_name":
 		rule.Pattern = first
 		for _, pair := range r.keywordPairs(args) {
-			if r.symbolOrString(pair.key) == "surface" {
+			switch r.symbolOrString(pair.key) {
+			case "surface":
 				rule.Surface = r.symbolOrString(pair.value)
+			case "requires":
+				rule.Requires = r.symbolOrString(pair.value)
 			}
 		}
 	case "cap":
@@ -471,6 +493,10 @@ func setForm(rule *ConstraintRule, form, subject string) {
 		rule.RequireEdge = subject
 	case "require_defines":
 		rule.RequireDefines = subject
+	case "forbid_cycles":
+		rule.ForbidCycles = subject
+	case "independent":
+		rule.Independent = subject
 	case "require_name":
 		rule.RequireName = subject
 	case "forbid_name":
@@ -634,6 +660,20 @@ func (r *surfaceReader) partsNamedBy(args []*sitter.Node, role string) []string 
 		}
 		if name := r.symbolOrString(pair.value); name != "" {
 			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// symbolList reads every positional symbol or string argument, in order.
+func (r *surfaceReader) symbolList(args []*sitter.Node) []string {
+	var out []string
+	for _, a := range args {
+		if a.Kind() == "pair" {
+			continue
+		}
+		if v := r.symbolOrString(a); v != "" {
+			out = append(out, v)
 		}
 	}
 	return out

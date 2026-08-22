@@ -65,6 +65,12 @@ var RuleForms = []RuleForm{
 	{Key: "require", Subject: func(r ConstraintRule) string { return r.Require }},
 	{Key: "require_edge", Subject: func(r ConstraintRule) string { return r.RequireEdge }, WalksEdges: true, Side: requireEdgeSubjectSide, CensusMeasured: true},
 	{Key: "require_defines", Subject: func(r ConstraintRule) string { return r.RequireDefines }},
+	{Key: "forbid_cycles", Subject: func(r ConstraintRule) string { return r.ForbidCycles }},
+	// independent reads its own members' edges against the includers resolved
+	// ancestry names; no component resolves as the far end of a measured
+	// relation, so it is not an edge-role form and the concept screen leaves it
+	// to its own refusal.
+	{Key: "independent", Subject: func(r ConstraintRule) string { return r.Independent }},
 	{Key: "require_name", Subject: func(r ConstraintRule) string { return r.RequireName }},
 	{Key: "forbid_name", Subject: func(r ConstraintRule) string { return r.ForbidName }},
 	{Key: "protocol", Subject: func(r ConstraintRule) string { return r.Protocol }, WalksEdges: true, Side: sourceSide, CensusMeasured: true},
@@ -136,7 +142,7 @@ func PathTargetVia(via string) bool { return via == "imports" }
 // private carries none of its own and walks the whole rule-via vocabulary,
 // which forbid_reach also does when it declares no via.
 func RuleVias(r ConstraintRule) []string {
-	if r.Private != "" || (r.ForbidReach != "" && r.Via == "") {
+	if r.Private != "" || r.Independent != "" || (r.ForbidReach != "" && r.Via == "") {
 		return AllRuleVias
 	}
 	if r.Via == "" {

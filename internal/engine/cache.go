@@ -2156,7 +2156,18 @@ import (
 // provider emits, and refused with a named advisory when the store holds no
 // resolved ancestry at all. The selector changes which facts are members, so
 // every constraint verdict can move with it, and the version moves too.
-const cacheVersion = "v238"
+// v239: three forms join the constraint vocabulary. forbid_cycles/among
+// contracts the module graph to one node per declared part, with the rollup
+// edges admitted, and reports every circle; independent states that a module
+// never reaches a class whose resolved ancestry includes it; require_defines
+// takes any_of beside method. Verdicts move with the forms.
+// v240: five small spellings. require_name takes requires, a template that
+// pairs a name with a sibling through the captured base; a component takes
+// public, the files that are its visible surface, which private reads beside
+// the measured exported prop; a forbid with to_name takes receiver: none to
+// match only receiver-less calls; and constraints explain reads membership
+// per file. Verdicts move with the first three.
+const cacheVersion = "v240"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

@@ -7,6 +7,10 @@ roles:
   - name: policies
   - name: serializers
   - name: view-components
+  - name: helpers
+    optional: true
+  - name: services
+    optional: true
 rules:
   - id: jobs-do-not-render
     forbid: jobs
@@ -51,3 +55,38 @@ rules:
     to: controllers
     via: calls
     because: "A component that reads controller state cannot be rendered from a job, a mailer or a preview, which is most of why the component exists."
+
+  - id: services-do-not-reach-helpers
+    forbid: services
+    to: helpers
+    via: calls
+    mode: advisory
+    because: "A helper exists for a view; a service that calls one has taken a dependency on rendering it never needed, and it cannot run where no view is being drawn."
+
+  - id: models-do-not-reach-helpers
+    forbid: models
+    to: helpers
+    via: calls
+    mode: advisory
+    because: "A model that calls a view helper has presentation in its data layer, and every job, task and console session that loads the model pays for it."
+
+  - id: services-do-not-reach-controllers
+    forbid: services
+    to: controllers
+    via: calls
+    mode: advisory
+    because: "A service that reaches back into a controller can only run inside a request, which is the one place a service exists to be free of."
+
+  - id: request-api-stays-in-controllers
+    forbid: models
+    to_name: [render, redirect_to, params, session, cookies, flash]
+    via: calls
+    mode: advisory
+    because: "render, redirect_to, params, session, cookies and flash are the request's surface; a model calling one has no request to read it from outside a controller, and the call only works by accident of who invoked it."
+
+  - id: request-api-stays-out-of-services
+    forbid: services
+    to_name: [render, redirect_to, params, session, cookies, flash]
+    via: calls
+    mode: advisory
+    because: "A service handed params or session has been handed the request; the caller should pass what the service needs, so the service runs the same from a job, a task or a test."

@@ -93,6 +93,18 @@ var formFixtures = map[string]formFixture{
 			return base(ConstraintRule{RequireDefines: bind("require_defines"), Method: "perform"})
 		},
 	},
+	"forbid_cycles": {
+		roles: []string{"forbid_cycles"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{ForbidCycles: bind("forbid_cycles"), Among: []string{secondStep}})
+		},
+	},
+	"independent": {
+		roles: []string{"independent"},
+		build: func(bind func(string) string) ConstraintRule {
+			return base(ConstraintRule{Independent: bind("independent")})
+		},
+	},
 	"require_name": {
 		roles: []string{"require_name"},
 		build: func(bind func(string) string) ConstraintRule {

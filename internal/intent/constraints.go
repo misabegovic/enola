@@ -62,6 +62,11 @@ type ConstraintComponent struct {
 	// superclass text the extractor records. It is a separate key from a
 	// `where: {superclass:}` pair because the two are different claims.
 	Ancestor string `yaml:"ancestor"`
+	// Public names the files that are the component's public surface, as
+	// bounded globs. The private form treats members in those files as
+	// visible beside the measured exported prop, so a language without a
+	// visibility keyword can still state a surface by where it keeps it.
+	Public []string `yaml:"public"`
 
 	// SourceFile is the repo-relative enola/constraints file that declared
 	// this component, stamped at load time; empty means declared inline. It
@@ -197,13 +202,34 @@ type ConstraintRule struct {
 
 	MustPropContain *PropMatch `yaml:"must_prop_contain"`
 
-	RequireDefines string `yaml:"require_defines"`
-	Method         string `yaml:"method"`
+	RequireDefines string   `yaml:"require_defines"`
+	Method         string   `yaml:"method"`
+	AnyOf          []string `yaml:"any_of"`
+
+	// ForbidCycles names the first of a set of parts that may not depend on
+	// each other in a circle; Among names the rest. The reading contracts the
+	// module graph to one node per part and reports every strongly connected
+	// component of two or more.
+	ForbidCycles string   `yaml:"forbid_cycles"`
+	Among        []string `yaml:"among"`
+
+	// Independent names a component of modules none of which may reach a
+	// class whose resolved ancestry includes it: a mixin stays independent of
+	// its includers. Read over resolved ancestry only.
+	Independent string `yaml:"independent"`
 
 	RequireName string `yaml:"require_name"`
 	ForbidName  string `yaml:"forbid_name"`
 	Pattern     string `yaml:"pattern"`
 	Surface     string `yaml:"surface"`
+	// Requires pairs names: a member matching Pattern must have a sibling in
+	// the same component named by this template, the one * in Pattern
+	// captured and substituted for the one * here. with_* requires without_*.
+	Requires string `yaml:"requires"`
+	// Receiver narrows a to_name literal: none matches only call targets
+	// with no receiver part, any (the default) matches bare, chained and
+	// receiver-qualified forms alike.
+	Receiver string `yaml:"receiver"`
 
 	RequireEdge string `yaml:"require_edge"`
 	Direction   string `yaml:"direction"`
@@ -418,6 +444,11 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 			problems = append(problems, fmt.Sprintf("%s (%s): name_pattern %q must be an exact name, a prefix*, or a *suffix (no other pattern forms)", loc, c.Name, c.NamePattern))
 		}
 		problems = append(problems, ancestorProblems(loc, c)...)
+		for j, m := range c.Public {
+			if !validConstraintMatch(m) {
+				problems = append(problems, fmt.Sprintf("%s.public[%d]: %q must be an exact path, a prefix/** subtree, or a **/name basename glob", loc, j, m))
+			}
+		}
 		problems = append(problems, whereProblems(loc, c)...)
 		problems = append(problems, componentOwnershipProblems(loc, c)...)
 		// A name collision is a named error wherever the two declarations sit,
@@ -537,8 +568,34 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 		}
 		component("to", r.To)
 	case r.RequireDefines != "":
-		if r.Method == "" || strings.ContainsAny(r.Method, " \t") {
-			problems = append(problems, fmt.Sprintf("%s (%s): require_defines needs a method — one whitespace-free method name the class members must define", loc, r.ID))
+		switch {
+		case r.Method != "" && len(r.AnyOf) > 0:
+			problems = append(problems, fmt.Sprintf("%s (%s): method and any_of both name what the class members must define; declare exactly one", loc, r.ID))
+		case len(r.AnyOf) == 1:
+			problems = append(problems, fmt.Sprintf("%s (%s): any_of with one name is method; use method", loc, r.ID))
+		case len(r.AnyOf) > 1:
+			for _, m := range r.AnyOf {
+				if m == "" || strings.ContainsAny(m, " \t") {
+					problems = append(problems, fmt.Sprintf("%s (%s): any_of names must be whitespace-free method names", loc, r.ID))
+					break
+				}
+			}
+		case r.Method == "" || strings.ContainsAny(r.Method, " \t"):
+			problems = append(problems, fmt.Sprintf("%s (%s): require_defines needs a method — one whitespace-free method name the class members must define — or an any_of list", loc, r.ID))
+		}
+	case r.ForbidCycles != "":
+		if len(r.Among) == 0 {
+			problems = append(problems, fmt.Sprintf("%s (%s): forbid_cycles needs among — the other parts that may not depend on %s in a circle", loc, r.ID, r.ForbidCycles))
+		}
+		for _, name := range r.Among {
+			component("among", name)
+			if name == r.ForbidCycles {
+				problems = append(problems, fmt.Sprintf("%s (%s): among repeats the subject %s", loc, r.ID, name))
+			}
+		}
+	case r.Independent != "":
+		if r.Via != "" {
+			problems = append(problems, fmt.Sprintf("%s (%s): independent walks every rule-via edge kind, so it takes no via", loc, r.ID))
 		}
 	case r.RequireName != "":
 		if !ValidNamePattern(r.Pattern) {
@@ -676,11 +733,30 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 	if r.RequireEdge != "" && len(r.WhenEdgeTo) > 0 && r.WhenVia == "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to on the require_edge form needs a when_via (allowed: %s) — via already names the edge this rule demands, so the kind the antecedent reads is never defaulted from it", loc, r.ID, allowedRuleVias()))
 	}
-	if r.RequireDefines == "" && r.Method != "" {
-		problems = append(problems, fmt.Sprintf("%s (%s): method belongs to the require_defines form", loc, r.ID))
+	if r.RequireDefines == "" && (r.Method != "" || len(r.AnyOf) > 0) {
+		problems = append(problems, fmt.Sprintf("%s (%s): method belongs to the require_defines form, as does any_of", loc, r.ID))
+	}
+	if r.ForbidCycles == "" && len(r.Among) > 0 {
+		problems = append(problems, fmt.Sprintf("%s (%s): among belongs to the forbid_cycles form", loc, r.ID))
 	}
 	if r.RequireName == "" && r.ForbidName == "" && r.Pattern != "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): pattern belongs to the require_name and forbid_name forms", loc, r.ID))
+	}
+	if r.Requires != "" {
+		switch {
+		case r.RequireName == "":
+			problems = append(problems, fmt.Sprintf("%s (%s): requires belongs to the require_name form", loc, r.ID))
+		case strings.Count(r.Pattern, "*") != 1 || strings.Count(r.Requires, "*") != 1:
+			problems = append(problems, fmt.Sprintf("%s (%s): requires pairs names through one * in pattern and one * in requires (with_* requires without_*)", loc, r.ID))
+		}
+	}
+	if r.Receiver != "" {
+		switch {
+		case r.Forbid == "" || len(r.ToName) == 0:
+			problems = append(problems, fmt.Sprintf("%s (%s): receiver belongs to the forbid form with a to_name literal", loc, r.ID))
+		case r.Receiver != "none" && r.Receiver != "any":
+			problems = append(problems, fmt.Sprintf("%s (%s): receiver is none or any, not %q", loc, r.ID, r.Receiver))
+		}
 	}
 	if r.ForbidName == "" && r.Surface != "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): surface belongs to the forbid_name form", loc, r.ID))
@@ -819,7 +895,7 @@ func selectorOf(c ConstraintComponent) string {
 	}
 	sort.Strings(where)
 	return strings.Join([]string{c.Service, c.Kind, c.NamePattern,
-		strings.Join(match, ","), strings.Join(where, ","), string(c.Owns), c.Ancestor}, "\x00")
+		strings.Join(match, ","), strings.Join(where, ","), string(c.Owns), c.Ancestor, strings.Join(c.Public, ",")}, "\x00")
 }
 
 // ancestorProblems validates the ancestry selector at declaration time: the

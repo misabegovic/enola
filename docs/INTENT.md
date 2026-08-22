@@ -744,7 +744,7 @@ component has no match patterns for a path to join. A file nobody has
 written yet is still refused: nothing has been measured about it, and
 that is exactly what a predicate cannot answer for.
 
-### The fourteen rule forms
+### The sixteen rule forms
 
 Every rule has a lowercase-token `id`, unique per declaration, and a
 mandatory `because:` — the rationale every resulting finding surfaces,
@@ -1115,6 +1115,108 @@ stable witness. Modes, `exempt:` (witness is the member identity, e.g.
 gate's delta scoping, and `constraints_for`/plan's obligation
 statements (`members of events must have an inbound calls edge from
 handlers`) all apply exactly as they do to every other law form.
+
+### Parts that may not depend on each other in a circle: `forbid_cycles`
+
+A rule names a set of parts and holds when no dependency cycle runs among
+them. `forbid_cycles` names the first part and `among` the rest, every one
+a declared component:
+
+```yaml
+rules:
+  - id: parts-never-cycle
+    forbid_cycles: jobs
+    among: [models, mailers]
+    because: "parts that reach each other in a circle cannot be taken apart"
+```
+
+The reading contracts the module graph to one node per part, admits the
+reference and rollup edges (between declared parts a constant reference
+is a dependency, and on Ruby it is the only kind there is; associations
+stay out, as everywhere), drops self-edges, and reports every strongly
+connected component of two or more parts as one finding naming the parts
+in the circle and the module edges that close it. A cycle inside one
+part is not what the rule states. The repository-wide `cycles` explainer
+is unchanged: it excludes those edge kinds because estate-wide they merge
+everything, and a declared set is small and named. On the Ruby surface
+the law reads `jobs.must_not_cycle_with :models, :mailers`.
+
+A `to_name` literal naming a bare method matches the method of a chained
+or receiver-qualified call target as well: `update_all` is the call
+whether the extractor recorded it as `update_all`, `where.update_all` or
+`Order.update_all`, which is how a law about the mutating persistence
+methods holds against a query that reaches them through a relation
+chain. A literal carrying a receiver (`Order.update_all`) stays exact.
+
+### Five small spellings
+
+**A naming pair.** `require_name` takes `requires`, a template with one
+`*`: a member matching the pattern must have a sibling in the same
+component named by the template with the captured base substituted, so
+`pattern: "with_*"` with `requires: "without_*"` asks `Room#with_guests`
+for `Room#without_guests`. The base is read on the member's own part of
+the name, so a method on another class never satisfies it. On the Ruby
+surface: `chat.names_must_match "with_*", requires: "without_*"`.
+
+**A public surface by path.** A component takes `public`, a list of
+bounded globs naming the files that are its visible surface. The
+`private` form then decides visibility by path: inside those files a
+member is the surface, outside them it is internal, whatever the
+language's own keyword says. Ruby marks every method exported, so this
+is how a Ruby component states a surface at all. On the Ruby surface:
+`part :billing, files: "app/billing/**", public: "app/billing/public/**"`.
+
+**A receiver-qualified literal.** A `forbid` with `to_name` takes
+`receiver: none` to match only call targets with no receiver part, so
+`params` alone is named and `request.params` is not; the default, `any`,
+matches bare, chained and receiver-qualified forms alike. On the Ruby
+surface: `models.must_not_call "params", receiver: :none`.
+
+**Why a file belongs where it belongs.** `enola constraints explain
+<path>` names the components whose selectors admit a fact in the file,
+the selector that did it, and the edges the file's facts make, read off
+the same membership the evaluator verdicts on, so the sentence and the
+verdict cannot disagree. `--json` prints the same as data.
+
+**A strict Rails arrangement.** `rails-strict` ships as a recipe: the
+Rails laws, the request API kept out of models and services with
+`receiver: none`, no circle among the parts, and concerns that stay
+independent of their includers over an optional `concerns` role.
+
+### A module never reaches the classes that include it: `independent`
+
+```yaml
+rules:
+  - id: mixins-stay-independent
+    independent: concerns
+    because: "a mixin that knows its includer is half a class in hiding"
+```
+
+For each member module, the includers are the classes whose **resolved**
+ancestry includes it, read off the ancestry a provider emitted (the
+Rubydex provider does). The member's own edges, the edges of the methods
+it encloses and the edges its files carry are walked over every rule-via
+kind; one landing on an includer or on an includer's member is one
+finding. When the snapshot holds no resolved ancestry the rule emits one
+0.4 finding saying which provider would settle it and no verdict, the
+same refusal the `ancestor:` key makes. It takes no `via`. On the Ruby
+surface: `concerns.must_not_reach_includers`.
+
+### A protocol satisfied by one of several methods: `any_of`
+
+`require_defines` takes `any_of` beside `method`, exclusive with it: a
+class member satisfies the rule by defining at least one of the named
+methods, and the finding names the whole list.
+
+```yaml
+rules:
+  - id: entry-point
+    require_defines: services
+    any_of: [call, run]
+    because: "a service answers to one of two doors"
+```
+
+On the Ruby surface: `services.must_define_one_of :call, :run`.
 
 ### Protocol ordering — structural conformance, never runtime order
 
@@ -1680,7 +1782,7 @@ Enola.architecture "storefront" do
 end
 ```
 
-Fourteen verbs cover the fourteen rule forms, and a test walks the form
+Fourteen verbs cover the sixteen rule forms, and a test walks the form
 table and fails if any form cannot be reached from a verb, so a form
 added later without a way to say it breaks the build rather than
 quietly having no surface.
@@ -1873,9 +1975,37 @@ use_recipe:
       adapters: { match: ["lib/billing/adapters/**"] }
 ```
 
-Each one is three or four roles and three to five laws, so adopting an
+Each one is three or four roles and three to six laws, so adopting an
 arrangement is a paragraph of binding rather than a file of hand-written
 rules, and the laws arrive already carrying the reason they exist.
+
+Four more ship beside them. `vanilla-rails` is plain Rails: the extra
+directories (services, forms, policies, decorators, presenters) must stay
+empty, each with a stated reason, and models never reach controllers.
+`clean` is four rings (frameworks, interface adapters, use cases,
+entities) with every outward reach forbidden. `cqrs` splits commands,
+queries and read models, and adds the one law the split exists for: a
+query never calls a mutating persistence method, stated as a `to_name`
+literal list over calls. `ruby-conventions` bans the `get_`, `set_` and
+`is_` prefixes over whatever part the repository binds as its code.
+
+A recipe may mark a role **optional**. A binding may leave it out, the
+rules that reference it are expanded away for that instantiation, and
+the lint surface names each law the binding did not take, so a recipe
+can grow a role without breaking every repository that already binds it.
+`rails-conventions` grew `helpers` and `services` this way: services and
+models never reach helpers, services never reach controllers, and the
+request API (`render`, `redirect_to`, `params`, `session`, `cookies`,
+`flash`) stays out of models and services, all advisory, all in force
+only where the two roles are bound.
+
+**A first declaration in one command.** `enola constraints init [repo]`
+reads the shipped recipes, binds every role whose conventional directory
+the repository has, and writes one `use_recipe` per recipe whose required
+roles all resolved to `enola/constraints/recipes.yaml`, refusing to
+overwrite. A recipe missing a required directory is not bound and the
+output says which; nothing is guessed. `--dry-run` prints instead of
+writing and `--recipe NAME` limits the binding to one recipe.
 
 **A repository still authors its own**, under `enola/recipes/`, and a
 local recipe of the same name replaces the shipped one entirely. What a

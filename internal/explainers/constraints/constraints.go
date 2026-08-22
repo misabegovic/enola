@@ -167,6 +167,7 @@ type component struct {
 	where       []intent.WherePair
 	owns        string
 	ancestor    string
+	public      []string
 	source      string
 	recipe      string
 	instance    string
@@ -198,7 +199,12 @@ type rule struct {
 	whenEdgeTo                []string
 	mustProp, mustValue       string
 	requireDefines, method    string
+	anyOf                     []string
+	forbidCycles              string
+	among                     []string
+	independent               string
 	requireName, pattern      string
+	requires, receiver        string
 	forbidName, surface       string
 	requireEdge, direction    string
 	whenVia                   string
@@ -248,20 +254,7 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 	for _, f := range store.ByKind(facts.KindIntent) {
 		switch f.PropString("intent_kind") {
 		case "component":
-			c := component{
-				name:        f.PropString("component"),
-				service:     f.PropString("service"),
-				match:       strings.Fields(f.PropString("match")),
-				kind:        f.PropString("kind"),
-				namePattern: f.PropString("name_pattern"),
-				where:       intent.DecodeWhere(f.PropString("where")),
-				owns:        f.PropString("owns"),
-				ancestor:    f.PropString("ancestor"),
-				source:      f.PropString("source"),
-				recipe:      f.PropString("recipe"),
-				instance:    f.PropString("instance"),
-				role:        f.PropString("role"),
-			}
+			c := decodeComponent(f)
 			// First declaration wins, which is what the declaration screen's own
 			// index does. A duplicate component name is refused there, so a
 			// second fact for one name reaches this loop only from a store the
@@ -272,57 +265,90 @@ func declarations(store *facts.Store) (map[string]component, []rule) {
 				components[c.name] = c
 			}
 		case "rule":
-			r := rule{
-				id:             f.PropString("rule"),
-				mode:           f.PropString("mode"),
-				recipe:         f.PropString("recipe"),
-				instance:       f.PropString("instance"),
-				because:        f.PropString("because"),
-				source:         f.PropString("source"),
-				forbid:         f.PropString("forbid"),
-				forbidReach:    f.PropString("forbid_reach"),
-				to:             f.PropString("to"),
-				allow:          f.PropString("allow"),
-				only:           strings.Fields(f.PropString("only")),
-				protect:        f.PropString("protect"),
-				owners:         strings.Fields(f.PropString("owners")),
-				private:        f.PropString("private"),
-				except:         strings.Fields(f.PropString("except")),
-				forbidFact:     f.PropString("forbid_fact"),
-				cap:            f.PropString("cap"),
-				require:        f.PropString("require"),
-				whenProp:       f.PropString("when_prop"),
-				whenValue:      f.PropString("when_value"),
-				whenEdgeTo:     strings.Fields(f.PropString("when_edge_to")),
-				mustProp:       f.PropString("must_prop"),
-				mustValue:      f.PropString("must_value"),
-				requireDefines: f.PropString("require_defines"),
-				method:         f.PropString("method"),
-				requireName:    f.PropString("require_name"),
-				forbidName:     f.PropString("forbid_name"),
-				surface:        f.PropString("surface"),
-				pattern:        f.PropString("pattern"),
-				requireEdge:    f.PropString("require_edge"),
-				direction:      f.PropString("direction"),
-				whenVia:        f.PropString("when_via"),
-				toName:         strings.Fields(f.PropString("to_name")),
-				protocol:       f.PropString("protocol"),
-				steps:          strings.Fields(f.PropString("steps")),
-				guide:          f.PropString("guide"),
-				message:        f.PropString("message"),
-				exemplars:      strings.Fields(f.PropString("exemplars")),
-				via:            f.PropString("via"),
-				owns:           intent.DecodeOwnership(f.PropString("owns")),
-				exempt:         intent.DecodeExemptions(f.PropString("exempt")),
-			}
-			if n, ok := intPropOf(f, "max_members"); ok {
-				r.maxMembers = n
-			}
-			rules = append(rules, r)
+			rules = append(rules, decodeRule(f))
 		}
 	}
 	sort.Slice(rules, func(i, j int) bool { return rules[i].id < rules[j].id })
 	return components, rules
+}
+
+// decodeComponent reads one compiled component fact back into the selector
+// the evaluator resolves.
+func decodeComponent(f facts.Fact) component {
+	c := component{
+		name:        f.PropString("component"),
+		service:     f.PropString("service"),
+		match:       strings.Fields(f.PropString("match")),
+		kind:        f.PropString("kind"),
+		namePattern: f.PropString("name_pattern"),
+		where:       intent.DecodeWhere(f.PropString("where")),
+		owns:        f.PropString("owns"),
+		ancestor:    f.PropString("ancestor"),
+		public:      strings.Fields(f.PropString("public")),
+		source:      f.PropString("source"),
+		recipe:      f.PropString("recipe"),
+		instance:    f.PropString("instance"),
+		role:        f.PropString("role"),
+	}
+	return c
+}
+
+// decodeRule reads one compiled rule fact back into the rule the evaluator
+// verdicts.
+func decodeRule(f facts.Fact) rule {
+	r := rule{
+		id:             f.PropString("rule"),
+		mode:           f.PropString("mode"),
+		recipe:         f.PropString("recipe"),
+		instance:       f.PropString("instance"),
+		because:        f.PropString("because"),
+		source:         f.PropString("source"),
+		forbid:         f.PropString("forbid"),
+		forbidReach:    f.PropString("forbid_reach"),
+		to:             f.PropString("to"),
+		allow:          f.PropString("allow"),
+		only:           strings.Fields(f.PropString("only")),
+		protect:        f.PropString("protect"),
+		owners:         strings.Fields(f.PropString("owners")),
+		private:        f.PropString("private"),
+		except:         strings.Fields(f.PropString("except")),
+		forbidFact:     f.PropString("forbid_fact"),
+		cap:            f.PropString("cap"),
+		require:        f.PropString("require"),
+		whenProp:       f.PropString("when_prop"),
+		whenValue:      f.PropString("when_value"),
+		whenEdgeTo:     strings.Fields(f.PropString("when_edge_to")),
+		mustProp:       f.PropString("must_prop"),
+		mustValue:      f.PropString("must_value"),
+		requireDefines: f.PropString("require_defines"),
+		anyOf:          strings.Fields(f.PropString("any_of")),
+		forbidCycles:   f.PropString("forbid_cycles"),
+		among:          strings.Fields(f.PropString("among")),
+		independent:    f.PropString("independent"),
+		method:         f.PropString("method"),
+		requireName:    f.PropString("require_name"),
+		forbidName:     f.PropString("forbid_name"),
+		surface:        f.PropString("surface"),
+		pattern:        f.PropString("pattern"),
+		requireEdge:    f.PropString("require_edge"),
+		direction:      f.PropString("direction"),
+		whenVia:        f.PropString("when_via"),
+		toName:         strings.Fields(f.PropString("to_name")),
+		receiver:       f.PropString("receiver"),
+		requires:       f.PropString("requires"),
+		protocol:       f.PropString("protocol"),
+		steps:          strings.Fields(f.PropString("steps")),
+		guide:          f.PropString("guide"),
+		message:        f.PropString("message"),
+		exemplars:      strings.Fields(f.PropString("exemplars")),
+		via:            f.PropString("via"),
+		owns:           intent.DecodeOwnership(f.PropString("owns")),
+		exempt:         intent.DecodeExemptions(f.PropString("exempt")),
+	}
+	if n, ok := intPropOf(f, "max_members"); ok {
+		r.maxMembers = n
+	}
+	return r
 }
 
 // Explain resolves each declared component to its member facts, then emits one
@@ -559,6 +585,10 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			verdicts = e.verdictRequire(r, memberFacts, members)
 		case r.requireDefines != "":
 			verdicts = e.verdictRequireDefines(r, memberFacts, members, definedNames, composed)
+		case r.forbidCycles != "":
+			verdicts = e.verdictForbidCycles(r, store, memberFacts)
+		case r.independent != "":
+			verdicts = e.verdictIndependent(r, store, memberFacts, carried)
 		case r.requireName != "":
 			verdicts = e.verdictRequireName(r, memberFacts, members)
 		case r.forbidName != "":
@@ -756,6 +786,9 @@ func (e *Explainer) verdictForbid(r rule, resolve *resolver, ground *grounding) 
 				if !matchesAnyBoundedName(rel.Target, r.toName) {
 					continue
 				}
+				if r.receiver == "none" && strings.ContainsAny(rel.Target, ".#") {
+					continue
+				}
 			} else {
 				var landed bool
 				onto, landed = resolve.target(r, r.to, rel, f)
@@ -817,6 +850,15 @@ func matchesAnyBoundedName(target string, patterns []string) bool {
 	for _, p := range patterns {
 		if intent.MatchBoundedName(target, p) {
 			return true
+		}
+		// A literal naming a bare method matches the method of a chained or
+		// receiver-qualified call target as well: `update_all` is the call
+		// whether the extractor recorded it as update_all, where.update_all or
+		// Order.update_all. A literal carrying a receiver stays exact.
+		if !strings.ContainsAny(p, ".#") {
+			if i := strings.LastIndexAny(target, ".#"); i >= 0 && intent.MatchBoundedName(target[i+1:], p) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1130,8 +1172,17 @@ func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, resolve *reso
 	// in the file disqualifies it; a member with no visibility prop, or a name
 	// whose facts disagree, disqualifies that name, both fail closed.
 	internalFiles := map[string]bool{}
+	// A component that names its public files decides visibility by path:
+	// inside those files a member is the surface, outside them it is
+	// internal, whatever the language's own keyword says. Ruby marks every
+	// method exported, so without this a Ruby component could not state a
+	// surface at all.
+	public := resolve.components[r.private].public
 	for _, f := range memberFacts[r.private] {
 		visible, ok := f.Props["exported"].(bool)
+		if len(public) > 0 && f.File != "" {
+			visible, ok = matchConstraintPath(f.File, public), true
+		}
 		if !ok || visible {
 			internal[f.Name] = false
 			if f.File != "" {
@@ -1439,12 +1490,12 @@ func (e *Explainer) verdictRequireDefines(r rule, memberFacts map[string][]facts
 		if !classKind[name] || composed[name] {
 			continue
 		}
-		if definedNames[name+"#"+r.method] || definedNames[name+"."+r.method] {
+		if definesAny(definedNames, name, r.wantedMethods()) {
 			continue
 		}
 		f := first[name]
 		out = append(out, facts.Insight{
-			Title:       r.titled(fmt.Sprintf("%s does not define %s", name, r.method)),
+			Title:       r.titled(fmt.Sprintf("%s does not define %s", name, r.wantedSentence())),
 			Description: fmt.Sprintf("%s is a class member of %s, so it must define %s — and no measured symbol %s#%s or %s.%s exists. Classes that inherit, include or extend anything are out of this rule's scope, so the definition is visibly absent, not composed in. The rule is declared and membership is exact, so this is a decided-rule breach, not a heuristic. Because: %s", name, r.requireDefines, r.method, name, r.method, name, r.method, r.because),
 			Confidence:  r.confidence(),
 			Evidence: []facts.Evidence{{
@@ -1468,6 +1519,9 @@ func (e *Explainer) verdictRequireDefines(r rule, memberFacts map[string][]facts
 // name always exists on a member, so the form has no unmeasured case: every
 // member is in scope, and the verdict is total over the membership.
 func (e *Explainer) verdictRequireName(r rule, memberFacts map[string][]facts.Fact, members map[string]map[string]bool) []facts.Insight {
+	if r.requires != "" {
+		return e.verdictRequireNamePairs(r, memberFacts, members)
+	}
 	var out []facts.Insight
 	first := firstFactByName(memberFacts[r.requireName])
 	for _, name := range sortedMemberNames(members[r.requireName]) {
@@ -2364,4 +2418,84 @@ func matchConstraintFile(f facts.Fact, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// wantedMethods is what a require_defines rule asks for: the single method,
+// or the any-of list.
+func (r rule) wantedMethods() []string {
+	if len(r.anyOf) > 0 {
+		return r.anyOf
+	}
+	return []string{r.method}
+}
+
+func (r rule) wantedSentence() string {
+	if len(r.anyOf) > 0 {
+		return "any of " + strings.Join(r.anyOf, ", ")
+	}
+	return r.method
+}
+
+func definesAny(definedNames map[string]bool, class string, methods []string) bool {
+	for _, m := range methods {
+		if definedNames[class+"#"+m] || definedNames[class+"."+m] {
+			return true
+		}
+	}
+	return false
+}
+
+// verdictRequireNamePairs is the pairing reading of require_name: a member
+// whose name matches the pattern must have a sibling in the same component
+// named by the template with the captured base substituted. The base is what
+// the pattern's one * stood for, taken on the member's own part of the name
+// so `Order#with_tax` pairs with `Order#without_tax` and not with a method on
+// another class.
+func (e *Explainer) verdictRequireNamePairs(r rule, memberFacts map[string][]facts.Fact, members map[string]map[string]bool) []facts.Insight {
+	var out []facts.Insight
+	first := firstFactByName(memberFacts[r.requireName])
+	for _, name := range sortedMemberNames(members[r.requireName]) {
+		owner, short := splitOwner(name)
+		base, ok := capturedBase(short, r.pattern)
+		if !ok {
+			continue
+		}
+		sibling := owner + strings.Replace(r.requires, "*", base, 1)
+		if members[r.requireName][sibling] {
+			continue
+		}
+		f := first[name]
+		out = append(out, facts.Insight{
+			Title:       r.titled(fmt.Sprintf("%s has no %s", name, sibling)),
+			Description: fmt.Sprintf("%s matches %s, so the convention asks for %s beside it in %s, and no member of that name is measured. The rule is declared and membership is exact, so this is a decided-rule breach, not a heuristic. Because: %s", name, r.pattern, sibling, r.requireName, r.because),
+			Confidence:  r.confidence(),
+			Evidence:    []facts.Evidence{{File: f.File, Symbol: f.Name, Detail: "no measured " + sibling}},
+			Actions: []string{
+				fmt.Sprintf("Define %s if the convention stands", sibling),
+				"Amend the rule on its declaring page if the decision behind it changed",
+			},
+		})
+	}
+	return out
+}
+
+func splitOwner(name string) (owner, short string) {
+	if i := strings.LastIndexAny(name, "#."); i >= 0 {
+		return name[:i+1], name[i+1:]
+	}
+	return "", name
+}
+
+// capturedBase returns what a bounded pattern's one * matched in name.
+func capturedBase(name, pattern string) (string, bool) {
+	i := strings.Index(pattern, "*")
+	if i < 0 {
+		return "", false
+	}
+	prefix, suffix := pattern[:i], pattern[i+1:]
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) || len(name) < len(prefix)+len(suffix) {
+		return "", false
+	}
+	base := name[len(prefix) : len(name)-len(suffix)]
+	return base, base != ""
 }
