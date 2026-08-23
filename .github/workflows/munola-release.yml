@@ -1,0 +1,172 @@
+name: munola release
+
+on:
+  push:
+    tags:
+      - "munola-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Release notes must name the difference from upstream
+        run: |
+          grep -q '^## Differs from upstream' RELEASE_NOTES.md
+          awk '/^## Differs from upstream/{flag=1; next} /^## /{flag=0} flag && /^- /{n++} END {exit n==0}' RELEASE_NOTES.md
+
+  test:
+    needs: notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+  build:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#munola-v}"
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::munola tags are munola-v<upstream>.<n>, got $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+        run: |
+          BINARY="enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
+          go build \
+            -ldflags "-s -w -X github.com/enola-labs/enola/internal/version.Version=${{ steps.version.outputs.version }}" \
+            -o "${BINARY}${EXT}" \
+            ./cmd/enola
+
+      - name: Create tarball
+        shell: bash
+        run: |
+          BINARY="enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
+          tar czf "${BINARY}.tar.gz" "${BINARY}${EXT}" LICENSE NOTICE
+          sha256sum "${BINARY}.tar.gz" > "${BINARY}.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          body_path: RELEASE_NOTES.md
+          files: |
+            enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#munola-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify all platform assets are present
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PLATFORMS="linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64"
+          VERSION="${{ steps.version.outputs.version }}"
+          ASSETS="$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          missing=0
+          for platform in $PLATFORMS; do
+            for ext in tar.gz sha256; do
+              name="enola-${VERSION}-${platform}.${ext}"
+              if ! grep -qxF "$name" <<<"$ASSETS"; then
+                echo "::error::missing release asset: $name"
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Publish update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BINARY="enola-${VERSION}-linux-amd64"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --pattern "${BINARY}.tar.gz"
+          tar xzf "${BINARY}.tar.gz"
+          ./"${BINARY}" --version --json > built.json
+          grep -q '"version"' built.json
+          grep -q '"extractor_version"' built.json
+          jq --arg channel munola \
+             --arg base "${VERSION%.*}" \
+             --arg commit "$GITHUB_SHA" \
+             '. + {channel: $channel, upstream_version: $base, fork_commit: $commit}' \
+             built.json > version.json
+          cat version.json
+          gh release upload "$GITHUB_REF_NAME" version.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --draft=false
