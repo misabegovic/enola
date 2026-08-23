@@ -2173,7 +2173,128 @@ import (
 // require_governed; since and growth on rules; recipe roles carry selector
 // defaults, so a repository's own recipe binds in one line; every edge and
 // cycle verdict names its smallest cut.
-const cacheVersion = "v241"
+// v242: the Rubydex provider emits one dependency per qualified read, for the
+// leaf, carrying the file that defines it as target_file; the segments before
+// the leaf are its path, not dependencies. A read that resolves to nothing, or
+// to a constant alias, is a dependency fact with no relation and a named
+// resolution_cause. A consumer resolving a target by name prefers the carried
+// file when the name is defined in several, so a read of a reopened module's
+// member no longer lands on a reopening. Verdicts move with the edges.
+// v243: provider facts enter this cache. A per-file provider (files: per-file in
+// its config entry) keeps one entry per file keyed by its name, reported version
+// and the file's content digest, and runs only over the files with no entry; the
+// built-in Rubydex provider keeps one whole-index entry keyed by the engine
+// library version, the Ruby file set with content digests and Gemfile.lock, with
+// its census beside it. The receipt's provider block says what was reused.
+// v244: the provider seam spells receivers once and pairs what two producers
+// read identically. A singleton notation is unified by a table the seam owns;
+// a call relation two producers emitted at the same file, line and callee is
+// kept once under the first producer in name order, in the scope-bearing
+// spelling, stamped resolution_agreement; differing receivers stay as emitted
+// and are counted by shape in the receipt. The merged fact set changes for
+// every Ruby repository with both providers on.
+// v245: Angular's decorator-declared classes and its dependency injection. A
+// class carrying @Component/@Directive/@Pipe/@Injectable/@NgModule now records the
+// role the container gives it, its selector or pipe name, where its template lives,
+// and framework_registered — without which a container-instantiated class reads as
+// code nothing names. Constructor parameters and inject() initializers become
+// injects edges, resolved through the file's own import table or a class the file
+// declares and COUNTED as unresolved otherwise; across a ten-repository corpus that
+// is 21,418 injection sites which previously formed no edge at all. Everything is
+// gated on an @angular/core dependency, so a decorator of the same name in another
+// repository still models nothing.
+// v246: Angular's routes. A route array declares a path fragment; the prefix it
+// hangs under is decided by a parent's children:, by the entry whose loadChildren
+// lazily loads the module the array belongs to, or by nothing at all — so the paths
+// are composed by a repo-wide walk outward from the application roots (forRoot and
+// provideRouter), the shape the Express, gorilla/mux and Axum passes already share.
+// A lazy module names no array, so one is found by an exact export name, by the
+// target file's single forChild array, or by the single one among that file's own
+// imports; anything ambiguous is counted rather than guessed, and an array no root
+// reaches emits nothing rather than a fragment. Every fact carries type=page, so an
+// application's navigation can never surface as an unserved HTTP endpoint.
+// v247: three resolution fixes in the TypeScript path resolver and the Angular
+// router, each found by running the router against real workspaces.
+// resolveModuleFile now accepts a path that already names a file, because a
+// tsconfig EXACT alias maps a bare specifier onto its entry point with the
+// extension included and appending another matched nothing; a wildcard alias keeps
+// whatever follows the `*` in its target, instead of resolving one directory short;
+// and a route path written as a constant member is folded to the literal it names,
+// through an enum or an `as const` map in this file or the one it was imported
+// from. The first two are TypeScript-wide and affect every repository with a
+// workspace-style tsconfig, not only Angular ones.
+// v248: Angular templates. A component member is very often referenced ONLY from
+// its template — `(click)="save()"`, `{{ total }}` — and so is a child component,
+// which appears as a tag and nowhere else in the class; 4,251 external templates and
+// 10,844 inline ones were previously walked past, so every such symbol read as code
+// nothing calls. Templates are now scanned (both the older `*ngIf` dialect and
+// Angular 17 `@if`/`@for`/`@defer` blocks) and joined to the component that owns
+// them. A binding is an edge only when it names a member that component declares; a
+// tag resolves against a DECLARED selector, matched whole so a compound selector
+// needs both of its halves; anything else is counted by cause, never guessed. The
+// extractor now also owns .html for cache-invalidation purposes, since a template
+// edit changes what it emits.
+// v249: the Angular composition graph and the workspace shape. An application's
+// dependency structure is in its @NgModule declarations/imports/exports/providers
+// arrays and a standalone component's own imports — not in its import statements,
+// which say which files were loaded rather than which declarations were assembled.
+// Those arrays are now edges, resolved through the same import table as the
+// injection edges and reconciled the same way, so none of them names a node that
+// does not exist. Module facts additionally carry the workspace project that owns
+// their directory, read from an Nx project.json or an angular.json projects map:
+// in a monorepo the unit of ownership is the project, and every reading that groups
+// by unit was inferring that boundary from the path.
+// v250: Angular requests made through an injected HttpClient. The general client
+// pass requires a "/"-rooted literal, which is right when the receiver is anonymous
+// — it is what keeps map.get("key") out of the graph — and wrong here: a class that
+// injects HttpClient has a member whose declared type says so, and this.<that
+// member>.get(…) is a request whatever its argument looks like. Two shapes that rule
+// was rejecting are now read: a path with no leading slash (one client's whole
+// module contributed nothing) and a class-static base concatenated with a literal
+// tail, folded repo-wide because the base belongs to the service that owns the
+// resource and is named by every service that touches it. An unresolved LEADING
+// operand means the prefix is unknown and the call contributes nothing.
+// v251: three corrections found by auditing what the explainers now report on
+// Angular repositories. A tsconfig `paths` target is resolved against `baseUrl`,
+// which TypeScript does and this did not — in one workspace that meant every
+// aliased import resolved to nothing, and with it every module composition edge
+// those imports carry. `loadComponent: () => import('./page')` binds to the class
+// that file declares, so a page reachable only through a lazy route is no longer a
+// component nothing renders. And framework_registered is now set ONLY on NgModules:
+// after the template, composition and injection passes a component, directive, pipe
+// or service is named by edges the graph holds, and flagging them as
+// framework-invoked would suppress the dead code those edges make findable.
+// v252: dependency injection reaches the module layer. The module-edges binder
+// rolled up calls, dependencies and instantiations but not injections — and a
+// constructor parameter IS how a dependency is declared under a DI container, with
+// frequently no call, instantiation or import edge beside it to carry the pair.
+// Adding the relation takes an Angular storefront library from 3,895 derived module
+// edges to 6,128, a Java monolith from 1,407 to 1,700 and an ASP.NET Core media
+// server from 68 to 97. Every reading that walks the module graph moves with it,
+// by value rather than by count: no explainer reports a different NUMBER of
+// findings on the corpus, while one storefront's deepest chain becomes 78 not 77.
+// v253: a markdown link resolves against the walked files, not the filesystem.
+// mdintent stat'd each link target on disk, so a repository whose documentation
+// names paths under its own output directory produced a different fact stream on
+// every run: this one's docs cite `.enola/extractor_cache.json`, absent on a cold
+// run and present on the next, and `.enola/previous`, which the run after that
+// creates. Three passes, three hashes, on the one corpus row whose docs describe
+// enola — the property the whole reproducibility claim rests on, broken by reading
+// the disk instead of the file list the walker had already filtered.
+// v254: a markdown document is not a public surface. Sections became exported
+// symbols when mdintent started reading every page, and exported-surface read a
+// document as a module exporting its whole API — a changelog "exports 1,405 of
+// 1,405 symbols (100%)", 22 such findings across the corpus. Markdown joins Ruby as
+// a language whose symbols carry no visibility signal, so the ratio measures the
+// module rather than the format.
+// v255: the output directory is ignored at any depth, not only at the repository
+// root. A cluster config that snapshots subdirectories leaves an `.enola` in each,
+// and only the rooted glob covered them — so enola indexed its own llm_context.md
+// as a source document, and a repository's fact count depended on which of its
+// subdirectories somebody had snapshotted before. Harmless while a stray markdown
+// file was merely unread; a document with a section per heading once every page
+// became a source.
+const cacheVersion = "v255"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
@@ -2449,6 +2570,36 @@ func (c *extractorCache) get(key string) ([]facts.Fact, bool) {
 // into an internal buffer before writing a byte). A whole extractor's output is
 // 800 MB on a kernel-sized repository; a single fact is a few hundred bytes, and
 // becomes garbage as soon as it is written.
+// peek decodes an entry without carrying it forward or dropping it, for a caller
+// that is about to replace the entry under the same key: carrying it forward and
+// then writing the replacement would put the key in the spool twice.
+func (c *extractorCache) peek(key string) ([]facts.Fact, bool) {
+	raw, ok := c.prev[key]
+	if !ok {
+		return nil, false
+	}
+	var ff []facts.Fact
+	if err := json.Unmarshal(raw, &ff); err != nil {
+		return nil, false
+	}
+	return ff, true
+}
+
+// providerCache is the view of the extractor cache the provider seam receives:
+// the same spool, the same version and build stamps, keys scoped under a
+// provider namespace so a provider entry can never collide with an extractor's.
+type providerCache struct{ c *extractorCache }
+
+func (p providerCache) key(key string) string {
+	return cacheVersion + "\x00provider\x00" + key
+}
+
+func (p providerCache) Get(key string) ([]facts.Fact, bool) { return p.c.get(p.key(key)) }
+func (p providerCache) Peek(key string) ([]facts.Fact, bool) {
+	return p.c.peek(p.key(key))
+}
+func (p providerCache) Put(key string, ff []facts.Fact) { p.c.put(p.key(key), ff) }
+
 func (c *extractorCache) put(key string, ff []facts.Fact) {
 	if c.noPersist || c.closed {
 		return
