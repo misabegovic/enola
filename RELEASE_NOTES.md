@@ -14,5 +14,9 @@ guides: v0.3.1
   background-work, data-ownership and ember-conventions bind through
   `constraints init` when their roles resolve; held identical to the gem's
   files at the tag the `guides:` line names.
-- List every change here that is not in that upstream release, one line each,
-  with the upstream pull request number where one exists.
+- Every `constraints` subcommand exits as itself; upstream v0.4.4 exits 1
+  after `init` has written its file.
+- `constraints init` binds a recipe role by the role's own match default, so a
+  carried recipe can bind at all.
+- The Rubydex provider indexes a Rails engine's `app/` directory beside its
+  `lib/`, so engine constants resolve.
