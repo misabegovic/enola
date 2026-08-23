@@ -137,7 +137,7 @@ func initDeclaration(repoPath, only string) (string, string, error) {
 			required[role] = true
 		}
 		for _, role := range rec.Roles {
-			dir := existingDirectory(repoPath, roleDirectories[role.Name])
+			dir := existingDirectory(repoPath, roleCandidates(role))
 			if dir == "" {
 				if required[role.Name] {
 					missing = append(missing, role.Name)
@@ -171,6 +171,24 @@ func initDeclaration(repoPath, only string) (string, string, error) {
 		return "", report.String(), nil
 	}
 	return body.String(), report.String(), nil
+}
+
+// roleCandidates lists the directories a role may bind to: the directory its
+// own match default names first (a recipe that says `match: ["app/tasks/**"]`
+// has said where it lives), then the conventional places for that role name.
+// A default of one segment (`app/**`) is not a place: it is true of every
+// application, so a recipe resting on it would bind everywhere, and its
+// binding is left to whoever knows the application's kind.
+func roleCandidates(role intent.RecipeRole) []string {
+	var out []string
+	for _, pattern := range role.Match {
+		dir := strings.TrimSuffix(pattern, "/**")
+		if dir == pattern || strings.ContainsAny(dir, "*?[") || !strings.Contains(dir, "/") {
+			continue
+		}
+		out = append(out, dir)
+	}
+	return append(out, roleDirectories[role.Name]...)
 }
 
 func existingDirectory(repoPath string, candidates []string) string {
