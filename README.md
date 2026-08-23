@@ -1,3 +1,12 @@
+> **This fork is the source of munola releases.** `munola` is a distribution
+> of enola built from this repository's `upstream-current-sync` lineage: the
+> released upstream plus changes that are proposed upstream, under review, or
+> that upstream may never take. Releases are cut from tags `munola-v<upstream
+> version>.<n>` (for example `munola-v0.4.4.1` is the first munola release on
+> upstream 0.4.4), carry the same asset names as upstream with that version,
+> and their notes name exactly what differs from the upstream version they
+> descend from. Everything below this line is upstream's README.
+
 # enola — architectural regression testing for AI-assisted development
 
 [![MCP Toplist](https://mcptoplist.com/badge/glama%2Fenola-labs%2Fenola.svg)](https://mcptoplist.com/server/glama%2Fenola-labs%2Fenola)
