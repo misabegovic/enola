@@ -34,6 +34,15 @@ jobs:
       - name: Run tests
         run: go test -race -count=1 ./...
 
+      - name: Check out the enola-guides tag the notes name
+        run: |
+          tag="$(sed -n 's/^guides: *//p' RELEASE_NOTES.md | head -1)"
+          test -n "$tag" || { echo "RELEASE_NOTES.md must carry a guides: line naming the enola-guides tag"; exit 1; }
+          git clone --depth 1 --branch "$tag" https://github.com/misabegovic/enola-guides.git /tmp/enola-guides
+
+      - name: Carried recipes match the guides at that tag
+        run: RECIPES_SOURCE=/tmp/enola-guides go test -count=1 ./internal/intent -run TestMunolaRecipes_MatchTheGuides
+
   build:
     needs: test
     runs-on: ${{ matrix.os }}

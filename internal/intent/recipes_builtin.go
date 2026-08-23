@@ -19,7 +19,7 @@ import (
 // beats what arrived in a binary, and the override is reported rather than
 // silent so nobody has to wonder which one ran.
 //
-//go:embed recipes/*.yaml
+//go:embed recipes/*.yaml recipes/munola/*.yaml
 var builtinRecipeFiles embed.FS
 
 // BuiltinRecipeSource is what a shipped recipe cites as its declaring file, so
@@ -27,11 +27,51 @@ var builtinRecipeFiles embed.FS
 // path that exists in no repository.
 const BuiltinRecipeSource = "enola:recipes"
 
+// MunolaRecipeSource is the citation for the recipes this build carries beyond
+// upstream's set: the catalogue the enola-guides gem publishes, copied here at
+// release so `constraints init` on this binary can bind them. The copies are
+// held identical to the gem's files by a test the release runs.
+const MunolaRecipeSource = "munola:recipes"
+
+// MunolaRecipesDir is where those copies live inside the embedded tree.
+const MunolaRecipesDir = "recipes/munola"
+
 // BuiltinRecipes returns the shipped recipes in name order. A shipped recipe
 // that does not parse is a build defect rather than a user error, so it is
 // returned as a problem naming the file and the rest still load.
 func BuiltinRecipes() ([]Recipe, []string) {
-	entries, err := builtinRecipeFiles.ReadDir("recipes")
+	upstream, problems := loadEmbeddedRecipes("recipes", BuiltinRecipeSource)
+	munola, more := loadEmbeddedRecipes(MunolaRecipesDir, MunolaRecipeSource)
+	problems = append(problems, more...)
+
+	// A catalogue recipe wins over an upstream built-in of the same name and
+	// says so, the way a repository's own recipe wins over both: the copy this
+	// build carries is the one its release notes describe.
+	carried := make(map[string]string, len(munola))
+	for _, rec := range munola {
+		carried[rec.Name] = rec.Path
+	}
+	out := make([]Recipe, 0, len(upstream)+len(munola))
+	for _, rec := range upstream {
+		if where, replaced := carried[rec.Name]; replaced {
+			problems = append(problems, fmt.Sprintf("%s replaces the upstream recipe %q", where, rec.Name))
+			continue
+		}
+		out = append(out, rec)
+	}
+	out = append(out, munola...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, problems
+}
+
+// MunolaRecipes returns only the catalogue recipes this build carries, in name
+// order, for the release-time check against the gem's files.
+func MunolaRecipes() ([]Recipe, []string) {
+	return loadEmbeddedRecipes(MunolaRecipesDir, MunolaRecipeSource)
+}
+
+func loadEmbeddedRecipes(dir, source string) ([]Recipe, []string) {
+	entries, err := builtinRecipeFiles.ReadDir(dir)
 	if err != nil {
 		return nil, []string{fmt.Sprintf("built-in recipes: %v", err)}
 	}
@@ -46,7 +86,7 @@ func BuiltinRecipes() ([]Recipe, []string) {
 	var recipes []Recipe
 	var problems []string
 	for _, name := range names {
-		data, err := builtinRecipeFiles.ReadFile(path.Join("recipes", name))
+		data, err := builtinRecipeFiles.ReadFile(path.Join(dir, name))
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("built-in recipe %s: %v", name, err))
 			continue
@@ -57,10 +97,16 @@ func BuiltinRecipes() ([]Recipe, []string) {
 			continue
 		}
 		rec.Normalize()
-		rec.Path = BuiltinRecipeSource + "/" + name
+		rec.Path = source + "/" + name
 		recipes = append(recipes, rec)
 	}
 	return recipes, problems
+}
+
+// EmbeddedMunolaRecipe returns the bytes of one carried recipe file, for the
+// match test against the gem's copy.
+func EmbeddedMunolaRecipe(name string) ([]byte, error) {
+	return builtinRecipeFiles.ReadFile(path.Join(MunolaRecipesDir, name))
 }
 
 // MergeBuiltinRecipes puts the shipped recipes behind the repository's own. A
