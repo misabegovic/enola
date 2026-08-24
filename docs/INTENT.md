@@ -1270,8 +1270,8 @@ reserve-stock, validate-cart, in the declared order of obligation —
 structural conformance, not runtime ordering`). A protocol rule in a
 recipe references roles as its steps, so one declared order
 instantiates per bounded context — the checkout example above is the
-natural recipe body. With this form the ArchSpec parity table's
-protocols family graduates from partial to **covered-structural**: the
+natural recipe body. With this form the comparison table's protocols
+family graduates from partial to **covered-structural**: the
 structural half of ordered-interaction sequences is expressible and
 verdictable, the runtime half remains future provider work, and the
 parity re-measure belongs to the next harness run.
