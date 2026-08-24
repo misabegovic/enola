@@ -17,25 +17,31 @@ guides: v0.3.1
 - `constraints init` binds a recipe role by the role's own match default, so a
   carried recipe can bind at all. A default of one segment is not a place and
   is left unbound.
-- SARIF and host annotations beside text and JSON, so a verdict shows on the
-  diff where the change was made.
-- `constraints explain` answers who reaches a file and which verdicts change
-  if it leaves its part.
-- A Rubydex dependency lands on the file that defines the leaf it names,
-  rather than on a reopening of the same constant.
-- A corpus run records the identity of every finding it held and judges it, and
-  a promotion refuses to drop a finding judged a true positive.
+- The built-in Rubydex provider is told what the repository configuration
+  excludes, so an excluded document is skipped before its definitions are read
+  and an excluded reference before its fact is built (enola-labs/enola#255,
+  merged upstream 08:48Z on 2026-08-24, an hour after v0.4.6 was published, so
+  the release this descends from does not carry it). On a Rails monolith the
+  snapshot goes from 440 seconds to 193 with the fact set byte for byte
+  identical.
 - Provider facts are cached inside the engine, and the receipt says what the
   run reused and what it recomputed.
-- A breach is dated by its witness line where the history store cannot reach
-  back far enough to date it directly.
 - Receivers are spelled once across providers: what two producers emitted
   identically is kept once and stamped as agreement, and differing receivers
   stay as emitted and are counted by shape in the receipt.
-- Every verdict carries one line naming what the run could not see.
-- Every `constraints` subcommand exits as itself; upstream v0.4.4 exits 1
-  after `init` has written its file.
-- Recipe expansion rebinds every rule form, so a role bound at expansion holds
-  for the forms written after it.
-- The Rubydex provider indexes a Rails engine's `app/` directory beside its
-  `lib/`, so engine constants resolve.
+- A Rubydex dependency lands on the file that defines the leaf it names,
+  rather than on a reopening of the same constant.
+- The constraints reference carries the constraints directory, the component
+  vocabulary and the rule forms built on it; upstream v0.4.6 documents the
+  three carriers and stops there.
+- Cache versions v242 through v244 are this channel's own, so upstream's v242
+  and v243 are carried here as v245 and v246. The numbers differ from a stock
+  build of the same code; the facts do not.
+
+## Prior releases
+
+`munola-v0.4.4.1` and `munola-v0.4.4.2` descend from upstream v0.4.4. Their
+notes named a longer list, most of which upstream has since taken: the prefix
+walk fix shipped in v0.4.6 as enola-labs/enola#254, and the constraints
+program, SARIF output and `constraints explain` arrived over v0.4.5 and
+v0.4.6. What remains above is what upstream has not taken yet.

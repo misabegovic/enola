@@ -2194,6 +2194,8 @@ import (
 // and are counted by shape in the receipt. The merged fact set changes for
 // every Ruby repository with both providers on.
 // v245: Angular's decorator-declared classes and its dependency injection. A
+// Upstream's v242 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // class carrying @Component/@Directive/@Pipe/@Injectable/@NgModule now records the
 // role the container gives it, its selector or pipe name, where its template lives,
 // and framework_registered — without which a container-instantiated class reads as
@@ -2204,6 +2206,8 @@ import (
 // gated on an @angular/core dependency, so a decorator of the same name in another
 // repository still models nothing.
 // v246: Angular's routes. A route array declares a path fragment; the prefix it
+// Upstream's v243 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // hangs under is decided by a parent's children:, by the entry whose loadChildren
 // lazily loads the module the array belongs to, or by nothing at all — so the paths
 // are composed by a repo-wide walk outward from the application roots (forRoot and
@@ -2214,6 +2218,8 @@ import (
 // reaches emits nothing rather than a fragment. Every fact carries type=page, so an
 // application's navigation can never surface as an unserved HTTP endpoint.
 // v247: three resolution fixes in the TypeScript path resolver and the Angular
+// Upstream's v244 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // router, each found by running the router against real workspaces.
 // resolveModuleFile now accepts a path that already names a file, because a
 // tsconfig EXACT alias maps a bare specifier onto its entry point with the
@@ -2224,6 +2230,8 @@ import (
 // from. The first two are TypeScript-wide and affect every repository with a
 // workspace-style tsconfig, not only Angular ones.
 // v248: Angular templates. A component member is very often referenced ONLY from
+// Upstream's v245 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // its template — `(click)="save()"`, `{{ total }}` — and so is a child component,
 // which appears as a tag and nowhere else in the class; 4,251 external templates and
 // 10,844 inline ones were previously walked past, so every such symbol read as code
@@ -2235,6 +2243,8 @@ import (
 // extractor now also owns .html for cache-invalidation purposes, since a template
 // edit changes what it emits.
 // v249: the Angular composition graph and the workspace shape. An application's
+// Upstream's v246 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // dependency structure is in its @NgModule declarations/imports/exports/providers
 // arrays and a standalone component's own imports — not in its import statements,
 // which say which files were loaded rather than which declarations were assembled.
@@ -2245,6 +2255,8 @@ import (
 // in a monorepo the unit of ownership is the project, and every reading that groups
 // by unit was inferring that boundary from the path.
 // v250: Angular requests made through an injected HttpClient. The general client
+// Upstream's v247 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // pass requires a "/"-rooted literal, which is right when the receiver is anonymous
 // — it is what keeps map.get("key") out of the graph — and wrong here: a class that
 // injects HttpClient has a member whose declared type says so, and this.<that
@@ -2255,6 +2267,8 @@ import (
 // resource and is named by every service that touches it. An unresolved LEADING
 // operand means the prefix is unknown and the call contributes nothing.
 // v251: three corrections found by auditing what the explainers now report on
+// Upstream's v248 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // Angular repositories. A tsconfig `paths` target is resolved against `baseUrl`,
 // which TypeScript does and this did not — in one workspace that meant every
 // aliased import resolved to nothing, and with it every module composition edge
@@ -2265,6 +2279,8 @@ import (
 // or service is named by edges the graph holds, and flagging them as
 // framework-invoked would suppress the dead code those edges make findable.
 // v252: dependency injection reaches the module layer. The module-edges binder
+// Upstream's v249 in 0.4.4, taking the next free number here because this
+// channel had already spent v242 through v244.
 // rolled up calls, dependencies and instantiations but not injections — and a
 // constructor parameter IS how a dependency is declared under a DI container, with
 // frequently no call, instantiation or import edge beside it to carry the pair.
@@ -2273,28 +2289,40 @@ import (
 // server from 68 to 97. Every reading that walks the module graph moves with it,
 // by value rather than by count: no explainer reports a different NUMBER of
 // findings on the corpus, while one storefront's deepest chain becomes 78 not 77.
-// v253: a markdown link resolves against the walked files, not the filesystem.
-// mdintent stat'd each link target on disk, so a repository whose documentation
-// names paths under its own output directory produced a different fact stream on
-// every run: this one's docs cite `.enola/extractor_cache.json`, absent on a cold
-// run and present on the next, and `.enola/previous`, which the run after that
-// creates. Three passes, three hashes, on the one corpus row whose docs describe
-// enola — the property the whole reproducibility claim rests on, broken by reading
-// the disk instead of the file list the walker had already filtered.
-// v254: a markdown document is not a public surface. Sections became exported
-// symbols when mdintent started reading every page, and exported-surface read a
-// document as a module exporting its whole API — a changelog "exports 1,405 of
-// 1,405 symbols (100%)", 22 such findings across the corpus. Markdown joins Ruby as
-// a language whose symbols carry no visibility signal, so the ratio measures the
-// module rather than the format.
-// v255: the output directory is ignored at any depth, not only at the repository
-// root. A cluster config that snapshots subdirectories leaves an `.enola` in each,
-// and only the rooted glob covered them — so enola indexed its own llm_context.md
-// as a source document, and a repository's fact count depended on which of its
-// subdirectories somebody had snapshotted before. Harmless while a stray markdown
-// file was merely unread; a document with a section per heading once every page
-// became a source.
-const cacheVersion = "v255"
+// v253: detection stopped re-walking the tree. Every extractor answered Detect with
+// its own bounded walk, and every bound was a cliff a real repository falls off:
+// dotnet/runtime keeps all 3,270 of its C/C++ sources below the three levels the C++
+// detector scanned, so the extractor never ran and 5,574 files it owns were missing
+// from the graph. Raising a bound only moves the cliff — flutterfire's Java sits at
+// depth 10, past the generous 8 the JVM extractors allowed — and root-anchored rules
+// failed the same way without looking like depth at all: ente's Go backend is at
+// server/go.mod, so 493 Go files went unindexed in a repository being read as a
+// cross-repo cluster. Detection is now membership over the names the engine already
+// walked (plugin.FileListDetector), which has no bound to beat and costs no walk;
+// across a 20-repository polyglot corpus this recovered 13,496 of 13,828 files that
+// an extractor claimed and no extractor read. The remaining 332 are .html and loose
+// .js that OwnsFile over-claims and detection correctly declines.
+// v254: the Rubydex provider emits one dependency per qualified read, for the
+// leaf, carrying the file that defines it as target_file; the segments before
+// the leaf are its path, not dependencies. A read that resolves to nothing, or
+// to a constant alias, is a dependency fact with no relation and a named
+// resolution_cause. A consumer resolving a target by name prefers the carried
+// file when the name is defined in several, so a read of a reopened module's
+// member no longer lands on a reopening. Verdicts move with the edges.
+// v255: provider facts enter this cache. A per-file provider (files: per-file in
+// its config entry) keeps one entry per file keyed by its name, reported version
+// and the file's content digest, and runs only over the files with no entry; the
+// built-in Rubydex provider keeps one whole-index entry keyed by the engine
+// library version, the Ruby file set with content digests and Gemfile.lock, with
+// its census beside it. The receipt's provider block says what was reused.
+// v256: the provider seam spells receivers once and pairs what two producers
+// read identically. A singleton notation is unified by a table the seam owns;
+// a call relation two producers emitted at the same file, line and callee is
+// kept once under the first producer in name order, in the scope-bearing
+// spelling, stamped resolution_agreement; differing receivers stay as emitted
+// and are counted by shape in the receipt. The merged fact set changes for
+// every Ruby repository with both providers on.
+const cacheVersion = "v256"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

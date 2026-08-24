@@ -1,312 +1,29 @@
-# Declared intent — the enola standard
+# Declared constraints — the repo's law
 
-Enola measures what your architecture *is*. Intent declarations state
-what it was *meant* to be — and every snapshot diffs the two, so
-disagreement between decision and code surfaces as a finding with
-evidence instead of waiting for someone to notice.
+> The constraints program — this vocabulary, its evaluator, the provider seam it reads,
+> and the Ruby surface for writing laws as sentences — was contributed by
+> [Muhamed Isabegović](https://github.com/misabegovic), who also maintains the Ruby and
+> Rails integration gems enola-labs endorses.
 
-This page is the contract: where intent lives, exactly what enola
-reads, the full vocabulary, and how verdicts behave. Everything here
-is deterministic — declarations parse, compile, and verdict the same
-way on every machine, and an invalid declaration fails the snapshot
-rather than degrading silently.
+[INTENT.md](INTENT.md) states what an architecture *is meant to look like*;
+constraints state what it is **not allowed to do**, and the
+`constraints` explainer verdicts them against the measured graph on
+every snapshot. Two sections carry the whole vocabulary: `components`
+name sets of measured facts, `rules` state enforcement over them.
 
-## The one rule: enola reads only what enola defines
+Constraints are **file-level only**: they live in `enola-intent.yaml`
+or under `enola/constraints/` (or a cluster config's `intent:` entry,
+which overrides the repo's files wholesale) — never on a page. A page
+carrying `components:` or `rules:` is a validation error, not a
+merge: constraints are the repo's declared desired architecture,
+reviewed beside the code they govern, and a decision page references
+rule ids rather than carrying the rules themselves.
 
-Intent reaches enola through exactly three carriers, each an
-enola-defined schema:
+Some of what a rule can select is measured by a **provider** rather than an
+extractor — `ancestor:` reads a resolved ancestry chain, and a rule may verdict over
+a runtime observation or a declared signature. See [PROVIDERS.md](PROVIDERS.md).
 
-| Carrier | Where | Scope |
-|---|---|---|
-| `enola-intent.yaml` | a repo's root | that repo's own declaration |
-| `intent:` block | a cluster config (`mcp-arch.yaml`) | per-repo declarations for an estate, overriding repo files wholesale |
-| `enola_intent:` key | a markdown page's YAML frontmatter | intent declared where the *decision* lives — a wiki, a docs tree |
-
-For markdown, the key is deliberately namespaced: a wiki's own
-toolchain, linters and renderers ignore `enola_intent:`, and enola
-ignores everything else — it never reads your `title:`, your tags,
-your custom frontmatter, and it **never parses the page body**. Prose
-stays prose. If your wiki has its own conventions (statuses, source
-citations, ownership fields), your tooling can *derive* the
-`enola_intent:` block from them — but that derivation is your side of
-the boundary; enola's contract is the block itself.
-
-## The repo and cluster schema
-
-`enola-intent.yaml` at a repo's root and one entry of a cluster
-config's `intent:` block are **the same schema**, which is why an
-entry overrides a repo file wholesale rather than merging into it.
-Every section is optional; declaring nothing is not an error:
-
-```yaml
-service:                   # this repo's declared identity
-  name: backend
-  description: order and payment API
-consumes:                  # seams this repo intends to call
-  - {repo: payments, via: http}
-serves:                    # mechanisms this repo offers its callers
-  - {via: http, description: public REST API}
-layers:                    # this repo's layer order, outermost first
-  - {name: handlers, paths: ["app/handlers/**"]}
-  - {name: domain,   paths: ["app/domain/**"]}
-  - {name: storage,  paths: ["app/storage/**"]}
-```
-
-In a cluster config the same document is nested one level under the
-repo's label, because the file describes an estate rather than a repo:
-
-```yaml
-intent:
-  backend:
-    consumes:
-      - {repo: payments, via: http}
-```
-
-**`layers:` here is a flat, ordered list of `{name, paths}`** — the
-file already knows which repo it is about, so no `repo:` key. That is
-the one place this schema and the page schema below genuinely differ,
-and the difference is not cosmetic: a page can declare layers *for*
-several repos, so its entries name their owner and nest the order
-under `order:`. Getting it backwards is a validation error naming the
-missing field, never a silently ignored section.
-
-**What a `paths:` entry may say** is two forms and no more: an exact
-module path (`src/lib`), or a `prefix/**` subtree matching the prefix
-and everything under it (`src/lib/**`). There is deliberately no
-basename form — a layer is a *region* of the tree, and a rule about
-files named `*_controller.rb` wherever they live is a component, not a
-layer. Anything else is a validation error naming the two forms, at the
-moment you write it. It used to be accepted and then matched against
-nothing, which is a layer order that lints clean and governs zero
-modules.
-
-Paths are repo-relative and forward-slash **on every host**. A
-declaration written with backslashes is normalized rather than
-refused: the same file is read on the laptop that wrote it and on the
-runner that grades it, and it has to select the same code in both.
-
-Two ways to see what an order actually selects, before it is anything
-you rely on. `enola constraints lint` resolves each layer against the
-snapshot on disk and prints its member count beside the measured module
-paths, so a path that matches nothing is caught while you are editing
-it. And every snapshot raises an advisory when a declared order
-classifies no modules at all, or when one layer within it does —
-reported, never gating, because the run that first declares an order is
-exactly when a mistyped path shows up.
-
-Declaring a layer order buys more than documentation. The `layers`
-explainer verdicts a declared order at confidence `1.00` — declared,
-not recognised — where a pattern it inferred for itself caps at
-`0.80`. Since `enola check` gates at a `1.00` floor, only a declared
-order is enforceable with `--fail-on=layers` alone; an inferred one
-also needs `--min-confidence=0.8`.
-
-`--fail-on` is the whole opt-in: enola fails nothing until it is
-passed, so a declared layer order is a rule you wrote down and then
-chose to enforce, in that order.
-
-enola's own [`enola-intent.yaml`](../enola-intent.yaml) is the worked
-example, and its CI runs `--fail-on=layers` against it. Two things in
-it are worth copying: the layers are grouped by ROLE rather than by
-directory tree (`pkg/` and `internal/` both appear at several levels,
-because visibility is not a layer), and the file states in prose why
-each boundary is where it is — a declaration nobody can explain is one
-nobody will maintain. What it deliberately does not declare is anything
-about cycles: Go's compiler already refuses those between packages, and
-a declaration that restates the toolchain earns nothing.
-
-**Declaring an order does not fail the pull request that declares it.**
-The `layers` explainer emits an exact finding announcing the pattern it
-matched, which is a description rather than a violation; the gate
-routes those to a `Descriptive (never graded)` section and never counts
-them. The first thing your new declaration reports is therefore itself,
-harmlessly.
-
-## The page schema
-
-A page opts in by carrying `enola_intent:` in its frontmatter. Four
-sections, all optional, all validated:
-
-```yaml
-enola_intent:
-  page:                      # this page as a knowledge node
-    type: decision           # lowercase token — your taxonomy
-    status: living           # optional lowercase token
-    scope: [backend]         # repos this knowledge is about
-    affects: [mobile]        # repos this knowledge has consequences for
-    origin: [slack, langfuse]  # channels the knowledge came from (closed set)
-    relations:               # typed edges to other pages
-      - {rel: part-of,       to: wiki/backend/epics/messaging.md}
-      - {rel: depends-on,    to: wiki/backend/adrs/queue-choice.md}
-      - {rel: supersedes,    to: wiki/backend/adrs/old-queue.md}
-    anchors:                 # code locations this knowledge is about
-      - {repo: backend, path: app/services/payment_processor.rb}
-      - {repo: backend, path: app/handlers}
-  consumes:                  # seams: who intends to call whom, and how
-    - {repo: mobile, target: backend, via: graphql}
-  layers:                    # a repo's declared layer order, outermost first
-    - repo: backend          # named here — one page may declare layers for several repos
-      order:                 # (the repo-file form above is a flat list, with no repo:)
-        - {name: handlers, paths: ["app/handlers/**"]}
-        - {name: domain,   paths: ["app/domain/**"]}
-  claims:                    # measurable statements, re-verdicted every snapshot
-    - {metric: fact-count, repo: backend, kind: route, name_prefix: "/api", value: 214}
-    - {metric: seam, consumer: mobile, provider: backend, via: graphql}
-```
-
-Every fact compiled from a page carries the **page as its
-provenance** — a verdict's evidence cites the decision that declared
-the intent, not a config artifact. Seam and layer entries name their
-owner repo explicitly (`repo:`), because a page lives where the
-decision lives, not inside the repo it governs.
-
-## The vocabularies (closed, validated, named in errors)
-
-- **`via`** — how a seam is mechanized: `http`, `http-client`,
-  `grpc`, `graphql`, `kafka`, `import`, `shared_symbols`,
-  `object-storage`. The last two name coupling a call graph cannot
-  see: shared/vendored code, and bucket-mediated export/import
-  handoffs. A via outside this set is a parse error naming the set.
-- **`rel`** — how pages relate: `depends-on`, `supersedes`,
-  `superseded-by`, `part-of`, `relates-to`. Targets are
-  repo-relative markdown paths.
-- **`anchors`** — where a relation joins page to page, an anchor
-  joins page to code: a repo label plus a repo-relative path,
-  either a file or a directory prefix. A validated shape rather
-  than a closed vocabulary: both fields required, the path
-  repo-relative. With anchors the reverse query — *which
-  decisions govern this file?* — becomes a graph traversal
-  instead of a grep through prose.
-- **`origin`** — where knowledge came from: `slack`, `langfuse`,
-  `notion`, `github`, `web`, `repo`, `other`. Channels, not source
-  files: the entry names the class of system the page's evidence was
-  ingested from, and your wiki keeps the mapping from its own source
-  layout to these names. A new channel is a vocabulary addition
-  here, never a stringly-typed leak.
-- **`page.type` / `page.status`** — lowercase tokens; the taxonomy
-  is yours.
-- **`claims.metric`** — `fact-count` (kind + owner + optional
-  file/name prefix + expected value) or `seam` (a measured
-  cross-repo edge must exist).
-
-## What compiles
-
-Declarations become ordinary facts (`kind: intent`) at snapshot
-time — snapshots carry them, diffs track them, receipts fingerprint
-them. Nothing about intent lives in a side channel:
-
-- a `page:` block → one **knowledge node** plus one **relation
-  edge** per relation plus one **anchor fact** per anchor
-- each `consumes:` entry → a seam-intent fact with `intent_owner`
-- each `layers:` entry → per-layer facts feeding the layers explainer
-- each `claims:` entry → a claim fact the explainer re-evaluates
-
-## How verdicts behave
-
-The `intent` explainer diffs declared against measured, with honest
-confidences:
-
-| Finding | Confidence | Why |
-|---|---|---|
-| Unexpected seam (measured, not declared) | 1.0 | set difference between stated and measured — exact |
-| Mis-via (right target, wrong mechanism) | 1.0 | exact |
-| Failed claim (count or seam doesn't hold) | 1.0 | the claim is stated, the count is counted |
-| Missing intended seam (declared, not measured) | 0.8 | could be drift *or* an extraction miss — an estimate never presents as certainty |
-| Dangling relation (edge to an uncompiled page) | 0.8 | the target may be deleted or merely not opted in |
-| Dangling code anchor (a measurable path no fact touches) | 0.8 | the code moved or died — or this one file eluded extraction |
-| Superseded intent still measured (edge covered only by a retired page) | 0.8 | the code may lag the superseding decision — or the successor's intent is undeclared |
-
-**Superseded pages retire from current intent.** Two signals mark a
-page retired: an outgoing `superseded-by` relation (enola's own
-closed vocabulary), or the status token `superseded` — the one
-status token enola reads meaning into; the rest of the status
-taxonomy stays yours. A retired page's seams, claims, anchors and
-scope stop verdicting — history must not nag as drift — while its
-relations still verdict, because the supersession trail itself must
-not break. The one thing a retired page still *says*: a measured
-seam that only a retired declaration covers surfaces as *superseded
-intent still measured* — the code has not caught up with the
-superseding decision, or the successor's intent is not declared
-where enola can see it. That finding replaces the generic
-unexpected-seam verdict for such edges, because it carries the
-diagnosis.
-
-**Anchored code is traversable back to its decisions.**
-`impact_analysis` on any node reports the knowledge pages whose
-anchors cover the node's file — the governing decision trail,
-surfaced exactly when someone is about to change the code it
-governs — with each page's type and status joined from its own
-declaration, and each page's outgoing relations riding along so
-the trail continues past the first hop: the decision names what
-it is part of, depends on, or supersedes. `show_symbol` carries
-the same governing line beside the source. When the question is
-governance alone, the `governing_intent` tool answers it directly
-in either direction — a fact name or file path lists the pages
-that govern it; a compiled page path lists its anchors with the
-measured coverage under each — without computing a blast radius.
-Its empty states stay honest to the counterparty rule: a snapshot
-with no compiled pages answers *not asked*, which is never the
-same answer as *asked, none governs*.
-
-Repos that declare nothing are unasked — adoption is per-repo, and
-undeclared is not a finding. A declared seam whose counterparty is
-absent from the graph is skipped, never failed; an anchor into a
-repo the graph never measured is skipped the same way — and so is
-a file anchor whose kind the repo's graph never measures: for a
-file with an extension the kind is the extension (a README, a
-doc), and for a file without one the kind is its exact basename
-(a Gemfile, a Dockerfile, a version dotfile — the manifests this
-rule exists for are extensionless almost by convention, and a
-repo measuring extensionless scripts has not thereby measured
-them). No extractor could have proven any of these either way, so
-they are unasked, never dangling. Only a path the graph plausibly
-measures and does not touch is dangling. An anchor
-that joins is silence — and the join is the point: it is the
-stale-citation check a wiki otherwise performs by hand, and it
-makes every anchored file's governing decisions reachable from the
-graph.
-
-Scope and affects, by contrast, are **never verdicted**: they
-speak the wiki's own repo vocabulary, and the mapping from that
-vocabulary to cluster labels is the deriving toolchain's side of
-the boundary (working rule 5) — a page about one name may compile
-against a cluster that labels the same repo another way. Keeping
-those names truthful is the wiki's job, where the mapping is
-known. Declared layer
-patterns verdict at 1.0 through the layers explainer, *alongside*
-heuristic recognition rather than instead of it: a declaring repo gets
-its declared pattern and its proof-class violations, and the
-snapshot-wide heuristic pattern is still reported next to them. The
-heuristic cannot be switched off per repo, because its confidence is a
-ratio over every module in the snapshot — suppressing one repo's
-modules would move the score, and possibly the verdict, for repos that
-declared nothing.
-
-Two consequences worth designing for. A **declared seam also earns
-coverage**: unresolved client calls in a repo with exactly one
-declared HTTP target attribute to it (`attributed_by_intent`) —
-declarations supply what static analysis cannot, visibly, without
-inventing an edge. And a declared seam **no linker can measure yet**
-(e.g. `object-storage`) surfaces as a standing 0.8 — that is the
-honest state, not noise; judge it once in whatever ledger your
-workflow keeps and it stays acknowledged.
-
-## Where the rest of it lives
-
-This page is the declaration itself: where intent lives, what enola reads, the
-vocabularies, and how a verdict behaves. Two neighbours carry the parts that grew
-their own weight:
-
-- **[CONSTRAINTS.md](CONSTRAINTS.md)** — a repository's *law*. Components and the
-  selectors that resolve them, the 21 rule forms, modes, exemptions, recipes, laws
-  written in Ruby, and the `constraints lint` / `mine` / `explain` and `plan` surfaces.
-- **[PROVIDERS.md](PROVIDERS.md)** — measured facts from tools enola does not ship.
-  The seam's fail-closed contract, and the Rubydex, runtime and RBS/Sorbet providers.
-
-Constraints reach enola through the same three carriers described above, with one
-narrowing: they are file-level only, never on a page.
-
-### The constraints directory
+## The constraints directory
 
 A repo whose law outgrows one file splits it into per-domain files
 under `enola/constraints/*.yaml` — visible source at the repo root,
@@ -323,7 +40,7 @@ fact cites the file that declared it, so a verdict names
 CODEOWNERS work: each domain's file routes to the team that owns that
 domain's law.
 
-### Components
+## Components
 
 A component names the facts its selector matches:
 
@@ -414,7 +131,7 @@ linker emits, so service-to-service `depends_on` edges are walkable
 like any other. A fact with no repo label matches no service, fail
 closed.
 
-#### Selecting by concept: `where`
+### Selecting by concept: `where`
 
 `where` selects members by what the measured facts **carry** instead of
 by where their files sit, so a rule can name an enforceable concept
@@ -621,7 +338,7 @@ production Rails+Ember monolith (153,252 facts, 2026-08-13):
   and fixing witness Y in one change credits Y to the change that fixed
   it.
 
-#### A concept in an edge role: `owns`, and the basis a verdict states
+### A concept in an edge role: `owns`, and the basis a verdict states
 
 A predicate selects the facts that CARRY a property, and every property
 this vocabulary can test — `superclass`, `symbol_kind`, `storage_kind`,
@@ -743,7 +460,7 @@ component has no match patterns for a path to join. A file nobody has
 written yet is still refused: nothing has been measured about it, and
 that is exactly what a predicate cannot answer for.
 
-### The 21 rule forms
+## The 21 rule forms
 
 Every rule has a lowercase-token `id`, unique per declaration, and a
 mandatory `because:` — the rationale every resulting finding surfaces,
@@ -973,7 +690,7 @@ with the rule's `because` in the description. Target resolution fails
 closed: an edge whose target names nothing measured is skipped, never
 guessed into a violation.
 
-### Decorator discipline — the cached-getter example
+## Decorator discipline — the cached-getter example
 
 The TypeScript extractor records every decorated class member's (and
 class's) decorators as a sorted, deduped, space-separated `decorators`
@@ -1038,7 +755,7 @@ the .hbs scanner refuses bare `{{name}}` as ambiguous and strict-mode
 `.gts` tokens resolve against imports only — and a guessed fan-in is
 worse than an absent one.
 
-### Concern rules
+## Concern rules
 
 Concern discipline composes from the edge forms — no dedicated form
 exists because none is needed. "Concerns must not depend on their
@@ -1068,7 +785,7 @@ rules:
 An include whose constant resolves to nothing measured verdicts
 nothing — fail closed, like every other target resolution here.
 
-### Existential edges — the first recipe primitive
+## Existential edges — the first recipe primitive
 
 Everything above forbids: edges that must not exist, members that must
 not exist, names and props that must not deviate. `require_edge` is
@@ -1115,7 +832,7 @@ gate's delta scoping, and `constraints_for`/plan's obligation
 statements (`members of events must have an inbound calls edge from
 handlers`) all apply exactly as they do to every other law form.
 
-### Parts that may not depend on each other in a circle: `forbid_cycles`
+## Parts that may not depend on each other in a circle: `forbid_cycles`
 
 A rule names a set of parts and holds when no dependency cycle runs among
 them. `forbid_cycles` names the first part and `among` the rest, every one
@@ -1147,7 +864,7 @@ whether the extractor recorded it as `update_all`, `where.update_all` or
 methods holds against a query that reaches them through a relation
 chain. A literal carrying a receiver (`Order.update_all`) stays exact.
 
-### Five small spellings
+## Five small spellings
 
 **A naming pair.** `require_name` takes `requires`, a template with one
 `*`: a member matching the pattern must have a sibling in the same
@@ -1182,7 +899,7 @@ Rails laws, the request API kept out of models and services with
 `receiver: none`, no circle among the parts, and concerns that stay
 independent of their includers over an optional `concerns` role.
 
-### A module never reaches the classes that include it: `independent`
+## A module never reaches the classes that include it: `independent`
 
 ```yaml
 rules:
@@ -1201,7 +918,7 @@ finding. When the snapshot holds no resolved ancestry the rule emits one
 same refusal the `ancestor:` key makes. It takes no `via`. On the Ruby
 surface: `concerns.must_not_reach_includers`.
 
-### A protocol satisfied by one of several methods: `any_of`
+## A protocol satisfied by one of several methods: `any_of`
 
 `require_defines` takes `any_of` beside `method`, exclusive with it: a
 class member satisfies the rule by defining at least one of the named
@@ -1217,7 +934,7 @@ rules:
 
 On the Ruby surface: `services.must_define_one_of :call, :run`.
 
-### Protocol ordering — structural conformance, never runtime order
+## Protocol ordering — structural conformance, never runtime order
 
 `protocol` closes the last gap in the rule vocabulary's expressiveness
 table: ordered interaction sequences. It does so with a form that is
@@ -1269,13 +986,13 @@ reserve-stock, validate-cart, in the declared order of obligation —
 structural conformance, not runtime ordering`). A protocol rule in a
 recipe references roles as its steps, so one declared order
 instantiates per bounded context — the checkout example above is the
-natural recipe body. With this form the comparison table's protocols
-family graduates from partial to **covered-structural**: the
+natural recipe body. With this form the ArchSpec parity table's
+protocols family graduates from partial to **covered-structural**: the
 structural half of ordered-interaction sequences is expressible and
 verdictable, the runtime half remains future provider work, and the
 parity re-measure belongs to the next harness run.
 
-### Laws only a graph can state
+## Laws only a graph can state
 
 Five forms and two component keys read what only the fact graph holds:
 storage facts, the routes behind code, the seams between repositories,
@@ -1356,7 +1073,7 @@ alone, and every path is overridable where a tree differs. The shipped
 recipes stay framework-general; house conventions belong in the
 repository's recipe, where the team that owns them reviews them.
 
-### Recipes — named patterns as instantiable bundles
+## Recipes — named patterns as instantiable bundles
 
 A recurring architectural pattern — event-driven, ports-and-adapters,
 a migration target state — is the same handful of rules written again
@@ -1485,7 +1202,7 @@ counts conforming pages over time: the migration's progress is the
 number of instances whose rules verdict clean, measured, not
 asserted.
 
-### Cross-repo rules
+## Cross-repo rules
 
 With service-scoped components the rule forms reach across
 repositories — the edges are the ones the cross-repo linker measures
@@ -1515,7 +1232,7 @@ answer for a repo it does not contain — and one 0.4 advisory
 snapshot`) keeps the silence visible, exactly like the dead-selector
 advisory.
 
-### Modes
+## Modes
 
 - **`ratchet`** (the default): breaches verdict at `1.0` and the check
   gate fails **new** ones — pre-existing violations stay silent, the
@@ -1545,7 +1262,7 @@ suppressed finding is reported in the verdict's own `Suppressed`
 bucket (text and JSON) and never fails; the ledger applies to ratchet
 findings too. enola never writes this file.
 
-### Exemptions — declared carve-outs
+## Exemptions — declared carve-outs
 
 A rule may carry an `exempt:` list: declared, reasoned carve-outs
 riding the law itself. Each entry names one **witness** — the exact
@@ -1611,7 +1328,7 @@ that is true:
    merely stops it getting worse. Invisible and unreasoned, which is
    exactly why anything decided deserves one of the forms above.
 
-### Guidance rules
+## Guidance rules
 
 Everything above is law — a rule states what the architecture must
 not do, and a breach is a decided finding. The `guide` form is
@@ -1683,224 +1400,10 @@ carries guidance the same way, over its own graded delta; a declined
 or errored gate carries none, because there is no trustworthy delta
 for the advice to travel with.
 
-### The provider seam
 
-A tool enola does not ship can contribute measured facts through the
-engine config's `providers:` block: an executable run once with
-`--version` and once with the repository path, emitting facts as JSONL
-in the store's own schema. The contract is fail-closed end to end —
-one invalid line rejects the provider's whole output, a provider fact
-may not collide with an extractor fact's kind+name identity, and every
-fact must carry a **`resolution_level`** prop: the provider's own
-honesty declaration of how it resolved what it emitted (the same
-vocabulary the Stimulus pass uses for its `markup-declared` binding
-facts). The seam stamps provenance (`provider`, `provider_version`)
-onto every accepted fact, and each run lands in the receipt's provider
-**census** — including providers that contributed nothing and why. The
-census is comparability: a delta whose two snapshots ran different
-provider sets (`provider_set`) is never graded as a full verdict,
-exactly as a differing extractor set is. `enola check` grades the
-**intersection** — only facts from producers that ran on both sides,
-the disputed provider's facts excluded by their stamped `provider`
-prop and named in a partial verdict that says what went ungraded —
-and still declines outright when fact identity itself is in doubt (a
-different enola version or build, repository, or ignore set).
+## Laws written in Ruby
 
-The `resolution_level` vocabulary is closed, for the same reason the
-kind and relation vocabularies are — a level nothing knows how to
-weigh is a claim nothing can act on: `constant-receiver`,
-`lexical-self`, `name-only`, `literal-declared`, `markup-declared`,
-`convention-derived`, `runtime-observed`, `declared`, and `resolved`.
-`resolved` states that the provider resolved a name through the
-language's own lookup rules (nesting, inheritance, the locked gems) to
-one declaration: neither a receiver typing, nor a signature-file claim,
-nor a path convention, which is why it is its own word.
-Two producers reading one Ruby tree read many of the same call sites,
-and they do not spell a receiver the same way: one engine writes a
-singleton class as `<Owner>`, the other writes the plain constant, and
-only one of them knows a class method from an instance one. The seam
-owns the one spelling table and applies it after validation and before
-merge, so no script learns another's notation. It then pairs call
-relations across producers by file, line, receiver and method: a
-relation two producers emitted identically is kept once, under the
-first producer in name order, in the spelling that carries the scope
-(`Board.find`, as the extractor names a class method), with a separate
-prop **`resolution_agreement: agreement`** beside the producer's own
-`resolution_level`, which is never rewritten. A site where the producers
-resolved different receivers is left exactly as each emitted it and
-counted in the receipt's provider block by shape: `differing`,
-`alias-resolved` when the producer carried `resolution_cause: alias` for
-that line, and `singleton-spelling`, a cause expected to read zero so a
-notation the table does not cover shows up as a number. Agreed,
-differing and one-sided counts per provider sit beside the census; a
-difference is a count, never a vote and never a refusal.
-
-`runtime-observed` is its own level, not a stronger static one: it
-states that a **booted application** reported the fact, and a fact
-carrying it must also carry an **`observed_via`** prop naming the
-observation channel (`rails-boot`, `query-counter`) — runtime
-provenance without a channel is a claim that cannot be re-derived.
-`declared` is the mirror obligation on the static side: it states
-that a **signature file claims** the fact — a type annotation, not
-code observed or run — and a fact carrying it must also carry a
-**`declared_in`** prop naming that signature file, because a
-declaration is not source: the claim can drift from the
-implementation, so a consumer must always be able to weigh it apart
-from extracted and runtime truth, and find the file that made it.
-
-A provider may additionally report its own coverage accounting over
-one stderr line prefixed `enola-provider-census: ` — files seen,
-declarations parsed, constructs skipped with named causes — which the
-seam validates as strictly as the facts and carries into the
-receipt's provider census, the same honesty discipline the engine's
-file census applies to its own walk.
-
-### Reusing provider facts
-
-Provider facts enter the engine's extractor cache, under the same
-version and build stamps, so a provider whose inputs did not move is
-not run again. A provider whose output partitions by file declares it
-in its entry, `files: per-file`, with the `extensions:` it reads; the
-seam then keeps one entry per file, keyed by the provider's name, its
-reported version and the file's content digest, hands the provider only
-the files with no entry (the repository path, then `--files` and the
-path of a listing, one repo-relative path per line), and merges the
-cached facts for the rest. A fact the provider emits about a file it was
-not handed is dropped and counted, so a script cannot widen its own
-scope. A provider that declares nothing runs whole-tree on every
-snapshot as before; a provider that reads across files must not declare
-per-file, because the cache would serve facts computed against a tree
-that has since changed. The built-in Rubydex provider keeps one
-whole-index entry instead, keyed by the engine library version, the
-Ruby file set with content digests and `Gemfile.lock`; a hit reuses the
-facts and the census as recorded, a miss rebuilds the index, never
-patches it.
-
-The receipt's provider record carries a `reuse` block whenever the
-cache was consulted for a provider that ran: `reused` and `computed`
-fact counts, the files behind them for a per-file provider, facts
-dropped as `outside_scope`, and for the whole-index case `cache: hit`
-or `miss` with what the key did not match (`files`, `lockfile`,
-`version`, or `cold` when no index had been recorded). A skipped
-provider carries no reuse block, and a run without a cache carries
-none either: absent means not asked, never zero. A cold and a warm
-snapshot of one tree produce byte-identical facts, which the suite
-asserts.
-
-### The Rubydex provider
-
-Rubydex, the shared Ruby analysis engine, is a provider the binary
-carries itself. A `providers:` entry named `rubydex` with no `command`
-runs it in-process: the engine's C-ABI library, which every platform gem
-ships prebuilt, is loaded at run time (no cgo, no Ruby interpreter, no
-gem in the measured repository's bundle) from enola's cache, where
-`enola providers fetch rubydex` puts it after downloading the pinned
-gem version from rubygems.org and verifying its published digest. A
-configured provider whose library is absent is a named skip in the
-census that says which command installs it; `doctor` reports the same.
-Fetching is the only network access a provider makes, never at snapshot
-time. Dependency gem paths come from the repository's own bundle
-(`bundle list --paths`) when `bundle` is on PATH; without it the
-workspace alone is indexed and the census says so. A reference
-implementation in Ruby stays at `examples/providers/ruby/rubydex/` for
-an installation that prefers an external process; both emit the same
-facts.
-
-The provider indexes the workspace, resolves it, and emits the three
-things enola's own Ruby extractor and the Prism provider do not: constant
-references resolved through Ruby's nesting and inheritance rules
-(`rubydex-ref:`, a `depends_on` edge at `resolved`), method calls whose
-receiver resolves to a constant other than the lexical enclosing class
-(`rubydex-call:`, a `calls` edge at `constant-receiver`; the enclosing
-class is the extractor's to say), and each class's linearised ancestor
-chain with mixins in resolution order (`rubydex-ancestor:`, one
-`implements` edge per ancestor at `resolved`, carrying the ancestor's
-distance and whether the workspace declares it). Only facts located in
-the workspace are emitted; built-in ancestors are omitted because every
-class reaches them; unresolved references and Rubydex's own diagnostics
-are counted in the census rather than guessed around. The ancestry edges
-are what the `ancestor:` component key reads.
-
-### The runtime provider
-
-`examples/providers/ruby/runtime/enola_runtime_provider.rb` is the reference
-collector for runtime-observed facts. It reads capture files from
-`.enola-runtime/*.json` in the target repository — captures an
-operator produced by running the app, never something the snapshot
-produces — and emits them through the seam. Two capture schemas are
-recognized: the booted-Rails capture (`source: "enola runtime"`,
-the final route table plus reflected associations and table bindings,
-which only exist after boot) and the query-counter capture
-(`source: "activesupport-notifications"`, database queries per
-application frame measured under a spec run). Facts are namespaced
-(`runtime-route:`, `runtime-association:`, `runtime-storage:`,
-`runtime-queries:`) so they add observations without colliding with
-the identities the extractors own, and every fact carries
-`resolution_level: runtime-observed` plus its `observed_via` channel.
-
-The contract is fail-closed end to end: a boot capture reporting any
-`unreachable` subject is refused whole (an incomplete boot must not
-become partial truth), an unrecognized capture source is refused by
-name, and a repository with no captures contributes zero facts — a
-visible census entry, never an error. After the merge, the engine
-cross-links observations to measurements: an extracted route fact
-whose method and path a `runtime-route:` observation reports gains
-**`runtime_observed: true`** and the merged, sorted `observed_via`
-set, so runtime truth is queryable on the measured graph
-(`query_facts(kind=route, prop=runtime_observed, prop_value=true)`)
-and constraint rules can verdict over it (a `require` on
-`observed_via`, a `forbid_fact` over a component selecting
-observations). Runtime truth informs the graph; it never gates
-anything by itself — observations carry no linker verdicts
-(`unmatched_by_clients` never lands on one) and stay out of the
-unused-routes censuses, because an observation of the booted
-application is not a static route the linker could assess.
-
-### The RBS/Sorbet provider
-
-`examples/providers/ruby/rbs/enola_rbs_provider.rb` brings declared Ruby types into
-the graph as facts. One provider covers both signature dialects: RBS
-files (`**/*.rbs`), Sorbet interface files (`**/*.rbi`), and inline
-Sorbet `sig { }` blocks in `**/*.rb` — pure-Ruby stdlib parsing (a
-conservative hand parser, `json` only), deliberately not the `rbs`
-gem: the gem's parser is a native extension whose rendering drifts
-across gem versions, and a fact stream that depends on which rbs a
-machine has installed is not deterministic. The hand parser reads the
-common declaration forms and **fails closed by name** on everything
-else — an attr declaration, a mixin, a type alias, an unrecognized
-sig chain link each land in the census as a counted skip cause, never
-as a guessed fact, and a structurally broken signature file is
-discarded whole with its already-parsed declarations retracted from
-the parsed count.
-
-Two fact shapes, both `symbol` facts at level `declared` with
-`declared_in` pointing at the signature file: **method contracts**
-(`rbs-signature: Billing::Ledger#record`, carrying receiver, method,
-singleton, the rendered signature, per-parameter declarations —
-`untyped` and `T.untyped` recorded, never omitted — the return type,
-overload counts where RBS declares overloads, and one `has_method`
-relation targeting the method identity) and **type declarations**
-(`rbs-decl: Billing::Ledger`, carrying `decl_kind`
-class/module/interface, type parameters where generic, and the
-declared superclass). The namespaced names add declarations without
-colliding with the identities the extractors own.
-
-After the merge the engine cross-links claims to measurements,
-mirroring the runtime cross-link: an extracted symbol whose exact
-class+method identity a declared contract names gains **`typed:
-true`**, the merged sorted `declared_signature` summary, and the
-merged sorted `declared_in` file set — never touching the extractor's
-account of the symbol itself. Declared truth is then queryable
-(`query_facts(kind=symbol, prop=typed, prop_value=true)`) and
-constraint rules can verdict over it — a `require` on `declared_in`
-over an API component, a `forbid_fact` over a component selecting
-retired contracts — with every verdict citing the signature file that
-made the claim. A declaration is a claim about the implementation,
-not proof of it: the provider records what the signature file says,
-the level says who said it, and nothing presents the claim as
-inferred or verified.
-
-### Laws written in Ruby
+Shipped in v0.4.4.
 
 A repository whose team writes Ruby may write its laws in Ruby. Files
 ending in `.rb` in `enola/constraints/` are read beside the YAML ones,
@@ -1958,7 +1461,7 @@ like, and a component name is a lowercase token, so the underscore
 becomes a dash on the way through: `part :service_objects` is the
 component `service-objects`.
 
-#### A Rails and Ruby catalogue
+### A Rails and Ruby catalogue
 
 Laws a Rails codebase can state today, each compiling to a form above.
 They are written to be read and adapted rather than copied: the parts
@@ -2077,7 +1580,7 @@ Nothing in the surface is Rails-specific except the `rails` line, which is
 sugar for parts a Rails layout already names. Every other construct takes
 globs, predicates and services, so a Go service, an Ember application and
 a Python worker declare their laws the same way.
-### Recipes that ship with enola
+## Recipes that ship with enola
 
 A convention set nobody can adopt in one line is a convention nobody
 adopts, so some ship with the binary. `rails-conventions` is the first:
@@ -2164,7 +1667,7 @@ crossing rather than a breach (jobs and models reaching a controller,
 where `ApplicationController.renderer` is the sanctioned path) ship as
 advisory for that reason.
 
-### `constraints lint`
+## `constraints lint`
 
 The authoring loop. `enola constraints lint` parses the declaration
 (repo file, `enola/constraints/` files — each listed with its own
@@ -2177,7 +1680,7 @@ verdicts anything. No snapshot degrades to a named validation-only
 mode; nothing is generated or written. Exit `1` on validation
 problems, `0` otherwise.
 
-### `constraints mine`
+## `constraints mine`
 
 Discovering the law instead of writing it. `enola constraints mine`
 walks the current snapshot's fact store for **near-invariants** —
@@ -2268,7 +1771,7 @@ a constraint proposal. Nothing is written to the repository's plugin
 and no ESLint configuration is touched: the scaffold is a starting
 point the operator reviews, like the would-be declaration.
 
-### `plan` / `plan_check` — the pre-edit contract
+## `plan` / `plan_check` — the pre-edit contract
 
 The contract, moved into the planning loop. `enola plan` (and the
 `plan_check` MCP tool, the same code path) answers, **before any edit
@@ -2335,31 +1838,3 @@ This ordering is the point: the self-correction benchmark measures
 that violations drop sharply when the contract is in reach at
 planning time rather than at the CI gate, and plan-check is that
 contract as a first-class query.
-
-## Working with intent, the enola way
-
-1. **Declare only what you know.** A declaration triggers
-   unexpected-seam verdicts over everything it measures for that
-   repo — declare a repo's seams when you can stand behind the
-   complete list, not for completeness's sake.
-2. **Put the declaration where the decision lives.** If an ADR
-   decides that the mobile app talks to the backend over GraphQL,
-   that ADR's page carries the seam — and every future verdict cites
-   it.
-3. **One seam, one deciding page.** The same seam declared on two
-   pages is a compile error, not a merge.
-4. **Let claims guard your load-bearing numbers.** Any count your
-   documentation states as fact can be a `fact-count` claim; from
-   then on the number failing is a snapshot finding, not a stale
-   sentence.
-5. **Derive, don't hand-maintain, what your wiki already knows.**
-   If your pages carry structured metadata (kinds, statuses,
-   relations, source citations), generate the `enola_intent:` block
-   from it with your own tooling and check the derivation in CI —
-   enola validates the block; keeping it truthful to your
-   conventions is yours. Source citations that name code paths are
-   anchors waiting to be derived: the richest page-to-code signal a
-   wiki carries is usually already in its citation discipline.
-6. **Treat vocabulary gaps as decisions.** If a real seam has no
-   via, that is a proposal for this page — not a reason to shoehorn
-   it into a wrong one or drop it silently.

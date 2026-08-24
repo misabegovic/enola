@@ -44,6 +44,10 @@ type collector struct {
 	dependencyPaths     int
 	bundleAbsent        bool
 	documentCache       map[uint64][]span
+	declarationNames    map[uint64]string
+	ignored             func(file string) bool
+	excludedDocuments   int
+	excludedReferences  int
 }
 
 type span struct {
@@ -55,7 +59,16 @@ type span struct {
 
 // Collect indexes the repository at root with the loaded library and returns
 // the facts the reference script would have emitted for it.
-func Collect(ctx context.Context, lib *Library, root string) Result {
+//
+// ignored reports whether a repo-relative file is excluded by the
+// repository's configuration. The seam drops facts about such files after a
+// provider returns, which for a built-in is work done to be thrown away: on a
+// Rails monolith 1,520,163 of 2,155,664 facts. A built-in runs in the
+// engine's own address space and can be told, so it is: an excluded document
+// is skipped before its definitions are read, which also skips the graph
+// calls behind them, and an excluded reference before its fact is built. A
+// nil predicate accepts everything.
+func Collect(ctx context.Context, lib *Library, root string, ignored func(file string) bool) Result {
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return Result{Refusal: err.Error()}
@@ -63,7 +76,7 @@ func Collect(ctx context.Context, lib *Library, root string) Result {
 	if _, err := os.Stat(filepath.Join(root, "Gemfile")); err != nil {
 		return Result{Census: facts.ProviderCensus{ConstructsSkipped: 1, SkipCauses: []facts.CensusCause{{Cause: "no Gemfile: not a workspace Rubydex can index", Count: 1}}}}
 	}
-	c := &collector{root: root, workspace: "file://" + root + "/", documentCache: map[uint64][]span{}}
+	c := &collector{root: root, workspace: "file://" + root + "/", documentCache: map[uint64][]span{}, declarationNames: map[uint64]string{}, ignored: ignored}
 	paths, dependencyPaths, bundleAbsent := workspacePaths(ctx, root)
 	c.dependencyPaths = dependencyPaths
 	c.bundleAbsent = bundleAbsent
@@ -75,9 +88,15 @@ func Collect(ctx context.Context, lib *Library, root string) Result {
 
 	var documents []uint64
 	for _, doc := range c.g.documents() {
-		if c.inWorkspace(c.g.documentURI(doc)) {
-			documents = append(documents, doc)
+		uri := c.g.documentURI(doc)
+		if !c.inWorkspace(uri) {
+			continue
 		}
+		if c.excluded(uri) {
+			c.excludedDocuments++
+			continue
+		}
+		documents = append(documents, doc)
 	}
 	for _, doc := range documents {
 		for _, definition := range c.g.definitions(doc) {
@@ -129,6 +148,10 @@ func workspacePaths(ctx context.Context, root string) (paths []string, dependenc
 		}
 	}
 	return paths, dependencyPaths, false
+}
+
+func (c *collector) excluded(uri string) bool {
+	return c.ignored != nil && c.ignored(c.relative(uri))
 }
 
 func (c *collector) inWorkspace(uri string) bool {
@@ -228,6 +251,10 @@ func (c *collector) emitReferences(ids []cConstantReference) {
 		if !ok || !c.inWorkspace(location.URI) {
 			continue
 		}
+		if c.excluded(location.URI) {
+			c.excludedReferences++
+			continue
+		}
 		ref := &constantReference{id: id.id, location: location}
 		ref.doc, _ = c.g.constantReferenceDocument(id.id)
 		ref.target, ref.resolved = c.g.resolvedConstantReference(id.id)
@@ -254,6 +281,13 @@ func (c *collector) emitReferences(ids []cConstantReference) {
 
 // pathPrefixes walks back from a leaf over the adjacent segments on its line
 // and returns their written names, outermost first.
+//
+// Adjacency is a property of one line, so a candidate qualifies only when it
+// is another reference and its end column belongs to the line the walk is on.
+// A reference spanning lines carries an end column from its last line, and
+// `<LibDDWAF>` at lib_ddwaf.rb:262 spans to 267 with end column 25 against
+// start column 27: without both conditions it satisfies the arithmetic
+// against itself, is returned as its own predecessor, and the walk never ends.
 func (c *collector) pathPrefixes(byLine map[string][]*constantReference, leaf *constantReference) []string {
 	line := byLine[leaf.location.URI+"\x00"+strconv.Itoa(leaf.location.StartLine)]
 	var prefixes []string
@@ -261,6 +295,9 @@ func (c *collector) pathPrefixes(byLine map[string][]*constantReference, leaf *c
 	for {
 		var previous *constantReference
 		for _, candidate := range line {
+			if candidate == current || candidate.location.EndLine != current.location.StartLine {
+				continue
+			}
 			if candidate.location.EndColumn+len("::") == current.location.StartColumn {
 				previous = candidate
 			}
@@ -268,17 +305,32 @@ func (c *collector) pathPrefixes(byLine map[string][]*constantReference, leaf *c
 		if previous == nil {
 			break
 		}
-		prefixes = append([]string{c.writtenName(previous)}, prefixes...)
+		prefixes = append(prefixes, c.writtenName(previous))
 		current = previous
+	}
+	for i, j := 0, len(prefixes)-1; i < j; i, j = i+1, j-1 {
+		prefixes[i], prefixes[j] = prefixes[j], prefixes[i]
 	}
 	return prefixes
 }
 
+// A declaration referenced many times is marshalled across the seam once:
+// a Rails monolith resolves 1,624,360 references to 132,603 declarations, so the
+// same name is asked for a dozen times on average. An unresolved reference
+// carries its own written name and has nothing to share.
 func (c *collector) writtenName(ref *constantReference) string {
-	if ref.resolved {
-		return plainName(c.g.declarationName(ref.target.id))
+	if !ref.resolved {
+		return c.g.constantReferenceName(ref.id)
 	}
-	return c.g.constantReferenceName(ref.id)
+	if name, known := c.declarationNames[ref.target.id]; known {
+		return name
+	}
+	name := plainName(c.g.declarationName(ref.target.id))
+	if c.declarationNames == nil {
+		c.declarationNames = map[uint64]string{}
+	}
+	c.declarationNames[ref.target.id] = name
+	return name
 }
 
 func (c *collector) emitReference(ref *constantReference, prefixes []string) {
@@ -447,6 +499,8 @@ func (c *collector) census(filesSeen, diagnostics int) facts.ProviderCensus {
 	add("receiver resolves to no constant", c.untypedReceivers)
 	add("declaration is a constant alias, not a class", c.aliasedDeclarations)
 	add("rubydex diagnostic", diagnostics)
+	add("document excluded by the repository's ignore globs", c.excludedDocuments)
+	add("reference in a file the repository's ignore globs exclude", c.excludedReferences)
 	if c.bundleAbsent {
 		add("bundle not on PATH or not readable: workspace indexed without its gems", 1)
 	}

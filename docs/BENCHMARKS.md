@@ -1,6 +1,6 @@
 # Benchmarks
 
-Everything here was measured on 2026-08-20, at extractor version v224, on 81 public
+Everything here was measured on 2026-08-23, at extractor version v256, on 91 public
 open-source repositories, with one binary, by scripts you can re-run. This page
 carries the latest sweep rather than a released version's, so it moves when the
 extractors do. Where a number is unflattering it is still here.
@@ -33,10 +33,10 @@ would have been.
 
 ## The corpus
 
-91 repositories, 432,510 source files parsed, 7,756,077 facts carrying 26
-distinct language tags (Ansible, C, C++, C#, Dart, F#, Go, HCL, Java, Kotlin,
-Markdown, PHP, Python, Razor, Ruby, Rust, Scala, SQL, Stimulus, Swift, TypeScript,
-VB.NET, XAML, gRPC, OpenAPI, AsyncAPI). Public open-source only: every row is a
+91 repositories, 444,986 source files parsed of 743,912 seen, 8,014,394 facts
+carrying 26 distinct language tags (Ansible, C, C++, C#, Dart, F#, Go, HCL, Java,
+Kotlin, Markdown, PHP, Python, Razor, Ruby, Rust, Scala, SQL, Stimulus, Swift,
+TypeScript, VB.NET, XAML, gRPC, OpenAPI, and enola's own intent pages). Public open-source only: every row is a
 repository you can clone and re-run.
 
 **91 of 91 reproduce** — identical `snapshot_id` and identical
@@ -59,115 +59,131 @@ work described below. The four it had — gitlab, discourse, chatwoot, solidus �
 one shape between them, a single application with a single root `config/routes.rb`,
 and three defects hid behind that. See [the Ruby rows](#ruby--rails).
 
-**.NET is the largest language family after C** — 1,134,999 facts across fourteen
-repositories covering C#, VB.NET, F#, Razor/Blazor and XAML, against C's 1,886,304
-(almost all of it the Linux kernel), Dart's 792,439 and TypeScript's 781,437. C# alone,
-at 954,282, is the largest single language tag after C. See [the .NET rows](#net) below.
+**TypeScript is now the largest language after C** — 1,150,446 facts against C's
+1,920,024 (almost all of it the Linux kernel). It was 781,437 at v224, and the jump is
+the v253 detection change rather than a corpus change: extractors used to answer
+`Detect` with their own bounded walk, so loose `.js` and `.ts` below a scan depth were
+claimed and never read. It overtakes both the .NET family — 1,122,993 facts tagged C#,
+VB.NET, F#, Razor/Blazor or XAML — and C# alone at 954,285, each of which held the
+position at v224. Dart is unchanged at 792,439. Every figure in this paragraph counts
+facts by **language tag**, not by repository: a per-language section below totals
+everything its repositories contain, which is a larger and different number.
+See [the .NET rows](#net) below.
 
 | Repository | Language | Files parsed | Facts | Cold | Warm |
 |---|---|---|---|---|---|
-| linux | c | 55,408 | 1,892,480 | 153.0s | 38.4s |
-| dart-sdk | dart | 16,337 | 445,416 | 57.7s | 10.5s |
-| gitlab | ruby | 49,543 | 445,154 | 48.4s | 34.1s |
-| runtime | csharp | 17,772 | 397,748 | 60.4s | 33.8s |
-| rust | rust | 36,083 | 394,966 | 22.4s | 12.4s |
-| roslyn | csharp | 17,117 | 360,842 | 21.8s | 12.7s |
-| shopware | php | 13,732 | 218,968 | 12.3s | 6.9s |
-| spark | scala | 5,437 | 216,768 | 36.5s | 20.0s |
-| grafana | go | 10,315 | 171,445 | 10.9s | 5.5s |
-| thingsboard | java | 6,372 | 160,381 | 5.2s | 2.9s |
-| flutter | dart | 3,780 | 154,587 | 7.2s | 5.3s |
-| discourse | ruby | 13,043 | 140,289 | 10.5s | 5.7s |
-| nextcloud-server | php | 6,037 | 101,493 | 5.5s | 2.3s |
-| openproject | ruby | 10,555 | 99,535 | 11.2s | 7.9s |
-| flutter-packages | dart | 1,980 | 96,081 | 5.0s | 4.0s |
-| pekko | scala | 1,844 | 94,270 | 7.3s | 2.8s |
-| dubbo | java | 4,351 | 82,550 | 2.3s | 1.9s |
-| bitwarden-clients | typescript | 4,945 | 75,713 | 4.4s | 2.4s |
-| supabase | typescript | 6,983 | 71,062 | 7.6s | 3.2s |
-| fsharp | fsharp | 1,769 | 68,379 | 2.3s | 1.6s |
-| airflow | python | 4,068 | 68,225 | 7.7s | 6.2s |
-| ente | dart | 2,762 | 63,350 | 5.4s | 2.2s |
-| deno | rust | 4,523 | 63,066 | 7.0s | 2.7s |
-| avalonia | xaml | 3,790 | 62,997 | 2.9s | 1.6s |
-| appflowy | dart | 2,342 | 54,889 | 2.0s | 1.3s |
-| lila | scala | 2,308 | 54,778 | 4.6s | 2.0s |
-| orchardcore | razor | 6,994 | 53,627 | 4.4s | 2.3s |
-| superset | python | 3,841 | 52,005 | 5.4s | 2.8s |
-| cal.com | typescript | 4,601 | 49,208 | 3.7s | 1.9s |
-| dbt-core | rust | 1,371 | 46,935 | 2.6s | 1.0s |
-| wordpress | php | 2,748 | 45,425 | 4.6s | 1.2s |
-| gmsh | cpp | 1,680 | 41,529 | 2.3s | 0.7s |
-| powershell | csharp | 1,202 | 40,341 | 2.6s | 1.1s |
-| bitwarden-server | csharp | 3,626 | 39,957 | 4.2s | 1.9s |
-| chatwoot | ruby | 3,995 | 37,036 | 2.8s | 1.6s |
-| mudblazor | razor | 3,172 | 36,034 | 1.8s | 0.8s |
-| gitea | go | 2,220 | 35,983 | 1.9s | 1.1s |
-| immich | dart | 1,978 | 35,761 | 1.9s | 1.0s |
-| rails | ruby | 2,538 | 34,249 | 2.1s | 1.4s |
-| saleor | python | 2,474 | 30,193 | 2.8s | 1.8s |
-| mastodon | ruby | 3,426 | 29,842 | 3.2s | 1.5s |
-| flarum | php | 2,687 | 28,313 | 1.4s | 0.8s |
-| jellyfin | csharp | 1,883 | 27,481 | 1.2s | 0.8s |
-| zio | scala | 701 | 25,224 | 6.1s | 1.6s |
-| mcp | csharp | 2,033 | 22,666 | 1.8s | 1.3s |
-| pekko-http | scala | 752 | 22,275 | 1.6s | 0.9s |
-| spotube | dart | 435 | 21,528 | 0.6s | 0.5s |
-| drift | dart | 726 | 18,703 | 1.1s | 0.6s |
-| cognee | python | 1,492 | 16,924 | 1.7s | 0.9s |
-| files | xaml | 1,275 | 16,272 | 1.0s | 0.5s |
-| cognee-rs | rust | 846 | 15,867 | 1.0s | 0.4s |
-| fastlane | ruby | 974 | 15,215 | 1.3s | 0.7s |
-| tokio | rust | 780 | 14,450 | 0.7s | 0.3s |
-| flutterfire | dart | 590 | 13,677 | 1.5s | 1.0s |
-| openwhisk | scala | 375 | 13,448 | 1.8s | 1.1s |
-| http4s | scala | 438 | 13,068 | 2.9s | 0.5s |
-| crates-io | rust | 883 | 12,623 | 1.0s | 0.6s |
-| solidus | ruby | 2,012 | 12,282 | 1.4s | 0.8s |
-| localsend | dart | 393 | 10,000 | 0.6s | 0.3s |
-| excalidraw | typescript | 526 | 8,796 | 1.3s | 0.4s |
-| enola | go | 348 | 7,527 | 0.6s | 0.3s |
-| rubygems.org | ruby | 1,196 | 6,499 | 0.8s | 0.4s |
-| gitbucket | scala | 219 | 5,688 | 0.8s | 0.3s |
-| isowords | swift | 382 | 5,615 | 0.5s | 0.2s |
-| nowinandroid | kotlin | 312 | 5,110 | 0.5s | 0.3s |
-| nextcloud-collectives | php | 384 | 4,983 | 0.6s | 0.2s |
-| getdp | cpp | 169 | 4,564 | 0.7s | 0.1s |
-| csharp-sdk | csharp | 432 | 4,526 | 0.5s | 0.3s |
-| eshop | csharp | 580 | 3,488 | 0.4s | 0.3s |
-| lobsters | ruby | 528 | 2,799 | 0.4s | 0.2s |
-| elk | vue | 381 | 2,563 | 0.3s | 0.2s |
-| trading | scala | 122 | 2,207 | 0.2s | 0.1s |
-| activeadmin | ruby | 263 | 2,015 | 0.2s | 0.2s |
-| grape | ruby | 191 | 1,932 | 0.2s | 0.2s |
-| nextcloud-contacts | php | 171 | 1,714 | 0.4s | 0.2s |
-| devise | ruby | 171 | 1,314 | 0.2s | 0.1s |
-| giraffe | fsharp | 33 | 641 | 0.1s | 0.1s |
-| grpc-web-example | grpc | 12 | 321 | 0.1s | 0.1s |
-| sveltekit-realworld | svelte | 42 | 195 | 0.1s | 0.1s |
-| cachet | php | 21 | 101 | 0.1s | 0.1s |
-| orocrm | php | 3 | 17 | 0.1s | 0.1s |
+| linux | c | 55,883 | 1,908,734 | 155.2s | 40.1s |
+| gitlab | ruby | 55,936 | 544,431 | 38.0s | 22.6s |
+| runtime | csharp | 23,547 | 529,820 | 96.3s | 62.2s |
+| dart-sdk | dart | 16,823 | 453,013 | 97.2s | 14.1s |
+| rust | rust | 37,565 | 404,094 | 35.2s | 14.0s |
+| roslyn | csharp | 17,517 | 375,200 | 38.2s | 16.7s |
+| shopware | php | 19,904 | 237,985 | 16.5s | 5.4s |
+| spark | scala | 5,745 | 219,732 | 58.3s | 40.0s |
+| flutter | dart | 7,788 | 210,794 | 23.6s | 8.8s |
+| grafana | go | 11,343 | 186,365 | 14.4s | 8.7s |
+| thingsboard | java | 6,617 | 163,288 | 5.0s | 2.7s |
+| discourse | ruby | 13,250 | 143,940 | 9.5s | 5.1s |
+| flutter-packages | dart | 3,865 | 136,165 | 11.5s | 8.2s |
+| gauzy | angular | 8,869 | 119,931 | 39.1s | 9.3s |
+| openproject | ruby | 11,284 | 109,510 | 9.1s | 5.7s |
+| nextcloud-server | php | 6,056 | 101,669 | 11.1s | 1.9s |
+| pekko | scala | 2,296 | 97,647 | 10.2s | 3.9s |
+| bitwarden-clients | typescript | 5,070 | 83,217 | 17.4s | 2.2s |
+| dubbo | java | 4,367 | 82,782 | 2.0s | 1.7s |
+| ente | dart | 3,693 | 79,680 | 12.1s | 2.7s |
+| angular | angular | 7,096 | 78,892 | 17.6s | 3.5s |
+| spartacus | angular | 7,265 | 75,311 | 8.8s | 5.3s |
+| supabase | typescript | 7,336 | 74,645 | 29.1s | 2.8s |
+| airflow | python | 4,363 | 73,820 | 7.4s | 4.6s |
+| fsharp | fsharp | 1,916 | 69,844 | 4.0s | 2.5s |
+| avalonia | xaml | 3,880 | 64,750 | 8.5s | 2.9s |
+| deno | rust | 4,644 | 63,983 | 9.5s | 2.4s |
+| orchardcore | razor | 7,294 | 59,338 | 14.3s | 3.3s |
+| appflowy | dart | 2,472 | 56,890 | 2.9s | 1.2s |
+| superset | python | 4,071 | 55,311 | 4.7s | 2.6s |
+| lila | scala | 2,332 | 55,025 | 6.0s | 2.2s |
+| cal.com | typescript | 4,956 | 51,348 | 21.4s | 3.4s |
+| dbt-core | rust | 1,480 | 49,067 | 4.0s | 1.0s |
+| wordpress | php | 2,769 | 45,506 | 14.7s | 2.1s |
+| gmsh | cpp | 1,758 | 42,906 | 2.4s | 0.7s |
+| powershell | csharp | 1,302 | 42,827 | 9.1s | 1.7s |
+| peertube | angular | 2,824 | 42,813 | 108.6s | 2.7s |
+| bitwarden-server | csharp | 3,700 | 42,040 | 3.9s | 2.0s |
+| mudblazor | razor | 3,183 | 38,726 | 6.7s | 1.4s |
+| immich | dart | 2,154 | 38,146 | 2.8s | 1.1s |
+| rails | ruby | 2,667 | 37,899 | 2.0s | 1.4s |
+| chatwoot | ruby | 4,006 | 37,246 | 2.3s | 1.3s |
+| gitea | go | 2,249 | 36,500 | 1.7s | 1.0s |
+| taiga-ui | angular | 2,979 | 35,415 | 8.1s | 1.4s |
+| flutterfire | dart | 1,149 | 32,953 | 3.1s | 1.9s |
+| angular-components | angular | 2,270 | 32,415 | 5.7s | 4.2s |
+| saleor | python | 2,500 | 30,585 | 4.2s | 3.4s |
+| mastodon | ruby | 3,442 | 30,249 | 2.7s | 1.5s |
+| flarum | php | 2,721 | 28,986 | 1.6s | 0.7s |
+| zio | scala | 1,136 | 28,208 | 17.6s | 3.5s |
+| mcp | csharp | 2,311 | 28,041 | 4.6s | 2.4s |
+| jellyfin | csharp | 1,892 | 27,617 | 2.6s | 1.3s |
+| pekko-http | scala | 1,028 | 23,759 | 2.3s | 2.3s |
+| spotube | dart | 455 | 21,917 | 1.1s | 0.9s |
+| drift | dart | 898 | 20,361 | 2.0s | 1.0s |
+| cognee | python | 1,540 | 17,631 | 1.5s | 0.7s |
+| files | xaml | 1,286 | 17,340 | 2.4s | 0.9s |
+| cognee-rs | rust | 990 | 17,233 | 1.1s | 0.4s |
+| fastlane | ruby | 1,071 | 15,885 | 1.2s | 0.7s |
+| tokio | rust | 809 | 15,276 | 0.7s | 0.3s |
+| openwhisk | scala | 479 | 15,252 | 4.9s | 2.7s |
+| http4s | scala | 474 | 13,856 | 7.5s | 0.9s |
+| crates-io | rust | 928 | 12,918 | 1.0s | 0.5s |
+| solidus | ruby | 2,035 | 12,884 | 1.2s | 0.7s |
+| localsend | dart | 441 | 10,601 | 0.7s | 0.4s |
+| ngrx | angular | 1,074 | 10,345 | 6.2s | 2.3s |
+| dashboard | angular | 635 | 9,987 | 2.0s | 0.9s |
+| enola | go | 458 | 9,534 | 6.7s | 0.3s |
+| excalidraw | typescript | 543 | 9,265 | 7.4s | 1.0s |
+| rubygems.org | ruby | 1,211 | 6,670 | 0.6s | 0.4s |
+| gitbucket | scala | 238 | 5,857 | 1.5s | 0.6s |
+| isowords | swift | 387 | 5,836 | 0.4s | 0.2s |
+| nextcloud-collectives | php | 413 | 5,454 | 1.9s | 0.2s |
+| csharp-sdk | csharp | 497 | 5,393 | 0.8s | 0.5s |
+| nowinandroid | kotlin | 356 | 5,310 | 0.4s | 0.3s |
+| getdp | cpp | 183 | 4,652 | 0.7s | 0.1s |
+| eshop | csharp | 584 | 3,614 | 0.4s | 0.2s |
+| lobsters | ruby | 540 | 2,844 | 0.6s | 0.8s |
+| ngx-admin | angular | 253 | 2,735 | 0.3s | 0.2s |
+| elk | vue | 396 | 2,699 | 0.2s | 0.1s |
+| grape | ruby | 200 | 2,406 | 0.2s | 0.2s |
+| activeadmin | ruby | 293 | 2,383 | 0.2s | 0.1s |
+| trading | scala | 127 | 2,255 | 0.4s | 0.3s |
+| nextcloud-contacts | php | 176 | 1,808 | 2.3s | 0.3s |
+| ng-alain | angular | 138 | 1,755 | 0.2s | 0.2s |
+| devise | ruby | 176 | 1,387 | 0.1s | 0.1s |
+| giraffe | fsharp | 48 | 1,241 | 0.1s | 0.1s |
+| grpc-web-example | grpc | 13 | 328 | 0.2s | 0.1s |
+| sveltekit-realworld | svelte | 44 | 205 | 0.1s | 0.1s |
+| cachet | php | 27 | 154 | 0.1s | 0.1s |
+| orocrm | php | 7 | 65 | 0.1s | 0.1s |
 
 ### Ruby / Rails
 
-Thirteen repositories, 88,435 files parsed, 828,161 facts of which **556,064 are Ruby**.
+Thirteen repositories, 96,111 files parsed, 947,734 facts of which **556,078 are Ruby**.
 All thirteen reproduce.
 
 | Repository | Files parsed | Facts | Ruby facts | rails routes | grape routes |
 |---|---:|---:|---:|---:|---:|
-| gitlab | 49,543 | 445,154 | 306,735 | 2,059 | 1,554 |
-| discourse | 13,043 | 140,289 | 69,908 | 1,552 | 0 |
-| openproject | 10,555 | 99,535 | 74,435 | 1,678 | 389 |
-| chatwoot | 3,995 | 37,036 | 14,362 | 690 | 0 |
-| rails | 2,538 | 34,249 | 33,668 | 32 | 0 |
-| mastodon | 3,426 | 29,842 | 17,414 | 777 | 0 |
-| fastlane | 974 | 15,215 | 13,689 | 0 | 0 |
-| solidus | 2,012 | 12,282 | 11,625 | 690 | 0 |
-| rubygems.org | 1,196 | 6,499 | 6,291 | 239 | 0 |
-| lobsters | 528 | 2,799 | 2,749 | 246 | 0 |
-| activeadmin | 263 | 2,015 | 1,942 | 0 | 0 |
-| grape | 191 | 1,932 | 1,932 | 0 | 5 |
-| devise | 171 | 1,314 | 1,314 | 0 | 0 |
+| gitlab | 55,936 | 544,431 | 306,745 | 2,059 | 1,554 |
+| discourse | 13,250 | 143,940 | 69,909 | 1,552 | 0 |
+| openproject | 11,284 | 109,510 | 74,437 | 1,678 | 250 |
+| mastodon | 3,442 | 30,249 | 17,414 | 777 | 0 |
+| rails | 2,667 | 37,899 | 33,668 | 23 | 0 |
+| chatwoot | 4,006 | 37,246 | 14,363 | 690 | 0 |
+| solidus | 2,035 | 12,884 | 11,625 | 690 | 0 |
+| rubygems.org | 1,211 | 6,670 | 6,291 | 239 | 0 |
+| lobsters | 540 | 2,844 | 2,749 | 246 | 0 |
+| grape | 200 | 2,406 | 1,932 | 0 | 5 |
+| fastlane | 1,071 | 15,885 | 13,689 | 0 | 0 |
+| devise | 176 | 1,387 | 1,314 | 0 | 0 |
+| activeadmin | 293 | 2,383 | 1,942 | 0 | 0 |
 
 **The four zero rows are the result, not a gap.** `fastlane` is scale Ruby with no Rails
 at all — the control for whether a Rails change breaks plain Ruby. `devise` and
@@ -177,7 +193,7 @@ for the same reason: `lib/grape/**` implements the DSL, and the specs that exerc
 are excluded as tests. A library defines a DSL and does not use one, so validating a
 route extractor against the library that implements it measures the wrong thing — the
 lesson the Scala corpus learned, applied here from the start. gitlab and openproject are
-what grade the extractor; `rails`' own 36 routes come from `activestorage` and
+what grade the extractor; `rails`' own 23 routes come from `activestorage` and
 `actionmailbox`, the two gems that ship a real route file.
 
 #### What the nine new repositories exposed
@@ -223,23 +239,23 @@ every gap above was in extraction logic.
 
 ### Dart / Flutter
 
-Ten repositories, 31,323 files, 913,992 facts of which **792,041 are Dart**. All ten
+Ten repositories, 39,738 files, 1,060,520 facts of which **792,041 are Dart**. All ten
 reproduce, and **all ten parse with zero errors** — see the corpus notes in
 [`enola-benchmarks`](https://github.com/enola-labs/enola-benchmarks) for the
 up-front parse-coverage measurement that preceded the extractor.
 
 | Repository | Files parsed | Facts | Dart facts | Cold | Warm |
 |---|---|---|---|---|---|
-| dart-sdk | 16,337 | 445,416 | 394,478 | 57.7s | 10.5s |
-| flutter | 3,780 | 154,587 | 143,735 | 7.2s | 5.3s |
-| flutter-packages | 1,980 | 96,081 | 96,074 | 5.0s | 4.0s |
-| ente | 2,762 | 63,350 | 41,595 | 5.4s | 2.2s |
-| appflowy | 2,342 | 54,889 | 40,484 | 2.0s | 1.3s |
-| immich | 1,978 | 35,761 | 14,479 | 1.9s | 1.0s |
-| spotube | 435 | 21,528 | 21,272 | 0.6s | 0.5s |
-| drift | 726 | 18,703 | 18,703 | 1.1s | 0.6s |
-| flutterfire | 590 | 13,677 | 13,645 | 1.5s | 1.0s |
-| localsend | 393 | 10,000 | 7,576 | 0.6s | 0.3s |
+| dart-sdk | 16,823 | 453,013 | 394,478 | 97.2s | 14.1s |
+| flutter | 7,788 | 210,794 | 143,735 | 23.6s | 8.8s |
+| flutter-packages | 3,865 | 136,165 | 96,074 | 11.5s | 8.2s |
+| ente | 3,693 | 79,680 | 41,595 | 12.1s | 2.7s |
+| appflowy | 2,472 | 56,890 | 40,484 | 2.9s | 1.2s |
+| immich | 2,154 | 38,146 | 14,479 | 2.8s | 1.1s |
+| flutterfire | 1,149 | 32,953 | 13,645 | 3.1s | 1.9s |
+| spotube | 455 | 21,917 | 21,272 | 1.1s | 0.9s |
+| drift | 898 | 20,361 | 18,703 | 2.0s | 1.0s |
+| localsend | 441 | 10,601 | 7,576 | 0.7s | 0.4s |
 
 dart-sdk is the outlier on cold time and not because of its Dart: it carries 1,138
 C/C++ sources and a large `runtime/` tree, so the C/C++ extractor does substantial work
@@ -256,25 +272,27 @@ the rows where a Dart extraction regression shows up undiluted.
 
 ### .NET
 
-Fourteen repositories, 61,678 files, 1,134,999 facts — the
-largest language block in the corpus. All fourteen reproduce.
+Fourteen repositories, 68,957 files, 1,305,791 facts — everything those repositories
+contain, markdown and configuration included. Counted by language tag instead, C#,
+VB.NET, F#, Razor and XAML together carry 1,122,993 of them; the corpus section above
+ranks the languages on that basis. All fourteen reproduce.
 
 | Repository | Files parsed | Facts | Cold | Warm |
 |---|---|---|---|---|
-| runtime | 17,772 | 397,748 | 60.4s | 33.8s |
-| roslyn | 17,117 | 360,842 | 21.8s | 12.7s |
-| fsharp | 1,769 | 68,379 | 2.3s | 1.6s |
-| avalonia | 3,790 | 62,997 | 2.9s | 1.6s |
-| orchardcore | 6,994 | 53,627 | 4.4s | 2.3s |
-| powershell | 1,202 | 40,341 | 2.6s | 1.1s |
-| bitwarden-server | 3,626 | 39,957 | 4.2s | 1.9s |
-| mudblazor | 3,172 | 36,034 | 1.8s | 0.8s |
-| jellyfin | 1,883 | 27,481 | 1.2s | 0.8s |
-| mcp | 2,033 | 22,666 | 1.8s | 1.3s |
-| files | 1,275 | 16,272 | 1.0s | 0.5s |
-| csharp-sdk | 432 | 4,526 | 0.5s | 0.3s |
-| eshop | 580 | 3,488 | 0.4s | 0.3s |
-| giraffe | 33 | 641 | 0.1s | 0.1s |
+| runtime | 23,547 | 529,820 | 96.3s | 62.2s |
+| roslyn | 17,517 | 375,200 | 38.2s | 16.7s |
+| fsharp | 1,916 | 69,844 | 4.0s | 2.5s |
+| avalonia | 3,880 | 64,750 | 8.5s | 2.9s |
+| orchardcore | 7,294 | 59,338 | 14.3s | 3.3s |
+| powershell | 1,302 | 42,827 | 9.1s | 1.7s |
+| bitwarden-server | 3,700 | 42,040 | 3.9s | 2.0s |
+| mudblazor | 3,183 | 38,726 | 6.7s | 1.4s |
+| mcp | 2,311 | 28,041 | 4.6s | 2.4s |
+| jellyfin | 1,892 | 27,617 | 2.6s | 1.3s |
+| files | 1,286 | 17,340 | 2.4s | 0.9s |
+| csharp-sdk | 497 | 5,393 | 0.8s | 0.5s |
+| eshop | 584 | 3,614 | 0.4s | 0.2s |
+| giraffe | 48 | 1,241 | 0.1s | 0.1s |
 
 The corpus is deliberately split so each mechanism has a control:
 
@@ -301,21 +319,21 @@ than an unsupported language, because nothing in the output says so.
 
 ### Angular
 
-Ten repositories, 33,174 files parsed, 406,391 facts. All ten reproduce; the largest
-peaks at 346 MiB.
+Ten repositories, 33,403 files parsed, 409,599 facts. All ten reproduce; the largest
+peaks at 393 MiB.
 
 | Repository | Files parsed | Facts | Cold | Warm |
 |---|---|---|---|---|
-| gauzy | 8,870 | 119,935 | 7.4s | 5.3s |
-| angular | 7,097 | 78,896 | 6.6s | 3.9s |
-| spartacus | 7,266 | 75,315 | 5.8s | 4.6s |
-| peertube | 2,825 | 42,819 | 33.0s | 1.8s |
-| taiga-ui | 2,980 | 35,419 | 2.2s | 1.9s |
-| components | 2,271 | 32,419 | 2.5s | 1.8s |
-| ngrx | 1,075 | 10,356 | 1.8s | 0.8s |
-| dashboard | 397 | 6,720 | 0.7s | 0.5s |
-| ngx-admin | 254 | 2,746 | 0.4s | 0.3s |
-| ng-alain | 139 | 1,766 | 0.3s | 0.2s |
+| gauzy | 8,869 | 119,931 | 39.1s | 9.3s |
+| angular | 7,096 | 78,892 | 17.6s | 3.5s |
+| spartacus | 7,265 | 75,311 | 8.8s | 5.3s |
+| peertube | 2,824 | 42,813 | 108.6s | 2.7s |
+| taiga-ui | 2,979 | 35,415 | 8.1s | 1.4s |
+| angular-components | 2,270 | 32,415 | 5.7s | 4.2s |
+| ngrx | 1,074 | 10,345 | 6.2s | 2.3s |
+| dashboard | 635 | 9,987 | 2.0s | 0.9s |
+| ngx-admin | 253 | 2,735 | 0.3s | 0.2s |
+| ng-alain | 138 | 1,755 | 0.2s | 0.2s |
 
 The corpus is split so that each mechanism has a control, the same way the .NET one is:
 
@@ -348,7 +366,7 @@ three. Running cold then warm is the point: it tests that a cached run and a
 from-scratch run agree, not merely that the same code path repeats itself.
 
 > **91 of 91 repositories in this sweep produced a byte-identical `snapshot_id` and a
-> byte-identical `facts.jsonl` across all three runs — 273 runs, 7,756,077 facts,
+> byte-identical `facts.jsonl` across all three runs — 273 runs, 8,014,394 facts,
 > zero drift.** `insights.json` is byte-stable on all 91 as well. This is one sweep:
 > the Dart/Flutter rows previously measured separately are folded in.
 
@@ -399,28 +417,30 @@ either way — the delta itself, and the fact that it is exactly one finding.
 
 | Repository | Language | Pre-existing findings | No change | Benign addition | Injected cycle | Reverted |
 |---|---|---|---|---|---|---|
-| solidus | Ruby | 235 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
-| chatwoot | Ruby | 234 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
+| solidus | Ruby | 239 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
+| chatwoot | Ruby | 231 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
+| gauzy | TypeScript | 182 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | superset | Python | 130 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | cognee | Python | 111 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | drift | Dart | 102 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | jellyfin | C# | 100 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
 | lobsters | Ruby | 98 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
-| localsend | Dart | 98 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
+| localsend | Dart | 96 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | gitea | Go | 93 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
-| enola | Go | 79 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
-| eshop | C# | 78 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
-| excalidraw | TypeScript | 72 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
+| eshop | C# | 80 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
+| excalidraw | TypeScript | 73 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
+| enola | Go | 69 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | crates-io | Rust | 67 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | gitbucket | Scala | 56 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
-| nowinandroid | Kotlin | 38 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
+| ngx-admin | TypeScript | 44 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
+| nowinandroid | Kotlin | 39 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | elk | TypeScript | 27 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | sveltekit-realworld | TypeScript | 2 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | cachet | PHP | 0 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
 
-Read the columns as four separate claims, all of which hold on all eighteen:
+Read the columns as four separate claims, all of which hold on all twenty:
 
-- **No change → +0 facts, +0 edges, PASS.** Exactly zero on all eighteen repositories.
+- **No change → +0 facts, +0 edges, PASS.** Exactly zero on all twenty repositories.
   That's what makes a PASS or FAIL on a real change something you can rely on.
 - **Benign addition → PASS**, with the delta naming exactly the 2–3 facts added.
   A new leaf module isn't a structural regression, so there's nothing to report.
@@ -535,7 +555,7 @@ identity; an edge matched by comparing URL strings is a resemblance. See
 ### On a real public cluster
 
 Nextcloud server plus two first-party apps, indexed into one graph
-(101,462 + 1,706 + 4,966 facts):
+(101,673 + 1,812 + 5,458 facts):
 
 ```
   service      classification  detected  resolved  unresolved
@@ -626,21 +646,20 @@ so the demonstration proves its own limit in the same run.
 
 | | |
 |---|---|
-| Largest repository indexed | **Linux kernel** — 55,408 files, **1,892,480 facts**, 153.0s cold / 38.4s warm |
-| Largest .NET | dotnet/runtime — 17,772 files, 397,748 facts, 60.4s / 33.8s |
-| Largest Ruby | GitLab — 49,543 files, 445,154 facts, 48.4s / 34.1s |
-| Largest Rust | rust-lang/rust — 36,083 files, 394,966 facts, 22.4s / 12.4s |
-| Largest Scala | Spark — 5,437 files, 216,768 facts, 36.5s / 20.0s |
-| Largest Go | Grafana — 10,315 files, 171,445 facts, 10.9s / 5.5s |
-| Throughput | 4,100–36,100 facts/sec depending on language |
+| Largest repository indexed | **Linux kernel** — 55,883 files, **1,908,734 facts**, 155.2s cold / 40.1s warm |
+| Largest .NET | dotnet/runtime — 23,547 files, 529,820 facts, 96.3s / 62.2s |
+| Largest Ruby | GitLab — 55,936 files, 544,431 facts, 38.0s / 22.6s |
+| Largest Rust | rust-lang/rust — 37,565 files, 404,094 facts, 35.2s / 14.0s |
+| Largest Scala | Spark — 5,745 files, 219,732 facts, 58.3s / 40.0s |
+| Largest Go | Grafana — 11,343 files, 186,365 facts, 14.4s / 8.7s |
+| Throughput | 400–41,700 facts/sec depending on language |
 | Parse errors, all 91 repositories | **0** |
-| Memory | peak heap per run is recorded by the sweep (`--memstats`) alongside time and hashes. The Linux kernel is the high-water mark at **6,699 MiB**; only five others exceed 1 GiB (GitLab 2,543, roslyn 1,680, dotnet/runtime 1,505, dart-sdk 1,432, rust-lang/rust 1,395). The largest Angular repository peaks at 346 MiB. No repository required tuning on this machine |
+| Memory | peak heap per run is recorded by the sweep (`--memstats`) alongside time and hashes. The Linux kernel is the high-water mark at **6,896 MiB**; only five others exceed 1 GiB (GitLab 2,341, dotnet/runtime 1,944, roslyn 1,938, dart-sdk 1,354, rust-lang/rust 1,342). The largest Angular repository peaks at 393 MiB. No repository required tuning on this machine |
 
-Warm runs are 1.2×–17.9× faster than cold (over the 79 repositories whose cold run
+Warm runs are 0.68×–41.0× faster than cold (over the 76 repositories whose cold run
 exceeds 0.5s; below that the timing is noise), from the per-file content-hash cache
-in `snapshot.meta.json`. One row runs 0.94× — i.e. slower warm than cold — which is
-what this machine's run-to-run spread looks like on a repository that indexes in
-under two seconds, and is quoted rather than trimmed. These numbers establish that the graph the other four
+in `snapshot.meta.json`. One row runs below 1.0× — slower warm than cold — which is
+what this machine's run-to-run spread looks like, and is quoted rather than trimmed. These numbers establish that the graph the other four
 sections rely on can actually be built on real code. enola isn't benchmarked on
 speed as a competitive claim.
 
