@@ -401,7 +401,7 @@ func runPerFile(ctx context.Context, p Provider, in Input, version string, recor
 	if err != nil {
 		return skip("could not write the file listing: %v", err)
 	}
-	defer os.Remove(listing)
+	defer func() { _ = os.Remove(listing) }()
 	accepted, census, err := invoke(ctx, p, in.RepoPath, listing)
 	if err != nil {
 		return skip("%v", err)
@@ -463,12 +463,12 @@ func writeFileListing(files []string) (string, error) {
 	w := bufio.NewWriter(f)
 	for _, file := range files {
 		if _, err := w.WriteString(filepath.ToSlash(file) + "\n"); err != nil {
-			f.Close()
+			_ = f.Close()
 			return "", err
 		}
 	}
 	if err := w.Flush(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return "", err
 	}
 	if err := f.Close(); err != nil {

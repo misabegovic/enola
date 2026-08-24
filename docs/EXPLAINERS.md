@@ -44,10 +44,10 @@ find*. It is **what happens to a finding after you have found it** — and that 
 entirely on the thing [SNAPSHOTS.md](SNAPSHOTS.md) describes: whether your graph is a
 value you can compare against another one, or a picture of right now.
 
-## Seventeen explainers: three proofs and fourteen estimates
+## Eighteen explainers: three proofs and fifteen estimates
 
 An explainer reads the fact graph and emits **findings** — a claim, a confidence, and
-the entities the claim is about. There are sixteen, and they fall into six kinds:
+the entities the claim is about. There are eighteen, and they fall into six kinds:
 
 - **The proofs.** `cycles` runs Tarjan's SCC over the resolved import edges — a cycle
   either exists or it does not. `intent` diffs DECLARED architecture (a repo's
@@ -100,10 +100,20 @@ the entities the claim is about. There are sixteen, and they fall into six kinds
   nothing uses, and the names only specs use. A name-based index under-reports, so
   what it lists is a candidate to delete, never a verdict.
 
+  `vendored-candidates` is the one that reports so it will not have to act. It names
+  directories that look like in-tree copies of another project — a licence file of
+  their own, under a parent conventionally used for dependencies — and stops there.
+  An earlier version of this idea excluded them automatically and deleted a
+  repository's own source along with the dependencies, which nothing reported
+  because the fact count moving DOWN is what a successful exclusion looks like too.
+  A heuristic wired to an irreversible action has no way to be wrong safely. So this
+  one hands the reader the evidence and the `ignore:` globs, and the config — which
+  the reader writes and can read back — stays the only thing that excludes anything.
+
 What each one computes, every threshold it uses and what it deliberately ignores is in
 [ARCHITECTURE.md → Insights](../ARCHITECTURE.md#insights-explainers). The distinction
-that matters here is smaller and blunter: **three of the seventeen prove something. The
-other fourteen estimate.** A cycle is a fact about your import graph. A god class is an opinion
+that matters here is smaller and blunter: **three of the eighteen prove something. The
+other fifteen estimate.** A cycle is a fact about your import graph. A god class is an opinion
 about your repository, expressed as a number, and reasonable people can disagree with
 it.
 
@@ -172,7 +182,7 @@ Comparing findings across two snapshots gives three outcomes, not two:
 
 That third bucket is small, unglamorous, and the reason the gate stays switched on.
 
-Most of the seventeen explainers are relative to your repository. `mean + 2σ` moves when the
+Most of the eighteen explainers are relative to your repository. `mean + 2σ` moves when the
 population moves. A ranked top-N list has fixed membership size, so when a worse
 offender is deleted the next module rises into the window — and a finding "appears" for
 a module nobody edited. Both are real effects of statistics, not of your work.

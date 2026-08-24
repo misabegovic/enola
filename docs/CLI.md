@@ -278,8 +278,25 @@ The argument is a **repository** when it is a directory and a **config file** wh
 - **Architecture** - detected pattern with confidence, cyclic dependencies, layer violations, cross-repo edges
 - **Impact analysis (hotspots)** - top modules ranked by fan-in + fan-out coupling, with criticality tier and blast radius
 - **Code health** - per-explainer findings with their top offenders: god classes (high fan-in symbols), call-graph hotspots, deep dependency chains, large public surfaces, and complexity outliers
+- **Vendored candidates** - directories that look like in-tree copies of another project, so you can decide whether to exclude them. Nothing is excluded on your behalf; the section is absent when there is nothing to report
 
 Every finding carries a confidence score, and it means something exact: `1.0` is a structural fact — in practice a dependency cycle, the one thing enola computes rather than infers — while anything below is a flagged heuristic for you to review (a god class is a statistical fan-in outlier, not a rule, so it tops out below `1.0` however extreme it gets). The analyses are computed by graph algorithms - Tarjan's SCC, which finds groups of modules that can all reach each other, for cycles; longest-path for the deepest import chain; and mean+2σ outlier tests, which flag what sits two standard deviations above your own repository's average, for the rest - so the same commit yields the same report. The vocabulary here is defined in **[docs/GLOSSARY.md](GLOSSARY.md)**.
+
+**Vendored candidates.** Airflow vendors nothing, so its report has no such section. Here is one that does — [gmsh](https://gitlab.onelab.info/gmsh/gmsh), a mesh generator that keeps its dependencies in `contrib/`:
+
+```
+Vendored candidates (nothing excluded)
+  6 directories carrying their own licence under a dependency-named parent (564 files)
+    contrib/Netgen                               305 files, cpp, LICENSE, no inbound refs
+    contrib/voro++                               78 files, cpp, LICENSE, 1 inbound ref
+    contrib/metis                                74 files, c, LICENSE.txt, 1 inbound ref
+    contrib/hxt                                  68 files, c/cpp, LICENSE.txt, 44 inbound refs
+    contrib/ANN                                  28 files, c/cpp, License.txt, 9 inbound refs
+    … and 1 more                                 see .enola/insights.json
+    Add any you agree are vendored to `ignore:` in your enola config.
+```
+
+Each line is a directory carrying its own licence file under a parent conventionally used for dependencies. That is a hint and not a verdict — the same names are used for first-party code, and gmsh's own `contrib/mobile/` and `contrib/MeshOptimizer/` are correctly absent from the list. **Nothing here has been excluded from the snapshot**: every one of those 564 files is in the graph. The inbound reference count is the part worth reading before you act — `contrib/hxt` has 44 references from gmsh's own code and `contrib/Netgen` has none, which are different decisions. To exclude any of them from future snapshots, add its glob to `ignore:` in your config; the full list, with the globs, is in `.enola/insights.json` and via `query_insights(explainer="vendored-candidates")`.
 
 Here's the actual report for [Apache Airflow](https://github.com/apache/airflow) - a large polyglot codebase (Python, TypeScript, Java and gRPC in one tree) analyzed in a single pass: **68,161 facts, 175,000+ resolved edges, in under 8 seconds** on a laptop (extraction parses files in parallel across cores). Nothing here was written by a model.
 
@@ -413,8 +430,9 @@ Every path argument follows the same rule: **a directory is a repository, a file
 | `uninstall [--global]` | Remove everything `install` wrote, leaving the rest of each file byte-for-byte as it was. |
 | `baseline pin\|show\|clear [repo\|config]` | Manage the diff baseline - the "before" a change is graded against. `pin` freezes the snapshot on disk when every repository's own receipt shows it matches the working tree under this build and config (members of a cluster must also agree on one union), and otherwise snapshots first, linking once on the cluster's last turn, and says which repository made it regenerate; `show` reports what the current baseline describes; `clear` removes it. Stored per repository, in that repo's `.enola/baseline`, so several repos each keep their own. |
 | `check [flags] [repo\|config]` | **Grade what a change did to the architecture**, and exit with a code CI can act on. Read-only: writes nothing and leaves the baseline in place, so it can be run repeatedly. See [The gate](#the-gate---enola-check). |
-| `constraints <lint\|mine\|init\|explain> [repo\|config]` | **The authoring loop.** `lint` validates the declared vocabulary and resolves each component against the current snapshot; `mine` proposes candidate rules out of the snapshot's own regularities; `init` writes a first declaration binding every shipped recipe whose required roles resolve to directories the repository has, refusing to overwrite and guessing nothing; `explain <path>` names the components a file's facts belong to, the selector that admitted each, and the edges the file makes. See [INTENT.md](INTENT.md). |
-| `plan [flags] [path...] [repo\|config]` | **The pre-edit contract.** Which declared constraints govern an intended change (`--paths`, `--symbols`), its blast radius over the current snapshot, and — for a `--patch` — the constraint verdicts that WOULD appear, evaluated over a scratch copy before any edit lands in the tree. Nothing is written; a report, never a gate. Exits `0` on any produced report, `2` when it could not run. See [INTENT.md](INTENT.md). |
+| `constraints <lint\|mine\|init\|explain> [repo\|config]` | **The authoring loop.** `lint` validates the declared vocabulary and resolves each component against the current snapshot; `mine` proposes candidate rules out of the snapshot's own regularities; `init` writes a first declaration binding every shipped recipe whose required roles resolve to directories the repository has, refusing to overwrite and guessing nothing; `explain <path>` names the components a file's facts belong to, the selector that admitted each, and the edges the file makes. `lint` exits `0` when every declaration is valid, `1` when it reported validation problems; `mine`, `init` and `explain` exit `0` whenever they produced a report, and `2` when they could not run — no snapshot to read, or a declaration `init` would have had to overwrite. See [CONSTRAINTS.md](CONSTRAINTS.md). |
+| `endpoint [flags] <endpoint> [repo\|config]` | **What changing an HTTP endpoint reaches.** The controller serving it, the models that controller touches, the models associated with those, the tables behind them, and the callers - including the frontend screen a calling route module implements. The endpoint is matched as a substring of the path, optionally prefixed with a verb (`GET /v1/candidates`, or just `/v1/candidates`). Client call sites and mock-server routes are excluded: this answers about what the application serves. `--json` emits the report; `--max-routes` bounds how many matched endpoints are followed. The `endpoint_impact` MCP tool answers the same question in a session. |
+| `plan [flags] [path...] [repo\|config]` | **The pre-edit contract.** Which declared constraints govern an intended change (`--paths`, `--symbols`), its blast radius over the current snapshot, and — for a `--patch` — the constraint verdicts that WOULD appear, evaluated over a scratch copy before any edit lands in the tree. Nothing is written; a report, never a gate. Exits `0` on any produced report, `2` when it could not run. See [CONSTRAINTS.md](CONSTRAINTS.md). |
 | `upgrade` | Download and install the latest release over the running binary. |
 
 | Flag | What it does |
@@ -540,7 +558,7 @@ The baseline is a pinned artifact rather than "whatever state the tool last held
 
 **A stale baseline warns; it never blocks.** Past three days it tells you exactly how stale and what that means (the delta now also contains whatever the repo itself changed in between) - then grades anyway, because a long-lived baseline is a legitimate way to measure a multi-day refactor and only you know which you meant.
 
-**Nothing fails by default.** A bare `enola check` runs all seventeen explainers, reports every finding the change introduced, and exits `0` - saying in its own output that no policy was in effect, because a gate that enforces nothing must never be mistaken for a gate that found nothing. What breaks the build is what you name:
+**Nothing fails by default.** A bare `enola check` runs all eighteen explainers, reports every finding the change introduced, and exits `0` - saying in its own output that no policy was in effect, because a gate that enforces nothing must never be mistaken for a gate that found nothing. What breaks the build is what you name:
 
 ```bash
 enola check --fail-on=layers                               # fail on a declared layer order
@@ -560,10 +578,10 @@ enola check --write                                        # also persist the sn
 
 **The verdict has four writers, and all four read the same verdict.** `--format` picks `text` (the default), `json` (what `--json` means), `sarif` or `annotations`; nothing is recomputed for a writer, so a fifth is a table row. SARIF carries one rule per declared rule id with the team's `because` as its description, one result per finding in every bucket (failures as errors, advisories and declared findings as warnings, resolved findings at no level and with no region, suppressed and exempted findings with the ledger entry or exemption that excused them), the evidence span as the region, and the finding's stable identity under `partialFingerprints.enola/v1`. Annotations place every finding that has a measured position on its file and line, as Buildkite markdown grouped by file (`--link` takes the pull request's files view so each line links into the diff) or as GitHub workflow commands; findings without a position are counted at the end and never placed. The host is a flag and never read from the environment, so a run on a laptop renders exactly what the run in CI rendered.
 
-The seventeen names `--fail-on` accepts are `cycles`, `layers`, `intent`, `constraints`,
+The eighteen names `--fail-on` accepts are `cycles`, `layers`, `intent`, `constraints`,
 `crossrepo`, `coverage`, `unused-routes`, `messaging-coverage`, `god-class`, `hotspots`,
 `dependency-depth`, `exported-surface`, `complexity-outliers`, `domain`, `query-loops`,
-`entry-points` and `dead-methods`.
+`entry-points`, `dead-methods` and `vendored-candidates`.
 
 **A name it does not recognise is refused, not ignored.** `--fail-on=cyles` exits `2`
 and names what it could not match, rather than exiting `0` while enforcing nothing —
