@@ -60,6 +60,8 @@ The install script installs **only the binary**, by design - it does not place a
 curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/mcp-arch.yaml -o mcp-arch.yaml
 ```
 
+Third-party code copied into your own source tree is worth adding to those globs: the bundled list covers where dependencies conventionally live — `vendor/`, `node_modules/`, `Pods/` — but not a library vendored into `src/`, which is then part of everything the snapshot says about size, coupling and layering. The `vendored-candidates` explainer reports the ones it can recognise, each with the glob to paste.
+
 The [`examples/`](../examples/) directory has ready-made per-language and multi-repo starting points, and [`examples/full.yaml`](../examples/full.yaml) documents every option. For the full field reference and defaults, see **[ARCHITECTURE.md → Configuration](../ARCHITECTURE.md#configuration)**.
 
 ### Connect it to your agent
@@ -114,7 +116,9 @@ Everything below is a prompt you type at your agent in plain English. enola pick
 
 > "Generate an architectural snapshot of /path/to/my/project"
 
-That's the whole setup. Snapshots are fast - seconds even on very large polyglot repos - and your agent now has all 19 tools (`enola --list`) plus a ready-to-read summary at `.enola/llm_context.md`.
+The snapshot gives your agent all 19 tools (`enola --list`) plus a summary at
+`.enola/llm_context.md`. Measured cold and warm times across the public corpus are in
+[BENCHMARKS.md](BENCHMARKS.md#4-scale).
 
 #### 2. Understand it
 
@@ -136,7 +140,7 @@ That's the whole setup. Snapshots are fast - seconds even on very large polyglot
 
 #### 4. Make the change - and verify it
 
-This is the loop that keeps an agent honest, and it's worth building the habit:
+This closes the verification loop around the agent's change:
 
 > "Pin the current architecture as a baseline before we start."
 
@@ -182,19 +186,25 @@ Some questions don't need an agent at all. The MCP server also serves a **read-o
 
 - *What is in this graph right now?* - the repos loaded, services, cross-repo edges (with a node-link diagram), fact and insight counts.
 - *What did the analysis find?* - every insight grouped by explainer and filterable by confidence, so you can see the cycles and hotspots without asking a model to list them.
-- *Is this snapshot trustworthy?* - the receipt: snapshot ID, enola version, git ref and dirty flag, extractors used.
+- *How was this snapshot produced?* - the receipt: snapshot ID, enola version, git ref and dirty flag, extractors used.
 - *Why does this snapshot look thin?* - extraction quality: files seen vs. parsed vs. skipped, parse errors with samples, unresolved cross-repo edges, coverage gaps.
 - *What has this actually saved me?* - the same value estimate `--status` prints, per tool and lifetime ([how it's calculated](../ARCHITECTURE.md#the-value-model)).
 
-Reading it costs nothing and burns no context. It's also the fastest way to sanity-check a snapshot before you trust an answer built on it.
+Reading it costs nothing and burns no context. It is also the fastest way to inspect a snapshot before relying on an answer built from it.
 
-#### 7. Especially good with local and smaller models
+#### 7. Useful with local and smaller models
 
-If you run a local LLM - Ollama, LM Studio, an on-prem endpoint, or a smaller hosted model - enola is not a nice-to-have, it's the difference between usable and not. A smaller model's weakness usually isn't writing code; it's holding a large repository in its head and doing multi-hop structural reasoning over it. enola does that part deterministically and hands over the answer:
+Local and smaller models often have less context available for exploring a large repository.
+Enola can move structural questions into deterministic graph queries and leave the model
+to interpret the result:
 
-- **Context stays small.** Instead of stuffing 40 files into a short context window hoping the dependency is in there, the model gets the exact dependent set - a handful of names, precisely scoped.
-- **No long inference chains to get wrong.** "What depends on this, transitively, across three repos" is a graph traversal, not a reasoning task. The model never attempts it, so it never fluffs it.
-- **Fewer round trips.** Every avoided grep-open-read cycle is a full local inference pass you don't wait for. On local hardware that's wall-clock time, not just tokens.
+- **Less source in context.** A graph query returns the dependents measured within the
+  snapshot's scope, so the model can open only the evidence it needs.
+- **Graph traversal outside the model.** Questions such as "what depends on this across
+  three repositories?" are answered over resolved edges rather than reconstructed from
+  a sequence of file reads.
+- **Fewer exploration turns.** Avoiding grep-open-read loops can reduce both inference
+  time and context use on local hardware.
 - **Nothing leaves your machine.** enola is a local binary, the graph is a local file, the dashboard binds loopback only. A fully offline architecture-intelligence stack.
 
 #### Keeping it current
@@ -204,8 +214,6 @@ If you run a local LLM - Ollama, LM Studio, an on-prem endpoint, or a smaller ho
 > **Very large repositories (e.g. the Linux kernel).** The first, cold index of a huge repo can take a minute or more and may exceed your MCP client's per-tool-call timeout, surfacing as `MCP error -32001: Request timed out`. The snapshot usually still finishes and is cached server-side - but to avoid the error, either:
 > - **Raise your MCP client's tool-call timeout.** In Claude Code, set the `MCP_TOOL_TIMEOUT` environment variable (milliseconds) before launching, e.g. `MCP_TOOL_TIMEOUT=600000`.
 > - **Pre-generate from the shell once**, then start the server: run `enola --generate <config-pointing-at-the-repo>` (writes `.enola/`), after which the MCP server auto-loads the cached snapshot on startup and later `generate_snapshot` calls reuse the extractor cache (only changed files are re-parsed), so they return quickly.
-
----
 
 ---
 
@@ -233,7 +241,7 @@ thing.
 | `query_insights` | What did the explainers find? |
 | `set_baseline` | Remember the architecture as it is now. |
 | `diff_snapshot` | What did my change actually do? |
-| `snapshot_receipt` | What was this graph generated over, and how complete was extraction? |
+| `snapshot_receipt` | What was this graph generated over, what was excluded, and where are its known limits? |
 | `compare_receipts` | Are these two snapshots comparable enough to trust a diff between them? |
 | `architecture_history` | How has the architecture changed over time? |
 | `architecture_blame` | When did this enter the architecture, and when did it leave? |
@@ -245,12 +253,12 @@ Full parameter reference for each: **[ARCHITECTURE.md → The tools](../ARCHITEC
 
 ## Explain a repository at a glance
 
-**Point it at any repository - yours or one you've never seen - and get its architecture on one screen, in seconds, with no AI, no API key, and no account.**
+**Generate a one-screen architecture report with no AI, API key or account.**
 
-`enola --explain [repo_path]` is a one-shot mode that generates a snapshot, computes statistics over the fact graph, and prints a human-readable report to stdout - no MCP server started, no artifacts written to `.enola/`, nothing sent anywhere. It is the fastest honest answer to "what *is* this codebase?"
+`enola --explain [repo_path]` is a one-shot mode that generates a snapshot, computes statistics over the fact graph, and prints a human-readable report to stdout - no MCP server started, no artifacts written to `.enola/`, nothing sent anywhere. Use it for a direct view of the structure enola measured.
 
 **When to use it:**
-- **Onboarding onto an unfamiliar codebase** - module count, architecture pattern, hottest packages, where the complexity lives. Ten seconds instead of a week of reading.
+- **Onboarding onto an unfamiliar codebase** - module count, architecture pattern, hottest packages and where the complexity lives.
 - **Evaluating code you didn't write** - a dependency, an acquisition, an open-source project, a contractor's delivery. Cycles, coupling and complexity are hard to hide from a graph.
 - **Pre-refactor sanity check** - cycles, layer violations, blast radius of the top modules, before you commit to a plan.
 - **CI and audits** - plain text, no color codes, safe to pipe or capture.
@@ -280,7 +288,13 @@ The argument is a **repository** when it is a directory and a **config file** wh
 - **Code health** - per-explainer findings with their top offenders: god classes (high fan-in symbols), call-graph hotspots, deep dependency chains, large public surfaces, and complexity outliers
 - **Vendored candidates** - directories that look like in-tree copies of another project, so you can decide whether to exclude them. Nothing is excluded on your behalf; the section is absent when there is nothing to report
 
-Every finding carries a confidence score, and it means something exact: `1.0` is a structural fact — in practice a dependency cycle, the one thing enola computes rather than infers — while anything below is a flagged heuristic for you to review (a god class is a statistical fan-in outlier, not a rule, so it tops out below `1.0` however extreme it gets). The analyses are computed by graph algorithms - Tarjan's SCC, which finds groups of modules that can all reach each other, for cycles; longest-path for the deepest import chain; and mean+2σ outlier tests, which flag what sits two standard deviations above your own repository's average, for the rest - so the same commit yields the same report. The vocabulary here is defined in **[docs/GLOSSARY.md](GLOSSARY.md)**.
+Every finding carries a confidence score. Proof-class findings reach `1.0`: dependency
+cycles, `intent` set differences, violations of a declared layer order, and breaches of
+declared constraints. Heuristics such as god classes and complexity outliers stay below
+`1.0`. The analyses use graph algorithms and repository-relative statistics, including
+Tarjan's SCC, longest-path and mean+2σ outlier tests. The same source, enola version and
+configuration produce the same report. The vocabulary is defined in
+**[docs/GLOSSARY.md](GLOSSARY.md)**.
 
 **Vendored candidates.** Airflow vendors nothing, so its report has no such section. Here is one that does — [gmsh](https://gitlab.onelab.info/gmsh/gmsh), a mesh generator that keeps its dependencies in `contrib/`:
 
@@ -426,13 +440,20 @@ Every path argument follows the same rule: **a directory is a repository, a file
 | `install [--hooks] [--global]` | **Tell your coding agents enola is here.** Writes its instructions into the files they actually read - `.claude/rules/enola.md`, `.cursor/rules/enola.mdc`, and a marked block in `AGENTS.md` if you have one. Previews every change and asks before writing. See [Wiring it into your agents](#wiring-it-into-your-agents---enola-install). |
 | `coverage [--repo=<svc>] [--unresolved] [--json]` | **Which cross-repo edges enola resolved, and which it did not** — per service, so you can tell a genuinely isolated service from one whose outbound edges enola could not follow. The unresolved list is always shown: it is what makes the resolved count worth believing, and each entry is either a repository you have not loaded, a third-party endpoint, or a blind spot in enola. Needs two or more repositories in one graph. A report, not a gate — it always exits `0`. |
 | `doctor [repo]` | **Are the session hooks actually firing?** `install --hooks` writes a hook configuration and reports success — but whether your agent honours that configuration is a contract owned by the agent, not by enola, and a config it ignores looks identical to one it runs. So the hooks record every time they fire, *including* the runs where they deliberately say nothing, and this reports when each last ran, what it concluded, and whether the pinned baseline can still be graded against at all. `NEVER FIRED` after a real session means the wiring is not working. A report, not a gate — it always exits `0`. |
+| `dashboard [--open] [repo\|config]` | **Explore the latest snapshot visually without starting MCP.** Starts the read-only localhost dashboard attached to the terminal until Ctrl-C; `--open` also launches the browser. |
 | `providers list \| fetch <name>` | **The fact providers this binary carries itself.** `list` names each built-in and whether it is ready; `fetch rubydex` downloads the pinned Rubydex engine library from rubygems.org, verifies its published sha256, and caches it under the user cache directory, after which a `providers:` entry named `rubydex` with no command runs in-process. The only network access a provider ever makes, and never at snapshot time. |
 | `uninstall [--global]` | Remove everything `install` wrote, leaving the rest of each file byte-for-byte as it was. |
 | `baseline pin\|show\|clear [repo\|config]` | Manage the diff baseline - the "before" a change is graded against. `pin` freezes the snapshot on disk when every repository's own receipt shows it matches the working tree under this build and config (members of a cluster must also agree on one union), and otherwise snapshots first, linking once on the cluster's last turn, and says which repository made it regenerate; `show` reports what the current baseline describes; `clear` removes it. Stored per repository, in that repo's `.enola/baseline`, so several repos each keep their own. |
 | `check [flags] [repo\|config]` | **Grade what a change did to the architecture**, and exit with a code CI can act on. Read-only: writes nothing and leaves the baseline in place, so it can be run repeatedly. See [The gate](#the-gate---enola-check). |
-| `constraints <lint\|mine\|init\|explain> [repo\|config]` | **The authoring loop.** `lint` validates the declared vocabulary and resolves each component against the current snapshot; `mine` proposes candidate rules out of the snapshot's own regularities; `init` writes a first declaration binding every shipped recipe whose required roles resolve to directories the repository has, refusing to overwrite and guessing nothing; `explain <path>` names the components a file's facts belong to, the selector that admitted each, and the edges the file makes. `lint` exits `0` when every declaration is valid, `1` when it reported validation problems; `mine`, `init` and `explain` exit `0` whenever they produced a report, and `2` when they could not run — no snapshot to read, or a declaration `init` would have had to overwrite. See [CONSTRAINTS.md](CONSTRAINTS.md). |
+| `constraints <lint\|mine\|init\|explain\|ledger> [repo\|config]` | **The authoring loop.** `lint` validates the declared vocabulary and resolves each component against the current snapshot; `mine` proposes candidate rules out of the snapshot's own regularities; `init` writes a first declaration binding every shipped recipe whose required roles resolve to directories the repository has, refusing to overwrite and guessing nothing; `explain <path>` names the components a file's facts belong to, the selector that admitted each, and the edges the file makes; `ledger` reports how much of the declared law is being EXCUSED rather than obeyed — each rule's breaches beside the suppressions and exemptions that signed them away, with every excuse's owner, reason and age, and the ones that now match nothing. `lint` exits `0` when every declaration is valid, `1` when it reported validation problems; `mine`, `init`, `explain` and `ledger` exit `0` whenever they produced a report, and `2` when they could not run — no snapshot to read, or a declaration `init` would have had to overwrite. See [CONSTRAINTS.md](CONSTRAINTS.md). |
 | `endpoint [flags] <endpoint> [repo\|config]` | **What changing an HTTP endpoint reaches.** The controller serving it, the models that controller touches, the models associated with those, the tables behind them, and the callers - including the frontend screen a calling route module implements. The endpoint is matched as a substring of the path, optionally prefixed with a verb (`GET /v1/candidates`, or just `/v1/candidates`). Client call sites and mock-server routes are excluded: this answers about what the application serves. `--json` emits the report; `--max-routes` bounds how many matched endpoints are followed. The `endpoint_impact` MCP tool answers the same question in a session. |
 | `plan [flags] [path...] [repo\|config]` | **The pre-edit contract.** Which declared constraints govern an intended change (`--paths`, `--symbols`), its blast radius over the current snapshot, and — for a `--patch` — the constraint verdicts that WOULD appear, evaluated over a scratch copy before any edit lands in the tree. Nothing is written; a report, never a gate. Exits `0` on any produced report, `2` when it could not run. See [CONSTRAINTS.md](CONSTRAINTS.md). |
+| `log [flags] [repo\|config]` | **What has this architecture done over time?** One line per snapshot enola recorded, oldest first, with what changed since the one before it - `--graph` draws the branch topology, `--stat` breaks each delta down by fact kind, `-n` and `--since` bound the window. Read-only: it reports what was observed and never snapshots to fill a gap. `--backfill` instead BUILDS the timeline from the repository's own commit history, so a repository enola has never seen still has a past to read. **Experimental.** See [HISTORY.md](HISTORY.md). |
+| `show [rev] [repo\|config]` | **What did THIS revision do?** `log` says a revision added twelve facts; this says which twelve. Reconstructs the revision and its predecessor out of the stored history and compares them, so a past change is described in the words it was described in at the time. A revision is a snapshot id or prefix, a git commit, `HEAD~3`, `@7`, a ref name, or `latest` (the default). **Experimental.** |
+| `diff <a>..<b> [repo\|config]` | **What happened between these two points?** The architecture delta across a range - the question a week of work produces, where `show` answers for a single revision. Either side of the range may be empty, meaning the oldest or the newest recorded revision. **Experimental.** |
+| `blame [flags] <pattern> [repo\|config]` | **When did this enter the architecture, and when did it leave?** A question a snapshot cannot answer however good it is, because it is about the past. The pattern matches a module or symbol name, a file path, or both endpoints of an edge; `--findings` searches recorded findings instead ("which snapshot introduced this cycle?"), and `--first` stops at the introduction. Revisions whose stored contents have aged out are reported as `unsearched`, never as absent. **Experimental.** |
+| `gc [flags] [repo\|config]` | **What is stored, and what can go?** Reports how many revisions the history holds, how many can still be replayed, and how much disk they cost. With no flags it removes only garbage - segment directories no revision refers to. `--thin-older-than=90d` drops old contents while keeping the timeline complete, and `--prune-working` discards uncommitted-tree snapshots; each has to be asked for, because both lose something a reader could still reach. **Experimental.** |
+| `history <push\|pull\|verify\|gc> [store] [repo\|config]` | **Share a history between machines** through a directory store - a git repository, a shared mount, an S3-synced folder. Plain files, content-addressed, tamper-evident. `push` copies local revisions in, `pull` imports what other machines pushed, `verify` walks every chain and names gaps and tampering (exits `1` when it finds a problem), and `gc` applies retention - printed first, deleted only with `--apply`, and recorded in the chain. Point it with `history.shared_dir` or the first argument. **Experimental.** |
 | `upgrade` | Download and install the latest release over the running binary. |
 
 | Flag | What it does |
@@ -543,6 +564,36 @@ enola check /path/to/repo           # 2. grade what they did
 
 The baseline is a pinned artifact rather than "whatever state the tool last held" - it survives re-snapshots, publishes atomically, and travels to another machine. Why the graph works that way at all: **[docs/SNAPSHOTS.md](SNAPSHOTS.md)**.
 
+**`pin` never pins a stale snapshot.** If the repository holds no snapshot, or its tree has moved since the one it holds, `pin` regenerates first and says which repository made it do so, and why:
+
+```
+enola baseline: regenerating, shopfront holds no snapshot
+enola baseline: regenerating, shopfront moved since its snapshot: 1 modified (e.g. storage/storage.go)
+```
+
+That is what makes step 1 safe to run without thinking about it: the "before" is always the tree you were looking at when you typed it, not whenever enola last happened to index. For a cluster, every member must agree on one union before the pin stands, so a config with `repos:` snapshots what it must and links once on the cluster's last turn.
+
+A baseline is stored **per repository**, in that repo's own `.enola/baseline`, so several repositories each keep their own and pinning one never disturbs another. `baseline show` reports what the current one describes - when it was generated, over which repo, how many facts, and its snapshot id - and `baseline clear` removes it.
+
+**Pinned, or one step back?** `check` grades against the pinned baseline. `--baseline=previous` grades against the preceding snapshot instead - the `previous/` set that rotates every time a snapshot is written. The two answer different questions, and diverge as soon as more than one change has landed:
+
+```
+$ enola check                        # against the pin, three edits ago
+  symbols      +3
+  Added (3):
+    symbol     api.ChangeA                                  api/api.go:14
+    symbol     web.ChangeB                                  web/web.go:11
+    symbol     notify.ChangeC                               notify/notify.go:12
+
+$ enola check --baseline=previous    # against the last snapshot written
+  symbols      +2
+  Added (2):
+    symbol     web.ChangeB                                  web/web.go:11
+    symbol     notify.ChangeC                               notify/notify.go:12
+```
+
+Pin when you start a piece of work and the answer stays "what has this branch done since I began", however many times you re-snapshot in between - which is why it is the default and why a multi-day refactor only warns rather than declining. Reach for `previous` when the question is narrower: what did the run that just finished change?
+
 | Exit | Meaning |
 |------|---------|
 | `0` | **clean** - nothing the policy enforces (which, with no `--fail-on`, is everything) |
@@ -574,7 +625,50 @@ enola check --detail                                       # full delta under th
 enola check --baseline=previous                            # compare against the preceding snapshot
 enola check --focus=internal/auth                          # narrow the delta to what you touched
 enola check --write                                        # also persist the snapshot (default: read-only)
+enola check --reviewers                                    # who owns what you touched, and who should review it
 ```
+
+### Who should review this — `--reviewers`
+
+`--reviewers` adds one section to the verdict: for each module the change touched, who owns
+it, and — where you barely know the code you just edited but own something that imports it —
+who to ask.
+
+```
+Reviewers for this change (1) — authorship over the last 500 commits;
+steering, never graded:
+  pkg/auth — owner: Bob (100%), 0 minor contributor(s) of 1
+      you are a minor contributor here (0%)
+      you own pkg/tokens (100%), which imports pkg/auth  [major-minor-dependency]
+      suggested reviewer: Bob
+```
+
+> The `major-minor-dependency` — owning a component while being a stranger to one it
+> depends on — is from Christian Bird, Nachiappan Nagappan, Brendan Murphy, Harald Gall and
+> Premkumar Devanbu, [*Don't Touch My Code! Examining the Effects of Ownership on Software
+> Quality*](https://www.microsoft.com/en-us/research/publication/dont-touch-my-code-examining-the-effects-of-ownership-on-software-quality/)
+> (ESEC/FSE 2011). They found it in 52% of Windows Vista binaries, well above a randomised
+> null model, and recommended telling the owner what you need instead of making the change
+> yourself. The 5% line between major and minor contributors is theirs.
+
+Spotting it needs the import graph as well as the commit log, which is why it lives here
+rather than in a tool that reads only git.
+
+**Off by default.** Without the flag no author name is read or printed. The measurement is
+one `git log` over the last `--reviewer-window` commits (500), so it costs the same at any
+repository age and nothing is cached. Names come from `%aN`, so `.mailmap` applies.
+`--author` overrides `git config user.name`; an actor with no commits in the window is
+named once and only owners are reported.
+
+**Never graded.** It cannot change the verdict, the exit code, or what `--fail-on` fails on.
+It moves with your git history rather than your code, and the 5% line is a correlation
+measured on Vista binaries, not a rule you declared. A module with fewer than five commits
+in the window names no owner and carries no `major-minor-dependency`; at one commit somebody
+holds 100% of it. Expect the clearest signal where components have their own teams — in a
+single library maintained by one core team, most people are minor to most modules.
+
+Text and JSON only. SARIF and the annotation hosts place entries on diff lines as problems,
+and this is neither.
 
 **The verdict has four writers, and all four read the same verdict.** `--format` picks `text` (the default), `json` (what `--json` means), `sarif` or `annotations`; nothing is recomputed for a writer, so a fifth is a table row. SARIF carries one rule per declared rule id with the team's `because` as its description, one result per finding in every bucket (failures as errors, advisories and declared findings as warnings, resolved findings at no level and with no region, suppressed and exempted findings with the ledger entry or exemption that excused them), the evidence span as the region, and the finding's stable identity under `partialFingerprints.enola/v1`. Annotations place every finding that has a measured position on its file and line, as Buildkite markdown grouped by file (`--link` takes the pull request's files view so each line links into the diff) or as GitHub workflow commands; findings without a position are counted at the end and never placed. The host is a flag and never read from the environment, so a run on a laptop renders exactly what the run in CI rendered.
 
@@ -708,23 +802,36 @@ And the estimate stays conservative where it can't measure. It prices the ingest
 
 ### The dashboard
 
-Starting the MCP server also starts a **read-only dashboard** on a free loopback port (`127.0.0.1`), printed to stderr on startup - run `enola --status` while the server is up to get the URL again. It refreshes every 30 seconds and shows, in one page:
+For a task-oriented walkthrough of every tab, with screenshots, see
+**[DASHBOARD.md](DASHBOARD.md)**.
 
-- **this server** - its PID, binary, uptime, the repos *it* has loaded, and the directory it was launched from;
-- **every enola server running right now**, with a link to each one's dashboard, so you can switch between them;
-- the same activity and value data as `--status`, split into what this server has served and the lifetime total across all of them;
-- the **snapshot receipt** - snapshot ID, enola version, git ref, extractors, fact/insight counts;
-- the **graph receipt** - the repos in this server's graph, and clickable counters listing the services and cross-repo edges (the edges also render as a node-link diagram);
-- the **insights** grouped by explainer, filterable by confidence band, so you can see what each finding is and how certain it is;
-- **extraction quality** - per-service coverage, unresolved routes, and samples of skipped files and parse errors, which is where you look when a snapshot seems thin.
+Open the latest snapshot directly:
 
-It is strictly a viewer: every request reads through the same concurrency-safe accessors the MCP tools use and never mutates server state. It binds loopback only and serves nothing but that one page. Pass `--no-dashboard` to skip it.
+```bash
+enola dashboard --open
+```
+
+This serves only the dashboard and stays attached to the terminal until Ctrl-C. Startup prints the snapshot directory and complete `http://` URL. Use `enola --status` in another terminal to list running sessions and their dashboard URLs. Starting the MCP server also starts the same **read-only dashboard** on a free loopback port (`127.0.0.1`), printed to stderr at startup. Data refresh is explicit, so a graph investigation is never interrupted by a periodic page reload.
+
+The dashboard is organized into five tabs:
+
+- **Overview** — architectural change cards, current facts, findings, repositories, services, and cross-repository edges.
+- **Architecture** — a searchable module graph, focused consumer/dependency neighborhoods, edge evidence, findings, and a synchronized module table.
+- **Snapshots** — freshness, Git capture, extractor schema, repositories in the graph, and the complete technical receipt.
+- **Activity** — every currently active Enola session, this page's highlighted session, lifetime totals across completed and active sessions, and estimated value. Lifetime totals are retained; individual completed-session records are not.
+- **Quality** — complete file accounting, expected exclusions, potential blind spots, inactive extractors, parse failures, and unresolved cross-repository connections. Genuine parse failures include a prefilled GitHub issue action.
+
+It is strictly a viewer: every request reads through the same concurrency-safe accessors the MCP tools use and never mutates server state. It binds loopback only and serves nothing but the dashboard. Use **Refresh data** when you want to reload the currently available state. Pass `--no-dashboard` to skip the dashboard attached to an MCP server.
+
+`enola --generate` is different: it generates the snapshot files and exits, without starting an MCP server or dashboard and without registering a running instance. A later MCP server can auto-load those files when it starts. A dashboard that is already running still describes its own process and its own in-memory graph; a separate `--generate` invocation does not turn that dashboard into a viewer for the generator process.
 
 #### Several servers at once
 
 Agent tooling starts one enola server per session, so opening four terminals means four servers - each with its own graph, its own dashboard, and its own ephemeral port. Two things keep that legible.
 
 **One bookmarkable URL.** Besides its own port, every server competes for a fixed **shared URL**, `http://127.0.0.1:7171` by default. The first to start wins it; when that one exits another takes over within a few seconds, so the address keeps working for as long as any server is up. Whichever server answers there lists all the others. Set `ENOLA_DASHBOARD_PORT` (or `dashboard.port` in the config) to move it, or `ENOLA_DASHBOARD_PORT=off` to keep only the ephemeral ports.
+
+There is no standalone dashboard process. When the last agent session closes, the last MCP server and its dashboard exit too, so the shared URL stops responding. When a new session starts, its server claims the shared URL again. As sessions start and stop, click **Refresh data** on an open dashboard to update the server list; joining servers appear and departed servers disappear on that request.
 
 **Every page describes its own server.** The PID, uptime, repos and per-server call counts on a page belong to the process serving it - never to whichever server happened to start last. If a page shows a graph you did not expect, the switcher tells you which server holds the one you want.
 

@@ -23,6 +23,121 @@ Some of what a rule can select is measured by a **provider** rather than an
 extractor — `ancestor:` reads a resolved ancestry chain, and a rule may verdict over
 a runtime observation or a declared signature. See [PROVIDERS.md](PROVIDERS.md).
 
+## Start here
+
+The rest of this page is a reference: 21 rule forms, the selector
+dialect, recipes, modes, exemptions. You do not need any of it to
+write your first rule. The loop is four commands, and it is worth
+running once on a repository you know before reading further.
+
+**1. Ask what enola can bind for you.** `constraints init` writes a
+first declaration, binding every shipped recipe whose required roles
+resolve to directories your repository actually has. It refuses to
+overwrite an existing declaration and it guesses nothing — which
+means the honest answer on many repositories is that it binds
+nothing:
+
+```
+$ enola constraints init .
+clean                not bound: no directory for frameworks, interface-adapters, use-cases, entities
+layered              not bound: no directory for presentation, application, domain, infrastructure
+ports-and-adapters   not bound: no directory for core, ports, adapters
+rails-conventions    not bound: no directory for controllers, jobs, models, mailers, policies, …
+nothing to bind: no shipped recipe's roles resolve to a directory here
+```
+
+That is not a failure. A recipe is a named pattern with required
+roles ([Recipes](#recipes--named-patterns-as-instantiable-bundles)),
+and a repository laid out its own way has none of them. Read the list
+as a question — *is my repository one of these, under different
+directory names?* If it is, bind the recipe by naming the roles
+yourself. If it is not, write the rule directly, which is step 2.
+
+**2. Write one rule, by hand.** Two components and one rule is a
+complete declaration. This goes in `enola-intent.yaml`, beside the
+`layers:` you may already have:
+
+```yaml
+components:
+  - name: storage
+    match: ["storage/**"]
+  - name: notify
+    match: ["notify/**"]
+
+rules:
+  - id: storage-sends-nothing
+    forbid: storage
+    to: notify
+    via: imports
+    because: "persistence must not decide what the buyer is told"
+```
+
+`because:` is mandatory, and it is not decoration: every finding this
+rule produces carries it, so a violation says why the rule exists
+rather than only that it was broken.
+
+**3. Check that it means what you think.** `constraints lint`
+validates the vocabulary and — when a snapshot exists — resolves each
+component against it, so you find out that a selector matches nothing
+*before* a verdict silently passes:
+
+```
+$ enola constraints lint .
+Component resolution against the snapshot at ./.enola:
+  notify                   2 member(s)
+                             match notify/**
+  storage                  2 member(s)
+                             match storage/**
+
+OK — every declaration is valid.
+```
+
+A component with `0 member(s)` is the failure mode to watch for. It
+is valid YAML, it lints clean, and it can never be violated.
+
+**4. Enforce it.** The `constraints` explainer verdicts declared
+rules on every snapshot at confidence `1.00`, so the gate can fail on
+them:
+
+```
+$ enola check --fail-on=constraints .
+FAIL — 1 structural regression introduced.
+law: 1 rule · 1 breach · none excused
+
+Regressions (fail):
+  - [constraints] 1.00 — Constraint storage-sends-nothing violated: storage -> notify via imports
+      forbidden imports edge
+      storage/storage.go:3
+      import "layersgate/notify"
+```
+
+**Then: what is the law actually doing?** As a declaration grows,
+the question stops being "does it pass" and becomes "how much of it
+is being excused rather than obeyed". `constraints ledger` answers
+that — every rule beside its breaches, its suppressions and its
+exemptions, each with an owner, a reason and an age:
+
+```
+$ enola constraints ledger .
+law: 1 rule · 1 breach · none excused
+read from the snapshot generated 2026-08-25T19:30:54Z — a rule declared since then is not counted here
+
+storage-sends-nothing [ratchet] — 1 breach reported, 0 excused · declared in enola-intent.yaml
+    because: persistence must not decide what the buyer is told
+```
+
+`constraints mine` is the fifth command, and it belongs after these
+four rather than before them: it proposes candidate rules out of the
+regularities your snapshot already shows, which is useful once you
+know what a rule means and can judge a proposal. It never
+self-adopts.
+
+From here, the reference. [Components](#components) is the selector
+dialect, [The 21 rule forms](#the-21-rule-forms) is everything a rule
+can say, [Modes](#modes) is how strictly each is enforced,
+[Exemptions](#exemptions--declared-carve-outs) is how a breach is
+signed off, and [`plan` / `plan_check`](#plan--plan_check--the-pre-edit-contract)
+answers which rules govern a change *before* you make it.
 ## The constraints directory
 
 A repo whose law outgrows one file splits it into per-domain files
@@ -49,7 +164,9 @@ components:
   - name: domain                 # lowercase token
     match: ["app/domain/**"]     # exact path, prefix/** subtree, or **/name
                                  # basename glob — nothing else
-    kind: module                 # optional: module, route, storage, symbol
+    kind: module                 # optional: module, route, storage, symbol —
+                                 # plus test_ref, file_ref, lint and dependency,
+                                 # which a component acquires ONLY by naming them
     name_pattern: "*Serializer"  # optional: a fact-name family — an exact
                                  # name, one prefix*, or one *suffix
     service: billing             # optional: one repo of a multi-repo snapshot,
@@ -1650,6 +1767,38 @@ request API (`render`, `redirect_to`, `params`, `session`, `cookies`,
 `flash`) stays out of models and services, all advisory, all in force
 only where the two roles are bound.
 
+> The rule `supply-chain` states — every external dependency declared, pinned, and
+> given a stated purpose — is H14 from Stanislav Rumega's position paper
+> [*Tell Your Coding Agent to Work as an Architect First*](https://github.com/styrumg/Architect-First-Article).
+
+`supply-chain` is the odd one out, and worth reading as the shape rather
+than the rule. It has one role and one law — every declared dependency
+names a version — and the role binds to nothing the repository has to
+name, because what an unpinned dependency IS is a property the facts
+carry rather than a place in the tree:
+
+```yaml
+use_recipe:
+  - recipe: supply-chain
+    as: supply
+    bind:
+      unpinned-dependencies: {}
+```
+
+The role's own selector is `kind: dependency` with
+`where: {type: package, pinned: false}`, over the package facts the
+`manifests` extractor measures (see [INTENT.md](INTENT.md)), and the law is a
+`forbid_fact` over it — no new rule form, because "this set must be empty" was
+already one. `dependency` is an opt-in member kind for the same reason
+`test_ref` and `lint` are: a component that does not name it never acquires a
+package, so no existing rule changes what it judges.
+
+One caveat before adopting it: `where:` fails closed and loudly on a property
+no measured fact carries, so a repository with no manifest enola reads gets a
+`1.0` *selector cannot be evaluated* finding rather than silence. A rule that
+holds because it looked at nothing must never read as compliance — but it is
+surprising the first time.
+
 **A first declaration in one command.** `enola constraints init [repo]`
 reads the shipped recipes, binds every role whose conventional directory
 the repository has, and writes one `use_recipe` per recipe whose required
@@ -1770,6 +1919,67 @@ candidate the scaffolder leaves is listed with the reason it stays
 a constraint proposal. Nothing is written to the repository's plugin
 and no ESLint configuration is touched: the scaffold is a starting
 point the operator reviews, like the would-be declaration.
+
+## `constraints ledger` — how much of the law is being excused
+
+Every excuse this vocabulary admits already demands a signature. A suppression
+entry names an owner, a reason and a date, and the ledger rejects as a whole if
+any is missing. An `exempt:` carve-out names the same three beside the witness
+it covers. What was never asked is the question those signatures answer
+together: **how much of the declared law is being excused rather than obeyed.**
+
+`enola constraints ledger` asks it:
+
+```
+law: 34 rules (28 ratchet, 4 advisory, 2 strict) · 12 breaches · 5 excused (42%) · oldest excuse 214 days · 2 excuses matched nothing
+
+company-fk [ratchet] — 7 breaches reported, 3 excused · declared in enola/constraints/billing.yaml
+    because: tenant isolation rides the company FK
+    exemption by alice (2024-11-02, 296 days ago) — users must have fk_constraints containing company_id->companies
+        "legacy tables migrate in Q4"
+    suppression by bob (2026-06-01, 85 days ago)
+        "second signature while the migration lands"
+```
+
+Three things in that output are the point, and none of them is visible one
+verdict at a time.
+
+**The rate.** A rule most of whose breaches are signed away is a rule to
+reconsider — the declaration is asking for something the codebase has decided
+not to do, and the team is paying a signature per occurrence to say so. Read
+one excuse at a time, that looks like thirty separate reasonable decisions. Read
+as a ratio, it is one wrong rule. The gate cannot make that judgement and
+should not try; what it can do is make the number available to whoever can.
+
+**The age.** An excuse nobody has revisited in a year is a reason that has
+probably stopped being true. `since:` and `date:` were mandatory long before
+anything read them; this is what they were mandatory *for*.
+
+**The ones that match nothing.** An excuse that excused nothing in this
+snapshot is the row somebody can act on today: the breach it covered was fixed,
+moved, or stopped being selected, and the signature is still standing. It is
+marked inline and counted on the summary line. The snapshot's own census
+already reported the same two facts as `unused suppression` and
+`exemption matching nothing`; the ledger is where they acquire a denominator.
+
+The report reads the **snapshot's** compiled intent facts, not the working
+tree's YAML — deliberately, so both halves of every ratio come from one state
+of the law. A rule declared since the snapshot was generated is therefore
+absent, and the report prints the snapshot's timestamp so a reader can tell.
+This is the opposite choice from `plan`, which answers governance from the
+working tree precisely because its question is about an edit that has not
+happened yet.
+
+**A report, never a gate.** It exits `0` whenever it produced a report. Nothing
+here changes what `enola check` fails on, and nothing here fails a build: a gate
+that failed on its own unpopularity is the one nobody would leave enabled — the
+false-alarm economy of [EXPLAINERS.md](EXPLAINERS.md) applied to the gate's own
+record rather than to its findings.
+
+`enola check` carries the same summary as one line beside its census line, and
+as a `law` object in `--format json`. A repository that declares no rules gets
+no line and no object at all: undeclared is unasked, and a zeroed ledger would
+read as a law with nothing wrong with it.
 
 ## `plan` / `plan_check` — the pre-edit contract
 

@@ -17,9 +17,9 @@ import (
 	"github.com/enola-labs/enola/internal/diff"
 	"github.com/enola-labs/enola/internal/engine"
 	"github.com/enola-labs/enola/internal/facts"
-	"github.com/enola-labs/enola/internal/updatecheck"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
+	"github.com/enola-labs/enola/pkg/cli"
 	pkghistory "github.com/enola-labs/enola/pkg/history"
 )
 
@@ -147,6 +147,9 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 		target        = fs.String("target", "", "the symbol, type or package you INTENDED to change; packages reached outside its predicted blast radius are reported as spillover")
 		expected      = fs.String("expected", "", "comma-separated packages you expected to touch, in addition to the predicted radius")
 		maxSpillover  = fs.Int("max-spillover", -1, "fail when more than N packages are reached outside the declared scope (default: report only, never fail)")
+		reviewers     = fs.Bool("reviewers", false, "report who owns the modules this change touched, and who should review it (reads git author names)")
+		reviewWindow  = fs.Int("reviewer-window", 500, "with --reviewers, how many recent commits authorship is measured over")
+		author        = fs.String("author", "", "with --reviewers, whose change this is (default: git config user.name)")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: "+r.name()+" check [flags] [config_path]\n\n"+
@@ -309,7 +312,15 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 	verdict = check.RegradeIntersection(verdict, base, current, policy,
 		check.OwnershipFromExtractors(eng.Extractors()), current.Insights, *focus, measurements...)
 	verdict = check.AttachGuidance(verdict, eng.Store())
+	// Opt-in, and gated here rather than inside AttachReviewers, so that without the
+	// flag no git author name is read, computed, or printed at all.
+	if *reviewers {
+		verdict = check.AttachReviewers(verdict, eng.Store(),
+			check.ReadAuthorship(anchor, *reviewWindow, eng.Store()),
+			check.Actor(anchor, *author))
+	}
 	verdict = check.AttachCensus(verdict, current.Meta, policy, current.Insights)
+	verdict = check.AttachLedger(verdict, eng.Store(), policy, current.Insights, time.Now())
 
 	switch outFormat {
 	case check.FormatText:
@@ -321,7 +332,14 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 			fmt.Printf("\n%s\n", verdict.Detail())
 		}
 	default:
-		out, err := verdict.Write(outFormat, outHost, *link)
+		out, err := verdict.Write(check.Output{
+			Format: outFormat,
+			Host:   outHost,
+			Link:   *link,
+			// A SARIF document is uploaded and attributed, so it names the
+			// binary that actually graded the change. See check.Tool.
+			Tool: check.Tool{Name: r.name(), Version: r.buildVersion()},
+		})
 		if err != nil {
 			r.checkFatal("failed to encode verdict: %v", err)
 		}
@@ -330,7 +348,13 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 	// After the verdict and on STDERR, in both output modes. Stderr because `--json`
 	// promises stdout is a verdict document and nothing else, and after because a
 	// housekeeping note must never be the first thing read when the gate just failed.
-	updatecheck.Fprint(os.Stderr, engine.ExtractorVersion())
+	// Only when --write actually persisted a snapshot: without it the dashboard
+	// would read whatever a PRIOR --generate left behind, which is not what this
+	// run graded and would be a misleading thing to point someone at.
+	if *write && cli.ShowDashboardHint(os.Stderr) {
+		fmt.Fprint(os.Stderr, cli.DashboardHint(r.name(), arg))
+	}
+	r.updateNotice(os.Stderr)
 	os.Exit(verdict.ExitCode())
 }
 
@@ -396,7 +420,7 @@ func (r *Runner) cmdFatal(cmd, format string, args ...any) {
 // After the error, never before it: what failed is what they need first.
 func (r *Runner) writeFatal(w io.Writer, cmd, format string, args ...any) {
 	_, _ = fmt.Fprintf(w, r.name()+" "+cmd+": "+format+"\n", args...)
-	updatecheck.Fprint(w, engine.ExtractorVersion())
+	r.updateNotice(w)
 }
 
 // runBaseline is `enola baseline pin|show|clear` — the CLI half of the loop, so the

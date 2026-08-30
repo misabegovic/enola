@@ -81,6 +81,30 @@ func TestDefaultHelp_DocumentsGateCommands(t *testing.T) {
 	}
 }
 
+func TestDefaultHelp_PromotesDashboardLifecycle(t *testing.T) {
+	out := renderDefault(t)
+	for _, want := range []string{
+		"dashboard [--open]",
+		"dashboard --open",
+		"stop with Ctrl-C",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dashboard help %q missing:\n%s", want, out)
+		}
+	}
+	for _, removed := range []string{"dashboard status", "dashboard stop", "--foreground"} {
+		if strings.Contains(out, removed) {
+			t.Errorf("dashboard help still advertises removed command %q:\n%s", removed, out)
+		}
+	}
+
+	dashboard := strings.Index(out, "\nDASHBOARD\n")
+	gate := strings.Index(out, "\nTHE GATE")
+	if dashboard < 0 || gate < 0 || dashboard > gate {
+		t.Errorf("dashboard detail should appear before the gate documentation")
+	}
+}
+
 func TestRenderHelp_MultiLineDescriptionsAlign(t *testing.T) {
 	var b strings.Builder
 	spec := DefaultHelp(testBinary())

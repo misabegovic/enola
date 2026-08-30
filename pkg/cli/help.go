@@ -41,6 +41,19 @@ type Binary struct {
 	// BuildOutput is the artifact name a source build produces, when it differs
 	// from Name (e.g. "enola-ent" for enola-enterprise). Defaults to Name.
 	BuildOutput string
+
+	// Version is the build version of THIS binary, as its own main package knows
+	// it — the value VersionVar names, already resolved.
+	//
+	// It is carried here rather than read from internal/version because that
+	// variable is enola's, stamped by enola's release workflow. A wrapper is
+	// stamped through a different -X target (enola-enterprise uses
+	// `main.version`), so anything reading internal/version inside a wrapper
+	// reports "dev" forever: `doctor` said "enola dev", the SARIF driver claimed
+	// to be enola dev, and the dashboard registered its instance as dev. Empty
+	// falls back to internal/version, which is correct for the OSS binary and is
+	// what keeps this field optional.
+	Version string
 }
 
 // output returns the artifact name to show in the BUILD section.
@@ -76,9 +89,10 @@ func DefaultHelp(bin Binary) HelpSpec {
 		Intro:   "Give your AI agent a map of the codebase before it starts exploring.",
 		Usage: []string{
 			bin.Name + " [flags] [repo_path|config_path]",
+			bin.Name + " dashboard [--open] [repo_path|config_path]",
 			bin.Name + " baseline <pin|show|clear> [repo_path|config_path]",
 			bin.Name + " check [flags] [repo_path|config_path]",
-			bin.Name + " constraints <lint|mine> [repo_path|config_path]",
+			bin.Name + " constraints <lint|mine|ledger> [repo_path|config_path]",
 			bin.Name + " plan [flags] [path...] [repo_path|config_path]",
 			bin.Name + " coverage [flags] [repo_path|config_path]",
 			bin.Name + " doctor [repo_path]",
@@ -91,11 +105,12 @@ func DefaultHelp(bin Binary) HelpSpec {
 			bin.Name + " install [--hooks] [--global] [repo_path]",
 		},
 		Commands: []FlagDoc{
+			{Flag: "dashboard", Desc: "Explore the latest snapshot in a read-only local web dashboard,\nwithout starting an MCP server. Add --open to launch the browser.\nStays attached to the terminal; stop with Ctrl-C."},
 			{Flag: "install", Desc: "Write " + bin.Name + "'s instructions into the files your coding\nagents read (Claude Code, Cursor, AGENTS.md). Previews every\nchange and asks before writing.\n  --hooks   also run the loop automatically: report the\n            architectural delta at the end of a session, but only\n            if the change introduced a regression. Opt-in,\n            because hooks run commands.\n  --global  configure this user rather than this repository.\n  --dry-run show what would change and write nothing."},
 			{Flag: "uninstall", Desc: "Remove everything \"install\" wrote, leaving the rest of each\nfile byte-for-byte as it was."},
 			{Flag: "baseline", Desc: "Manage the diff baseline — the \"before\" your changes are graded\nagainst. \"pin\" snapshots the repository and freezes it (no separate\n--generate needed), \"show\" reports what the current baseline\ndescribes, \"clear\" removes it. The baseline is stored per-repository,\nin that repo's output dir, so several repos each keep their own."},
 			{Flag: "check", Desc: "Grade what a change did to the architecture against the pinned\nbaseline, and exit with a code CI can act on:\n  0 clean · 1 regression · 2 error · 3 declined (not comparable)\nRead-only by default — nothing is written, and the baseline stays\nput, so it can be run as often as you like. Run\n\"" + bin.Name + " check --help\" for the flags."},
-			{Flag: "constraints", Desc: "Author the declared constraint vocabulary. \"lint\" parses each repo's\nenola-intent.yaml (and any cluster-config intent override), reports\nevery validation problem with its file context, and resolves each\ndeclared component against the current snapshot if one exists —\nso a selector that matches nothing is caught while authoring, not\nby a vacuously-passing rule. Exits 1 on validation problems.\n\"mine\" searches the snapshot's fact store for near-invariants and\nreports candidate rules with their evidence and named exceptions —\nproposals for review, never self-adopting law."},
+			{Flag: "constraints", Desc: "Author the declared constraint vocabulary. \"lint\" parses each repo's\nenola-intent.yaml (and any cluster-config intent override), reports\nevery validation problem with its file context, and resolves each\ndeclared component against the current snapshot if one exists —\nso a selector that matches nothing is caught while authoring, not\nby a vacuously-passing rule. Exits 1 on validation problems.\n\"mine\" searches the snapshot's fact store for near-invariants and\nreports candidate rules with their evidence and named exceptions —\nproposals for review, never self-adopting law.\n\"ledger\" reports how much of the law you already declared is being\nEXCUSED rather than obeyed — each rule's breaches beside the\nsuppressions and exemptions that signed them away, with every\nexcuse's owner and age. Evidence for judging a rule, never a gate."},
 			{Flag: "plan", Desc: "The pre-edit contract: which declared constraints govern an\nintended change (--paths, --symbols), its blast radius over the\ncurrent snapshot, and — for a --patch — the constraint verdicts\nthat WOULD appear, evaluated over a scratch copy BEFORE any edit\nlands in the tree. Nothing is written; a report, never a gate.\nRun \"" + bin.Name + " plan --help\" for the flags."},
 			{Flag: "coverage", Desc: "Report which cross-repo edges were resolved and which were not,\nper service — telling a genuinely isolated service apart from one\nwhose outbound edges could not be followed. Needs two or more\nrepositories in one graph. A report, not a gate: always exits 0."},
 			{Flag: "endpoint", Desc: "Report what changing an HTTP endpoint reaches: the controller\nserving it, the models that controller touches, the models\nassociated with those, the tables behind them, and the callers,\nincluding the frontend screen a calling route module implements.\nUse impact_analysis when you have a symbol; use this when what\nyou have is a URL."},
@@ -122,6 +137,7 @@ func DefaultHelp(bin Binary) HelpSpec {
 		},
 		ConfigDoc: "Path to the config file (default: mcp-arch.yaml). Set `repos:` in it to\n  name a multi-repo cluster; entries resolve relative to the config file, so\n  a checked-in cluster config means the same thing wherever it is run from.",
 		Examples: []Example{
+			{Comment: "Start the dashboard and open it (Ctrl-C to stop)", Command: bin.Name + " dashboard --open"},
 			{Comment: "Start MCP server with default config", Command: bin.Name},
 			{Comment: "Start MCP server with custom config", Command: bin.Name + " my-config.yaml"},
 			{Comment: "Generate a snapshot and exit", Command: bin.Name + " --generate"},
@@ -152,8 +168,8 @@ func DefaultHelp(bin Binary) HelpSpec {
 			{Comment: "Check version", Command: bin.Name + " --version"},
 		},
 		Sections: []Section{
+			dashboardSection(bin),
 			gateSection(bin),
-			dashboardSection(),
 			updatesSection(bin),
 			mcpConfigSection(bin),
 			buildSection(bin),
@@ -201,14 +217,20 @@ func gateSection(bin Binary) Section {
 
 // dashboardSection documents the read-only HTTP dashboard served alongside the
 // MCP server.
-func dashboardSection() Section {
+func dashboardSection(bin Binary) Section {
 	return Section{
 		Title: "DASHBOARD",
-		Body: `  When the MCP server starts, a read-only HTTP dashboard is served on a free
-  localhost port (127.0.0.1). It shows the same status data plus the snapshot and
-  graph receipts. Refresh it explicitly when you want updated data. Run "--status" while the server
-  is up to get its URL, or pass "--no-dashboard" to skip it entirely.
-`,
+		Body: fmt.Sprintf(`  Run "%s dashboard [repo_path|config_path]" to serve the latest snapshot
+  without starting an MCP server; add --open to launch the browser. It stays attached
+  to the terminal until Ctrl-C. The normal MCP
+  server also exposes the same read-only dashboard. Data refresh is explicit, so an
+  investigation is never interrupted. Run "--status" to find its URL, or pass
+  "--no-dashboard" to disable it.
+
+  In an interactive terminal, "--generate", "--refresh", and "check --write"
+  each print an "Explore this snapshot" command using "dashboard --open". CI,
+  redirected output, hooks, and ENOLA_NO_PROMPTS=1 suppress the hint.
+`, bin.Name),
 	}
 }
 

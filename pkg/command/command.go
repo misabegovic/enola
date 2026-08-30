@@ -18,13 +18,18 @@ package command
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/config"
+	"github.com/enola-labs/enola/internal/engine"
+	"github.com/enola-labs/enola/internal/updatecheck"
+	"github.com/enola-labs/enola/internal/version"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/cli"
+	"github.com/enola-labs/enola/pkg/dashboard"
 )
 
 // Runner runs the shared subcommands on behalf of one binary.
@@ -48,6 +53,58 @@ type Runner struct {
 	// plain OSS engine here. That is how `baseline pin` came to write a snapshot with a
 	// different explainer set than `--generate` on the same tree, from the same binary.
 	setup func(*bootstrap.Engine)
+	// dashboardOpts builds the options the standalone `dashboard` command serves with,
+	// so a wrapper's page is its own here as well as on its MCP server. See
+	// WithDashboard.
+	dashboardOpts func(*bootstrap.Engine) dashboard.Options
+	// extraInstructions and extraHooksNote are what a wrapper adds to the agent
+	// instructions `install` writes, so its own tools are named there. See
+	// WithInstructions.
+	extraInstructions string
+	extraHooksNote    string
+}
+
+// WithDashboard registers the dashboard options `dashboard` serves with. Returns the
+// Runner so it can be chained onto New.
+//
+// It exists for the same reason WithEngine does, one layer further out. This command
+// starts a dashboard of its OWN — a standalone one, without an MCP server — so a wrapper
+// that only passed its options to bootstrap's server got the plain OSS page here: OSS
+// title, no licensed panel, and, worse, no licensed entries in Options.InsightLabels.
+// That map is the page's admission list, so the dead-code, performance and
+// package-metrics findings the wrapper's own explainers had just computed were filtered
+// out of its own Insights modal. Licensed value, silently absent from the newest surface
+// that shows it.
+//
+// The callback takes the Engine because a wrapper's options are computed per engine (the
+// Package Metrics panel reads the live store); Tracker and StablePort are set by this
+// package afterwards and must not be set here — see Dashboard.
+func (r *Runner) WithDashboard(opts func(*bootstrap.Engine) dashboard.Options) *Runner {
+	r.dashboardOpts = opts
+	return r
+}
+
+// dashboardOptions is the options a dashboard this package starts is built from: the
+// wrapper's, when it registered any, and the OSS defaults otherwise.
+func (r *Runner) dashboardOptions(eng *bootstrap.Engine) dashboard.Options {
+	if r.dashboardOpts == nil {
+		return dashboard.Options{}
+	}
+	return r.dashboardOpts(eng)
+}
+
+// WithInstructions registers text appended to the agent instructions `install` writes,
+// and to the hooks note it adds under --hooks. Returns the Runner so it can be chained
+// onto New.
+//
+// install.Options has carried these two seams since it was written, for a wrapper that
+// serves tools this package cannot know about. Nothing reached them: `install` built its
+// Options here and left both empty, so a licensed binary wrote instruction files that
+// named only the OSS tools, and an agent in that repository had no way to learn its
+// licensed tools existed. Either string may be empty.
+func (r *Runner) WithInstructions(extra, hooksNote string) *Runner {
+	r.extraInstructions, r.extraHooksNote = extra, hooksNote
+	return r
 }
 
 // WithEngine registers a hook applied to every engine these commands construct. Returns
@@ -97,6 +154,40 @@ func (r *Runner) name() string {
 	return r.bin.Name
 }
 
+// buildVersion is the version of the binary running these commands — its own, not
+// enola's. See cli.Binary.Version for why the two differ in a wrapper.
+func (r *Runner) buildVersion() string {
+	if r.bin.Version == "" {
+		return version.Version
+	}
+	return r.bin.Version
+}
+
+// selfUpgrades reports whether this binary can replace itself in place, which is the
+// same question as whether it dispatches `upgrade`: cmd/enola passes it to New as its
+// own subcommand, and a wrapper — shipping through its own release path — does not.
+//
+// It gates the update notice as well as the suggested command, because the two are one
+// decision. The notice compares against ENOLA's release manifest, so in a wrapper it
+// would not merely name a command that does not exist: it would compare a version from
+// a different release stream against enola's and advertise the difference as an
+// upgrade. Silence is the only correct output there.
+//
+// Today the notice is suppressed in the wrapper by accident — updatecheck.Suppressed
+// reads internal/version, which no wrapper stamps, so it is permanently "dev". This
+// makes the intent explicit rather than a consequence of an unstamped variable, which
+// is the sort of thing that stops being true the moment somebody adds a -X flag.
+func (r *Runner) selfUpgrades() bool { return slices.Contains(r.own, "upgrade") }
+
+// updateNotice writes the "a newer enola is available" line, when there is one to write
+// and this binary is the one it is about. See selfUpgrades.
+func (r *Runner) updateNotice(w io.Writer) {
+	if !r.selfUpgrades() {
+		return
+	}
+	updatecheck.Fprint(w, engine.ExtractorVersion())
+}
+
 // Subcommands are the commands Dispatch handles. Exported so a binary's --help can be
 // checked against what it can actually run: the shared help documents all of these, and
 // a binary that advertises one it does not dispatch sends the caller into whatever its
@@ -105,7 +196,7 @@ func (r *Runner) name() string {
 // `upgrade` is deliberately absent. It is OSS-only — a wrapper ships through its own
 // release path — so cmd/enola dispatches it itself, before calling Dispatch.
 func Subcommands() []string {
-	return []string{"check", "constraints", "plan", "coverage", "endpoint", "doctor", "providers", "baseline", "log", "show", "diff", "blame", "gc", "history", "install", "uninstall", "hook"}
+	return []string{"check", "constraints", "plan", "coverage", "endpoint", "doctor", "providers", "dashboard", "baseline", "log", "show", "diff", "blame", "gc", "history", "install", "uninstall", "hook"}
 }
 
 // Dispatch runs the subcommand named by args[0], if it is one of Subcommands().
@@ -161,6 +252,9 @@ func (r *Runner) Dispatch(ctx context.Context, args []string) bool {
 		os.Exit(0)
 	case "providers":
 		r.Providers(ctx, args[1:])
+		os.Exit(0)
+	case "dashboard":
+		r.Dashboard(ctx, args[1:])
 		os.Exit(0)
 	case "baseline":
 		r.Baseline(args[1:])

@@ -1,19 +1,40 @@
-# enola - architectural regression testing for AI-assisted development
+# enola — architectural regression testing for AI-assisted development
 
 [![MCP Toplist](https://mcptoplist.com/badge/glama%2Fenola-labs%2Fenola.svg)](https://mcptoplist.com/server/glama%2Fenola-labs%2Fenola)
 [![CI](https://github.com/enola-labs/enola/actions/workflows/ci.yml/badge.svg)](https://github.com/enola-labs/enola/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/enola-labs/enola)](https://github.com/enola-labs/enola/releases)
 [![License](https://img.shields.io/github/license/enola-labs/enola)](LICENSE)
 
-**enola indexes your repository into a dependency graph, pins that graph before a change, and reports exactly what the change did to the structure - then exits `1` on the parts you said should fail.** What counts as worse is yours to state: out of the box nothing fails, and one flag turns a violated layer order, an undeclared cross-repo seam, or a change that spread outside the area you named into a broken build. Tree-sitter parsers and graph algorithms - no model, no embeddings, nothing leaves your machine.
+**Catch structural regressions that builds and tests cannot see:** new dependency cycles, violated layer boundaries, undeclared service dependencies, and changes that spread beyond their intended scope.
 
-Your agent reads the same graph over **MCP** - the protocol Claude Code, Cursor and Copilot use to plug in tools - so it knows what depends on what *before* it edits, and gets the verdict *after*, in time to fix its own regression.
+Enola maps your codebase before a change and compares it with the structure afterward. The result is about **this change** — not every problem already in the repository — and only the rules you choose can fail the build.
 
-**You never tell enola what your repository is.** It detects every language in the tree and indexes all of them into one graph, one baseline, one verdict - and the boundary worth grading is usually the one *between* them. On [Discourse](https://github.com/discourse/discourse) that is 66,497 Ruby facts beside 69,562 TypeScript/Ember ones, where the fifth-largest god class in the whole repository is the frontend's `ajax` module - 553 dependents, and its entire job is calling Rails. A Rails-only checker grades half that system and calls it the architecture.
+- **Exact, local measurement.** Parsed source and graph algorithms; no model, embeddings, upload, account, or license check.
+- **One graph across the repository.** [23 languages and formats](#supported-languages), detected automatically and combined into one baseline and verdict.
+- **One loop everywhere.** Your coding agent reads the graph before it edits and receives the verdict afterward; the same check runs from the CLI or in CI.
 
-[23 languages and formats](#supported-languages), detected rather than configured.
+**Documentation:** [Choose a guide by task](docs/README.md) · [CLI reference](docs/CLI.md) · [Architecture internals](ARCHITECTURE.md)
 
-Your agent adds a helper to `storage`, and the innermost layer of your app now reaches out to the outermost one to send an email. You run `enola check --fail-on=layers`:
+## Try it read-only
+
+After installing the one binary, run Enola against a repository you already have:
+
+```bash
+enola --explain /path/to/your/repo
+```
+
+No baseline, config file or MCP client. Nothing is written to disk. Enola prints the architecture it measured — patterns, cycles, layer violations, hotspots, blast radius and structural outliers — then exits.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/install.sh | sh
+enola --explain .
+```
+
+If that map looks right, regression testing is the same measurement with a *before* to compare against.
+
+## One change, one verdict
+
+A helper added to `storage` imports the delivery layer. The code builds and every test passes. The dependency now points against the layer order the repository declared:
 
 ```
 FAIL — 1 structural regression introduced.
@@ -25,7 +46,7 @@ Regressions (fail):
 Policy: fail on new findings from [layers] at confidence >= 1.00.
 ```
 
-Exit code `1`, so a commit hook or a CI job can stop there. That last line is the part worth reading twice: it is the policy **this run** enforced, not a fixed rule. enola shipped holding no opinion about your layers - it graded that crossing because you declared the order it crosses:
+Exit code `1` lets the agent fix the regression before it reports done, or lets a commit hook or CI stop it. Enola shipped with no opinion about your layers; it graded this crossing because the repository declared the order:
 
 ```yaml
 # enola-intent.yaml
@@ -35,26 +56,9 @@ layers:                          # outermost first
   - {name: storage,  paths: ["storage/**"]}
 ```
 
-Bound the *scope* as well - `--target=storage --max-spillover=0` - and the same command grades that too. The author said this change was about `storage`; it also edited `telemetry`, and that second regression has no finding behind it at all:
+[`examples/layers-gate/`](examples/layers-gate/) is the complete five-package example in one command. [What fails the build](#what-fails-the-build) explains every policy; [the full verdict](#what-the-verdict-tells-you) names the symbols and edges the change added.
 
-```
-FAIL — 2 structural regressions introduced.
-
-Measurements over threshold:
-  - [fail] 1 package(s) reached outside the declared scope
-
-Regressions (fail):
-  - [layers] 1.00 — Layer violation: storage -> delivery
-      import of notify
-
-Policy: fail on new findings from [layers] at confidence >= 1.00.
-```
-
-Both runs are [`examples/layers-gate/`](examples/layers-gate/) - five packages, one `./run.sh`, and the output above is what it prints.
-
-[What fails the build](#what-fails-the-build) is the full set and how to choose it. The [full output](#what-the-verdict-tells-you) names the symbols and edges the change added.
-
-## Quickstart
+## Quickstart: close the loop around a coding agent
 
 **1. Install the binary.** No Go toolchain, no C compiler - Linux, macOS (amd64/arm64) and Windows:
 
@@ -124,6 +128,14 @@ A report, not a gate - it always exits `0`. It is the fastest way to find out th
 - **whether your baseline still counts.** One pinned by a different enola version, or under different ignore rules, is not comparable - and nothing is graded against it until you re-pin.
 - **whether there is a newer release** - and specifically whether the **extractors** changed, which means your snapshots are missing facts a current build would find. `enola upgrade` installs it.
 
+**5. Explore the architecture visually.** Once a snapshot exists, open the read-only local dashboard:
+
+```bash
+enola dashboard --open
+```
+
+It stays attached to the terminal until you press Ctrl-C. The dashboard brings together architectural changes, the dependency map, findings, snapshot provenance, every active Enola session, lifetime activity, and extraction quality. If no snapshot exists yet, create one with `enola --generate`; repository data never leaves your machine. See the **[dashboard user guide](docs/DASHBOARD.md)** for a walkthrough of every tab.
+
 ### Not using an agent?
 
 The gate is a plain CLI. No MCP, no hooks, no config file:
@@ -136,51 +148,6 @@ enola check --fail-on=layers    # …and exit 1 on the part you named
 ```
 
 Same commands and same exit codes in CI, on every pull request. Every flag and all four exit codes: **[docs/CLI.md](docs/CLI.md)**.
-
-## Try it on your own repo, right now
-
-One read-only command, no baseline, no setup, nothing written to disk:
-
-```bash
-enola --explain /path/to/your/repo
-```
-
-On this repository that takes 252ms and prints, among other sections:
-
-```
-Architecture
-  Pattern:             declared (enola) (100% confidence)
-  cyclic dependencies         0
-  layer violations            0
-
-Impact analysis (hotspots)
-  coupled modules            38
-    high criticality         22
-    medium criticality       16
-  Top hotspots (by coupling):
-    module                            fan-in  fan-out crit     blast radius
-    internal/facts                       157        0 high     69
-    pkg/bootstrap                          8       50 high     4
-    pkg/command                            1       43 high     1
-    internal/engine                        7       27 high     7
-
-Code health
-  god classes (high fan-in)     25
-    internal/extractors/dotnetextractor.kindOf   51 dependents
-    internal/extractors/tsextractor.kindOf       46 dependents
-  call-graph hotspots        88
-    internal/extractors/kotlinextractor.astWalk… fan-in 8 / out 31
-```
-
-`declared (enola)` rather than a guess: this repository states its layer order in [`enola-intent.yaml`](enola-intent.yaml), so the report names the architecture you wrote down. On a repo that declares nothing you get the pattern enola recognised instead, at whatever confidence it earned.
-
-Reading that table: **fan-in** is how many imports point at a module, **fan-out** how many point out of it, and **blast radius** how many distinct modules a change there could reach, following imports backwards up to three hops. Ten files in one module importing yours is ten imports but one module, which is why fan-in is often the larger number.
-
-If those numbers look right for your codebase, the rest of enola is the same measurement with a `before` to compare against.
-
-<sub>Already looked at other code-graph tools? [How enola differs](#why-not-codegraph-graphify-or-codebase-memory-mcp), in one table.</sub>
-
----
 
 ## What the verdict tells you
 
@@ -349,6 +316,18 @@ enforced: --fail-on=layers (`enola check --help` lists all 17).
 
 The `--target` you declare is a claim about intent, and this is the gate holding you to it. Nothing here is a judgement about `telemetry` - the code may be perfectly good. It is a report that the change did something its own description didn't cover.
 
+## Limitations
+
+What enola does not do, and where each limit is documented in full.
+
+- enola models structure: modules, symbols, routes, storage, dependencies and the edges between them. It has no representation for runtime behaviour - a timeout, a retry budget, whether a message can be lost - and cannot report on any of it.
+- Of the eighteen explainers, only `cycles`, `intent`, `constraints` and a declared layer order produce findings at confidence `1.00`. That is the floor `check` gates at, so naming the others in `--fail-on` has no effect unless you also lower `--min-confidence`. See [docs/EXPLAINERS.md](docs/EXPLAINERS.md).
+- Most findings are advisory. Across the benchmark corpus, 96.3% of them could not fail a build under the default policy.
+- The gate grades the delta against a baseline, so pre-existing findings stay silent and a repository can carry them indefinitely while every check passes. Read the findings directly to pay down existing debt.
+- Outlier thresholds are computed per repository. A uniformly complex codebase produces few findings, and a clean check means the change introduced nothing new rather than that the repository is clean.
+- The graph has an explicit analysis scope and visible limits. Ignore rules define which files are included; each snapshot separately reports configured exclusions, parse failures and relationships that enola detected but could not resolve. Per-language extraction limits are documented in [docs/extraction/](docs/extraction/), and explainers that under-report say so in [docs/EXPLAINERS.md](docs/EXPLAINERS.md). [docs/BLIND-SPOTS.md](docs/BLIND-SPOTS.md) records how such gaps were found.
+- Confidence is comparable within an explainer but not across explainers, so enola does not rank findings or say what to fix first.
+
 ## Why not CodeGraph, graphify, or codebase-memory-mcp?
 
 Several open-source projects turn a repository into a queryable graph for an AI agent. They are well built and they optimize for different things:
@@ -461,24 +440,13 @@ It is silent for builds from source, never runs when `CI` is set, and turns off 
 
 ## Learn more
 
-**[docs/](docs/README.md)** is the map of everything below, one line per page.
-
-- **[docs/CLI.md](docs/CLI.md)** - setup, every command and flag, the exit codes, and the `--explain` report.
-- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** - reproducibility, delta precision, cross-repo coverage and scale, measured on 81 public repositories.
-- **[docs/SNAPSHOTS.md](docs/SNAPSHOTS.md)** - why enola computes a graph on demand and keeps it as an addressable snapshot, rather than maintaining one continuously-updated graph, and where the opposite choice is the right one.
-- **[docs/GLOSSARY.md](docs/GLOSSARY.md)** - the words enola uses in its own output - finding, baseline, receipt, coverage gap, incidental shift - defined in one place.
-- **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)** - what the eighteen explainers compute, why a derived finding you can trust is still not a verdict, and how a delta turns 9,131 findings about a corpus into the one that is about your change.
-- **[docs/RAILS.md](docs/RAILS.md)** - the Rails workflow end to end: index the app, bind the shipped convention recipes with one command, pin a baseline, and read a graded change - with the output each step actually prints.
-- **[docs/extraction/](docs/extraction/)** - per language, what specific code produces which facts, from committed fixtures, and what each extractor deliberately does not resolve.
-- **[docs/BLIND-SPOTS.md](docs/BLIND-SPOTS.md)** - what an agent cannot see: six specific, reproducible failures against five public codebases, each with the repository, the pinned commit, the command and the wrong answer, so you can re-run them. One of the six is a bug in enola itself.
-- **[docs/EXTENDING.md](docs/EXTENDING.md)** - teaching enola a connection it does not know: binders, cross-repo signals, and the `linking:` vocabulary that fixes a wrong edge from config rather than a patch.
-- **[docs/INTENT.md](docs/INTENT.md)** - declared intent: the `enola-intent.yaml` / cluster / `enola_intent:` frontmatter carriers, the closed vocabularies, what compiles, and how verdicts behave.
-- **[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md)** - a repository's law: components, the 21 rule forms, modes, exemptions, recipes bound in one command or written by hand, laws written in Ruby, and the pre-edit contract.
-- **[docs/PROVIDERS.md](docs/PROVIDERS.md)** - facts enola did not extract: the fail-closed provider seam, and the Rubydex, runtime and RBS/Sorbet providers.
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - the concept, the fact model, the pipeline, the MCP tool reference, and the value model.
-- **[CHANGELOG.md](CHANGELOG.md)** - every released version, newest first, with the headline it shipped under.
-- **[examples/](examples/)** - [`layers-gate/`](examples/layers-gate/) is the gate on five packages in one command; [`cross-repo/`](examples/cross-repo/) is the two-service demo. Plus ready-made per-language and multi-repo configs, a pre-commit hook and a CI workflow.
-- **[enola-action](https://github.com/enola-labs/enola-action)** - the GitHub Action: the same check on every pull request, as source annotations and an architecture delta in the job summary, with no baseline artifact to manage.
+- **[Documentation](docs/README.md)** — choose a guide by task.
+- **[Your first graded change](docs/FIRST-CHANGE.md)** — the loop end to end, on a module small enough to read.
+- **[Dashboard guide](docs/DASHBOARD.md)** — review changes visually, trace dependencies and verify snapshot provenance.
+- **[Architecture](ARCHITECTURE.md)** — the fact model, pipeline, graph, MCP tools and value model.
+- **[Changelog](CHANGELOG.md)** — every released version, newest first.
+- **[Examples](examples/)** — runnable gates, cross-repository analysis, configuration and CI workflows.
+- **[GitHub Action](https://github.com/enola-labs/enola-action)** — grade every pull request against its exact base.
 
 ## Found it useful?
 

@@ -278,6 +278,14 @@ type Verdict struct {
 	// headline on every outcome; see AttachCensus.
 	Census *Census `json:"census,omitempty"`
 
+	// Law is the declared law's excuse summary — how many rules are declared,
+	// how many breaches they raised, and how many of those were signed away by
+	// a suppression or an exemption. Reported, never graded: see AttachLedger
+	// for why a gate must not fail on its own unpopularity. Absent entirely
+	// when the repository declares no rules, because undeclared is unasked and
+	// a zeroed ledger would read as a clean bill of health.
+	Law *LedgerSummary `json:"law,omitempty"`
+
 	// Failures are the new findings that violated the policy.
 	Failures []facts.Insight `json:"failures,omitempty"`
 	// Advisories are new findings that did NOT violate it — reported so a clean exit
@@ -343,6 +351,17 @@ type Verdict struct {
 	Intersection *IntersectionGrading `json:"intersection_grading,omitempty"`
 
 	Guidance []constraints.GuidanceMatch `json:"guidance,omitempty"`
+
+	// Reviewers is who owns the modules this change touched, and who to route it to.
+	// Present only under --reviewers; nil otherwise, so the default verdict is
+	// unchanged and no author name is read unless someone asked for one.
+	//
+	// Never graded, for two independent reasons. It is derived from git history rather
+	// than from the code, so it moves while the architecture stands still — the one
+	// thing a delta gate cannot have in its verdict. And the contributor split under it
+	// is a correlation with defects measured on Windows Vista binaries, not a rule this
+	// repository declared, and enola fails only what was declared. See AttachReviewers.
+	Reviewers *Reviewers `json:"reviewers,omitempty"`
 
 	// ComparabilityWarnings is every warning, verbatim and in full. Not split by
 	// severity: diff.Comparability records kinds as a set rather than per-message, and

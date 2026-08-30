@@ -254,6 +254,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  Artifacts:   %d\n", len(snapshot.Artifacts))
 		fmt.Fprintf(os.Stderr, "  Duration:    %s\n", snapshot.Meta.Duration)
 		fmt.Fprintf(os.Stderr, "  Output:      %s\n", filepath.Join(repoPaths[len(repoPaths)-1], cfg.Output.Dir))
+		if cli.ShowDashboardHint(os.Stderr) {
+			printDashboardHint(os.Stderr, repoArg, cfgPath)
+		}
 		updatecheck.Fprint(os.Stderr, engine.ExtractorVersion())
 		memWatch.Report(os.Stderr, snapshot.Meta.FactCount)
 		os.Exit(0)
@@ -318,7 +321,7 @@ func main() {
 	}
 	tracker.PersistStartup()
 
-	if err := srv.Run(ctx); err != nil {
+	if err := srv.Run(ctx); err != nil && !isNormalServerShutdown(err) {
 		// Deregister explicitly: log.Fatalf exits without running deferred calls.
 		tracker.Close()
 		log.Fatalf("server error: %v", err)
@@ -327,6 +330,15 @@ func main() {
 	// A server run peaks while snapshotting on behalf of a tool call, so its watch
 	// spans the whole session and reports once on clean shutdown.
 	memWatch.Report(os.Stderr, factCount(eng))
+}
+
+// isNormalServerShutdown distinguishes the cancellation signal.NotifyContext
+// sends on Ctrl-C/SIGTERM from an actual transport failure. The MCP server
+// returns context.Canceled when that context closes; reporting it through
+// log.Fatalf made an orderly, fully-cleaned-up shutdown look like a crash and
+// exit with status 1.
+func isNormalServerShutdown(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 // startMemWatch pulls the memory-instrumentation flags off the argument list and,
@@ -398,6 +410,7 @@ func binary() cli.Binary {
 		Name:       "enola",
 		CmdPackage: "./cmd/enola",
 		VersionVar: "github.com/enola-labs/enola/internal/version.Version",
+		Version:    version.Version,
 	}
 }
 
@@ -515,4 +528,7 @@ func runRefresh(ctx context.Context, eng *bootstrap.Engine, cfg *config.Config, 
 	fmt.Fprintf(os.Stderr, "  Insights:    %d\n", snapshot.Meta.InsightCount)
 	fmt.Fprintf(os.Stderr, "  Duration:    %s\n", snapshot.Meta.Duration)
 	fmt.Fprintf(os.Stderr, "  Output:      %s\n", filepath.Join(last, cfg.Output.Dir))
+	if cli.ShowDashboardHint(os.Stderr) {
+		printDashboardHint(os.Stderr, repoArg, cfg.SourcePath)
+	}
 }

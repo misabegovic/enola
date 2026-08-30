@@ -7,6 +7,259 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.10 — 2026-08-28
+
+**Snapshot artifacts now have a documented, versioned contract**
+
+The three supported snapshot artifacts — `facts.jsonl`, `insights.json`, and
+`receipt.json` — are documented under `docs/schema/`. The reference covers their fields,
+fact and relation kinds, contract props, identity rules, and compatibility policy. CI
+verifies the documented field names and vocabularies.
+
+`receipt.json` now carries `format_version: 1`. Current writers add an `id` to every fact,
+derived from `(repo, kind, name, file)`. Relations carry `target_id` when enola can
+resolve the target without ambiguity, preferring candidates in the source fact's
+repository. Multiple fact records can share an ID when those four identity fields are
+equal.
+
+Insight evidence can carry `fact_id`. Evidence resolution uses `symbol` when present,
+otherwise `fact`, and uses `file` to narrow candidates. Unresolved relations and evidence
+remain unresolved rather than selecting an arbitrary fact. The MCP and on-disk forms of
+an empty insights array are now both `[]`.
+
+The schema documentation also corrects existing assumptions: `repo` is present on
+single-repository facts, `declares` points from a declared fact to its containing module,
+and `(repo, kind, name)` is not a uniqueness guarantee. It also documents optional route
+provenance, test and file reference relations, coupling kinds, cross-repository types,
+and messaging props.
+
+`docs/INTEGRATING.md` documents how to pin an enola release, run generation, validate the
+receipt, and load the artifacts into another store.
+
+`cacheVersion` remains `v257`, so existing extraction caches remain valid. Snapshot IDs
+change after upgrading because fact IDs are part of the serialized facts. Baselines
+containing the corrected insight evidence may report content-only changes; no findings
+are added or removed.
+
+## v0.4.9 — 2026-08-27
+
+**A dashboard you can start on its own, and a change routed to the people who own what it touched**
+
+`enola dashboard` serves the latest snapshot in the read-only local dashboard without
+also starting an MCP server, with `--open` to launch the browser. It regenerates
+nothing: a missing snapshot produces the generate-first guidance before any listener is
+bound, so no half-started process registers itself. The command stays attached to the
+terminal and stops on Ctrl-C — an earlier iteration of this release ran it in the
+background with `status` and `stop` subcommands, and that was withdrawn, because a
+server whose lifetime is the terminal's is the one nobody has to remember to clean up.
+A dashboard-only process registers as an active session like the MCP startup path does,
+so Activity does not report zero sessions while serving the very page a reader is
+looking at, and it installs no tool callback: this process answers no MCP calls, so its
+session count truthfully stays at zero. In an interactive terminal, `--generate`,
+`--refresh` and `check --write` each print one line pointing at `dashboard --open` for
+the path they just wrote; CI, redirected output, hooks and `ENOLA_NO_PROMPTS=1` suppress
+it. Ctrl-C on the MCP server no longer reports the cancellation as a server error and
+exits 1.
+
+`enola check --reviewers` reports, per module the change touched, who owns it and
+whether the author is a stranger to it while owning something that imports it. That
+pairing is the major-minor-dependency from Bird, Nagappan, Murphy, Gall and Devanbu,
+[*Don't Touch My Code!*](https://dl.acm.org/doi/10.1145/2025113.2025119) (ESEC/FSE
+2011), and spotting it needs the import graph rather than the commit log alone. It is
+never graded, is not in the snapshot, and is off by default: without the flag no git
+author name is read, computed or printed. The paper's 5% minor-contributor line is a
+correlation measured over Windows Vista binaries averaging some 900 commits, not a rule
+any repository declared, and a module needs five commits in the window before its shares
+are read as evidence of anything — measured on one open-source repository, the top
+major-minor-dependency was a module holding its 100% on a single drive-by edit.
+`--reviewer-window` sets how many recent commits authorship is measured over (500), and
+`--author` names whose change it is when git's identity is not the answer.
+
+Dated rules now grade by git blame rather than by the architecture history, which
+annotates them instead. The two answer different questions — whether a finding was
+present at the date, versus whether its witness line was last changed before it — and
+they disagree whenever an old breach's witness was renamed, moved or reformatted.
+Grading with the history made the verdict depend on a per-machine record: the same
+commit graded one way on a laptop holding a local history and another in a fresh CI
+clone. What decides a verdict has to be reproducible from the checkout. The history's
+better answer is still reported, and never subtracted from the failures.
+
+A repository-scoped extraction fact carries the repository's directory name in `File`
+rather than a path, and `changedFiles` handed it to callers that read `File` as
+something somebody edited. Reviewer routing and guidance then opened with a line about
+the root module, measured over the whole repository, on any change that moved an
+extractor's coverage counters. It is filtered in `changedFiles` rather than at the
+source, since `File` is part of a fact's identity in every snapshot and diff.
+
+A wrapper binary now reports its own version. `pkg/command` read `internal/version`,
+which only enola's own release stamps, so a wrapper said "dev" in three places at once:
+`doctor`, the SARIF driver it uploads under, and its dashboard instance record.
+`cli.Binary` carries the version, and whether a binary can upgrade itself is derived
+from the subcommands it dispatches for itself rather than from a new field — `upgrade`
+being in that list already is the question. That also gates the update notice, since the
+release manifest describes enola releases and measuring another version series against
+it would report the distance between two unrelated streams as an upgrade.
+
+Six of the seventeen subcommands — `log`, `show`, `diff`, `blame`, `gc` and `history`,
+which is the whole of the architecture-history feature — had been absent from the CLI
+reference for as long as they existed, with every other check in the repository passing.
+A docslint test now ties the command table in `docs/CLI.md` to what the binary actually
+dispatches, in both directions, matching on the table's command column rather than
+anywhere in the prose, because a bare `log` or `diff` occurs in ordinary English on
+nearly every page. `docs/DASHBOARD.md` and `docs/FIRST-CHANGE.md` are new, clusters and
+constraints gained the sections their pages assumed, and the README was cut back.
+`govulncheck` moves to v1.7.0: the pin has a floor as well as a ceiling, and v1.1.4
+carried a type checker predating this module's `go` directive, refusing all 126 packages
+with an error that reads nothing like a vulnerability report — the job stayed red while
+reporting on nothing.
+
+`cacheVersion` stays at `v257`. Nothing re-extracts, and a pinned baseline does not
+churn.
+
+## v0.4.8 — 2026-08-25
+
+**Declared dependencies become facts, and the gate reports how much of the law is excused**
+
+A `manifests` extractor reads `go.mod`, `package.json`, `Gemfile`, `Cargo.toml`,
+`pubspec.yaml`, `requirements.txt` and `pyproject.toml`, emitting one fact per direct
+dependency named by its Package URL, carrying the constraint as written, the version a
+lockfile resolved it to, and whether it is pinned. Transitive entries are skipped: the
+closure runs to tens of thousands of nodes, and top-level is the boundary the Cyber
+Resilience Act draws for the products it covers from 11 December 2027.
+`enola-intent.yaml` gains a `dependencies:` section with a mandatory `purpose:`, and the
+`intent` explainer diffs it against the manifests — a measured package nothing declares
+verdicts at `1.0`, a declared package no manifest carries at `0.8`, since a removed
+dependency and an extraction miss look the same from here. The rule is H14 from Stanislav
+Rumega's position paper [*Tell Your Coding Agent to Work as an Architect
+First*](https://github.com/styrumg/Architect-First-Article): every external dependency
+declared, pinned, and given a stated purpose.
+
+`pinned` is three-valued. True when a lockfile resolved the package or the constraint
+names one version, false when no lockfile resolved a range, and absent — with
+`unresolved_lock` naming the file — when a lockfile enola cannot read sits at or above the
+manifest. Answering `false` in that third case reported 12 of one TypeScript monorepo's
+dependencies as unpinned when its root `yarn.lock` pins every one of them. A `where:`
+selector on `pinned` does not select an unanswered package.
+
+Six public repositories corrected the parsers. Cargo's `[dependencies.name]` table form
+was skipped entirely, and an async runtime declares its Windows dependency only under
+`[target.'cfg(windows)'.dependencies.…]`, so reading the list form alone lost the
+dependency rather than its version. Lockfiles are searched for at or above the manifest,
+nearest first, because a monorepo keeps one at the workspace root and a manifest in every
+package. `yarn.lock` is read in both its formats, and `uv.lock` and `poetry.lock` in the
+one they share with `Cargo.lock`. A PEP 621 `dependencies` array is read as quoted spans
+rather than split on commas: a comment line interrupting the array became a package, 33 of
+them in one Python project, and a single requirement containing commas was split into
+fragments. PEP 508 direct references and PEP 503 name normalisation came from the same
+corpus. That Python project went from 103 packages with 46 unpinned to 90 with 5; the four
+repositories measured against independently parsed manifests now match exactly.
+
+`enola check` prints the declared law's excuse rate as one line beside its census line and
+carries a `law` object in `--format json`. `enola constraints ledger` prints the per-rule
+table: breaches, the suppressions and exemptions that excused them, each excuse's owner
+and age, and the ones that matched nothing in this snapshot. Both read the owner, reason
+and date the two carriers already required. It is a report and changes no exit code.
+`kind: dependency` is opt-in for components, as `test_ref` and `lint` are, so a rule that
+does not name it judges what it judged before, and the shipped `supply-chain` recipe needs
+no new rule form.
+
+`cacheVersion` moves to `v257`: every repository re-extracts once, and one whose manifests
+enola reads gains facts, so a pinned baseline churns once.
+
+## v0.4.7 — 2026-08-25
+
+**Layers scored per language cohort, and a built-in provider that stops building the facts the configuration throws away**
+
+The layers explainer recognised one architecture per repository and scored every taxonomy
+over the whole tree. A taxonomy now declares the languages it may classify and is scored
+over that cohort alone; selection runs strongest first and skips a taxonomy whose cohort
+another has already claimed, so an ungated one yields rather than competing everywhere. A
+repository running two layer orders reports both, with the strongest kept beside them so
+the JSON shape does not move. Violation titles carry the taxonomy name, because two
+cohorts can produce the same layer pair — that changes finding identity, so a pinned
+baseline churns once.
+
+Three classes of false positive are gone. Dependency-injection and configuration packages
+are classified but placed in no direction, since every layer both uses them and is used by
+them, and matching now prefers an unordered layer, so a wiring directory nested inside an
+ordered one no longer inherits the enclosing layer — `core/data/…/data/di` read as data
+before. `android-clean` orders data innermost, per Android's own guidance, while
+`ios-clean` keeps the opposite order on purpose: the two disagree about which way domain
+and data depend, and neither is wrong. The Rails autoload rule stopped claiming `app/`
+children Rails does not autoload, which is where front-end applications live. And `core`
+left the hexagonal domain patterns, because it names a container rather than a layer: one
+platform keeping its product under `src/Core/` had 1,049 of its 1,491 classified modules
+read as domain on that segment alone, and 339 findings followed.
+
+`php-layered`, `nuxt` and `sveltekit` are new — the PHP one gated on the language, since
+there is no single PHP framework, the other two built from the frameworks' own prescribed
+directory structures. Python, Rust, Swift, the routers/services/models Go layout and .NET
+were each measured and deliberately left out, with what was measured recorded beside the
+taxonomy table: three share no vocabulary that holds across unrelated repositories, one
+would re-rank every `services` package on the evidence of a single example, and the .NET
+repository that looks layered is the trap — a media server whose `MediaBrowser.Controller`
+is its domain abstractions assembly, which dotted-name matching would read as fifty modules
+of delivery. Confidence drops the coverage term whose denominator was the layer table
+rather than the repository, and its floor applies to the pattern that won rather than at
+admission, where it had dropped a thin framework-gated match and handed the repository to
+an ungated hexagonal one.
+
+Explainers stated their numbers in prose and every caller parsed them back out of the
+title. An insight now carries `Metrics` beside its description, shaped like a fact's props;
+layers publishes its denominators, conformance counts and layer order for recognised and
+declared patterns alike, which is what lets the digest serve a repository that states its
+own architecture rather than one recognised for it. Metrics mirrors rather than replaces:
+the numbers stay in the prose the diff gate reads.
+
+That digest is bounded now. Its repository map was one unbounded row per module, so a large
+repository spent all 64,000 characters on an alphabetical census and the architecture
+section was never reached. Above a row cap the map summarises by area, entry points group
+by kind, routes by path prefix, storage by kind and dependency edges by out-degree, and no
+one section may take more than its share of the budget — a section over its share is
+truncated, not dropped. A large monolith's digest went from 64,000 characters holding two
+sections to 28,000 holding ten, with no truncation left to do.
+
+The provider seam drops facts about files the repository's ignore globs exclude, because
+a provider walks the tree itself and cannot know what the configuration leaves out. That
+holds for an external provider, a separate process handed a repository path. A built-in
+runs in the engine's own address space, and its input already carries the predicate.
+
+Rubydex is a built-in, and on a Rails monolith it built 2,155,664 facts so the seam
+could discard 1,520,163 of them, each one named, located, given a relation, appended to
+a slice growing into the millions and sorted with the rest. Collection now takes the
+predicate: an excluded document is skipped before its definitions are read, and an
+excluded reference before its fact is built. The census names both counts, so what the
+exclusions cost stays visible rather than disappearing quietly. Same configuration, same
+globs, 440 seconds before and 193 after, with 1,800,829 facts byte-for-byte identical.
+Indexing is untouched — vendored gems and engine directories are still handed to the
+indexer, because that is what lets a workspace constant resolve to a declaration outside
+it. Indexing is how the graph resolves; emission is what enters it.
+
+The provider work is [Muhamed Isabegović](https://github.com/misabegovic)'s.
+
+## v0.4.6 — 2026-08-24
+
+**A constant reference is never its own predecessor**
+
+Fixed: a Ruby prefix walk that could not terminate. The walk steps back over the
+segments written before a leaf on its line, so that `Foo::VERSION` reports `VERSION` as
+the dependency and `Foo` as the path it was named through, and it found the previous
+segment by comparing columns alone. A reference spanning several lines carries an end
+column belonging to its last line, and when that number plus the separator happened to
+equal its own start column, the reference was returned as its own predecessor and the
+walk went round forever. One reference does this on a Rails monolith; the provider was
+killed at 26 minutes holding 6.7GB with nothing written, on a tree the engine indexes in
+24 seconds. A second Rails application hung the same way. A candidate now qualifies only
+when it is a different reference ending on the line the walk is on, which is what the
+adjacency pass twenty lines earlier already asserts.
+
+Two things ride along: the walk appends and reverses once instead of allocating a new
+slice at every step, and a declaration's name is fetched across the library boundary
+once rather than per reference — that monolith resolves 1,624,360 references to 132,603
+declarations. Facts are byte-for-byte identical where both builds complete.
+
+This release is the work of [Muhamed Isabegović](https://github.com/misabegovic).
+
 ## v0.4.5 — 2026-08-23
 
 **The verdict where CI reads it, provider facts cached, and detection that stops re-walking the tree**
@@ -450,4 +703,3 @@ A release remains a GitHub draft until binaries and checksums exist for every su
 ## v0.0.1
 
 **First public release**
-
