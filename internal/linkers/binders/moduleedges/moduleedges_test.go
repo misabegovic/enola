@@ -1,0 +1,258 @@
+package moduleedges
+
+import (
+	"context"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/enola-labs/enola/internal/facts"
+)
+
+func module(name string) facts.Fact {
+	return facts.Fact{Kind: facts.KindModule, Name: name, File: name, Repo: "app",
+		Props: map[string]any{"language": "ruby"}}
+}
+
+func symbol(name, file string, relations ...facts.Relation) facts.Fact {
+	return facts.Fact{Kind: facts.KindSymbol, Name: name, File: file, Repo: "app",
+		Props: map[string]any{"language": "ruby", "symbol_kind": "method"}, Relations: relations}
+}
+
+func calls(targets ...string) []facts.Relation {
+	out := make([]facts.Relation, 0, len(targets))
+	for _, t := range targets {
+		out = append(out, facts.Relation{Kind: facts.RelCalls, Target: t})
+	}
+	return out
+}
+
+func derivedEdges(store *facts.Store) map[string]int {
+	out := map[string]int{}
+	for _, f := range store.ByKind(facts.KindDependency) {
+		if f.PropString(DerivedProp) != derivedFromSymbols {
+			continue
+		}
+		for _, r := range f.Relations {
+			if r.Kind == facts.RelImports {
+				weight, _ := f.Props[WeightProp].(int)
+				out[strings.TrimPrefix(f.Name, "module-edge: ")] = weight
+				_ = r
+			}
+		}
+	}
+	return out
+}
+
+// A call whose target resolves to a symbol in another directory is a module
+// edge, weighted by how many symbol edges stand behind it. A call inside one
+// directory is not an edge, a call naming no known symbol derives nothing,
+// and a test directory contributes none.
+func TestBind_ResolvedSymbolEdgesBecomeWeightedModuleEdges(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("app/services"), module("app/models"), module("app/jobs"), module("spec/services"),
+		symbol("Reports::Build#call", "app/services/reports/build.rb", calls("Order#total", "Order#lines", "Reports::Build#collect", "vanished_helper")...),
+		symbol("Reports::Build#collect", "app/services/reports/build.rb"),
+		symbol("Order#total", "app/models/order.rb", calls("ImportJob#perform")...),
+		symbol("Order#lines", "app/models/order.rb"),
+		symbol("ImportJob#perform", "app/jobs/import_job.rb"),
+		symbol("Reports::BuildSpec#test", "spec/services/reports/build_spec.rb", calls("Reports::Build#call")...),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	got := derivedEdges(store)
+	if got["app/services -> app/models"] != 2 {
+		t.Errorf("two calls into app/models are one edge of weight two: %v", got)
+	}
+	if got["app/models -> app/jobs"] != 1 {
+		t.Errorf("single call edge missing: %v", got)
+	}
+	names := make([]string, 0, len(got))
+	for name := range got {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) != 2 {
+		t.Fatalf("a same-directory call, an unresolved name and a spec directory derive nothing: %v", names)
+	}
+}
+
+// A pair an extractor already connected keeps the extractor's edge: this
+// fills the gap where nobody emitted one, it does not restate what was read.
+func TestBind_PairsAnExtractorConnectedAreLeftAlone(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("src/api"), module("src/core"),
+		facts.Fact{Kind: facts.KindDependency, Name: "src/api/client.ts", File: "src/api/client.ts", Repo: "app",
+			Props:     map[string]any{"language": "typescript"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/core"}}},
+		symbol("ApiClient.fetch", "src/api/client.ts", calls("CoreThing.read")...),
+		symbol("CoreThing.read", "src/core/thing.ts"),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	if got := derivedEdges(store); len(got) != 0 {
+		t.Fatalf("the extractor already connected this pair: %v", got)
+	}
+}
+
+// A directory name is repo-relative and names collide across repositories, so
+// a call whose target sits in another repository derives nothing: that seam is
+// the cross-repo linker's, measured rather than inferred from a shared name.
+func TestBind_CallsIntoAnotherRepositoryDeriveNothing(t *testing.T) {
+	store := facts.NewStore()
+	other := func(f facts.Fact) facts.Fact { f.Repo = "sibling"; return f }
+	store.Add(
+		module("app/services"),
+		other(module("app/models")),
+		symbol("Reports::Build#call", "app/services/reports/build.rb", calls("Order#total")...),
+		other(symbol("Order#total", "app/models/order.rb")),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	if got := derivedEdges(store); len(got) != 0 {
+		t.Fatalf("a cross-repository call must derive no module edge: %v", got)
+	}
+}
+
+func injects(targets ...string) []facts.Relation {
+	out := make([]facts.Relation, 0, len(targets))
+	for _, t := range targets {
+		out = append(out, facts.Relation{Kind: facts.RelInjects, Target: t})
+	}
+	return out
+}
+
+// A constructor-injected collaborator is how a dependency is declared under a DI
+// container, and there is frequently no call or import edge beside it: the
+// container does the constructing. The pair must reach the module layer, under the
+// same guards as every other relation — a target naming no known symbol derives
+// nothing, and one inside the same directory is not an edge.
+func TestBind_InjectedCollaboratorsBecomeModuleEdges(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("app/controllers"), module("app/services"), module("app/models"),
+		symbol("UsersController", "app/controllers/users_controller.rb",
+			injects("UserService", "AuditService", "UsersController#helper", "ContainerRegisteredThing")...),
+		symbol("UsersController#helper", "app/controllers/users_controller.rb"),
+		symbol("UserService", "app/services/user_service.rb"),
+		symbol("AuditService", "app/services/audit_service.rb"),
+		symbol("Order", "app/models/order.rb"),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	edges := derivedEdges(store)
+	if got, ok := edges["app/controllers -> app/services"]; !ok || got != 2 {
+		t.Errorf("injection edges = %v, want app/controllers -> app/services weighted 2", edges)
+	}
+	if _, ok := edges["app/controllers -> app/controllers"]; ok {
+		t.Error("an injection inside one directory is not a module edge")
+	}
+	if _, ok := edges["app/controllers -> app/models"]; ok {
+		t.Error("derived an edge for an injected name no symbol declares")
+	}
+}
+
+// The pair an extractor already stated stays the extractor's. An injection that
+// merely restates an import must not appear twice in the module graph.
+func TestBind_InjectionDoesNotRestateAnExtractorEdge(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("app/controllers"), module("app/services"),
+		facts.Fact{Kind: facts.KindDependency, Name: "app/controllers/users_controller.rb", File: "app/controllers/users_controller.rb", Repo: "app",
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "app/services"}}},
+		symbol("UsersController", "app/controllers/users_controller.rb", injects("UserService")...),
+		symbol("UserService", "app/services/user_service.rb"),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if edges := derivedEdges(store); len(edges) != 0 {
+		t.Errorf("restated an edge the extractor already carries: %v", edges)
+	}
+}
+
+// Binding twice derives once. A store that already carries this binder's
+// derivations (an append turn, a restored baseline replay) must not gain a
+// second copy of each edge: the existing-pair check cannot see a prior
+// derived edge, whose File is the module itself, so the binder drops its own
+// prior work before deriving.
+func TestBind_IsIdempotentOverItsOwnPriorDerivations(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("app/services"), module("app/models"),
+		symbol("Reports::Build#call", "app/services/reports/build.rb", calls("Order#total")...),
+		symbol("Order#total", "app/models/order.rb"),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	first := derivedEdges(store)
+	if len(first) != 1 {
+		t.Fatalf("precondition: one derived edge, got %v", first)
+	}
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	if got := derivedEdges(store); len(got) != len(first) {
+		t.Fatalf("a second Bind doubled the derivations: %v -> %v", first, got)
+	}
+	if n := store.CountByRepo("app"); n != 5 {
+		t.Fatalf("facts after two binds = %d, want 5 (4 given + 1 derived once)", n)
+	}
+}
+
+// Two repositories carrying the same symbol name must derive the same edges
+// whatever order their facts arrive in. Keyed by name alone, the last repo read
+// owned the name, so a union read in a different order (a baseline replay puts
+// its re-read member at the tail) derived different edges from identical facts
+// and diffed against its own pin.
+func TestBind_SharedSymbolNamesResolveWithinTheirOwnRepository(t *testing.T) {
+	build := func(reverse bool) map[string]int {
+		other := func(f facts.Fact) facts.Fact { f.Repo = "sibling"; return f }
+		ours := []facts.Fact{
+			module("app/services"), module("app/models"),
+			symbol("Reports::Build#call", "app/services/reports/build.rb", calls("Order#total")...),
+			symbol("Order#total", "app/models/order.rb"),
+		}
+		theirs := []facts.Fact{
+			other(module("app/services")), other(module("lib/billing")),
+			other(symbol("Invoice#issue", "app/services/invoice.rb", calls("Order#total")...)),
+			other(symbol("Order#total", "lib/billing/order.rb")),
+		}
+		store := facts.NewStore()
+		if reverse {
+			store.Add(theirs...)
+			store.Add(ours...)
+		} else {
+			store.Add(ours...)
+			store.Add(theirs...)
+		}
+		if err := New().Bind(context.Background(), store); err != nil {
+			t.Fatal(err)
+		}
+		return derivedEdges(store)
+	}
+	forward, backward := build(false), build(true)
+	if len(forward) != 2 {
+		t.Fatalf("each repository resolves Order#total in its own module: %v", forward)
+	}
+	keysF, keysB := make([]string, 0, len(forward)), make([]string, 0, len(backward))
+	for k := range forward {
+		keysF = append(keysF, k)
+	}
+	for k := range backward {
+		keysB = append(keysB, k)
+	}
+	sort.Strings(keysF)
+	sort.Strings(keysB)
+	if strings.Join(keysF, ",") != strings.Join(keysB, ",") {
+		t.Fatalf("derivation depends on fact order:\n forward  %v\n backward %v", keysF, keysB)
+	}
+}

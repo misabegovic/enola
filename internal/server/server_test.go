@@ -1,0 +1,2018 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/enola-labs/enola/internal/config"
+	"github.com/enola-labs/enola/internal/engine"
+	"github.com/enola-labs/enola/internal/facts"
+)
+
+func TestReadSourceWindow(t *testing.T) {
+	// Create a 10-line temp file
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.go")
+	var lines []string
+	for i := 1; i <= 10; i++ {
+		lines = append(lines, "line "+string(rune('0'+i)))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name         string
+		centerLine   int
+		contextLines int
+		wantStart    int
+		wantEnd      int
+	}{
+		// Asymmetric window: 1/4 before, 3/4 after the center line.
+		// context=6 → before=1, after=5: 5-1=4 to 5+5=10
+		{"center middle", 5, 6, 4, 10},
+		// context=10 → before=2, after=8: 1-2=-1→1 to 1+8=9
+		{"center at start", 1, 10, 1, 9},
+		// context=10 → before=2, after=8: 10-2=8 to 10+8=18→10
+		{"center at end", 10, 10, 8, 10},
+		// context=20 → before=5, after=15: 5-5=0→1 to 5+15=20→10
+		{"context larger than file", 5, 20, 1, 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readSourceWindow(path, tt.centerLine, tt.contextLines)
+			if err != nil {
+				t.Fatalf("readSourceWindow: %v", err)
+			}
+
+			outputLines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+
+			// Verify first line starts with expected line number
+			firstLine := outputLines[0]
+			if !strings.Contains(firstLine, "│") {
+				t.Fatalf("expected line number format with │, got: %s", firstLine)
+			}
+
+			// Count output lines
+			expectedCount := tt.wantEnd - tt.wantStart + 1
+			if len(outputLines) != expectedCount {
+				t.Errorf("got %d output lines, want %d (lines %d-%d)",
+					len(outputLines), expectedCount, tt.wantStart, tt.wantEnd)
+			}
+		})
+	}
+}
+
+func TestReadSourceWindow_SingleLineFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "single.go")
+	if err := os.WriteFile(path, []byte("only line"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readSourceWindow(path, 1, 30)
+	if err != nil {
+		t.Fatalf("readSourceWindow: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Errorf("expected 1 line for single-line file, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "only line") {
+		t.Errorf("expected output to contain 'only line', got: %s", lines[0])
+	}
+}
+
+func TestReadSourceWindow_LineNumberFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.go")
+	if err := os.WriteFile(path, []byte("a\nb\nc\nd\ne"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readSourceWindow(path, 3, 4)
+	if err != nil {
+		t.Fatalf("readSourceWindow: %v", err)
+	}
+
+	// Should have format "   N│ content"
+	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
+		if !strings.Contains(line, "│") {
+			t.Errorf("line missing │ separator: %q", line)
+		}
+	}
+}
+
+// --- test helpers ---
+
+// newEngineWithSnapshot creates an engine with a fake snapshot pointing at the given repo path.
+func newEngineWithSnapshot(repoPath string) *engine.Engine {
+	cfg := config.Default()
+	eng, _ := engine.New(cfg)
+	eng.SetSnapshot(&facts.Snapshot{
+		Meta: facts.SnapshotMeta{RepoPath: repoPath},
+	})
+	return eng
+}
+
+// --- explore helper tests ---
+
+// newTestServer creates a Server with a pre-populated fact store for testing explore methods.
+func newTestServer(store *facts.Store) *Server {
+	return &Server{}
+}
+
+func populateTestStore() *facts.Store {
+	store := facts.NewStore()
+	store.Add(
+		// Module
+		facts.Fact{Kind: facts.KindModule, Name: "internal/server", Props: map[string]any{"language": "go", "package": "server"}},
+		// Symbols declared in that module
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/server.New", File: "internal/server/server.go", Line: 26,
+			Props:     map[string]any{"symbol_kind": "function", "exported": true, "language": "go"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "internal/server"}}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/server.Run", File: "internal/server/server.go", Line: 45,
+			Props:     map[string]any{"symbol_kind": "method", "exported": true, "language": "go"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "internal/server"}, {Kind: facts.RelCalls, Target: "internal/engine.Store"}}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/server.handleQuery", File: "internal/server/handler.go", Line: 10,
+			Props:     map[string]any{"symbol_kind": "function", "exported": false, "language": "go"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "internal/server"}, {Kind: facts.RelCalls, Target: "internal/facts.Store.Query"}}},
+		// Another module
+		facts.Fact{Kind: facts.KindModule, Name: "internal/facts", Props: map[string]any{"language": "go", "package": "facts"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/facts.Store.Query", File: "internal/facts/store.go", Line: 105,
+			Props:     map[string]any{"symbol_kind": "method", "exported": true, "language": "go"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "internal/facts"}}},
+		// Dependency
+		facts.Fact{Kind: facts.KindDependency, Name: "internal/server -> internal/facts", File: "internal/server/server.go",
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "internal/facts"}}},
+		// Symbol in a different directory
+		facts.Fact{Kind: facts.KindSymbol, Name: "cmd.main", File: "cmd/main.go", Line: 1,
+			Props: map[string]any{"symbol_kind": "function", "exported": false, "language": "go"}},
+	)
+	return store
+}
+
+func TestExploreModule(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreModule(store, "internal/server", 1, modeSummary, &sb)
+	if !found {
+		t.Fatal("exploreModule should find 'internal/server'")
+	}
+
+	output := sb.String()
+
+	// Should contain the module header
+	if !strings.Contains(output, "# Module: internal/server") {
+		t.Error("missing module header")
+	}
+	// Should list symbols
+	if !strings.Contains(output, "internal/server.New") {
+		t.Error("missing symbol New")
+	}
+	if !strings.Contains(output, "internal/server.Run") {
+		t.Error("missing symbol Run")
+	}
+	if !strings.Contains(output, "internal/server.handleQuery") {
+		t.Error("missing symbol handleQuery")
+	}
+	// Should show dependents (who imports internal/server -> none in test data)
+	// Should show the symbols table
+	if !strings.Contains(output, "Symbols (3)") {
+		t.Error("missing symbols count")
+	}
+}
+
+func TestExploreModule_NestedModules(t *testing.T) {
+	// A directory module ("src/app") with only one directly-declared symbol, but
+	// many symbols in nested child modules. exploreModule must surface the subtree
+	// so the nested symbols are discoverable, not just the one direct symbol.
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "src/app", File: "src/app",
+			Props: map[string]any{"language": "typescript"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/app.Layout", File: "src/app/layout.tsx", Line: 1,
+			Props:     map[string]any{"symbol_kind": "function", "exported": true, "language": "typescript"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "src/app"}}},
+		// Nested module: src/app/dashboard
+		facts.Fact{Kind: facts.KindModule, Name: "src/app/dashboard", File: "src/app/dashboard",
+			Props: map[string]any{"language": "typescript"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/app/dashboard.Page", File: "src/app/dashboard/page.tsx", Line: 1,
+			Props:     map[string]any{"symbol_kind": "function", "exported": true, "language": "typescript"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "src/app/dashboard"}}},
+		// Deeper nested module: src/app/dashboard/settings
+		facts.Fact{Kind: facts.KindModule, Name: "src/app/dashboard/settings", File: "src/app/dashboard/settings",
+			Props: map[string]any{"language": "typescript"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/app/dashboard/settings.Page", File: "src/app/dashboard/settings/page.tsx", Line: 1,
+			Props:     map[string]any{"symbol_kind": "function", "exported": true, "language": "typescript"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "src/app/dashboard/settings"}}},
+		// Another immediate child: src/app/admin
+		facts.Fact{Kind: facts.KindModule, Name: "src/app/admin", File: "src/app/admin",
+			Props: map[string]any{"language": "typescript"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/app/admin.Page", File: "src/app/admin/page.tsx", Line: 1,
+			Props:     map[string]any{"symbol_kind": "function", "exported": true, "language": "typescript"},
+			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "src/app/admin"}}},
+	)
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreModule(store, "src/app", 1, modeSummary, &sb)
+	if !found {
+		t.Fatal("exploreModule should find 'src/app'")
+	}
+	output := sb.String()
+
+	// Nested-modules section with the 2 immediate children.
+	if !strings.Contains(output, "## Nested modules (2)") {
+		t.Errorf("missing nested modules section; got:\n%s", output)
+	}
+	// Aggregate covers all 3 nested modules and 3 nested symbols (dashboard,
+	// dashboard/settings, admin), not just the direct one.
+	if !strings.Contains(output, "Subtree: 3 modules, 3 symbols") {
+		t.Errorf("missing/incorrect subtree aggregate; got:\n%s", output)
+	}
+	// Immediate children listed; dashboard has a descendant so it shows a count.
+	if !strings.Contains(output, "src/app/dashboard (2 modules)") {
+		t.Errorf("expected dashboard child with descendant count; got:\n%s", output)
+	}
+	if !strings.Contains(output, "- src/app/admin\n") {
+		t.Errorf("expected admin child listed; got:\n%s", output)
+	}
+}
+
+func TestExploreModule_NotFound(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreModule(store, "nonexistent", 1, modeSummary, &sb)
+	if found {
+		t.Error("exploreModule should return false for nonexistent module")
+	}
+}
+
+func TestExploreModule_Depth2(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreModule(store, "internal/server", 2, modeCompact, &sb)
+	if !found {
+		t.Fatal("exploreModule should find 'internal/server'")
+	}
+
+	output := sb.String()
+	// Depth 2 in compact/full mode keeps the per-symbol relations section.
+	if !strings.Contains(output, "Symbol Relations") {
+		t.Error("depth=2 should include Symbol Relations section")
+	}
+	// Should show the calls relation from Run
+	if !strings.Contains(output, "internal/engine.Store") {
+		t.Error("depth=2 should show call targets")
+	}
+}
+
+func TestExploreModule_DependsOnAndImplements(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		// A Ruby-style packwerk module with depends_on relations.
+		facts.Fact{Kind: facts.KindModule, Name: "packages/orders",
+			Props: map[string]any{"language": "ruby", "framework": "rails", "packwerk": true},
+			Relations: []facts.Relation{
+				{Kind: facts.RelDependsOn, Target: "packages/payments"},
+				{Kind: facts.RelDependsOn, Target: "packages/users"},
+			}},
+		// Target modules.
+		facts.Fact{Kind: facts.KindModule, Name: "packages/payments",
+			Props: map[string]any{"language": "ruby"},
+			Relations: []facts.Relation{
+				{Kind: facts.RelDependsOn, Target: "packages/orders"},
+			}},
+		facts.Fact{Kind: facts.KindModule, Name: "packages/users",
+			Props: map[string]any{"language": "ruby"}},
+		// A dependency fact with implements (mixin).
+		facts.Fact{Kind: facts.KindDependency, Name: "Order -> Cacheable",
+			File: "packages/orders/app/models/order.rb",
+			Relations: []facts.Relation{
+				{Kind: facts.RelImplements, Target: "Cacheable"},
+			}},
+	)
+
+	srv := newTestServer(store)
+	var sb strings.Builder
+	found := srv.exploreModule(store, "packages/orders", 1, modeSummary, &sb)
+	if !found {
+		t.Fatal("exploreModule should find 'packages/orders'")
+	}
+
+	output := sb.String()
+
+	// Should render depends_on section with packwerk dependencies.
+	if !strings.Contains(output, "### Depends_on") {
+		t.Error("missing Depends_on subsection")
+	}
+	if !strings.Contains(output, "packages/payments") {
+		t.Error("missing depends_on target packages/payments")
+	}
+	if !strings.Contains(output, "packages/users") {
+		t.Error("missing depends_on target packages/users")
+	}
+
+	// Should render implements section with mixin.
+	if !strings.Contains(output, "### Implements") {
+		t.Error("missing Implements subsection")
+	}
+	if !strings.Contains(output, "Cacheable") {
+		t.Error("missing implements target Cacheable")
+	}
+
+	// Should render dependents (packages/payments depends_on packages/orders).
+	if !strings.Contains(output, "## Dependents") {
+		t.Error("missing Dependents section")
+	}
+	if !strings.Contains(output, "packages/payments") {
+		t.Error("packages/payments should appear as a dependent")
+	}
+}
+
+func TestExploreFile(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreFile(store, "internal/server/server.go", 1, &sb)
+	if !found {
+		t.Fatal("exploreFile should find 'internal/server/server.go'")
+	}
+
+	output := sb.String()
+	if !strings.Contains(output, "# File: internal/server/server.go") {
+		t.Error("missing file header")
+	}
+	// Should list the symbols in this file (New, Run) and the dependency
+	if !strings.Contains(output, "internal/server.New") {
+		t.Error("missing symbol New")
+	}
+	if !strings.Contains(output, "internal/server.Run") {
+		t.Error("missing symbol Run")
+	}
+}
+
+func TestExploreFile_NotFound(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreFile(store, "nonexistent.go", 1, &sb)
+	if found {
+		t.Error("exploreFile should return false for nonexistent file")
+	}
+}
+
+func TestExploreSymbol(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreSymbol(store, "Store.Query", 1, &sb)
+	if !found {
+		t.Fatal("exploreSymbol should find 'Store.Query'")
+	}
+
+	output := sb.String()
+	if !strings.Contains(output, "# Symbol: Store.Query") {
+		t.Error("missing symbol header")
+	}
+	if !strings.Contains(output, "internal/facts/store.go") {
+		t.Error("missing file reference")
+	}
+	// Should include Referenced By section (handleQuery calls it)
+	if !strings.Contains(output, "Referenced By") {
+		t.Error("missing Referenced By section")
+	}
+	if !strings.Contains(output, "internal/server.handleQuery") {
+		t.Error("missing caller handleQuery in Referenced By")
+	}
+}
+
+func TestExploreSymbol_NotFound(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreSymbol(store, "NonExistentSymbol", 1, &sb)
+	if found {
+		t.Error("exploreSymbol should return false for nonexistent symbol")
+	}
+}
+
+func TestExploreDirectory(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreDirectory(store, "internal/server", &sb)
+	if !found {
+		t.Fatal("exploreDirectory should find 'internal/server'")
+	}
+
+	output := sb.String()
+	if !strings.Contains(output, "# Directory: internal/server") {
+		t.Error("missing directory header")
+	}
+	if !strings.Contains(output, "Summary") {
+		t.Error("missing Summary section")
+	}
+}
+
+func TestExploreDirectory_NotFound(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreDirectory(store, "nonexistent/dir", &sb)
+	if found {
+		t.Error("exploreDirectory should return false for nonexistent directory")
+	}
+}
+
+// --- normalizeToRelative tests ---
+
+func TestNormalizeToRelative_AbsolutePath(t *testing.T) {
+	srv := &Server{
+		eng: newEngineWithSnapshot("/Users/me/development"),
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"absolute subdir", "/Users/me/development/go-service", "go-service"},
+		{"absolute file", "/Users/me/development/go-service/lib/foo.rb", "go-service/lib/foo.rb"},
+		{"absolute repo root", "/Users/me/development", "."},
+		{"already relative", "internal/server", "internal/server"},
+		{"unrelated absolute", "/other/path/foo", "/other/path/foo"},
+		{"empty string", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := srv.normalizeToRelative(tt.input)
+			if got != tt.want {
+				t.Errorf("normalizeToRelative(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeToRelative_MultiRepo(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"go-service":    "/Users/me/development/go-service",
+		"ruby-monolith": "/Users/me/development/ruby-monolith",
+	})
+	srv := &Server{eng: eng}
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"multi-repo go-service dir", "/Users/me/development/go-service", "go-service"},
+		{"multi-repo go-service file", "/Users/me/development/go-service/lib/foo.rb", "go-service/lib/foo.rb"},
+		{"multi-repo ruby-monolith file", "/Users/me/development/ruby-monolith/lib/bar.rb", "ruby-monolith/lib/bar.rb"},
+		{"unrelated absolute", "/other/path/foo", "/other/path/foo"},
+		{"relative passthrough", "internal/server", "internal/server"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := srv.normalizeToRelative(tt.input)
+			if got != tt.want {
+				t.Errorf("normalizeToRelative(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- Integration tests: original reported use cases ---
+
+// TestScenario_QueryFactsWithFilePrefixCrossRepo simulates the first reported issue:
+// query_facts with file_prefix like "go-service/..." or "ruby-monolith/..." returned nothing.
+func TestScenario_QueryFactsWithFilePrefixCrossRepo(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/development/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"go-service":    "/Users/me/development/go-service",
+		"ruby-monolith": "/Users/me/development/ruby-monolith",
+	})
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+
+	// Simulate repo A facts (go-service) - files prefixed as in append mode
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "Pricing", File: "go-service/lib/pricing.rb", Repo: "go-service",
+			Props: map[string]any{"language": "ruby"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "PricingService", File: "go-service/lib/pricing_service.rb", Line: 5, Repo: "go-service",
+			Props:     map[string]any{"symbol_kind": "class", "exported": true, "language": "ruby"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "CoreUtils"}}},
+		facts.Fact{Kind: facts.KindDependency, Name: "go-service -> ruby-monolith", File: "go-service/lib/pricing_service.rb", Repo: "go-service",
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "ruby-monolith"}}},
+	)
+
+	// Simulate repo B facts (ruby-monolith)
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "Core", File: "ruby-monolith/lib/core.rb", Repo: "ruby-monolith",
+			Props: map[string]any{"language": "ruby"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "CoreUtils", File: "ruby-monolith/lib/utils.rb", Line: 10, Repo: "ruby-monolith",
+			Props: map[string]any{"symbol_kind": "class", "exported": true, "language": "ruby"}},
+	)
+
+	// Test 1: query_facts with file_prefix "go-service" should find go-service facts
+	results, total := store.QueryAdvanced(facts.QueryOpts{FilePrefix: "go-service"})
+	if total != 3 {
+		t.Errorf("file_prefix=go-service: total=%d, want 3", total)
+	}
+	for _, f := range results {
+		if !strings.HasPrefix(f.File, "go-service") {
+			t.Errorf("unexpected file %q in go-service results", f.File)
+		}
+	}
+
+	// Test 2: query_facts with file_prefix "ruby-monolith" should find ruby-monolith facts
+	_, total = store.QueryAdvanced(facts.QueryOpts{FilePrefix: "ruby-monolith"})
+	if total != 2 {
+		t.Errorf("file_prefix=ruby-monolith: total=%d, want 2", total)
+	}
+
+	// Test 3: repo filter should work
+	_, total = store.QueryAdvanced(facts.QueryOpts{Repo: "go-service"})
+	if total != 3 {
+		t.Errorf("repo=go-service: total=%d, want 3", total)
+	}
+
+	// Test 4: normalize absolute path to file_prefix
+	normalized := srv.normalizeToRelative("/Users/me/development/go-service/lib")
+	if normalized != "go-service/lib" {
+		t.Errorf("normalize(/Users/me/development/go-service/lib) = %q, want go-service/lib", normalized)
+	}
+	_, total = store.QueryAdvanced(facts.QueryOpts{FilePrefix: normalized})
+	if total != 3 {
+		t.Errorf("normalized file_prefix: total=%d, want 3 (module + symbol + dep all in go-service/lib/)", total)
+	}
+}
+
+// TestScenario_ExploreWithAbsolutePathCrossRepo simulates the second reported issue:
+// explore with focus "/Users/.../go-service" returned "No facts matching focus".
+func TestScenario_ExploreWithAbsolutePathCrossRepo(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"go-service":    "/Users/me/development/go-service",
+		"ruby-monolith": "/Users/me/development/ruby-monolith",
+	})
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "PricingService", File: "go-service/lib/pricing_service.rb", Line: 5, Repo: "go-service",
+			Props: map[string]any{"symbol_kind": "class", "exported": true}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "CoreUtils", File: "ruby-monolith/lib/utils.rb", Line: 10, Repo: "ruby-monolith",
+			Props: map[string]any{"symbol_kind": "class", "exported": true}},
+	)
+
+	// Test: explore with absolute path to go-service repo root
+	focus := srv.normalizeToRelative("/Users/me/development/go-service")
+	t.Logf("normalized focus: %q", focus)
+
+	var sb strings.Builder
+	found := srv.exploreDirectory(store, focus, &sb)
+	if !found {
+		t.Errorf("exploreDirectory should find facts for normalized focus %q", focus)
+	}
+	output := sb.String()
+	if !strings.Contains(output, "PricingService") {
+		t.Errorf("explore output should contain PricingService, got:\n%s", output)
+	}
+
+	// Test: explore with absolute path to ruby-monolith repo root
+	focus = srv.normalizeToRelative("/Users/me/development/ruby-monolith")
+	t.Logf("normalized focus: %q", focus)
+
+	sb.Reset()
+	found = srv.exploreDirectory(store, focus, &sb)
+	if !found {
+		t.Errorf("exploreDirectory should find facts for normalized focus %q", focus)
+	}
+	output = sb.String()
+	if !strings.Contains(output, "CoreUtils") {
+		t.Errorf("explore output should contain CoreUtils, got:\n%s", output)
+	}
+
+	// Test: explore with absolute path to subdirectory
+	focus = srv.normalizeToRelative("/Users/me/development/go-service/lib")
+	if focus != "go-service/lib" {
+		t.Errorf("normalized subdir = %q, want go-service/lib", focus)
+	}
+
+	sb.Reset()
+	found = srv.exploreDirectory(store, focus, &sb)
+	if !found {
+		t.Errorf("exploreDirectory should find facts for subdir focus %q", focus)
+	}
+}
+
+// TestScenario_ExploreSingleRepoAbsolutePath tests the single-repo case where
+// someone passes the repo root as an absolute path to explore.
+func TestScenario_ExploreSingleRepoAbsolutePath(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/development/go-service")
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+	// Use Go-style names with dots — these would be falsely matched if "."
+	// were used as a substring query on symbol names.
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "pricing.Service", File: "lib/pricing_service.go", Line: 5,
+			Props: map[string]any{"symbol_kind": "struct", "exported": true}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "pricing.Calculator", File: "lib/price_calculator.go", Line: 10,
+			Props: map[string]any{"symbol_kind": "struct", "exported": true}},
+	)
+
+	// Normalize the exact repo root
+	focus := srv.normalizeToRelative("/Users/me/development/go-service")
+	t.Logf("single-repo root normalized to: %q", focus)
+
+	// Raw exploreSymbol WOULD match "." as substring of "pricing.Service" etc.
+	// This is the bug we're guarding against at the handler level.
+	var sb strings.Builder
+	rawSymbolMatch := srv.exploreSymbol(store, focus, 1, &sb)
+	if !rawSymbolMatch {
+		t.Log("(note: exploreSymbol didn't match — names may not contain dots)")
+	} else {
+		t.Log("exploreSymbol falsely matches '.' — handler switch must prevent this")
+	}
+
+	// The handler-level fix: exploreDirectory handles "." as repo root.
+	// In the explore switch, "." routes directly to exploreDirectory, skipping exploreSymbol.
+	sb.Reset()
+	found := srv.exploreDirectory(store, focus, &sb)
+	if !found {
+		t.Errorf("exploreDirectory should handle %q as repo root", focus)
+	}
+	output := sb.String()
+	if !strings.Contains(output, "pricing.Service") {
+		t.Errorf("root directory explore should contain pricing.Service, got:\n%s", output)
+	}
+	// Verify it's a directory-style output (not a symbol dump)
+	if !strings.Contains(output, "Directory:") {
+		t.Error("root explore should produce Directory-style output")
+	}
+
+	// Normalize a subdirectory - should work
+	focus = srv.normalizeToRelative("/Users/me/development/go-service/lib")
+	if focus != "lib" {
+		t.Errorf("normalized subdir = %q, want lib", focus)
+	}
+
+	sb.Reset()
+	found = srv.exploreDirectory(store, focus, &sb)
+	if !found {
+		t.Errorf("exploreDirectory should find facts for focus %q", focus)
+	}
+	output = sb.String()
+	if !strings.Contains(output, "pricing.Service") {
+		t.Errorf("should contain pricing.Service, got:\n%s", output)
+	}
+
+	// Normalize a specific file path
+	focus = srv.normalizeToRelative("/Users/me/development/go-service/lib/pricing_service.go")
+	if focus != "lib/pricing_service.go" {
+		t.Errorf("normalized file = %q, want lib/pricing_service.go", focus)
+	}
+
+	sb.Reset()
+	found = srv.exploreFile(store, focus, 1, &sb)
+	if !found {
+		t.Errorf("exploreFile should find facts for focus %q", focus)
+	}
+}
+
+// TestScenario_FirstRepoNoAppendThenAppend simulates the exact reported issue:
+// 1. generate_snapshot(repo_path="/path/ruby-monolith") — no append, facts have Repo: ""
+// 2. generate_snapshot(repo_path="/path/go-service", append=true)
+// 3. query_facts(repo: "ruby-monolith") should return results (retroactively tagged)
+func TestScenario_FirstRepoNoAppendThenAppend(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/development/ruby-monolith")
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+
+	// Step 1: Simulate facts from "ruby-monolith" (the first non-append snapshot).
+	// These facts have Repo: "" and unprefixed file paths — exactly like
+	// what GenerateSnapshot produces without append.
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "Core", File: "lib/core.rb",
+			Props: map[string]any{"language": "ruby"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "CoreUtils", File: "lib/utils.rb", Line: 10,
+			Props: map[string]any{"symbol_kind": "class", "exported": true, "language": "ruby"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "CoreLogger", File: "lib/logger.rb", Line: 1,
+			Props: map[string]any{"symbol_kind": "class", "exported": true, "language": "ruby"}},
+	)
+
+	// In the new flow, SetRepoRange is called right after extraction even in
+	// non-append mode, so Repo is already set.
+	store.SetRepoRange(0, "ruby-monolith")
+
+	// Verify: repo filter works immediately (before any append)
+	_, total := store.QueryAdvanced(facts.QueryOpts{Repo: "ruby-monolith"})
+	if total != 3 {
+		t.Errorf("before append: repo=ruby-monolith should return 3, got %d", total)
+	}
+
+	// Step 2: Simulate entering append mode.
+	// TagUntagged retroactively prefixes file paths for facts that already
+	// have Repo set but lack the file prefix.
+	prevLabel := "ruby-monolith" // filepath.Base("/Users/me/development/ruby-monolith")
+	tagged := store.TagUntagged(prevLabel, prevLabel+"/")
+	t.Logf("retroactively prefixed %d facts with file prefix %q", tagged, prevLabel+"/")
+
+	if tagged != 3 {
+		t.Errorf("expected 3 file paths prefixed, got %d", tagged)
+	}
+
+	// Now add go-service facts (simulating what TagRange does)
+	preCount := store.Count()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "PricingService", File: "lib/pricing_service.rb", Line: 5,
+			Props:     map[string]any{"symbol_kind": "class", "exported": true, "language": "ruby"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "CoreUtils"}}},
+	)
+	store.TagRange(preCount, "go-service", "go-service/")
+
+	// Step 3: Verify both repos are now queryable
+
+	// repo: "ruby-monolith" should now return results
+	results, total := store.QueryAdvanced(facts.QueryOpts{Repo: "ruby-monolith"})
+	if total != 3 {
+		t.Errorf("repo=ruby-monolith: total=%d, want 3", total)
+	}
+	for _, f := range results {
+		if f.Repo != "ruby-monolith" {
+			t.Errorf("expected Repo=ruby-monolith, got %q for %s", f.Repo, f.Name)
+		}
+	}
+
+	// repo: "go-service" should return results
+	_, total = store.QueryAdvanced(facts.QueryOpts{Repo: "go-service"})
+	if total != 1 {
+		t.Errorf("repo=go-service: total=%d, want 1", total)
+	}
+
+	// file_prefix: "ruby-monolith" should work (files are now ruby-monolith/lib/...)
+	_, total = store.QueryAdvanced(facts.QueryOpts{FilePrefix: "ruby-monolith/"})
+	if total != 3 {
+		t.Errorf("file_prefix=ruby-monolith/: total=%d, want 3", total)
+	}
+
+	// file_prefix: "go-service" should work
+	_, total = store.QueryAdvanced(facts.QueryOpts{FilePrefix: "go-service/"})
+	if total != 1 {
+		t.Errorf("file_prefix=go-service/: total=%d, want 1", total)
+	}
+
+	// explore with absolute path to ruby-monolith should resolve
+	focus := srv.normalizeToRelative("/Users/me/development/ruby-monolith")
+	t.Logf("normalized focus for ruby-monolith: %q", focus)
+
+	// In multi-repo mode, normalizeToRelative should find ruby-monolith in repoPaths
+	eng.SetRepoPaths(map[string]string{
+		"ruby-monolith": "/Users/me/development/ruby-monolith",
+		"go-service":    "/Users/me/development/go-service",
+	})
+	focus = srv.normalizeToRelative("/Users/me/development/ruby-monolith")
+	t.Logf("normalized focus for ruby-monolith (with repoPaths): %q", focus)
+	if focus != "ruby-monolith" {
+		t.Errorf("expected focus=ruby-monolith, got %q", focus)
+	}
+
+	var sb strings.Builder
+	found := srv.exploreDirectory(store, focus, &sb)
+	if !found {
+		t.Errorf("exploreDirectory should find facts for focus %q", focus)
+	}
+	output := sb.String()
+	if !strings.Contains(output, "CoreUtils") {
+		t.Errorf("explore output should contain CoreUtils, got:\n%s", output)
+	}
+	if !strings.Contains(output, "CoreLogger") {
+		t.Errorf("explore output should contain CoreLogger, got:\n%s", output)
+	}
+}
+
+// --- exploreModuleSubstring tests ---
+
+func TestExploreModuleSubstring_SingleMatch(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	// "server" should substring-match "internal/server" (the only module containing "server")
+	found := srv.exploreModuleSubstring(store, "server", 1, modeSummary, &sb)
+	if !found {
+		t.Fatal("exploreModuleSubstring should find a module matching 'server'")
+	}
+
+	output := sb.String()
+	// Single match delegates to full exploreModule rendering
+	if !strings.Contains(output, "# Module: internal/server") {
+		t.Errorf("expected full module exploration, got:\n%s", output)
+	}
+}
+
+func TestExploreModuleSubstring_MultipleMatches(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	// "internal" should substring-match both "internal/server" and "internal/facts"
+	found := srv.exploreModuleSubstring(store, "internal", 1, modeSummary, &sb)
+	if !found {
+		t.Fatal("exploreModuleSubstring should find modules matching 'internal'")
+	}
+
+	output := sb.String()
+	if !strings.Contains(output, "Modules matching") {
+		t.Errorf("expected disambiguation summary, got:\n%s", output)
+	}
+	if !strings.Contains(output, "internal/server") {
+		t.Error("should list internal/server")
+	}
+	if !strings.Contains(output, "internal/facts") {
+		t.Error("should list internal/facts")
+	}
+	if !strings.Contains(output, "Narrow with") {
+		t.Error("should tell the caller how to narrow the match")
+	}
+}
+
+func TestExploreModuleSubstring_NoMatch(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreModuleSubstring(store, "nonexistent", 1, modeSummary, &sb)
+	if found {
+		t.Error("exploreModuleSubstring should return false for nonexistent")
+	}
+}
+
+// --- expandFilePrefix tests ---
+
+func TestExpandFilePrefix_SingleRepo(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/development/myrepo")
+	srv := &Server{eng: eng}
+
+	// No repoPaths set — single repo mode. Should pass through.
+	prefixes := srv.expandFilePrefix("src/")
+	if len(prefixes) != 1 || prefixes[0] != "src/" {
+		t.Errorf("single-repo: expected [src/], got %v", prefixes)
+	}
+}
+
+func TestExpandFilePrefix_MultiRepoExpands(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"golf-ui": "/Users/me/development/golf-ui",
+		"golf":    "/Users/me/development/golf",
+	})
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "AuthForm", File: "golf-ui/src/components/Auth.tsx", Repo: "golf-ui"},
+		facts.Fact{Kind: facts.KindSymbol, Name: "LoginPage", File: "golf-ui/src/pages/login.tsx", Repo: "golf-ui"},
+		facts.Fact{Kind: facts.KindModule, Name: "internal/auth", File: "golf/internal/auth/auth.go", Repo: "golf"},
+	)
+
+	// "src/" doesn't start with a repo label — should expand to "golf-ui/src/"
+	prefixes := srv.expandFilePrefix("src/")
+	if len(prefixes) != 1 || prefixes[0] != "golf-ui/src/" {
+		t.Errorf("expected [golf-ui/src/], got %v", prefixes)
+	}
+
+	// "internal/" should expand to "golf/internal/"
+	prefixes = srv.expandFilePrefix("internal/")
+	if len(prefixes) != 1 || prefixes[0] != "golf/internal/" {
+		t.Errorf("expected [golf/internal/], got %v", prefixes)
+	}
+}
+
+func TestExpandFilePrefix_AlreadyPrefixed(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"golf-ui": "/Users/me/development/golf-ui",
+	})
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "AuthForm", File: "golf-ui/src/Auth.tsx", Repo: "golf-ui"},
+	)
+
+	// Already prefixed — should pass through unchanged.
+	prefixes := srv.expandFilePrefix("golf-ui/src/")
+	if len(prefixes) != 1 || prefixes[0] != "golf-ui/src/" {
+		t.Errorf("already-prefixed: expected [golf-ui/src/], got %v", prefixes)
+	}
+}
+
+func TestExpandFilePrefix_Empty(t *testing.T) {
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	srv := &Server{eng: eng}
+
+	prefixes := srv.expandFilePrefix("")
+	if len(prefixes) != 1 || prefixes[0] != "" {
+		t.Errorf("empty: expected [\"\"], got %v", prefixes)
+	}
+}
+
+// --- exploreFile fallback tests ---
+
+func TestExploreFile_RepoLabelFallback(t *testing.T) {
+	// Simulate multi-repo mode where files are stored with repo-label prefix.
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"golf-ui": "/Users/me/development/golf-ui",
+		"golf":    "/Users/me/development/golf",
+	})
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/stores.useAuthStore", File: "golf-ui/src/stores/authStore.ts", Line: 5, Repo: "golf-ui",
+			Props: map[string]any{"symbol_kind": "function", "exported": true, "language": "typescript"}},
+		facts.Fact{Kind: facts.KindModule, Name: "src/stores/authStore", File: "golf-ui/src/stores/authStore.ts", Repo: "golf-ui",
+			Props: map[string]any{"language": "typescript"}},
+	)
+
+	// Bare path without repo label — should fall back to golf-ui/src/stores/authStore.ts
+	var sb strings.Builder
+	found := srv.exploreFile(store, "src/stores/authStore.ts", 1, &sb)
+	if !found {
+		t.Fatal("exploreFile should find 'src/stores/authStore.ts' via repo-label fallback")
+	}
+	output := sb.String()
+	if !strings.Contains(output, "golf-ui/src/stores/authStore.ts") {
+		t.Errorf("expected resolved file path in output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "useAuthStore") {
+		t.Error("expected useAuthStore symbol in output")
+	}
+}
+
+func TestExploreFile_ExtensionFallback(t *testing.T) {
+	// Simulate multi-repo mode where user omits the file extension.
+	eng := newEngineWithSnapshot("/Users/me/workspace")
+	eng.SetRepoPaths(map[string]string{
+		"golf-ui": "/Users/me/development/golf-ui",
+	})
+	srv := &Server{eng: eng}
+
+	store := eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/stores.useAuthStore", File: "golf-ui/src/stores/authStore.ts", Line: 5, Repo: "golf-ui",
+			Props: map[string]any{"symbol_kind": "function", "exported": true}},
+	)
+
+	// No extension + no repo label — should try "src/stores/authStore" + ".ts" + "golf-ui/" prefix
+	var sb strings.Builder
+	found := srv.exploreFile(store, "src/stores/authStore", 1, &sb)
+	if !found {
+		t.Fatal("exploreFile should find 'src/stores/authStore' via extension + repo-label fallback")
+	}
+	output := sb.String()
+	if !strings.Contains(output, "golf-ui/src/stores/authStore.ts") {
+		t.Errorf("expected resolved file path in output, got:\n%s", output)
+	}
+}
+
+func TestExploreFile_ExtensionFallback_SingleRepo(t *testing.T) {
+	// Single-repo mode — extension guessing should still work without repo labels.
+	srv := newTestServer(nil)
+
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/server.New", File: "internal/server/server.go", Line: 26,
+			Props: map[string]any{"symbol_kind": "function", "exported": true}},
+	)
+
+	// Without extension — should try "internal/server/server" + ".go"
+	var sb strings.Builder
+	found := srv.exploreFile(store, "internal/server/server", 1, &sb)
+	if !found {
+		t.Fatal("exploreFile should find 'internal/server/server' via .go extension fallback")
+	}
+	output := sb.String()
+	if !strings.Contains(output, "internal/server/server.go") {
+		t.Errorf("expected resolved file path, got:\n%s", output)
+	}
+}
+
+func TestExploreFile_NoFallbackNeeded(t *testing.T) {
+	// Exact match — no fallback should be needed.
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	var sb strings.Builder
+	found := srv.exploreFile(store, "internal/server/server.go", 1, &sb)
+	if !found {
+		t.Fatal("exploreFile should find exact match")
+	}
+	output := sb.String()
+	if !strings.Contains(output, "# File: internal/server/server.go") {
+		t.Error("exact match should use original focus in header")
+	}
+}
+
+func TestShowSymbol_PrefersExactMatch(t *testing.T) {
+	// Simulate the show_symbol handler's lookup logic:
+	// exact match via LookupByExactName should take priority over substring.
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "Transaction",
+			File: "models/transaction.rb", Line: 5,
+			Props: map[string]any{"symbol_kind": "class", "language": "ruby"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "AutoTransactionsTogglePatch",
+			File: "initializers/patches.rb", Line: 8,
+			Props: map[string]any{"symbol_kind": "interface", "language": "ruby"}},
+		// A non-symbol fact named "Transaction" should be ignored.
+		facts.Fact{Kind: facts.KindStorage, Name: "Transaction",
+			File:  "models/transaction.rb",
+			Props: map[string]any{"storage_kind": "model"}},
+	)
+
+	// Replicate the handler's resolution: exact match, filter to symbols.
+	results := store.LookupByExactName("Transaction")
+	var symbolResults []facts.Fact
+	for _, r := range results {
+		if r.Kind == facts.KindSymbol {
+			symbolResults = append(symbolResults, r)
+		}
+	}
+
+	if len(symbolResults) != 1 {
+		t.Fatalf("expected 1 symbol result, got %d", len(symbolResults))
+	}
+	if symbolResults[0].Name != "Transaction" {
+		t.Errorf("expected exact match 'Transaction', got %q", symbolResults[0].Name)
+	}
+	if symbolResults[0].File != "models/transaction.rb" {
+		t.Errorf("expected file models/transaction.rb, got %q", symbolResults[0].File)
+	}
+
+	// Substring search would return both -- verify the exact path avoids this.
+	substring := store.Query("symbol", "", "Transaction", "")
+	if len(substring) < 2 {
+		t.Errorf("substring search should match at least 2 symbols, got %d", len(substring))
+	}
+}
+
+// --- resolveNodeName / nameResolution tests ---
+
+// populateAmbiguousStore builds a store with several modules that share the
+// "svc-beta" prefix plus a symbol, modeling the real-world ambiguity the
+// resolution object addresses. Note "cmd/svc-beta" has the basename "svc-beta",
+// so the term "svc-beta" is a tier-1 (suffix-exact) hit on it and resolves
+// confidently; use a pure-substring term like "beta" to exercise refusal.
+func populateAmbiguousStore() *facts.Store {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "cmd/svc-beta", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "cmd/svc-beta-consumer", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "cmd/svc-beta-asynq", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "cmd/svc-beta-filters", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "cmd/svc-beta-task", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "cmd/svc-beta-asynq.jobServerResources",
+			File: "cmd/svc-beta-asynq/main.go", Line: 12,
+			Props: map[string]any{"symbol_kind": "function", "language": "go"}},
+	)
+	return store
+}
+
+func TestResolveNodeName_ExactMatch(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	name, res, err := srv.resolveNodeName(store, "internal/server")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "internal/server" {
+		t.Errorf("matched = %q, want internal/server", name)
+	}
+	if res != nil {
+		t.Errorf("expected nil resolution for exact match, got %+v", res)
+	}
+}
+
+func TestResolveNodeName_SingleSubstring(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	// "handleQuery" substring-matches exactly one fact.
+	name, res, err := srv.resolveNodeName(store, "handleQuery")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "internal/server.handleQuery" {
+		t.Errorf("matched = %q, want internal/server.handleQuery", name)
+	}
+	if res != nil {
+		t.Errorf("expected nil resolution for single substring match, got %+v", res)
+	}
+}
+
+func TestResolveNodeName_ConfidentSuffixExact(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	// "Query" hits internal/facts.Store.Query and internal/server.handleQuery,
+	// but only the former's last segment equals "Query" — a confident pick that is
+	// auto-resolved, with the resolution surfaced (Matched + high confidence) for
+	// transparency rather than silently.
+	name, res, err := srv.resolveNodeName(store, "Query")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "internal/facts.Store.Query" {
+		t.Errorf("matched = %q, want internal/facts.Store.Query", name)
+	}
+	if res == nil || res.Matched != "internal/facts.Store.Query" {
+		t.Fatalf("expected an auto-pick resolution naming the match, got %+v", res)
+	}
+	if !res.AutoPicked {
+		t.Error("a confident unique-suffix pick should be marked AutoPicked")
+	}
+	if res.Confidence <= autoPickConfidence {
+		t.Errorf("confidence = %v, want > %v", res.Confidence, autoPickConfidence)
+	}
+}
+
+func TestResolveNodeName_AmbiguousBelowThreshold(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "svc-foo", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "svc-bar", Props: map[string]any{"language": "go"}},
+	)
+	srv := newTestServer(store)
+
+	// "svc" matches both modules (2, below threshold) with no suffix winner.
+	name, res, err := srv.resolveNodeName(store, "svc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name == "" {
+		t.Fatal("expected a best-guess match below threshold, got empty")
+	}
+	if res == nil {
+		t.Fatal("expected a non-nil resolution for ambiguous match")
+	}
+	if !res.Ambiguous {
+		t.Error("resolution should be marked ambiguous")
+	}
+	if res.Matched != name {
+		t.Errorf("resolution.Matched = %q, want %q", res.Matched, name)
+	}
+	if res.Query != "svc" {
+		t.Errorf("resolution.Query = %q, want svc", res.Query)
+	}
+	if len(res.Alternatives) != 1 {
+		t.Errorf("expected 1 alternative, got %v", res.Alternatives)
+	}
+	for _, alt := range res.Alternatives {
+		if alt == name {
+			t.Errorf("alternatives should exclude the matched name %q", name)
+		}
+	}
+}
+
+func TestResolveNodeName_OverThreshold(t *testing.T) {
+	store := populateAmbiguousStore()
+	srv := newTestServer(store)
+
+	// "beta" is a pure substring of every module (no fact's short name IS "beta"),
+	// so all matches stay tier 0 — genuinely ambiguous → refuse.
+	name, res, err := srv.resolveNodeName(store, "beta")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("expected empty match over threshold, got %q", name)
+	}
+	if res == nil {
+		t.Fatal("expected a non-nil resolution over threshold")
+	}
+	if res.Matched != "" {
+		t.Errorf("resolution.Matched should be empty over threshold, got %q", res.Matched)
+	}
+	if !res.Ambiguous {
+		t.Error("resolution should be marked ambiguous")
+	}
+	if res.Query != "beta" {
+		t.Errorf("resolution.Query = %q, want beta", res.Query)
+	}
+	if len(res.Alternatives) < ambiguousMatchThreshold {
+		t.Errorf("expected at least %d alternatives, got %v", ambiguousMatchThreshold, res.Alternatives)
+	}
+}
+
+// TestResolveNodeName_ModuleBasename verifies a module's PATH basename is a
+// suffix-exact (tier 1) match, so a bare term resolves to the module it names
+// even amid substring siblings. This is the #2 fix (the "courses" module).
+func TestResolveNodeName_ModuleBasename(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "internal/domain/courses", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "internal/domain/coursestats", Props: map[string]any{"language": "go"}},
+	)
+	srv := newTestServer(store)
+	if name, _, err := srv.resolveNodeName(store, "courses"); err != nil || name != "internal/domain/courses" {
+		t.Errorf("resolve(courses) = %q, %v; want internal/domain/courses", name, err)
+	}
+}
+
+// TestResolveNodeName_FileBasenameFallback verifies the #5 fix: a file-shaped
+// term ("auth_routes") with no eponymous fact resolves to the symbol declared in
+// that file (whose own name does NOT contain the term), rather than failing as
+// ambiguous/unmatched. Mirrors the real snapshot: one symbol + several routes and
+// a dependency all carry the file path only in their File attribute.
+func TestResolveNodeName_FileBasenameFallback(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http.Handler.RegisterAuthRoutes",
+			File: "golf/internal/adapters/http/auth_routes.go", Line: 8, Repo: "golf",
+			Props: map[string]any{"symbol_kind": "method"}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/users", File: "golf/internal/adapters/http/auth_routes.go", Repo: "golf"},
+		facts.Fact{Kind: facts.KindDependency, Name: "internal/adapters/http -> github.com/gorilla/mux",
+			File: "golf/internal/adapters/http/auth_routes.go", Repo: "golf"},
+	)
+	srv := newTestServer(store)
+
+	// No fact is NAMED auth_routes; the only pathable node is the symbol declared
+	// in auth_routes.go.
+	name, _, err := srv.resolveNodeName(store, "auth_routes")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "internal/adapters/http.Handler.RegisterAuthRoutes" {
+		t.Errorf("resolve(auth_routes) = %q; want the RegisterAuthRoutes symbol", name)
+	}
+}
+
+func TestResolveNodeName_OverThresholdCapsAlternatives(t *testing.T) {
+	store := facts.NewStore()
+	for i := 0; i < maxAlternatives+5; i++ {
+		store.Add(facts.Fact{Kind: facts.KindModule, Name: "pkg/widget" + itoa(i), Props: map[string]any{"language": "go"}})
+	}
+	srv := newTestServer(store)
+
+	_, res, err := srv.resolveNodeName(store, "pkg/widget")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected a resolution")
+	}
+	if len(res.Alternatives) > maxAlternatives {
+		t.Errorf("alternatives = %d, want <= %d", len(res.Alternatives), maxAlternatives)
+	}
+}
+
+func TestResolveNodeName_NoMatch(t *testing.T) {
+	store := populateTestStore()
+	srv := newTestServer(store)
+
+	_, res, err := srv.resolveNodeName(store, "doesNotExistAnywhere")
+	if err == nil {
+		t.Fatal("expected an error for no match")
+	}
+	if res != nil {
+		t.Errorf("expected nil resolution on no match, got %+v", res)
+	}
+}
+
+// itoa is a tiny local helper for building distinct test fact names.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+// --- response wrapper marshaling tests ---
+
+func TestRenderImpactCompact(t *testing.T) {
+	resp := impactResponse{
+		ImpactResult: facts.ImpactResult{
+			Target:          "src/stores.useAuthStore",
+			TotalDependents: 312,
+			Summary:         "312 total dependents (showing 2) — depth 1: 2 symbols",
+			ByDepth: map[int][]facts.TraversalNode{
+				1: {
+					{Name: "src/components.UserForm", Kind: "symbol", File: "src/components/UserForm.tsx", Line: 38, Depth: 1},
+					{Name: "src/stores.useAuth", Kind: "symbol", File: "src/stores/authStore.ts", Line: 746, Depth: 1},
+				},
+			},
+			Stats: facts.TraversalStats{NodesVisited: 200, MaxDepthReached: 3, Truncated: true},
+		},
+	}
+	out := renderImpactCompact(resp)
+
+	for _, want := range []string{
+		"# Impact: src/stores.useAuthStore",
+		"312 total dependents (showing 2)",
+		"## Depth 1 (2)",
+		"src/components.UserForm",
+		"src/components/UserForm.tsx:38",
+		"truncated",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("compact impact output missing %q; got:\n%s", want, out)
+		}
+	}
+	// Must not dump the raw edges array.
+	if strings.Contains(out, "\"edges\"") {
+		t.Errorf("compact output should not contain raw JSON edges; got:\n%s", out)
+	}
+}
+
+func TestRenderImpactCompact_PerDepthCap(t *testing.T) {
+	var nodes []facts.TraversalNode
+	for i := 0; i < compactPerDepthCap+5; i++ {
+		nodes = append(nodes, facts.TraversalNode{
+			Name: fmt.Sprintf("pkg.Sym%d", i), Kind: "symbol", Depth: 1,
+		})
+	}
+	resp := impactResponse{ImpactResult: facts.ImpactResult{
+		Target:          "pkg.Core",
+		TotalDependents: len(nodes),
+		Summary:         fmt.Sprintf("%d total dependents — depth 1: %d symbols", len(nodes), len(nodes)),
+		ByDepth:         map[int][]facts.TraversalNode{1: nodes},
+	}}
+	out := renderImpactCompact(resp)
+	if !strings.Contains(out, "... and 5 more at depth 1") {
+		t.Errorf("expected per-depth cap note; got:\n%s", out)
+	}
+}
+
+func TestRenderImpactCompact_AmbiguousResolution(t *testing.T) {
+	resp := impactResponse{
+		Resolution: &nameResolution{
+			Query:     "Page",
+			Ambiguous: true,
+			Candidates: []scoredCandidate{
+				{Name: "src/app/login.LoginPage", Kind: "symbol", File: "src/app/login/page.tsx"},
+				{Name: "src/app/profile.ProfilePage", Kind: "symbol", File: "src/app/profile/page.tsx"},
+			},
+		},
+		ImpactResult: facts.ImpactResult{Target: "Page", ByDepth: map[int][]facts.TraversalNode{}},
+	}
+	out := renderImpactCompact(resp)
+	if !strings.Contains(out, "Ambiguous") || !strings.Contains(out, "LoginPage") {
+		t.Errorf("expected ambiguous candidate listing; got:\n%s", out)
+	}
+	if strings.Contains(out, "## Depth") {
+		t.Errorf("ambiguous-refused output should not list depths; got:\n%s", out)
+	}
+}
+
+func TestRenderTraverseCompact(t *testing.T) {
+	resp := traverseResponse{
+		TraversalResult: facts.TraversalResult{
+			Nodes: []facts.TraversalNode{
+				{Name: "start.Node", Kind: "symbol", Depth: 0},
+				{Name: "dep.A", Kind: "symbol", File: "a.ts", Line: 3, Depth: 1},
+			},
+			Edges: []facts.TraversalEdge{{Source: "dep.A", Target: "start.Node", Kind: "calls"}},
+			Stats: facts.TraversalStats{NodesVisited: 2, MaxDepthReached: 1},
+		},
+	}
+	out := renderTraverseCompact(resp, "start.Node", "reverse")
+	for _, want := range []string{
+		"# Traverse: start.Node (reverse)",
+		"Reached **1** nodes",
+		"## Depth 1 (1)",
+		"dep.A",
+		"Edges: 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("compact traverse output missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestTraverseResponse_MarshalWithResolution(t *testing.T) {
+	resp := traverseResponse{
+		Resolution: &nameResolution{
+			Query:        "svc-beta",
+			Matched:      "cmd/svc-beta",
+			Alternatives: []string{"cmd/svc-beta-asynq"},
+			Ambiguous:    true,
+		},
+		TraversalResult: facts.TraversalResult{
+			Nodes: []facts.TraversalNode{{Name: "cmd/svc-beta", Kind: "module"}},
+			Edges: []facts.TraversalEdge{},
+		},
+	}
+	data, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	out := string(data)
+	for _, want := range []string{`"resolution"`, `"matched"`, `"alternatives"`, `"ambiguous": true`, `"nodes"`, `"edges"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %s:\n%s", want, out)
+		}
+	}
+}
+
+func TestTraverseResponse_MarshalOmitsResolutionWhenNil(t *testing.T) {
+	resp := traverseResponse{
+		TraversalResult: facts.TraversalResult{
+			Nodes: []facts.TraversalNode{{Name: "internal/server", Kind: "module"}},
+		},
+	}
+	data, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if strings.Contains(string(data), "resolution") {
+		t.Errorf("expected no resolution key, got:\n%s", string(data))
+	}
+}
+
+func TestTraverseResponse_MarshalOverThresholdEmptyArrays(t *testing.T) {
+	resp := traverseResponse{
+		Resolution: &nameResolution{Query: "svc-beta", Ambiguous: true},
+		TraversalResult: facts.TraversalResult{
+			Nodes: []facts.TraversalNode{},
+			Edges: []facts.TraversalEdge{},
+		},
+	}
+	data, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	out := string(data)
+	if !strings.Contains(out, `"nodes": []`) {
+		t.Errorf("expected empty nodes array (not null), got:\n%s", out)
+	}
+	if !strings.Contains(out, `"edges": []`) {
+		t.Errorf("expected empty edges array (not null), got:\n%s", out)
+	}
+	if strings.Contains(out, `"matched"`) {
+		t.Errorf("matched should be omitted when empty, got:\n%s", out)
+	}
+}
+
+func TestFindPathResponse_MarshalIndependentResolutions(t *testing.T) {
+	resp := findPathResponse{
+		FromResolution: &nameResolution{Query: "svc-beta", Ambiguous: true},
+		PathResult:     facts.PathResult{From: "", To: "internal/facts", Found: false},
+	}
+	data, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	out := string(data)
+	if !strings.Contains(out, `"from_resolution"`) {
+		t.Errorf("expected from_resolution, got:\n%s", out)
+	}
+	if strings.Contains(out, `"to_resolution"`) {
+		t.Errorf("to_resolution should be omitted when nil, got:\n%s", out)
+	}
+}
+
+func TestCapitalize(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"module", "Module"},
+		{"symbol", "Symbol"},
+		{"", ""},
+		{"A", "A"},
+	}
+	for _, tt := range tests {
+		if got := capitalize(tt.input); got != tt.want {
+			t.Errorf("capitalize(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseScopedQuery(t *testing.T) {
+	cases := []struct {
+		in         string
+		repo       string
+		kinds      []string
+		symbolKind string
+		filePrefix string
+		term       string
+	}{
+		{"Currency", "", nil, "", "", "Currency"},
+		{"repo:golf kind:struct Currency", "golf", []string{"symbol"}, "struct", "", "Currency"},
+		{"kind:module internal/server", "", []string{"module"}, "", "", "internal/server"},
+		{"repo:golf/subtenant", "golf", nil, "", "", "subtenant"},
+		{"kind:symbol/Currency", "", []string{"symbol"}, "", "", "Currency"},
+		{"file:/domain//Currency", "", nil, "", "domain", "Currency"},
+		{"file:domain", "", nil, "", "domain", ""},
+		{"http://example.com", "", nil, "", "", "http://example.com"}, // not a scope keyword
+	}
+	for _, tc := range cases {
+		sq := parseScopedQuery(tc.in)
+		if sq.Repo != tc.repo {
+			t.Errorf("%q: Repo = %q, want %q", tc.in, sq.Repo, tc.repo)
+		}
+		if sq.SymbolKind != tc.symbolKind {
+			t.Errorf("%q: SymbolKind = %q, want %q", tc.in, sq.SymbolKind, tc.symbolKind)
+		}
+		if sq.FilePrefix != tc.filePrefix {
+			t.Errorf("%q: FilePrefix = %q, want %q", tc.in, sq.FilePrefix, tc.filePrefix)
+		}
+		if sq.Term != tc.term {
+			t.Errorf("%q: Term = %q, want %q", tc.in, sq.Term, tc.term)
+		}
+		if strings.Join(sq.Kinds, ",") != strings.Join(tc.kinds, ",") {
+			t.Errorf("%q: Kinds = %v, want %v", tc.in, sq.Kinds, tc.kinds)
+		}
+	}
+}
+
+func TestResolveNodeName_ScopedRepo(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "domain.Currency", Repo: "golf",
+			File: "golf/domain/currency.go", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "models.Currency", Repo: "golf-ui",
+			File: "golf-ui/models/currency.go", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	srv := newTestServer(store)
+
+	name, _, err := srv.resolveNodeName(store, "repo:golf Currency")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "domain.Currency" {
+		t.Errorf("matched = %q, want domain.Currency", name)
+	}
+}
+
+func TestResolveNodeName_ScopedKindStruct(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "models.Currency", File: "models/currency.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "models.Currency.Format", File: "models/currency.go",
+			Props: map[string]any{"symbol_kind": "method"}},
+		facts.Fact{Kind: facts.KindModule, Name: "internal/currency", Props: map[string]any{"language": "go"}},
+	)
+	srv := newTestServer(store)
+
+	name, _, err := srv.resolveNodeName(store, "kind:struct Currency")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "models.Currency" {
+		t.Errorf("matched = %q, want models.Currency", name)
+	}
+}
+
+func TestResolveNodeName_ScopedFilePrefix(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "a.Currency", File: "domain/currency.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "b.Currency", File: "api/currency.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	srv := newTestServer(store)
+
+	name, _, err := srv.resolveNodeName(store, "file:domain Currency")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "a.Currency" {
+		t.Errorf("matched = %q, want a.Currency", name)
+	}
+}
+
+func TestResolveNodeName_AutoPickAboveConfidence(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		// Suffix-exact match (tier 1) — its last segment IS the term.
+		facts.Fact{Kind: facts.KindSymbol, Name: "adapters.AuthHandler", File: "adapters/h.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+		// Substring-only peers (tier 0) — the term is buried in a longer name.
+		facts.Fact{Kind: facts.KindSymbol, Name: "adapters.AuthHandlerFactory", File: "adapters/f.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "middleware.NewAuthHandler", File: "mw/new.go",
+			Props: map[string]any{"symbol_kind": "function"}},
+	)
+	srv := newTestServer(store)
+
+	// Three matches (>= threshold) and no exact whole-name match, but exactly one
+	// has the term as its last segment — it dominates the substring-only peers, so
+	// it auto-picks instead of refusing.
+	name, res, err := srv.resolveNodeName(store, "AuthHandler")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "adapters.AuthHandler" {
+		t.Errorf("matched = %q, want adapters.AuthHandler", name)
+	}
+	if res == nil {
+		t.Fatal("expected a non-nil resolution for an auto-picked match")
+	}
+	if !res.AutoPicked {
+		t.Error("resolution should be marked AutoPicked")
+	}
+	if res.Matched != "adapters.AuthHandler" {
+		t.Errorf("resolution.Matched = %q, want adapters.AuthHandler", res.Matched)
+	}
+	if res.Confidence <= autoPickConfidence {
+		t.Errorf("confidence = %v, want > %v", res.Confidence, autoPickConfidence)
+	}
+	if len(res.Candidates) == 0 {
+		t.Error("expected ranked candidates in the resolution")
+	}
+}
+
+func TestResolveNodeName_OverThresholdReturnsCandidates(t *testing.T) {
+	store := populateAmbiguousStore()
+	srv := newTestServer(store)
+
+	// Near-identical modules → no dominant candidate → refuse, but now with
+	// ranked candidates attached. "beta" is a substring of all of them and the
+	// short name of none, so every match stays tier 0 (truly ambiguous).
+	name, res, err := srv.resolveNodeName(store, "beta")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("expected empty match for ambiguous low-confidence input, got %q", name)
+	}
+	if res == nil || res.Matched != "" {
+		t.Fatalf("expected resolution with empty Matched, got %+v", res)
+	}
+	if len(res.Candidates) == 0 {
+		t.Error("expected ranked candidates to be surfaced")
+	}
+	if res.Confidence > autoPickConfidence {
+		t.Errorf("confidence = %v, should not exceed auto-pick threshold for near-ties", res.Confidence)
+	}
+}
+
+// --- resolution discoverability: auto repo-prefix, cross-repo refusal, suggestions ---
+
+func newMultiRepoServer() *Server {
+	eng := newEngineWithSnapshot("/work")
+	eng.SetRepoPaths(map[string]string{
+		"go-auth": "/Users/me/development/go-auth",
+		"golf":    "/Users/me/development/golf",
+	})
+	return &Server{eng: eng}
+}
+
+func TestMaybePrefixRepoLabel(t *testing.T) {
+	srv := newMultiRepoServer()
+	cases := []struct{ in, want string }{
+		{"go-auth AuthHandler", "repo:go-auth AuthHandler"},
+		{"golf courses report", "repo:golf courses report"},
+		{"AuthHandler", "AuthHandler"},                           // single token, no remainder
+		{"repo:go-auth AuthHandler", "repo:go-auth AuthHandler"}, // already scoped
+		{"unknownrepo Thing", "unknownrepo Thing"},               // first token not a repo label
+	}
+	for _, c := range cases {
+		if got := srv.maybePrefixRepoLabel(c.in); got != c.want {
+			t.Errorf("maybePrefixRepoLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// Single-repo mode (RepoPaths nil) must never prefix.
+	single := &Server{eng: newEngineWithSnapshot("/work")}
+	if got := single.maybePrefixRepoLabel("go-auth AuthHandler"); got != "go-auth AuthHandler" {
+		t.Errorf("single-repo should not prefix, got %q", got)
+	}
+}
+
+func TestResolveNodeName_AutoRepoPrefix(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "adapters.AuthHandler", Repo: "go-auth", File: "go-auth/adapters/auth.go",
+			Props: map[string]any{"symbol_kind": "struct"}, Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "adapters"}}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "web.AuthHandler", Repo: "golf", File: "golf/web/auth.go",
+			Props: map[string]any{"symbol_kind": "struct"}, Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "web"}}},
+	)
+	// "go-auth AuthHandler" (no repo: prefix) should resolve like "repo:go-auth AuthHandler".
+	name, _, err := srv.resolveNodeName(store, "go-auth AuthHandler")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "adapters.AuthHandler" {
+		t.Errorf("got %q, want adapters.AuthHandler (repo-scoped pick)", name)
+	}
+}
+
+func TestResolveNodeName_CrossRepoRefusal(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "svc.AuthHandlerImpl", Repo: "go-auth", File: "go-auth/svc.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "web.HandlerRegistry", Repo: "golf", File: "golf/web.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	// "Handler" is a substring (tier 0) match in both repos and no repo: scope was
+	// given → refuse to guess, surface candidates spanning both repos.
+	name, res, err := srv.resolveNodeName(store, "Handler")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("expected refusal (empty name) for cross-repo ambiguity, got %q", name)
+	}
+	if res == nil || res.Matched != "" || len(res.Candidates) < 2 {
+		t.Fatalf("expected resolution with 2+ candidates, got %+v", res)
+	}
+	repos := map[string]bool{}
+	for _, c := range res.Candidates {
+		repos[c.Repo] = true
+	}
+	if !repos["go-auth"] || !repos["golf"] {
+		t.Errorf("candidates should span both repos, got %+v", res.Candidates)
+	}
+}
+
+// TestResolveNodeName_CoursesCrossRepo reproduces the reported #2 case: a bare
+// "courses" matched both a Go module (by path basename) and an iOS Swift field
+// (by dotted segment) in different repos. Both are now tier 1, so instead of the
+// iOS field silently winning, resolution refuses and surfaces both repos.
+func TestResolveNodeName_CoursesCrossRepo(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "internal/domain/courses", Repo: "golf",
+			Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "Screens/Report.CoursePerformanceSectionState.courses", Repo: "ios",
+			File: "ios/Screens/Report.swift", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	name, res, err := srv.resolveNodeName(store, "courses")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("expected refusal across repos, got %q", name)
+	}
+	if res == nil || res.Matched != "" {
+		t.Fatalf("expected resolution-only response, got %+v", res)
+	}
+	repos := map[string]bool{}
+	for _, c := range res.Candidates {
+		repos[c.Repo] = true
+	}
+	if !repos["golf"] || !repos["ios"] {
+		t.Errorf("candidates should span golf and ios, got %+v", res.Candidates)
+	}
+}
+
+func TestResolveNodeName_NoMatchSuggests(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "adapters.AuthHandler", Repo: "go-auth", File: "go-auth/adapters/auth.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	// The full term matches nothing, but its longest token ("AuthHandler") does —
+	// the error should suggest it instead of being a dead end.
+	_, _, err := srv.resolveNodeName(store, "find AuthHandler")
+	if err == nil {
+		t.Fatal("expected a no-match error")
+	}
+	if !strings.Contains(err.Error(), "did you mean") || !strings.Contains(err.Error(), "AuthHandler") {
+		t.Errorf("error should suggest candidates, got: %v", err)
+	}
+}
+
+// --- #3: package-qualified resolution + find_path try-candidates ---
+
+func TestMatchTier_QualifiedSuffix(t *testing.T) {
+	// matchTier expects an already-lowercased term (callers lowercase sq.Term).
+	if got := matchTier("internal/domain/ticket.Repository", "ticket.repository"); got != 1 {
+		t.Errorf("qualified-suffix tier = %d, want 1", got)
+	}
+	if got := matchTier("internal/adapters/contracts.Repository", "ticket.repository"); got != 0 {
+		t.Errorf("non-suffix tier = %d, want 0", got)
+	}
+	// Suffix must align on a '.'/'/' boundary, not mid-token.
+	if got := matchTier("internal/domain/myticket.Repository", "ticket.repository"); got != 0 {
+		t.Errorf("mid-token suffix tier = %d, want 0", got)
+	}
+}
+
+func TestResolveNodeName_PackageQualified(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/ticket.Repository", Props: map[string]any{"symbol_kind": "interface"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/cart.Repository", Props: map[string]any{"symbol_kind": "interface"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http/contracts.Repository", Props: map[string]any{"symbol_kind": "interface"}},
+	)
+	srv := newTestServer(store)
+
+	// Package-qualified term pins exactly one node.
+	if name, _, err := srv.resolveNodeName(store, "ticket.Repository"); err != nil || name != "internal/domain/ticket.Repository" {
+		t.Errorf("resolve(ticket.Repository) = %q, %v; want internal/domain/ticket.Repository", name, err)
+	}
+	// Bare common name stays ambiguous (3 matches over threshold → empty Matched).
+	name, res, err := srv.resolveNodeName(store, "Repository")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("bare Repository should be ambiguous, got %q", name)
+	}
+	if res == nil || res.Matched != "" {
+		t.Fatalf("expected refusal with empty Matched, got %+v", res)
+	}
+}
+
+func TestPathCandidates_LeadsWithResolved(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/cart.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http/contracts.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	srv := newTestServer(store)
+	name, res, _ := srv.resolveNodeName(store, "CartService") // 2 candidates < threshold → best guess
+	cands := srv.pathCandidates(store, "CartService", name, res)
+	if len(cands) < 2 {
+		t.Errorf("expected both CartService candidates, got %v", cands)
+	}
+	if cands[0] != name {
+		t.Errorf("pathCandidates should lead with the resolved name %q, got %v", name, cands)
+	}
+}
+
+func TestBestPath_TriesCandidates(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/cart.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http/contracts.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+		// Only the domain CartService is reachable from the handler.
+		facts.Fact{Kind: facts.KindSymbol, Name: "pkg/handler.Handler", Props: map[string]any{"symbol_kind": "struct"},
+			Relations: []facts.Relation{{Kind: facts.RelInstantiates, Target: "internal/domain/cart.CartService"}}},
+	)
+	store.BuildGraph()
+	srv := newTestServer(store)
+
+	from := []string{"pkg/handler.Handler"}
+	to := []string{"internal/adapters/http/contracts.CartService", "internal/domain/cart.CartService"}
+	res := srv.bestPath(store.Graph(), from, to, nil, 0)
+	if !res.Found {
+		t.Fatal("expected a path to the reachable CartService candidate")
+	}
+	if res.To != "internal/domain/cart.CartService" {
+		t.Errorf("bestPath connected to %q, want internal/domain/cart.CartService", res.To)
+	}
+}
+
+func TestBestPath_NoPath(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "a.Foo", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "b.Bar", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	store.BuildGraph()
+	srv := newTestServer(store)
+	res := srv.bestPath(store.Graph(), []string{"a.Foo"}, []string{"b.Bar"}, nil, 0)
+	if res.Found {
+		t.Error("expected no path between disconnected nodes")
+	}
+}
+
+// TestBestPath_EmptyCandidates_NoPanic: bestPath must return a clean not-found
+// result rather than panicking on fromCands[0]/toCands[0] when either candidate
+// slice is empty (defensive hardening; callers are expected to pre-filter).
+func TestBestPath_EmptyCandidates_NoPanic(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(facts.Fact{Kind: facts.KindSymbol, Name: "a.Foo", Props: map[string]any{"symbol_kind": "struct"}})
+	store.BuildGraph()
+	srv := newTestServer(store)
+
+	cases := []struct{ from, to []string }{
+		{nil, []string{"a.Foo"}},
+		{[]string{"a.Foo"}, nil},
+		{nil, nil},
+	}
+	for _, tc := range cases {
+		res := srv.bestPath(store.Graph(), tc.from, tc.to, nil, 0)
+		if res.Found {
+			t.Errorf("bestPath(from=%v, to=%v): Found = true, want false", tc.from, tc.to)
+		}
+	}
+}
+
+// --- GAP-LK-04: cross-repo explainers must not degrade silently ---
+
+func TestCrossRepoExplainer(t *testing.T) {
+	for _, name := range []string{"unused-routes", "coverage", "crossrepo"} {
+		if !crossRepoExplainer(name) {
+			t.Errorf("crossRepoExplainer(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"god-class", "cycles", "hotspots", ""} {
+		if crossRepoExplainer(name) {
+			t.Errorf("crossRepoExplainer(%q) = true, want false", name)
+		}
+	}
+}
+
+// A cross-repo explainer on a single-repo store (no KindService facts) could not
+// run at all — its response must say so, not read like a clean "nothing found".
+func TestNoMatchInsightsMessage_CrossRepoDidNotRun(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(facts.Fact{Kind: facts.KindRoute, Name: "GET /x", Props: map[string]any{"role": "server"}})
+	snap := &facts.Snapshot{Insights: []facts.Insight{{Title: "gc", Source: "god-class"}}}
+
+	msg := noMatchInsightsMessage("unused-routes", "", 0, snap, store)
+	if !strings.Contains(msg, "did not run") || !strings.Contains(msg, "append=true") {
+		t.Errorf("expected a did-not-run/append hint, got: %q", msg)
+	}
+	if strings.Contains(msg, "No insights matched") {
+		t.Errorf("a gated-out cross-repo explainer must not read as a clean no-match: %q", msg)
+	}
+}
+
+// With a KindService fact the linker ran, so a no-match is genuine. The message
+// must also list only the explainers that actually produced insights (from
+// Insight.Source), not the ran-without-error set — the old misattribution.
+func TestNoMatchInsightsMessage_RanFoundNothing(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(facts.Fact{Kind: facts.KindService, Name: "svc", Repo: "svc"})
+	snap := &facts.Snapshot{Insights: []facts.Insight{{Title: "gc", Source: "god-class"}}}
+
+	msg := noMatchInsightsMessage("unused-routes", "", 0, snap, store)
+	if !strings.Contains(msg, "No insights matched") {
+		t.Errorf("with services present the explainer ran; expected a genuine no-match: %q", msg)
+	}
+	// The source list names only explainers that produced an insight. unused-routes
+	// produced none, so it must not appear as a source (it still legitimately echoes
+	// in the explainer=... filter, so assert on the "produced by:" list specifically).
+	if !strings.Contains(msg, "produced by: [god-class]") {
+		t.Errorf("source list should be exactly the producing explainers: %q", msg)
+	}
+}
+
+func TestNoMatchInsightsMessage_NoInsightsAtAll(t *testing.T) {
+	msg := noMatchInsightsMessage("cycles", "", 0, &facts.Snapshot{}, facts.NewStore())
+	if !strings.Contains(msg, "No insights were produced") {
+		t.Errorf("empty snapshot should report no insights produced: %q", msg)
+	}
+}
+
+func TestSingleRepoServiceHint(t *testing.T) {
+	single := facts.NewStore()
+	single.Add(facts.Fact{Kind: facts.KindRoute, Name: "GET /x"}) // no Repo label -> single-repo
+
+	multi := facts.NewStore()
+	multi.Add(
+		facts.Fact{Kind: facts.KindService, Name: "a", Repo: "a"},
+		facts.Fact{Kind: facts.KindService, Name: "b", Repo: "b"},
+	)
+
+	if _, ok := singleRepoServiceHint(facts.KindService, 0, single); !ok {
+		t.Error("single-repo empty service query should return an append-mode hint")
+	}
+	if _, ok := singleRepoServiceHint(facts.KindService, 0, multi); ok {
+		t.Error("multi-repo store must not return the single-repo service hint")
+	}
+	if _, ok := singleRepoServiceHint(facts.KindSymbol, 0, single); ok {
+		t.Error("hint is only for kind=service")
+	}
+	if _, ok := singleRepoServiceHint(facts.KindService, 3, single); ok {
+		t.Error("hint must not fire when results are non-empty")
+	}
+}

@@ -1,0 +1,51 @@
+# enola configuration for a TypeScript / Next.js project.
+#
+# Detection: The TypeScript extractor activates when tsconfig.json exists
+#            or package.json has TypeScript in dependencies/devDependencies.
+# Features:  Classes, functions, interfaces, types, imports/dependencies,
+#            Next.js route detection (App Router and Pages Router).
+
+repo: "."
+ignore:
+  # Dependencies and tooling
+  - "node_modules/**"
+  - ".git/**"
+  - ".enola/**"
+  # Tests
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.spec.ts"
+  - "**/*.spec.tsx"
+  # Next.js / build and cache
+  - ".next/**"
+  - "out/**"
+  - ".vercel/**"
+  - ".turbo/**"
+  - "dist/**"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+extractors:
+  - typescript
+# explainers: / renderers: are deliberately absent.
+#
+# A list-valued key REPLACES the built-in list rather than extending it, so naming
+# a subset here silently disables everything that ships beyond it — this file used
+# to pin four explainers, turning off the other six (god-class, hotspots,
+# unused-routes, dependency-depth, exported-surface, complexity-outliers) for anyone
+# who adopted it. Omitting the keys means new plugins arrive automatically.
+output:
+  dir: ".enola"
+  max_context_tokens: 16000

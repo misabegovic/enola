@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+  build:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest      # linux/amd64
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm   # linux/arm64 — native arm64 runner
+            goos: linux
+            goarch: arm64
+          - os: macos-15-intel     # darwin/amd64 — native Intel runner
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest       # darwin/arm64 — native Apple Silicon
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest     # windows/amd64
+            goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+        run: |
+          BINARY="enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
+          go build \
+            -ldflags "-s -w -X github.com/enola-labs/enola/internal/version.Version=${{ steps.version.outputs.version }}" \
+            -o "${BINARY}${EXT}" \
+            ./cmd/enola
+
+      - name: Create tarball
+        shell: bash
+        run: |
+          BINARY="enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
+          # LICENSE and NOTICE ride along with the binary. The vendored
+          # tree-sitter grammars (Swift, Dart) are MIT, and MIT requires the notice
+          # to travel with copies of the software — the compiled binary embeds
+          # scanner.c verbatim and a parser generated from the upstream grammar, so
+          # the tarball is the copy that needs to carry it. Shipping the binary
+          # alone left the notice in the source tree only, which is not where
+          # anyone installing via install.sh ever looks.
+          #
+          # Neither install path is affected: install.sh extracts into a temp
+          # directory and installs the binary BY NAME, and `enola upgrade` searches
+          # the archive for that name (see extractBinary), so the extra members are
+          # ignored by both and nothing lands in ~/.local/bin.
+          tar czf "${BINARY}.tar.gz" "${BINARY}${EXT}" LICENSE NOTICE
+          sha256sum "${BINARY}.tar.gz" > "${BINARY}.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          # Stays a draft until the publish job confirms every platform made it.
+          draft: true
+          files: |
+            enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+  # Publishes the draft only if all platform assets are present. If a build leg
+  # fails — or never gets scheduled, e.g. because its runner label was retired —
+  # this job is skipped and the release stays a visible draft instead of
+  # silently shipping a partial set of binaries.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify all platform assets are present
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The contract for a complete release. Keep in sync with the build matrix.
+          PLATFORMS="linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          ASSETS="$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+
+          missing=0
+          for platform in $PLATFORMS; do
+            for ext in tar.gz sha256; do
+              name="enola-${VERSION}-${platform}.${ext}"
+              if ! grep -qxF "$name" <<<"$ASSETS"; then
+                echo "::error::missing release asset: $name"
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" -eq 0 ]
+
+      # The update manifest installed builds poll, at
+      # /releases/latest/download/version.json. Uploaded BEFORE the release leaves
+      # draft, so it is in place the moment that URL starts resolving here — and never
+      # advertises a release that failed the asset check above.
+      #
+      # Generated by RUNNING the artifact being released rather than by reading the
+      # source tree, so the manifest cannot disagree with what shipped: the extractor
+      # version it reports is the one compiled into the binary in the tarball.
+      - name: Publish update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BINARY="enola-${VERSION}-linux-amd64"
+
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --pattern "${BINARY}.tar.gz"
+          tar xzf "${BINARY}.tar.gz"
+          ./"${BINARY}" --version --json > version.json
+          cat version.json
+
+          # A manifest missing either field would silence every installed build's
+          # notice, or its extractor escalation, with no other symptom. Fail loudly here
+          # instead — this is the last moment anyone is looking.
+          grep -q '"version"' version.json
+          grep -q '"extractor_version"' version.json
+
+          gh release upload "$GITHUB_REF_NAME" version.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --draft=false

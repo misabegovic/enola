@@ -1,0 +1,41 @@
+# enola configuration for a Go project.
+#
+# Detection: The Go extractor activates when go.mod is present.
+# Features:  Packages, functions, types, interfaces, methods, imports,
+#            call graphs, storage (database/sql, GORM), routes (Chi, Gin, Echo).
+
+repo: "."
+ignore:
+  # Dependencies and tooling
+  - "vendor/**"
+  - ".git/**"
+  - ".enola/**"
+  # Tests
+  - "**/*_test.go"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+extractors:
+  - go
+# explainers: / renderers: are deliberately absent.
+#
+# A list-valued key REPLACES the built-in list rather than extending it, so naming
+# a subset here silently disables everything that ships beyond it — this file used
+# to pin four explainers, turning off the other six (god-class, hotspots,
+# unused-routes, dependency-depth, exported-surface, complexity-outliers) for anyone
+# who adopted it. Omitting the keys means new plugins arrive automatically.
+output:
+  dir: ".enola"
+  max_context_tokens: 16000

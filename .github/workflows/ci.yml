@@ -1,0 +1,256 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests with coverage
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: |
+          # One redirect for the whole block rather than four (shellcheck SC2129),
+          # which the actions job below enforces.
+          {
+            echo '### Coverage'
+            echo '```'
+            go tool cover -func=coverage.out | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  # The host-portability gate.
+  #
+  # Releases ship a windows-amd64 binary, and until this job existed nothing in CI
+  # ever ran on Windows. What that missed is a whole CLASS of defect rather than one
+  # bug: repo-relative paths came off the walker in the host's dialect, so on Windows
+  # a module was named `src\lib` while the import targets it had to match were
+  # forward-slash. Nothing errored. Module resolution simply stopped matching, and a
+  # declared layer order reported itself in force while classifying zero modules
+  # (issue #242).
+  #
+  # The goldens are the assertion. They embed fact paths, they are committed from a
+  # Unix run, and this job compares a Windows run against those same bytes — so any
+  # host separator that reaches a fact fails here, naming the fact. internal/facts'
+  # path contract catches the same class at author time on every host; this catches
+  # what a source scan cannot see.
+  #
+  # autocrlf is disabled at checkout: Git on Windows would otherwise rewrite the
+  # fixture repos' line endings, changing file hashes and every extracted line span,
+  # which would fail the goldens for a reason that has nothing to do with paths.
+  windows:
+    runs-on: windows-latest
+    steps:
+      # Before the checkout, so no fixture file is ever written converted.
+      - name: Disable line-ending conversion
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Path contract
+        run: go test -count=1 -run TestPathContract ./internal/facts/
+
+      - name: Golden + determinism
+        run: go test -count=1 -run "TestGolden|TestDeterminism" ./internal/engine/...
+
+      - name: Layer gate end to end
+        run: go test -count=1 -run TestLayerGate ./internal/engine/...
+
+  # Guards Enola's core promise: snapshotting a fixture repo twice yields an
+  # identical fact graph, and the committed goldens still match. Fast and
+  # CGO-light, so it runs as its own gate independent of the full test matrix.
+  determinism:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: cacheVersion coverage guard
+        run: go test -count=1 -run TestCacheVersionCoverage ./internal/cachecov/
+
+      - name: Golden + determinism
+        run: go test -count=1 -run 'TestGolden|TestDeterminism' ./internal/engine/...
+
+  # ENFORCING — the action this project ships, run on this project's own changes.
+  #
+  # It grades the PR with the latest PUBLISHED enola, which is the question a released
+  # gate exists to answer — does the engine our users actually have flag this change? —
+  # and it dogfoods the action itself.
+  #
+  # The action derives its base from the pull_request payload, which is the base branch
+  # TIP at event time and can carry commits this PR never touched. The merge-base step
+  # keeps the previous semantics: the delta describes this PR and nothing else.
+  #
+  # A repo that would rather restore a published baseline than index the base should use
+  # the publish/restore shape in examples/ci/architecture-gate.yml instead.
+  architecture:
+    runs-on: ubuntu-latest
+    # github.base_ref is empty outside pull_request, leaving nothing to grade against.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # merge-base needs history; the default depth-1 clone has none
+
+      - name: Resolve the merge base
+        id: base
+        run: |
+          # Be explicit about fetching the base branch: actions/checkout leaves a PR on a
+          # merge ref, and origin/<base> is not guaranteed to be present.
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          echo "sha=$(git merge-base HEAD "origin/${{ github.base_ref }}")" >> "$GITHUB_OUTPUT"
+
+      - uses: enola-labs/enola-action@v2
+        with:
+          config: mcp-arch.yaml
+          base-sha: ${{ steps.base.outputs.sha }}
+          # enola enforces nothing unless asked, this repository included. This is the
+          # policy THIS codebase chose for itself: the layer order declared in
+          # enola-intent.yaml, verdicted at 1.00 because it is declared rather than
+          # inferred. Other repositories will reasonably choose otherwise — that is the
+          # whole reason it is a flag and not a default.
+          #
+          # Not `cycles`: this is Go, and the compiler already refuses an import cycle
+          # between packages. The layer order is the part it cannot check — nothing stops
+          # a core package importing the CLI surface today except this file.
+          fail-on: layers
+
+  # The prose gate. Documentation is the one artifact in this repository with no
+  # compiler, and it had drifted accordingly: four dead references, and five counts
+  # that disagreed with the code they described. internal/docslint resolves every
+  # counted claim against the value the binary uses, so a new explainer, tool or rule
+  # form fails here until the pages that enumerate them say so.
+  #
+  # Its own job rather than a line in `test`: it needs no CGO and finishes in under a
+  # second, so a docs-only PR gets its answer without waiting for the tree-sitter
+  # matrix — and a red build here names the sentence rather than a package.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Documentation conformance
+        run: go test -count=1 ./internal/docslint/
+
+  # golangci-lint v2 (action @v9). The repo baseline is clean, so this gates the
+  # whole tree — any new finding fails the build. Linter set in .golangci.yml.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned, not `latest`. With `latest` the linter is whatever shipped that
+          # morning, so an unrelated PR can go red on a new check the author never
+          # touched — the same class of surprise this repo refuses everywhere else.
+          # Dependabot does not track this field, so bump it deliberately.
+          version: v2.12.2
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinning the BINARY does not pin the vulnerability data: govulncheck fetches
+      # the database from vuln.go.dev at run time, so a CVE disclosed today still
+      # fails this job tomorrow. What the pin removes is the other axis — a new
+      # analyser release changing its verdict on unchanged code.
+      #
+      # The pin has a FLOOR as well as a ceiling, which is what makes it a decision
+      # rather than a preference. govulncheck carries its own golang.org/x/tools, and a
+      # release whose type checker predates this module's `go` directive refuses every
+      # package with "package requires newer Go version go1.25 (application built with
+      # go1.24)" — a total failure that reads nothing like a vulnerability report, and
+      # exits non-zero for a reason no one would guess from the job name. v1.1.4 was
+      # such a release: it refused all 126 packages here for as long as `go` had been
+      # past 1.24, so this job reported on nothing while staying red.
+      #
+      # Raising `go` in go.mod means checking this line too. Nothing enforces that
+      # offline — the constraint lives inside govulncheck's own dependency tree, not in
+      # anything this repository can read — so the guard is this comment plus a job that
+      # fails loudly rather than silently passing.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  # Nothing else validates the workflows themselves. ci.yml at least runs on every
+  # PR, so a mistake in it surfaces immediately; release.yml runs ONLY on a `v*`
+  # tag, which means a typo, a bad action reference or a broken expression there is
+  # invisible until the moment it breaks a release. actionlint parses both, checks
+  # every action reference and expression, and shellchecks the `run:` blocks.
+  actions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinned for the same reason as golangci-lint above, and installed from source
+      # rather than via a marketplace action so the version is the only moving part.
+      # shellcheck is preinstalled on ubuntu-latest; actionlint picks it up and lints
+      # the shell inside every `run:` block.
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: actionlint
+        run: actionlint

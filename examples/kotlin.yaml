@@ -1,0 +1,50 @@
+# enola configuration for a Kotlin / Android project.
+#
+# Detection: The Kotlin extractor activates when build.gradle.kts or
+#            build.gradle contains "kotlin" or "android".
+# Features:  Classes, interfaces, objects, functions, Android components
+#            (Jetpack Compose, Hilt DI, Room database, ViewModels,
+#            Repositories, Use Cases, Workers).
+
+repo: "."
+ignore:
+  # Dependencies and tooling
+  - "vendor/**"
+  - ".git/**"
+  - ".enola/**"
+  # Kotlin / Android build and cache
+  - "build/**"
+  - "**/build/**"
+  - ".gradle/**"
+  - "**/.gradle/**"
+  - "**/generated/**"
+  # Tests
+  - "**/*Test.kt"
+  - "**/androidTest/**"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+extractors:
+  - kotlin
+# explainers: / renderers: are deliberately absent.
+#
+# A list-valued key REPLACES the built-in list rather than extending it, so naming
+# a subset here silently disables everything that ships beyond it — this file used
+# to pin four explainers, turning off the other six (god-class, hotspots,
+# unused-routes, dependency-depth, exported-surface, complexity-outliers) for anyone
+# who adopted it. Omitting the keys means new plugins arrive automatically.
+output:
+  dir: ".enola"
+  max_context_tokens: 16000
