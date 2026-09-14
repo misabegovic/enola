@@ -21,6 +21,18 @@ This installs `enola` to `~/.local/bin`. If that's not on your `PATH`, add it:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+It is also on PyPI and RubyGems. Same binary, same `enola` command:
+
+```bash
+pip install enola-cli
+```
+
+```ruby
+gem "enola"   # then: bundle exec enola
+```
+
+`enola-cli` is the PyPI project name because `enola` was taken; the installed command is unaffected. The gems live at [enola-labs/enola-rb](https://github.com/enola-labs/enola-rb).
+
 Binaries are published for Linux, macOS (amd64/arm64), and Windows (amd64). You can also download a specific build from the [Releases page](https://github.com/enola-labs/enola/releases), or [build from source](#build-from-source).
 
 ### Upgrade
@@ -38,6 +50,7 @@ Because your agent launches enola as a long-lived MCP server process, an upgrade
 - **Claude Code** - restart the session, or re-register with `claude mcp remove enola && claude mcp add enola enola`.
 - **Cursor** - toggle the enola server off and back on in **Settings → MCP** (or reload the window).
 - **GitHub Copilot (VS Code)** - restart the server from the `.vscode/mcp.json` editor (the **Restart** CodeLens above the server entry), or reload the window.
+- **opencode** - quit and restart it; it loads its configuration once at startup and never reloads it.
 
 ### Configuration (optional)
 
@@ -92,6 +105,10 @@ When you do pass a config, its `repo:` is only the *default* repository - you ca
   }
 }
 ```
+
+**opencode** - `enola install --targets opencode` writes the registration itself, because it is already editing the same file to register enola's instructions. It uses an existing `opencode.json` if there is one and otherwise creates `.opencode/opencode.json`, and it leaves a server entry you wrote yourself exactly as it is, in both directions: not overwritten on install, not deleted on uninstall. A `.jsonc` config is skipped rather than rewritten, since the comments in it would not survive. opencode reads its configuration once at startup, so restart it afterwards.
+
+With `--hooks` the same target installs `.opencode/plugin/enola.js`. opencode has no hook configuration in the shape Claude Code and Codex accept, so the plugin does a narrower job: it names the enola tool that answers a structural question in the descriptions of `grep`, `glob` and `list`, repeats that in the system prompt where it also reaches subagents, and refuses the first searches of a session outright with the tool to call instead. That last part blocks, so it is bounded twice: it gives up after two refusals, and it gives up the moment any enola tool is called, including one that failed. `ENOLA_OPENCODE_GATE=off` disables the refusals and leaves the rest.
 
 **GitHub Copilot (VS Code)** - add enola to `.vscode/mcp.json` in your workspace (or your user-level MCP config via **MCP: Open User Configuration**). Note the top-level key is `servers` (not `mcpServers`), and the config path in `args` is optional - drop it to use defaults:
 
@@ -516,10 +533,30 @@ enola uninstall               # remove it all again
 | Codex · Copilot · Pi | `AGENTS.md` *(marked block, only if it already exists)* | — |
 | Codex | `.codex/hooks.json` *(managed entries, `--hooks` only)*, covered by `AGENTS.md` otherwise | `~/.codex/AGENTS.md` *(marked block)*, `~/.codex/hooks.json` *(managed entries, `--hooks` only)* |
 | Pi | *covered by `AGENTS.md`* | `~/.pi/agent/AGENTS.md` *(marked block)* |
+| opencode | `.opencode/enola.md` *(owned)* + its entry in `opencode.json`, or covered by `AGENTS.md` | `~/.config/opencode/enola.md` *(owned)* + its entry in `~/.config/opencode/opencode.json` |
+| opencode | `mcp.enola` in the same config *(the one target that registers the server itself)* | same |
+| opencode | `.opencode/plugin/enola.js` *(owned, `--hooks` only)* | `~/.config/opencode/plugin/enola.js` *(owned, `--hooks` only)* |
 
-**Codex, Copilot and Pi all read the repository's `AGENTS.md`**, so locally one block serves all three - enola won't write a second repo-local file for them, which would only put the same instruction into the same context window twice. Their `--global` entries add what `AGENTS.md` can't: guidance in projects where nobody has run `enola install`. Those are written only when the tool's config directory already exists, so enola never creates `~/.codex` for someone who doesn't use Codex.
+**Codex, Copilot, Pi and opencode all read the repository's `AGENTS.md`**, so locally one block serves all four - enola won't write a second repo-local file for them, which would only put the same instruction into the same context window twice. Their `--global` entries add what `AGENTS.md` can't: guidance in projects where nobody has run `enola install`. Those are written only when the tool's config directory already exists, so enola never creates `~/.codex` for someone who doesn't use Codex.
 
-Restrict the run with `--targets=claude,copilot` if you only want some.
+**`--targets` is for narrowing, not for choosing.** The default is every target, and that
+is almost always what you want: each one writes only into files its own agent reads, and
+a target whose agent is not installed skips itself and says so, so installing "everywhere"
+costs nothing but a few small files in your repository. Reach for `--targets` when you
+have a specific reason - you are trying one agent out, a colleague objects to a directory
+appearing in the repo, or you are re-running after fixing one target's configuration:
+
+```bash
+enola install --targets=claude,copilot   # only these two
+enola install --targets opencode         # only opencode
+```
+
+One consequence worth knowing, because it is not obvious: enola skips a target's own
+instruction file when the repository's `AGENTS.md` already carries the block, since
+writing both would put the same paragraphs into the same context window twice. With
+`--targets opencode` the `agents` target is not part of the run, so that check asks
+whether the block is actually in `AGENTS.md` rather than whether the file exists - a
+narrowed run never leaves an agent with a registration and no instructions.
 
 **It never surprises you.** Every run previews what it will touch and asks before writing. It never creates an `AGENTS.md` that wasn't already there. Re-running reports `unchanged` rather than churning files. And `uninstall` restores shared files byte-for-byte - the block is delimited by explicit `<!-- enola:begin -->` / `<!-- enola:end -->` markers, and if those markers have been hand-edited into an unbalanced state, enola refuses to write rather than guess where its section ends.
 
@@ -529,10 +566,22 @@ Restrict the run with `--targets=claude,copilot` if you only want some.
 enola install --hooks
 ```
 
-This installs both halves of the loop, so it runs without anyone remembering to:
+Without it you get instructions and nothing else: a paragraph telling the agent the graph
+exists, which it is free to read and then ignore. That is the honest description of the
+default, and on a small local model it is often what happens. `--hooks` is what makes the
+loop run whether or not the agent remembers to.
+
+In Claude Code and Codex that means two session hooks:
 
 - **`SessionStart`** freezes the architecture as a baseline when a session begins - the "before".
 - **`Stop`** grades what the session changed when your agent finishes a turn, and hands the verdict back **only if** there is something to say: a structural regression under the policy you set, or - since the default policy is empty - a finding enola measured exactly and did not enforce.
+
+**In opencode it means something different**, because opencode has no hook configuration
+of that shape. There `--hooks` installs `.opencode/plugin/enola.js`, which works on the
+other end of the session: rather than grading the change afterwards, it pushes the first
+move towards the index. See the opencode section above for what it does and how to turn
+the blocking half off. Neither the baseline nor the grading is installed there, so
+`enola doctor` is not part of that setup and will not report on it.
 
 The agent gets a chance to fix the layer it crossed before telling you it's done, rather than you finding it in review.
 
@@ -609,7 +658,7 @@ Pin when you start a piece of work and the answer stays "what has this branch do
 
 **A stale baseline warns; it never blocks.** Past three days it tells you exactly how stale and what that means (the delta now also contains whatever the repo itself changed in between) - then grades anyway, because a long-lived baseline is a legitimate way to measure a multi-day refactor and only you know which you meant.
 
-**Nothing fails by default.** A bare `enola check` runs all eighteen explainers, reports every finding the change introduced, and exits `0` - saying in its own output that no policy was in effect, because a gate that enforces nothing must never be mistaken for a gate that found nothing. What breaks the build is what you name:
+**Nothing fails by default.** A bare `enola check` runs all nineteen explainers, reports every finding the change introduced, and exits `0` - saying in its own output that no policy was in effect, because a gate that enforces nothing must never be mistaken for a gate that found nothing. What breaks the build is what you name:
 
 ```bash
 enola check --fail-on=layers                               # fail on a declared layer order
@@ -672,10 +721,10 @@ and this is neither.
 
 **The verdict has four writers, and all four read the same verdict.** `--format` picks `text` (the default), `json` (what `--json` means), `sarif` or `annotations`; nothing is recomputed for a writer, so a fifth is a table row. SARIF carries one rule per declared rule id with the team's `because` as its description, one result per finding in every bucket (failures as errors, advisories and declared findings as warnings, resolved findings at no level and with no region, suppressed and exempted findings with the ledger entry or exemption that excused them), the evidence span as the region, and the finding's stable identity under `partialFingerprints.enola/v1`. Annotations place every finding that has a measured position on its file and line, as Buildkite markdown grouped by file (`--link` takes the pull request's files view so each line links into the diff) or as GitHub workflow commands; findings without a position are counted at the end and never placed. The host is a flag and never read from the environment, so a run on a laptop renders exactly what the run in CI rendered.
 
-The eighteen names `--fail-on` accepts are `cycles`, `layers`, `intent`, `constraints`,
+The nineteen names `--fail-on` accepts are `cycles`, `layers`, `intent`, `constraints`,
 `crossrepo`, `coverage`, `unused-routes`, `messaging-coverage`, `god-class`, `hotspots`,
 `dependency-depth`, `exported-surface`, `complexity-outliers`, `domain`, `query-loops`,
-`entry-points`, `dead-methods` and `vendored-candidates`.
+`entry-points`, `dead-methods`, `vendored-candidates` and `import-closure`.
 
 **A name it does not recognise is refused, not ignored.** `--fail-on=cyles` exits `2`
 and names what it could not match, rather than exiting `0` while enforcing nothing —
@@ -811,19 +860,20 @@ Open the latest snapshot directly:
 enola dashboard --open
 ```
 
-This serves only the dashboard and stays attached to the terminal until Ctrl-C. Startup prints the snapshot directory and complete `http://` URL. Use `enola --status` in another terminal to list running sessions and their dashboard URLs. Starting the MCP server also starts the same **read-only dashboard** on a free loopback port (`127.0.0.1`), printed to stderr at startup. Data refresh is explicit, so a graph investigation is never interrupted by a periodic page reload.
+This serves only the dashboard and stays attached to the terminal until Ctrl-C. An MCP server is not required. Startup prints the selected snapshot directory and complete `http://` URL. Use `enola --status` in another terminal to list running sessions and their dashboard URLs. Starting the MCP server also starts the same **read-only dashboard** on a free loopback port (`127.0.0.1`), printed to stderr at startup. A standalone dashboard keeps the current graph stable until you use **Refresh** to load a newer snapshot from its selected directory.
 
-The dashboard is organized into five tabs:
+The dashboard is organized into six tabs:
 
 - **Overview** — architectural change cards, current facts, findings, repositories, services, and cross-repository edges.
 - **Architecture** — a searchable module graph, focused consumer/dependency neighborhoods, edge evidence, findings, and a synchronized module table.
 - **Snapshots** — freshness, Git capture, extractor schema, repositories in the graph, and the complete technical receipt.
-- **Activity** — every currently active Enola session, this page's highlighted session, lifetime totals across completed and active sessions, and estimated value. Lifetime totals are retained; individual completed-session records are not.
+- **Lifetime usage** — retained tool totals and estimated value across repositories and completed sessions, kept separate from current-snapshot data.
+- **Diagnostics** — active processes, dashboard URLs, paths, ports, and this page's runtime identity.
 - **Quality** — complete file accounting, expected exclusions, potential blind spots, inactive extractors, parse failures, and unresolved cross-repository connections. Genuine parse failures include a prefilled GitHub issue action.
 
-It is strictly a viewer: every request reads through the same concurrency-safe accessors the MCP tools use and never mutates server state. It binds loopback only and serves nothing but the dashboard. Use **Refresh data** when you want to reload the currently available state. Pass `--no-dashboard` to skip the dashboard attached to an MCP server.
+It is strictly a viewer: it never extracts source or writes snapshot data. It binds loopback only and serves nothing but the dashboard. **Refresh** checks the selected snapshot directory immediately. Pass `--no-dashboard` to skip the dashboard attached to an MCP server.
 
-`enola --generate` is different: it generates the snapshot files and exits, without starting an MCP server or dashboard and without registering a running instance. A later MCP server can auto-load those files when it starts. A dashboard that is already running still describes its own process and its own in-memory graph; a separate `--generate` invocation does not turn that dashboard into a viewer for the generator process.
+`enola --generate` is different: it generates the snapshot files and exits, without starting an MCP server or dashboard and without registering a running instance. Use **Refresh** in a running standalone dashboard to load that publication. A normal repository dashboard restores only that repository's snapshot; pass an explicit cluster config to display a multi-repository graph.
 
 #### Several servers at once
 
@@ -831,7 +881,7 @@ Agent tooling starts one enola server per session, so opening four terminals mea
 
 **One bookmarkable URL.** Besides its own port, every server competes for a fixed **shared URL**, `http://127.0.0.1:7171` by default. The first to start wins it; when that one exits another takes over within a few seconds, so the address keeps working for as long as any server is up. Whichever server answers there lists all the others. Set `ENOLA_DASHBOARD_PORT` (or `dashboard.port` in the config) to move it, or `ENOLA_DASHBOARD_PORT=off` to keep only the ephemeral ports.
 
-There is no standalone dashboard process. When the last agent session closes, the last MCP server and its dashboard exit too, so the shared URL stops responding. When a new session starts, its server claims the shared URL again. As sessions start and stop, click **Refresh data** on an open dashboard to update the server list; joining servers appear and departed servers disappear on that request.
+`enola dashboard` is a standalone dashboard process. MCP-hosted dashboards exit with their agent sessions; a standalone dashboard remains until Ctrl-C. Diagnostics refreshes its process list on each page request.
 
 **Every page describes its own server.** The PID, uptime, repos and per-server call counts on a page belong to the process serving it - never to whichever server happened to start last. If a page shows a graph you did not expect, the switcher tells you which server holds the one you want.
 

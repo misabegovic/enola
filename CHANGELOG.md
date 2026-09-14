@@ -7,6 +7,202 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.19 — 2026-09-12
+
+**The Stop hook reports once per session instead of at every stop**
+
+A Stop hook's output prevents the turn from ending: the harness feeds it back to the
+model and stops again, setting `stop_hook_active` on that second stop. enola did not
+read that flag, and deduplicated only its incomparable-baseline report, so a standing
+finding re-emitted the identical report at every stop until the harness overrode the
+hook at its consecutive-block cap. The flag is now read before grading, so a suppressed
+run costs no snapshot, and the once-per-report rule also covers the regression and
+unenforced-finding reports, keyed by the findings themselves and the session id. A new
+session, a different finding, or a recurrence after a clean grade is reported again.
+
+## v0.4.18 — 2026-09-10
+
+**install.sh runs under dash and on Windows, and upgrades get their own checksum**
+
+`curl … | sh` failed wherever `sh` is dash, as on Debian and Ubuntu, because dash rejects
+`set -o pipefail`; install.sh is now POSIX sh. It also installs the native `enola.exe`
+from Git Bash, MSYS2 and Cygwin instead of refusing them, moving a running copy aside so a
+re-run can replace it. `enola upgrade` now verifies against a new
+`enola-<version>-<os>-<arch>.upgrade.sha256`, the same digest as `.sha256` under a name
+only the updater fetches, so release download counts can tell upgrades from fresh
+installs. Integrations should keep verifying against `.sha256`. Nothing changed for pip
+installs, and this version is not on PyPI.
+
+## v0.4.17 — 2026-09-09
+
+**Refresh loads a newer snapshot, and the dashboard opens on findings**
+
+`enola dashboard` re-reads its snapshot directory on Refresh, rather than only
+re-rendering what the process already held. The graph does not move until you ask for it,
+so a regeneration in another terminal cannot change the page under an open investigation.
+The replacement is published atomically and one request reads store, snapshot and receipt
+from a single publication. A repository launch restores that repository's own snapshot; a
+multi-repository graph needs an explicit cluster config.
+
+The tabs are now Findings, Architecture, Snapshots, Lifetime usage, Diagnostics and
+Quality: processes, ports and paths moved out of the usage tab into Diagnostics. The
+module graph condenses each dependency cycle into one node and curves the back edges.
+Change summaries read the configured `history.dir`.
+
+Python calls now bind to symbols a package defines in its own `__init__.py`, not only the
+ones it re-exports. `from pkg import helper` emitted the target `pkg.helper`, whose prefix
+names a directory rather than a module, so absolute resolution failed and the call bound
+to nothing.
+
+## v0.4.16 — 2026-09-08
+
+**Constraint checks now report cases they previously skipped**
+
+Three fixes address checks that returned incomplete or misleading results.
+`require_defines` now checks both `class` and `struct` symbols; previously, a rule over
+Go or another language with struct method owners could select a component without
+evaluating its members. `constraints lint` now includes facts compiled from knowledge
+pages when resolving components. Its `governed_by` results now agree with the explainer
+and constraint check. The intent explainer now emits one notice per policy page when its
+anchors name a repository that is not in the snapshot. The anchors remain unchecked,
+not dangling, because the referenced repository was not measured. The notice is useful
+for clones,
+worktrees and CI checkouts whose directory name differs from the repository label in the
+policy page.
+
+Yarn lockfile resolution now handles descriptors whose range contains an `@`, including
+npm aliases and `git+ssh` ranges. The parser previously split these descriptors at the
+last `@`, derived the wrong package name and reported a dependency as unpinned even when
+the committed `yarn.lock` pinned it. `cacheVersion` moves to `v265`, so existing
+extraction caches are rebuilt and pinned baselines may show a one-time change.
+
+The new `examples/policy-as-code` directory demonstrates a compliance boundary in a
+small Go module. Policy pages define which files are in scope, constraints cite the
+requirements they implement, exemptions include an owner, reason and date, and
+`run.sh` shows the checks before and after three policy violations.
+
+## v0.4.15 — 2026-09-06
+
+**Linux wheels answer to the older tag name as well**
+
+The linux wheels 0.4.14 published were tagged `manylinux_2_17`, which is the PEP 600
+spelling, and pip only learned to read it in 20.3. RHEL 8, Rocky 8 and Amazon Linux 2
+ship pip 20.2.4, so on exactly the systems the low glibc floor was chosen to reach, the
+wheel was invisible and `pip install enola-cli` answered "no matching distribution
+found". The linux wheels now carry a compressed tag set naming both the PEP 600 form and
+the legacy `manylinux2014` alias, so one file answers to either spelling. Verified
+against stock pip 20.2.4 on glibc 2.28.
+
+Nothing else changed. Binaries and extraction are identical to 0.4.14; 0.4.14 itself
+keeps the single tag, because an index will not accept a replacement file for a version
+it already has.
+
+## v0.4.14 — 2026-09-06
+
+**enola installs with pip, and the binaries reach older systems than they used to**
+
+enola is on PyPI as `enola-cli`, the name `enola` having been taken by someone else. The
+command it installs is still `enola`. The wheel carries the same compiled binary the
+release tarball does, with no Python launcher in front of it and no Python needed at run
+time, so a `pip install enola-cli` costs nothing at startup that `install.sh` does not.
+Wheels are published for linux, macOS and Windows on amd64 and arm64.
+
+Because pip records the file it installed, `enola upgrade` refuses on a pip install and
+names `pip install -U enola-cli` instead. Replacing the binary there would appear to work
+and then be undone by the next pip operation, with the version silently reverting.
+
+The two portability fixes this uncovered apply to `install.sh` and `enola upgrade` as
+much as to the wheels, since every route ships the same binary. The linux binaries are
+now compiled inside a manylinux_2_28 image rather than on the CI runner, which lowers
+what they require at run time from glibc 2.34 to 2.17: RHEL and Rocky 8, Amazon Linux 2,
+Ubuntu 20.04 and Debian 11 could not run a 0.4.13 binary and can run this one. The macOS
+binaries now declare a deployment target of 12.0, which is Go's own oldest supported
+release, rather than inheriting whatever SDK version the build machine happened to have.
+
+## v0.4.13 — 2026-09-04
+
+**Python imports bind to the module they name**
+
+An absolute Python import bound to the enclosing package directory, and one naming the
+importer's own package bound to nothing and read as a third-party dependency. Both now
+bind to the module, the granularity relative imports always had. Imports that never run
+at module-import time (function and class bodies, `if TYPE_CHECKING:`) carry a
+`deferred` prop. The new `import-closure` explainer reports what importing a package
+executes, including the `__init__.py` files no import statement names, and ranks
+barrels by how much each one alone brings in. Informational only.
+
+C++ call resolution binds a bare call when exactly one function in the repository
+declares that short name, and resolves `obj.method()` when the receiver has an explicit
+type and the method is unique; `auto`, template wrappers and missing methods stay
+unresolved. Three TypeScript passes now match inside tree-sitter instead of walking the
+tree in Go, cutting allocations with byte-identical output.
+
+`cacheVersion` moves to `v264`. Python and C++ repositories re-extract once; changed
+import targets and new call edges can shift findings, so re-pin baselines there.
+
+## v0.4.12 — 2026-09-01
+
+**GraphQL servers join the graph, so client operations have something to match**
+
+enola read GraphQL client operations and graphql-ruby's server field DSL, which left a
+schema-first Node server invisible: a TypeScript client's `Query.pageViews` crossed the
+repository boundary and found nothing on the other side. Server SDL is now read for Apollo
+Server, GraphQL Yoga, Mercurius, express-graphql, graphql-http, GraphQL Tools and
+GraphQL.js, along with code-first root fields from NestJS GraphQL, TypeGraphQL, Nexus and
+Pothos. Each root field becomes a server-role route in the same name shape the client
+emits, which is what the cross-repository `graphql` signal joins on. Activation is a
+repository-wide AST signal and package provenance is required, so a documentation example
+and a client's codegen copy of its backend's schema both stay inert.
+
+The client half widened to match: Relay's tag joins the `gql` tags, static operation
+strings are read in graphql-request modules and plain `fetch` bodies, and tag extraction
+now runs inside Vue and Nuxt `<script>` and `<script setup>`. Fixed: a Ruby client literal
+holding more than one operation reported only the first. The TypeScript pass reads each
+source once instead of rereading every file to build the gRPC stub index. Resolvers are
+not read — which root fields exist is in the graph, which function serves one is not.
+
+`cacheVersion` moves to `v259`: every repository re-extracts once, a repository serving
+GraphQL gains server-role routes, and baselines on those repositories should be re-pinned.
+
+## v0.4.11 — 2026-08-30
+
+**A Vue component's template is code, and enola now reads it**
+
+Vue and Nuxt extraction stops at the `<script>` block no longer. A Single File
+Component's TEMPLATE is where a handler is wired to a button and a child component is
+placed, so a component used only from a template read as an orphan and a `@click`
+handler read as dead. Interpolations and directive values are now resolved against the
+SFC's own declarations, and component tags through default imports, named imports, local
+aliases and unambiguous Nuxt `components/` auto-import conventions. The references that
+resolve become `calls` edges on the component, and `traverse`, `find_path`,
+`impact_analysis` and orphan analysis see them. Resolution is narrow where it cannot be
+sure: HTML text, native tags and CSS tokens are not read as code, and a tag two Nuxt
+layers could both supply stays unresolved rather than binding to whichever was walked
+first.
+
+`<script setup>` compiler macros are recorded as the component's public surface.
+`defineProps`, `defineEmits`, `defineSlots`, `defineModel`, `defineExpose` and
+`defineOptions` land in `vue_macros` with a boolean prop per macro; the statically
+declared prop, emit, slot, model and exposed names land in the matching `vue_*_names`
+lists, and generic declaration text is kept in `vue_contract_types`. Macro-looking text
+inside a comment or a string is ignored.
+
+Routing covers what the frameworks actually ship. Nuxt file-based routes are emitted for
+every supported page extension rather than `.vue` alone, route-group directories are
+omitted from the URL, and named-view, `.client` and `.server` suffixes no longer leak
+into it. Vue Router `createRouter({ routes })` records with literal paths emit page
+routes, nested `children` paths compose onto their parent, and a statically or lazily
+imported component becomes a `handled_by` edge; the configuration file keeps its
+`router_config` marker fact. A Nuxt auto-imported `useXxx()` call is rebound to its
+unique exported declaration under `composables/`, and left unresolved when two layers
+export the name.
+
+`cacheVersion` moves to `v258`. Every Vue and Nuxt repository gains facts and existing
+ones change shape, so extraction caches from earlier releases are invalidated and the
+first snapshot after upgrading re-extracts. Baselines taken on a Vue or Nuxt repository
+should be re-pinned: the new template edges can resolve orphan findings and can surface
+coupling that was previously invisible.
+
 ## v0.4.10 — 2026-08-28
 
 **Snapshot artifacts now have a documented, versioned contract**

@@ -93,6 +93,16 @@ type edge struct {
 	repo           string
 }
 
+// unresolvedReason distinguishes resolution work from expected graph boundaries.
+// Keep these values stable: they are emitted in coverage diagnostics so runs over
+// large repositories can be compared directly.
+const (
+	reasonKnownUnplaced  = "known_symbol_outside_production_module"
+	reasonUniqueShort    = "unique_short_name_match"
+	reasonAmbiguousShort = "ambiguous_short_name_match"
+	reasonUnknown        = "no_symbol_match"
+)
+
 func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	// Recomputed from scratch each run, prior derived edges dropped first, the
 	// same idempotence the cross-repo linker keeps for its synthetics. Without
@@ -126,10 +136,14 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	symbolModule := map[key]placed{}
 	nameRepos := map[string]int{}
 	seenNameInRepo := map[key]bool{}
+	knownSymbols := map[string]bool{}
+	shortNameCount := map[string]int{}
 	for _, f := range store.ByKind(facts.KindSymbol) {
 		if f.File == "" {
 			continue
 		}
+		knownSymbols[f.Name] = true
+		shortNameCount[symbolShortName(f.Name)]++
 		module := resolve(f, production, test)
 		if module == "" || !production[module] {
 			continue
@@ -150,6 +164,8 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 
 	weights := map[edge]int{}
 	unresolved, crossRepo := 0, 0
+	unresolvedReasons := map[string]int{}
+	unresolvedTargets := map[string]map[string]int{}
 	for _, f := range store.ByKind(facts.KindSymbol) {
 		source, ok := symbolModule[key{repo: f.Repo, name: f.Name}]
 		if !ok {
@@ -170,8 +186,21 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			if !known {
 				if nameRepos[r.Target] > 0 {
 					crossRepo++
-				} else {
-					unresolved++
+					continue
+				}
+				unresolved++
+				reason := classifyUnresolvedTarget(r.Target, knownSymbols, shortNameCount)
+				language := f.PropString("language")
+				if language == "" {
+					language = "unknown"
+				}
+				category := language + "/" + r.Kind + "/" + reason
+				unresolvedReasons[category]++
+				if language == "cpp" && r.Kind == facts.RelCalls {
+					if unresolvedTargets[reason] == nil {
+						unresolvedTargets[reason] = map[string]int{}
+					}
+					unresolvedTargets[reason][r.Target]++
 				}
 				continue
 			}
@@ -211,9 +240,88 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	}
 	sort.Slice(derived, func(i, j int) bool { return derived[i].Name < derived[j].Name })
 	store.Add(derived...)
-	log.Printf("[module-edges] derived %d module edge(s) from resolved symbol edges; %d pair(s) an extractor already connected, %d symbol edge(s) naming no known symbol, %d landing in another repository",
+	log.Printf("[module-edges] derived %d module edge(s) from resolved symbol edges; %d pair(s) an extractor already connected, %d symbol edge(s) not resolving to a production symbol, %d landing in another repository",
 		len(derived), skipped, unresolved, crossRepo)
+	if unresolved > 0 {
+		log.Printf("[module-edges] unresolved symbol edge breakdown: %s", formatBreakdown(unresolvedReasons))
+		for _, reason := range []string{reasonKnownUnplaced, reasonUniqueShort, reasonAmbiguousShort, reasonUnknown} {
+			if targets := unresolvedTargets[reason]; len(targets) > 0 {
+				log.Printf("[module-edges] top unresolved cpp/calls/%s targets: %s", reason, formatTopTargets(targets, 5))
+			}
+		}
+	}
 	return nil
+}
+
+func formatTopTargets(counts map[string]int, limit int) string {
+	type item struct {
+		name  string
+		count int
+	}
+	items := make([]item, 0, len(counts))
+	for name, count := range counts {
+		items = append(items, item{name: name, count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].count != items[j].count {
+			return items[i].count > items[j].count
+		}
+		return items[i].name < items[j].name
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("%s=%d", item.name, item.count))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func symbolShortName(name string) string {
+	for _, sep := range []string{"#", "::", "."} {
+		if i := strings.LastIndex(name, sep); i >= 0 {
+			name = name[i+len(sep):]
+		}
+	}
+	return name
+}
+
+func classifyUnresolvedTarget(target string, known map[string]bool, shortNames map[string]int) string {
+	if known[target] {
+		return reasonKnownUnplaced
+	}
+	switch shortNames[symbolShortName(target)] {
+	case 1:
+		return reasonUniqueShort
+
+	case 0:
+		return reasonUnknown
+	default:
+		return reasonAmbiguousShort
+	}
+}
+
+func formatBreakdown(counts map[string]int) string {
+	type item struct {
+		name  string
+		count int
+	}
+	items := make([]item, 0, len(counts))
+	for name, count := range counts {
+		items = append(items, item{name: name, count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].count != items[j].count {
+			return items[i].count > items[j].count
+		}
+		return items[i].name < items[j].name
+	})
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("%s=%d", item.name, item.count))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func moduleNames(store *facts.Store) (production, test map[string]bool) {

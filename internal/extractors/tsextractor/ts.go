@@ -65,7 +65,7 @@ func (e *TSExtractor) DetectFiles(repoPath string, files []string) (bool, error)
 	if _, found := findTSRoot(repoPath); found {
 		return true, nil
 	}
-	if detectGraphQLDocs(repoPath) {
+	if hasGraphQLDocs(files) {
 		return true, nil
 	}
 	for _, rel := range files {
@@ -242,18 +242,41 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 			htmlFiles = append(htmlFiles, relFile)
 		}
 	}
+	var nuxtAutoComponents map[string]string
+	if isNuxt {
+		nuxtAutoComponents = nuxtAutoComponentIndex(knownFiles)
+	}
 
 	// Repo-wide pre-pass: resolve generated gRPC-web client stubs (service FQN +
 	// RPC methods + client class) so per-file call-site detection can map a
 	// `client.method(...)` call to its "/pkg.Service/Method" route. Built before
 	// the parallel pass because a client's stub and its call sites usually live
 	// in different files.
-	grpcStubs := buildGRPCStubIndex(repoPath, tsFiles)
+	// Read each source once, in parallel. GraphQL context needs a repository-wide
+	// view before extraction, but it consumes these bytes rather than performing a
+	// serial pre-pass that rereads every file from disk.
+	type sourceResult struct {
+		src []byte
+		err error
+	}
+	readSources := parallel.MapFiles(ctx, tsFiles, func(relFile string) sourceResult {
+		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
+		return sourceResult{src: src, err: err}
+	})
+	sources := make(map[string][]byte, len(tsFiles))
+	for i, read := range readSources {
+		if read.err != nil {
+			log.Printf("[ts-extractor] error reading %s: %v", tsFiles[i], read.err)
+			continue
+		}
+		sources[tsFiles[i]] = read.src
+	}
+	grpcStubs := buildGRPCStubIndex(tsFiles, sources)
+	graphqlServer := detectGraphQLServerUsage(tsFiles, sources)
 
 	perFile := parallel.MapFiles(ctx, tsFiles, func(relFile string) tsFileResult {
-		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
-		if err != nil {
-			log.Printf("[ts-extractor] error reading %s: %v", relFile, err)
+		src := sources[relFile]
+		if src == nil {
 			return tsFileResult{}
 		}
 		if isMinifiedSource(src) {
@@ -265,7 +288,7 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 		}
 		aliases := aliasesForDir(aliasRoots, factpath.Dir(relFile))
 		var res tsFileResult
-		res.facts, res.angular, res.angularRouter, res.angularInline, res.angularHTTP = e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, isAngular, orms, aliases, knownFiles, grpcStubs)
+		res.facts, res.angular, res.angularRouter, res.angularInline, res.angularHTTP = e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, isAngular, graphqlServer, orms, aliases, knownFiles, nuxtAutoComponents, grpcStubs)
 		// Routers, mounts and held-back routes for the repo-wide mount pass below.
 		// Collected here because resolving an import needs this file's path aliases,
 		// which are in scope only during the per-file walk. Same test-path gate as
@@ -276,6 +299,7 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 		}
 		return res
 	})
+	sources = nil
 
 	// Templates are scanned in parallel with no parser: an Angular template is not
 	// HTML once its @if/@for blocks are in it, and both dialects are live in the
@@ -342,6 +366,9 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// Serial post-pass: propagate the per-body io_direct flag transitively across the
 	// call graph into performs_io, so wrapper-hidden network/file I/O is visible to the
 	// enterprise performance analyzer. Mirrors the Swift extractor's computePerformsIO.
+	if isNuxt {
+		resolveNuxtAutoComposableCalls(allFacts)
+	}
 	computeTSPerformsIO(allFacts)
 
 	// Engine-relative routes compose onto their mount point here, where every
@@ -471,7 +498,7 @@ type extractCtx struct {
 	aliases     map[string]tsAlias  // this directory's tsconfig path aliases, for resolving an import written as a bare specifier
 }
 
-func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, isAngular bool, orms ormFlags, aliases map[string]tsAlias, knownFiles map[string]bool, grpcStubs *grpcStubIndex) ([]facts.Fact, angularCounts, *angularRouterFile, map[string]*angularTemplate, *angularHTTPFile) {
+func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, isAngular bool, graphqlServer graphqlServerContext, orms ormFlags, aliases map[string]tsAlias, knownFiles map[string]bool, nuxtAutoComponents map[string]string, grpcStubs *grpcStubIndex) ([]facts.Fact, angularCounts, *angularRouterFile, map[string]*angularTemplate, *angularHTTPFile) {
 	// The grammar is chosen here, so the kind table is too: TypeScript and TSX assign
 	// different meanings to the same symbol ids, and everything below reads node kinds
 	// through this table. See kinds.go.
@@ -479,7 +506,7 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	kinds := tsKindsFor(isTSX)
 
 	if isVueFile(relFile) {
-		return e.extractVueSFC(kinds, src, relFile, isNuxt, aliases), angularCounts{}, nil, nil, nil
+		return e.extractVueSFC(kinds, src, relFile, isNuxt, aliases, nuxtAutoComponents), angularCounts{}, nil, nil, nil
 	}
 	if isSvelteFile(relFile) {
 		return e.extractSvelteSFC(kinds, src, relFile, isSvelteKit, aliases), angularCounts{}, nil, nil, nil
@@ -487,6 +514,11 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	if isGraphQLDocFile(relFile) {
 		if facts.IsTestPath(relFile) {
 			return nil, angularCounts{}, nil, nil, nil
+		}
+		if graphqlServer.sdlDocuments[filepath.ToSlash(relFile)] {
+			if routes := extractGraphQLServerSDLDocument(src, relFile); len(routes) > 0 {
+				return routes, angularCounts{}, nil, nil, nil
+			}
 		}
 		return extractGraphQLClientOps(string(src), relFile, facts.RouteSourceGraphQLOperation), angularCounts{}, nil, nil, nil
 	}
@@ -528,7 +560,9 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	// resolving test-ness here rather than with a local suffix list is deliberate —
 	// the copies that predated it had drifted apart in both directions.
 	if !facts.IsTestPath(relFile) {
-		result = append(result, extractGraphQLTagFacts(src, relFile)...)
+		if graphqlServer.enabled {
+			result = append(result, extractGraphQLServerSDL(src, relFile)...)
+		}
 		result = append(result, extractHTTPClientFacts(src, relFile)...)
 		// Call-registered server routes (Express/Fastify/Hono/Koa). Same test-path
 		// gate: an e2e suite that spins up its own app would otherwise contribute
@@ -555,6 +589,20 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 
 	root := tree.RootNode()
 	if !facts.IsTestPath(relFile) {
+		result = append(result, extractGraphQLTagFactsAST(src, relFile, kinds, isTSX, root)...)
+		text := string(src)
+		fetchBody := hasGraphQLFetchBodyCandidate(text)
+		clientCandidate := strings.Contains(text, "graphql-request") || fetchBody
+		var graphqlBindings graphqlImportBindings
+		if clientCandidate || graphqlServer.enabled {
+			graphqlBindings = collectGraphQLImportBindings(kinds, root, src)
+		}
+		if clientCandidate {
+			result = append(result, extractGraphQLClientCallFactsAST(src, relFile, kinds, root, fetchBody, graphqlBindings)...)
+		}
+		if graphqlServer.enabled {
+			result = append(result, extractGraphQLCodeFirstAST(src, relFile, kinds, root, graphqlBindings)...)
+		}
 		result = append(result, extractTSKafkaFacts(kinds, root, src, relFile)...)
 	}
 
@@ -658,6 +706,15 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 				"framework": "vue",
 			},
 		})
+		result = append(result, extractVueRouterRoutes(kinds, root, src, relFile, aliases)...)
+	}
+	// Nuxt accepts render-function pages in addition to .vue SFCs. Vue pages take
+	// the early SFC return above and are emitted by extractVueSFC; emit the other
+	// supported extensions here.
+	if isNuxt && !isVueFile(relFile) {
+		if route := detectNuxtRoute(relFile); route != nil {
+			result = append(result, *route)
+		}
 	}
 
 	return result, angular, router, inlineTemplates, httpFile
@@ -3374,4 +3431,22 @@ func resolveTSCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte, dir, 
 		}
 	}
 	return ""
+}
+
+// tsGrammarKey and tsGrammarLanguage name the grammar a tree was parsed with, so a
+// cached query is never reused across the two. TypeScript and TSX are separate
+// grammars with separate symbol ids, and a query compiled for one cannot be run
+// against a tree parsed by the other.
+func tsGrammarKey(isTSX bool) string {
+	if isTSX {
+		return "tsx"
+	}
+	return "typescript"
+}
+
+func tsGrammarLanguage(isTSX bool) *sitter.Language {
+	if isTSX {
+		return sitter.NewLanguage(typescript.LanguageTSX())
+	}
+	return sitter.NewLanguage(typescript.LanguageTypescript())
 }

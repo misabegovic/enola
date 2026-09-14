@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/enola-labs/enola/internal/version"
 )
 
 // Overridable base URLs (production defaults). Tests point these at an
@@ -50,6 +52,14 @@ var supportedPlatforms = map[string]bool{
 // Run performs a self-update to the latest release. current is the installed
 // version (version.Version); a value of "dev" is always treated as out of date.
 func Run(ctx context.Context, current string) error {
+	// Checked before anything else, including the release lookup. A pip install
+	// is not a slow path to the same outcome, it is the wrong outcome, and there
+	// is no reason to spend a network round trip discovering that.
+	if msg := externallyManaged(); msg != "" {
+		fmt.Fprint(os.Stderr, msg)
+		return nil
+	}
+
 	current = strings.TrimPrefix(current, "v")
 
 	latest, err := latestVersion(ctx)
@@ -99,6 +109,40 @@ func Run(ctx context.Context, current string) error {
 	return nil
 }
 
+// externallyManaged returns what to tell the user when something other than
+// enola owns the installed binary, or "" when self-update is enola's to perform.
+//
+// The pip case is not a permissions problem, and it is worth being precise about
+// why, because replacing the file would appear to WORK. pip records each
+// installed file's path and hash in the environment's RECORD. Renaming a new
+// binary over that path leaves the record describing a file that no longer
+// exists, so the install is silently inconsistent until the next pip operation
+// notices and clobbers the upgrade. The user would then be back on the old
+// version with no message explaining why.
+//
+// The PyPI project is enola-cli because `enola` was already taken by someone
+// else. The command it installs is still `enola`, which is exactly the sort of
+// asymmetry nobody remembers under pressure, so the message spells the whole
+// command out rather than saying "upgrade with pip".
+func externallyManaged() string {
+	if version.InstallMethod != "pip" {
+		return ""
+	}
+	where := "this installation"
+	if exe, err := os.Executable(); err == nil {
+		where = exe
+	}
+	return fmt.Sprintf(`enola was installed with pip, which owns %s.
+
+Self-updating would replace that file behind pip's back: pip's recorded hash for
+the package would no longer match, and the next pip operation would undo the
+upgrade without saying so.
+
+Upgrade with:
+  pip install -U enola-cli
+`, where)
+}
+
 // latestVersion queries the GitHub API for the latest release tag and returns
 // it without a leading "v".
 func latestVersion(ctx context.Context) (string, error) {
@@ -141,6 +185,12 @@ type assets struct {
 
 // assetNames derives the release artifact names for a version and platform,
 // matching the naming produced by .github/workflows/release.yml.
+//
+// The checksum is deliberately not the `.sha256` that install.sh fetches, though
+// it holds the same digest. GitHub counts downloads per asset and records nothing
+// else about a request, so two clients fetching the same file cannot be told
+// apart. A checksum of its own is what lets the release counters separate
+// upgrades from fresh scripted installs.
 func assetNames(version, goos, goarch string) (assets, error) {
 	if !supportedPlatforms[goos+"/"+goarch] {
 		return assets{}, fmt.Errorf("no prebuilt release for %s/%s; install manually from https://github.com/%s/releases", goos, goarch, repoSlug)
@@ -152,7 +202,7 @@ func assetNames(version, goos, goarch string) (assets, error) {
 	}
 	return assets{
 		tarball:     base + ".tar.gz",
-		checksum:    base + ".sha256",
+		checksum:    base + ".upgrade.sha256",
 		innerBinary: inner,
 	}, nil
 }
