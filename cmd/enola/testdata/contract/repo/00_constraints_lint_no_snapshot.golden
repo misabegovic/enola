@@ -4,8 +4,12 @@ exit: 0
 
 go_sample: declared by enola-intent.yaml.
   <TMP>/go_sample/enola-intent.yaml: 2 component(s), 1 rule(s), 0 exemption(s)
+  munola:recipes/api-boundaries.yaml: recipe api-boundaries — roles controllers, policies, public-api, mutating-actions, 2 rules
+  munola:recipes/background-work.yaml: recipe background-work — roles tasks, task-classes, controllers, 2 rules
   enola:recipes/clean.yaml: recipe clean — roles frameworks, interface-adapters, use-cases, entities, 6 rules
   enola:recipes/cqrs.yaml: recipe cqrs — roles commands, queries, read-models, 4 rules
+  munola:recipes/data-ownership.yaml: recipe data-ownership — roles store, readers, 1 rule
+  munola:recipes/ember-conventions.yaml: recipe ember-conventions — roles components, integration-tests, actions, framework-controllers, constructors, fetchers, legacy-accessor, argument-mutators, element-modifiers, state-writing-members, task-factories, fixture-setup, 9 rules
   enola:recipes/event-driven.yaml: recipe event-driven — roles publishers, events, handlers, 3 rules
   enola:recipes/layered.yaml: recipe layered — roles presentation, application, domain, infrastructure, 5 rules
   enola:recipes/modular-monolith.yaml: recipe modular-monolith — roles module-public, module-internal, other-modules, 3 rules

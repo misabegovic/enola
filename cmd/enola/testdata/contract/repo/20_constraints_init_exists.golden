@@ -1,8 +1,12 @@
 $ enola constraints init .
 exit: 0
 --- stdout
+api-boundaries       no role resolves to a directory here; not bound
+background-work      no role resolves to a directory here; not bound
 clean                not bound: no directory for frameworks, interface-adapters, use-cases, entities
 cqrs                 not bound: no directory for commands, queries, read-models
+data-ownership       no role resolves to a directory here; not bound
+ember-conventions    no role resolves to a directory here; not bound
 event-driven         not bound: no directory for publishers, events, handlers
 layered              not bound: no directory for presentation, application, domain, infrastructure
 modular-monolith     not bound: no directory for module-public, module-internal, other-modules
