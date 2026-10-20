@@ -1,20 +1,57 @@
 # Benchmarks
 
-Everything here was measured on 2026-09-04, at extractor version v264, on 91 public
-open-source repositories, with one binary, by scripts you can re-run. This page
-carries the latest sweep rather than a released version's, so it moves when the
-extractors do. Where a number is unflattering it is still here.
+This page carries two kinds of evidence: a field measurement from real coding-agent
+sessions, and a repeatable fixed-corpus benchmark of enola's structural verdicts.
 
-Timings are the engine's own snapshot `duration` rather than wall-clock. The sweep
-passes `--memstats`, which forces a full GC before reporting its figures, and on a
-kernel-sized heap that is a few hundred milliseconds of process time no user pays.
+The fixed corpus was measured on 2026-10-12, at extractor version v332, on 95 public
+open-source repositories, with one binary, by scripts you can re-run. It carries the
+latest sweep rather than a released version's, so it moves when the extractors do.
+Where a number is unflattering it is still here.
+
+## Real-session usage
+
+Between February and October 2026, the logs written by Claude Code and OpenCode
+recorded 4,375 enola calls across 238 sessions of ordinary development. Nothing was
+staged or re-run.
+
+Claude Code used the latest Claude Opus version available at the time throughout.
+OpenCode ran local 27B-class Qwen models throughout: Qwen 3.8 27B at the end of the
+measurement period, Qwen 3.6 27B before it, and Qwen Coder earlier.
+
+| | Claude Code | OpenCode | Total |
+|---|---:|---:|---:|
+| Sessions | 32 | 206 | **238** |
+| enola calls | 774 | 3,601 | **4,375** |
+| Tokens enola put into context | 389k | 3.7M | **4.1M** |
+| Opening only the files named in each answer | 5.4× as much | 7.7× as much | — |
+| Reading the full source represented by each session | 450× as much | 623× as much | — |
+| Snapshot sessions whose source exceeded median active context | 27 / 27 | 178 / 183 | **205 / 210** |
+
+The median call was about 220 to 250 tokens. Most graph lookups completed in tens of
+milliseconds; generating a snapshot took a median of 1.3 to 3.1 seconds. The full-source
+comparison applies to questions that need repository-wide structure. The named-file
+comparison is the narrower floor: it assumes the agent already knew which files to open,
+and prices only those files.
+
+The payload and latency come from the agents' own logs. No harness records tokens per
+tool call, so tokens are estimated as characters sent and returned divided by four. The
+two source-reading columns use repository source sizes and each harness's observed
+behaviour when reading files. They describe this workload; another developer's repositories,
+models and working style will produce different numbers under the same accounting.
+
+The [full field report](https://enola.tech/blog/what-enola-saves-in-real-agent-sessions)
+breaks the result down by tool and by one- versus multi-repository sessions.
 
 ## What is measured, and why these five things
 
 A code graph for agents is usually benchmarked on retrieval: how few tool calls,
-how few tokens, how fast the agent finds the right file. Those are real questions,
-and enola is not benchmarked on them here. They measure how quickly an agent
-reaches code it was going to read anyway.
+how few tokens, how fast the agent finds the right file. The field measurement above
+answers those questions for the workload that occurred. The fixed corpus below asks
+whether the structural verdict an agent receives can be believed.
+
+Its timings are the engine's own snapshot `duration` rather than wall-clock. The sweep
+passes `--memstats`, which forces a full GC before reporting its figures, and on a
+kernel-sized heap that is a few hundred milliseconds of process time no user pays.
 
 The questions below are the ones that decide whether a *structural verdict* about
 your change can be believed:
@@ -33,13 +70,13 @@ would have been.
 
 ## The corpus
 
-91 repositories, 448,086 source files parsed of 743,817 seen, 8,194,786 facts
+95 repositories, 468,899 source files parsed of 767,771 seen, 8,355,653 facts
 carrying 26 distinct language tags (Ansible, C, C++, C#, Dart, F#, Go, HCL, Java,
 Kotlin, Markdown, PHP, Python, Razor, Ruby, Rust, Scala, SQL, Stimulus, Swift,
 TypeScript, VB.NET, XAML, gRPC, OpenAPI, and enola's own intent pages). Public open-source only: every row is a
 repository you can clone and re-run.
 
-**91 of 91 reproduce** — identical `snapshot_id` and identical
+**95 of 95 reproduce** — identical `snapshot_id` and identical
 `facts.jsonl` hash across a cold run and two warm ones, i.e. across cache states.
 
 **And 81 of 81 reproduce across separate sweeps**, measured when 0.4.0 was validated:
@@ -59,8 +96,13 @@ work described below. The four it had — gitlab, discourse, chatwoot, solidus �
 one shape between them, a single application with a single root `config/routes.rb`,
 and three defects hid behind that. See [the Ruby rows](#ruby--rails).
 
-**TypeScript is now the largest language after C** — 1,156,486 facts against C's
-2,067,299 (almost all of it the Linux kernel). It was 781,437 at v224, and the jump is
+**PHP grew from eight repositories to twelve**, and the four are Laravel applications.
+The one Laravel repository it had, cachet, is since 3.x an application shell whose
+controllers and models live in a vendored package, so nothing in the corpus could show
+whether a Laravel route reaches a model. See [the Laravel rows](#php--laravel).
+
+**TypeScript is now the largest language after C** — 1,197,480 facts against C's
+2,075,190 (almost all of it the Linux kernel). It was 781,437 at v224, and the jump is
 the v253 detection change rather than a corpus change: extractors used to answer
 `Detect` with their own bounded walk, so loose `.js` and `.ts` below a scan depth were
 claimed and never read. It overtakes both the .NET family — 1,122,993 facts tagged C#,
@@ -72,118 +114,122 @@ See [the .NET rows](#net) below.
 
 | Repository | Language | Files parsed | Facts | Cold | Warm |
 |---|---|---|---|---|---|
-| linux | c | 57,423 | 2,062,288 | 159.2s | 29.4s |
-| gitlab | ruby | 55,949 | 549,649 | 44.6s | 25.3s |
-| runtime | csharp | 23,625 | 533,390 | 67.9s | 33.1s |
-| dart-sdk | dart | 16,865 | 453,204 | 58.4s | 8.8s |
-| rust | rust | 37,724 | 404,731 | 23.1s | 8.9s |
-| roslyn | csharp | 17,517 | 375,200 | 20.6s | 11.8s |
-| shopware | php | 19,907 | 238,194 | 12.5s | 5.3s |
-| spark | scala | 5,749 | 219,121 | 35.5s | 18.8s |
-| flutter | dart | 7,833 | 210,935 | 10.5s | 6.8s |
-| grafana | go | 11,379 | 187,076 | 8.9s | 4.6s |
-| thingsboard | java | 6,620 | 163,431 | 5.4s | 2.9s |
-| discourse | ruby | 13,258 | 144,297 | 10.7s | 5.8s |
-| flutter-packages | dart | 3,942 | 136,381 | 8.0s | 4.5s |
-| gauzy | angular | 8,915 | 120,577 | 6.7s | 2.8s |
-| openproject | ruby | 11,288 | 109,881 | 9.8s | 6.2s |
-| nextcloud-server | php | 6,057 | 102,193 | 6.6s | 2.0s |
-| pekko | scala | 2,296 | 97,647 | 6.1s | 2.8s |
-| bitwarden-clients | typescript | 5,085 | 83,487 | 4.5s | 2.2s |
-| dubbo | java | 4,367 | 82,782 | 2.2s | 1.7s |
-| ente | dart | 3,755 | 80,254 | 3.9s | 1.7s |
-| angular | angular | 7,121 | 79,121 | 5.3s | 2.2s |
-| spartacus | angular | 7,273 | 75,456 | 8.7s | 2.7s |
-| supabase | typescript | 7,387 | 75,250 | 6.9s | 2.7s |
-| airflow | python | 4,391 | 73,557 | 9.6s | 5.8s |
-| fsharp | fsharp | 1,916 | 69,844 | 2.3s | 1.6s |
-| deno | rust | 4,797 | 64,794 | 7.0s | 2.0s |
-| avalonia | xaml | 3,883 | 64,778 | 3.2s | 1.5s |
-| orchardcore | razor | 7,311 | 59,498 | 4.9s | 2.0s |
-| appflowy | dart | 2,510 | 57,226 | 2.5s | 1.3s |
-| superset | python | 4,099 | 55,731 | 5.6s | 3.0s |
-| lila | scala | 2,345 | 55,107 | 4.2s | 1.7s |
-| cal.com | typescript | 4,989 | 51,744 | 3.4s | 1.6s |
-| dbt-core | rust | 1,507 | 49,397 | 3.0s | 0.9s |
-| wordpress | php | 2,773 | 45,609 | 5.7s | 1.1s |
-| gmsh | cpp | 1,761 | 43,115 | 3.1s | 0.7s |
-| peertube | angular | 2,833 | 43,079 | 29.9s | 0.9s |
-| powershell | csharp | 1,302 | 42,827 | 3.0s | 1.0s |
-| bitwarden-server | csharp | 3,704 | 42,060 | 3.1s | 1.8s |
-| mudblazor | razor | 3,184 | 38,728 | 2.2s | 0.8s |
-| chatwoot | ruby | 4,009 | 38,651 | 2.5s | 1.5s |
-| immich | dart | 2,170 | 38,485 | 1.9s | 0.9s |
-| rails | ruby | 2,673 | 37,999 | 2.4s | 1.6s |
-| gitea | go | 2,251 | 36,742 | 1.6s | 0.9s |
-| taiga-ui | angular | 2,985 | 35,474 | 2.0s | 1.1s |
-| flutterfire | dart | 1,188 | 33,032 | 1.9s | 1.1s |
-| angular-components | angular | 2,276 | 32,533 | 2.0s | 1.1s |
-| mastodon | ruby | 3,445 | 30,564 | 3.0s | 1.6s |
-| saleor | python | 2,501 | 30,395 | 3.4s | 2.2s |
-| flarum | php | 2,735 | 29,058 | 1.4s | 0.7s |
-| zio | scala | 1,137 | 28,275 | 5.5s | 1.5s |
-| mcp | csharp | 2,315 | 28,074 | 2.0s | 1.2s |
-| jellyfin | csharp | 1,892 | 27,617 | 1.4s | 0.7s |
-| pekko-http | scala | 1,028 | 23,759 | 1.6s | 0.9s |
-| spotube | dart | 457 | 22,059 | 0.7s | 0.4s |
-| cognee | python | 1,806 | 21,885 | 3.1s | 1.5s |
-| drift | dart | 917 | 20,457 | 1.2s | 0.6s |
-| cognee-rs | rust | 1,016 | 17,405 | 1.1s | 0.4s |
-| files | xaml | 1,286 | 17,340 | 1.1s | 0.5s |
-| fastlane | ruby | 1,073 | 15,914 | 1.3s | 0.7s |
-| tokio | rust | 819 | 15,327 | 0.8s | 0.3s |
-| openwhisk | scala | 482 | 15,263 | 1.7s | 1.1s |
-| http4s | scala | 474 | 13,856 | 2.6s | 0.4s |
-| crates-io | rust | 945 | 13,121 | 1.0s | 0.4s |
-| solidus | ruby | 2,036 | 12,925 | 1.4s | 0.8s |
-| localsend | dart | 449 | 10,738 | 0.7s | 0.2s |
-| ngrx | angular | 1,077 | 10,452 | 0.8s | 2.2s |
-| enola | go | 485 | 10,051 | 7.1s | 0.3s |
-| dashboard | angular | 641 | 10,032 | 0.5s | 0.3s |
-| excalidraw | typescript | 552 | 9,381 | 1.2s | 0.4s |
-| rubygems.org | ruby | 1,212 | 6,790 | 0.8s | 0.4s |
-| gitbucket | scala | 238 | 5,857 | 0.7s | 0.3s |
-| isowords | swift | 387 | 5,836 | 0.4s | 0.2s |
-| nextcloud-collectives | php | 414 | 5,609 | 0.5s | 0.2s |
-| csharp-sdk | csharp | 498 | 5,396 | 0.6s | 0.3s |
-| nowinandroid | kotlin | 356 | 5,310 | 0.4s | 0.3s |
-| getdp | cpp | 183 | 4,655 | 0.8s | 0.1s |
-| eshop | csharp | 585 | 3,617 | 0.3s | 0.2s |
-| elk | vue | 398 | 3,168 | 0.2s | 0.1s |
+| linux | c | 57,480 | 2,068,619 | 142.1s | 37.9s |
+| gitlab | ruby | 55,949 | 551,664 | 37.4s | 23.0s |
+| runtime | csharp | 23,678 | 537,421 | 54.7s | 27.7s |
+| dart-sdk | dart | 16,892 | 454,572 | 47.6s | 8.7s |
+| rust | rust | 37,669 | 391,491 | 15.2s | 8.5s |
+| roslyn | csharp | 17,517 | 376,527 | 14.9s | 10.5s |
+| shopware | php | 19,908 | 238,940 | 8.8s | 5.2s |
+| spark | scala | 5,749 | 219,995 | 8.4s | 6.5s |
+| flutter | dart | 7,886 | 211,519 | 7.3s | 5.3s |
+| grafana | go | 11,379 | 190,048 | 8.8s | 4.5s |
+| thingsboard | java | 6,620 | 163,570 | 5.0s | 3.1s |
+| discourse | ruby | 13,258 | 144,727 | 9.3s | 5.1s |
+| flutter-packages | dart | 3,942 | 136,360 | 6.0s | 3.7s |
+| gauzy | angular | 8,915 | 120,923 | 6.4s | 2.7s |
+| openproject | ruby | 11,289 | 110,401 | 8.6s | 5.5s |
+| nextcloud-server | php | 6,071 | 104,065 | 5.1s | 2.0s |
+| pekko | scala | 2,296 | 97,657 | 2.4s | 2.0s |
+| airflow | python | 13,637 | 95,222 | 8.5s | 5.7s |
+| bitwarden-clients | typescript | 5,085 | 84,879 | 4.0s | 2.1s |
+| dubbo | java | 4,374 | 82,958 | 1.9s | 1.7s |
+| ente | dart | 3,755 | 80,368 | 3.6s | 1.8s |
+| angular | angular | 7,126 | 79,622 | 4.8s | 2.1s |
+| supabase | typescript | 7,387 | 79,171 | 6.7s | 2.4s |
+| spartacus | angular | 7,273 | 75,509 | 3.9s | 2.2s |
+| deno | rust | 4,817 | 70,880 | 5.5s | 2.0s |
+| fsharp | fsharp | 1,916 | 69,844 | 2.1s | 1.5s |
+| avalonia | xaml | 3,883 | 64,860 | 2.5s | 1.4s |
+| superset | python | 4,324 | 61,375 | 4.8s | 2.6s |
+| orchardcore | razor | 7,311 | 60,646 | 3.8s | 1.7s |
+| appflowy | dart | 2,510 | 57,197 | 1.6s | 1.2s |
+| lila | scala | 2,345 | 55,404 | 2.5s | 1.5s |
+| cal.com | typescript | 4,989 | 52,357 | 3.0s | 1.4s |
+| dbt-core | rust | 1,507 | 49,241 | 2.0s | 1.0s |
+| wordpress | php | 2,775 | 45,859 | 3.5s | 1.1s |
+| gmsh | cpp | 1,765 | 43,683 | 2.1s | 0.9s |
+| peertube | angular | 2,833 | 43,554 | 25.4s | 0.9s |
+| gitea | go | 5,540 | 43,486 | 2.2s | 1.2s |
+| powershell | csharp | 1,302 | 42,833 | 2.1s | 1.1s |
+| bitwarden-server | csharp | 3,704 | 42,187 | 2.0s | 1.4s |
+| chatwoot | ruby | 4,009 | 39,996 | 2.3s | 1.3s |
+| mudblazor | razor | 3,184 | 38,836 | 1.5s | 0.7s |
+| immich | dart | 2,170 | 38,831 | 1.7s | 0.9s |
+| rails | ruby | 2,673 | 38,020 | 1.9s | 1.4s |
+| taiga-ui | angular | 2,985 | 35,498 | 1.7s | 1.0s |
+| flutterfire | dart | 1,188 | 33,036 | 1.5s | 0.9s |
+| angular-components | angular | 2,276 | 31,570 | 1.7s | 0.9s |
+| mastodon | ruby | 3,444 | 31,000 | 2.5s | 1.3s |
+| saleor | python | 2,502 | 30,909 | 2.3s | 1.5s |
+| flarum | php | 2,735 | 29,248 | 1.2s | 0.6s |
+| zio | scala | 1,137 | 28,292 | 1.1s | 0.7s |
+| mcp | csharp | 2,315 | 28,080 | 1.4s | 0.9s |
+| cognee | python | 2,223 | 28,026 | 3.2s | 2.0s |
+| jellyfin | csharp | 1,892 | 27,628 | 1.0s | 0.6s |
+| koel | php | 2,226 | 26,482 | 1.0s | 0.5s |
+| firefly-iii | php | 1,600 | 24,953 | 1.4s | 0.5s |
+| pekko-http | scala | 1,028 | 23,763 | 0.7s | 0.6s |
+| spotube | dart | 457 | 22,059 | 0.6s | 0.4s |
+| monica | php | 1,695 | 20,969 | 0.8s | 0.4s |
+| drift | dart | 917 | 20,457 | 0.9s | 0.5s |
+| files | xaml | 1,286 | 17,397 | 0.8s | 0.4s |
+| cognee-rs | rust | 1,016 | 17,346 | 0.8s | 0.4s |
+| bookstack | php | 1,118 | 16,519 | 1.1s | 0.4s |
+| fastlane | ruby | 1,073 | 15,915 | 1.1s | 0.6s |
+| openwhisk | scala | 484 | 15,298 | 0.6s | 0.4s |
+| tokio | rust | 819 | 14,726 | 0.5s | 0.3s |
+| http4s | scala | 474 | 13,857 | 0.6s | 0.3s |
+| crates-io | rust | 945 | 13,032 | 0.7s | 0.3s |
+| solidus | ruby | 2,036 | 12,952 | 1.2s | 0.6s |
+| enola | go | 630 | 12,198 | 10.0s | 0.4s |
+| excalidraw | typescript | 1,209 | 10,977 | 1.3s | 0.4s |
+| localsend | dart | 449 | 10,738 | 0.5s | 0.2s |
+| ngrx | angular | 1,077 | 10,466 | 0.7s | 0.3s |
+| dashboard | angular | 641 | 10,097 | 0.8s | 0.3s |
+| rubygems.org | ruby | 1,212 | 6,801 | 0.6s | 0.3s |
+| nextcloud-collectives | php | 414 | 5,889 | 0.5s | 0.2s |
+| gitbucket | scala | 238 | 5,857 | 0.3s | 0.2s |
+| isowords | swift | 387 | 5,836 | 0.3s | 0.2s |
+| csharp-sdk | csharp | 498 | 5,402 | 0.4s | 0.3s |
+| nowinandroid | kotlin | 356 | 5,333 | 0.3s | 0.2s |
+| getdp | cpp | 184 | 4,754 | 0.6s | 0.1s |
+| eshop | csharp | 585 | 3,620 | 0.3s | 0.2s |
+| elk | vue | 398 | 3,200 | 0.2s | 0.1s |
 | lobsters | ruby | 541 | 2,902 | 0.4s | 0.2s |
-| ngx-admin | angular | 254 | 2,818 | 0.3s | 0.1s |
+| ngx-admin | angular | 254 | 2,818 | 0.2s | 0.1s |
 | grape | ruby | 201 | 2,424 | 0.2s | 0.2s |
-| activeadmin | ruby | 295 | 2,423 | 0.2s | 0.2s |
-| trading | scala | 128 | 2,257 | 0.2s | 0.1s |
-| nextcloud-contacts | php | 177 | 1,934 | 0.4s | 0.1s |
-| ng-alain | angular | 139 | 1,811 | 0.2s | 0.1s |
-| devise | ruby | 177 | 1,403 | 0.2s | 0.1s |
+| activeadmin | ruby | 295 | 2,424 | 0.2s | 0.1s |
+| trading | scala | 128 | 2,257 | 0.1s | 0.1s |
+| nextcloud-contacts | php | 177 | 2,025 | 0.3s | 0.1s |
+| ng-alain | angular | 139 | 1,812 | 0.1s | 0.1s |
+| devise | ruby | 177 | 1,403 | 0.1s | 0.1s |
 | giraffe | fsharp | 48 | 1,241 | 0.1s | 0.1s |
-| grpc-web-example | grpc | 15 | 339 | 0.1s | 0.1s |
-| sveltekit-realworld | svelte | 45 | 215 | 0.1s | 0.1s |
-| cachet | php | 27 | 154 | 0.1s | 0.1s |
-| orocrm | php | 8 | 124 | 0.1s | 0.1s |
+| grpc-web-example | grpc | 15 | 339 | 0.1s | 0.0s |
+| sveltekit-realworld | svelte | 45 | 226 | 0.1s | 0.0s |
+| cachet | php | 30 | 161 | 0.1s | 0.0s |
+| orocrm | php | 8 | 124 | 0.1s | 0.0s |
 
 ### Ruby / Rails
 
-Thirteen repositories, 96,111 files parsed, 947,734 facts of which **556,078 are Ruby**.
+Thirteen repositories, 96,157 files parsed, 960,629 facts of which **556,132 are Ruby**.
 All thirteen reproduce.
 
 | Repository | Files parsed | Facts | Ruby facts | rails routes | grape routes |
 |---|---:|---:|---:|---:|---:|
-| gitlab | 55,936 | 544,431 | 306,745 | 2,059 | 1,554 |
-| discourse | 13,250 | 143,940 | 69,909 | 1,552 | 0 |
-| openproject | 11,284 | 109,510 | 74,437 | 1,678 | 250 |
-| mastodon | 3,442 | 30,249 | 17,414 | 777 | 0 |
-| rails | 2,667 | 37,899 | 33,668 | 23 | 0 |
-| chatwoot | 4,006 | 37,246 | 14,363 | 690 | 0 |
-| solidus | 2,035 | 12,884 | 11,625 | 690 | 0 |
-| rubygems.org | 1,211 | 6,670 | 6,291 | 239 | 0 |
-| lobsters | 540 | 2,844 | 2,749 | 246 | 0 |
-| grape | 200 | 2,406 | 1,932 | 0 | 5 |
-| fastlane | 1,071 | 15,885 | 13,689 | 0 | 0 |
-| devise | 176 | 1,387 | 1,314 | 0 | 0 |
-| activeadmin | 293 | 2,383 | 1,942 | 0 | 0 |
+| gitlab | 55,949 | 551,664 | 306,769 | 2,059 | 1,554 |
+| discourse | 13,258 | 144,727 | 69,912 | 1,552 | 0 |
+| openproject | 11,289 | 110,401 | 74,437 | 1,678 | 389 |
+| mastodon | 3,444 | 31,000 | 17,438 | 777 | 0 |
+| rails | 2,673 | 38,020 | 33,668 | 32 | 0 |
+| chatwoot | 4,009 | 39,996 | 14,364 | 690 | 0 |
+| solidus | 2,036 | 12,952 | 11,625 | 690 | 0 |
+| rubygems.org | 1,212 | 6,801 | 6,292 | 239 | 0 |
+| lobsters | 541 | 2,902 | 2,749 | 246 | 0 |
+| grape | 201 | 2,424 | 1,932 | 0 | 5 |
+| fastlane | 1,073 | 15,915 | 13,690 | 0 | 0 |
+| devise | 177 | 1,403 | 1,314 | 0 | 0 |
+| activeadmin | 295 | 2,424 | 1,942 | 0 | 0 |
 
 **The four zero rows are the result, not a gap.** `fastlane` is scale Ruby with no Rails
 at all — the control for whether a Rails change breaks plain Ruby. `devise` and
@@ -239,23 +285,23 @@ every gap above was in extraction logic.
 
 ### Dart / Flutter
 
-Ten repositories, 39,738 files, 1,060,520 facts of which **792,041 are Dart**. All ten
+Ten repositories, 40,166 files, 1,065,137 facts of which **792,041 are Dart**. All ten
 reproduce, and **all ten parse with zero errors** — see the corpus notes in
 [`enola-benchmarks`](https://github.com/enola-labs/enola-benchmarks) for the
 up-front parse-coverage measurement that preceded the extractor.
 
 | Repository | Files parsed | Facts | Dart facts | Cold | Warm |
 |---|---|---|---|---|---|
-| dart-sdk | 16,823 | 453,013 | 394,478 | 97.2s | 14.1s |
-| flutter | 7,788 | 210,794 | 143,735 | 23.6s | 8.8s |
-| flutter-packages | 3,865 | 136,165 | 96,074 | 11.5s | 8.2s |
-| ente | 3,693 | 79,680 | 41,595 | 12.1s | 2.7s |
-| appflowy | 2,472 | 56,890 | 40,484 | 2.9s | 1.2s |
-| immich | 2,154 | 38,146 | 14,479 | 2.8s | 1.1s |
-| flutterfire | 1,149 | 32,953 | 13,645 | 3.1s | 1.9s |
-| spotube | 455 | 21,917 | 21,272 | 1.1s | 0.9s |
-| drift | 898 | 20,361 | 18,703 | 2.0s | 1.0s |
-| localsend | 441 | 10,601 | 7,576 | 0.7s | 0.4s |
+| dart-sdk | 16,892 | 454,572 | 394,478 | 47.6s | 8.7s |
+| flutter | 7,886 | 211,519 | 143,735 | 7.3s | 5.3s |
+| flutter-packages | 3,942 | 136,360 | 96,074 | 6.0s | 3.7s |
+| ente | 3,755 | 80,368 | 41,595 | 3.6s | 1.8s |
+| appflowy | 2,510 | 57,197 | 40,484 | 1.6s | 1.2s |
+| immich | 2,170 | 38,831 | 14,479 | 1.7s | 0.9s |
+| flutterfire | 1,188 | 33,036 | 13,645 | 1.5s | 0.9s |
+| spotube | 457 | 22,059 | 21,272 | 0.6s | 0.4s |
+| drift | 917 | 20,457 | 18,703 | 0.9s | 0.5s |
+| localsend | 449 | 10,738 | 7,576 | 0.5s | 0.2s |
 
 dart-sdk is the outlier on cold time and not because of its Dart: it carries 1,138
 C/C++ sources and a large `runtime/` tree, so the C/C++ extractor does substantial work
@@ -272,26 +318,26 @@ the rows where a Dart extraction regression shows up undiluted.
 
 ### .NET
 
-Fourteen repositories, 68,957 files, 1,305,791 facts — everything those repositories
+Fourteen repositories, 69,119 files, 1,316,522 facts — everything those repositories
 contain, markdown and configuration included. Counted by language tag instead, C#,
 VB.NET, F#, Razor and XAML together carry 1,122,993 of them; the corpus section above
 ranks the languages on that basis. All fourteen reproduce.
 
 | Repository | Files parsed | Facts | Cold | Warm |
 |---|---|---|---|---|
-| runtime | 23,547 | 529,820 | 96.3s | 62.2s |
-| roslyn | 17,517 | 375,200 | 38.2s | 16.7s |
-| fsharp | 1,916 | 69,844 | 4.0s | 2.5s |
-| avalonia | 3,880 | 64,750 | 8.5s | 2.9s |
-| orchardcore | 7,294 | 59,338 | 14.3s | 3.3s |
-| powershell | 1,302 | 42,827 | 9.1s | 1.7s |
-| bitwarden-server | 3,700 | 42,040 | 3.9s | 2.0s |
-| mudblazor | 3,183 | 38,726 | 6.7s | 1.4s |
-| mcp | 2,311 | 28,041 | 4.6s | 2.4s |
-| jellyfin | 1,892 | 27,617 | 2.6s | 1.3s |
-| files | 1,286 | 17,340 | 2.4s | 0.9s |
-| csharp-sdk | 497 | 5,393 | 0.8s | 0.5s |
-| eshop | 584 | 3,614 | 0.4s | 0.2s |
+| runtime | 23,678 | 537,421 | 54.7s | 27.7s |
+| roslyn | 17,517 | 376,527 | 14.9s | 10.5s |
+| fsharp | 1,916 | 69,844 | 2.1s | 1.5s |
+| avalonia | 3,883 | 64,860 | 2.5s | 1.4s |
+| orchardcore | 7,311 | 60,646 | 3.8s | 1.7s |
+| powershell | 1,302 | 42,833 | 2.1s | 1.1s |
+| bitwarden-server | 3,704 | 42,187 | 2.0s | 1.4s |
+| mudblazor | 3,184 | 38,836 | 1.5s | 0.7s |
+| mcp | 2,315 | 28,080 | 1.4s | 0.9s |
+| jellyfin | 1,892 | 27,628 | 1.0s | 0.6s |
+| files | 1,286 | 17,397 | 0.8s | 0.4s |
+| csharp-sdk | 498 | 5,402 | 0.4s | 0.3s |
+| eshop | 585 | 3,620 | 0.3s | 0.2s |
 | giraffe | 48 | 1,241 | 0.1s | 0.1s |
 
 The corpus is deliberately split so each mechanism has a control:
@@ -319,21 +365,21 @@ than an unsupported language, because nothing in the output says so.
 
 ### Angular
 
-Ten repositories, 33,403 files parsed, 409,599 facts. All ten reproduce; the largest
-peaks at 393 MiB.
+Ten repositories, 33,519 files parsed, 411,869 facts. All ten reproduce; the largest
+peaks at 438 MiB.
 
 | Repository | Files parsed | Facts | Cold | Warm |
 |---|---|---|---|---|
-| gauzy | 8,869 | 119,931 | 39.1s | 9.3s |
-| angular | 7,096 | 78,892 | 17.6s | 3.5s |
-| spartacus | 7,265 | 75,311 | 8.8s | 5.3s |
-| peertube | 2,824 | 42,813 | 108.6s | 2.7s |
-| taiga-ui | 2,979 | 35,415 | 8.1s | 1.4s |
-| angular-components | 2,270 | 32,415 | 5.7s | 4.2s |
-| ngrx | 1,074 | 10,345 | 6.2s | 2.3s |
-| dashboard | 635 | 9,987 | 2.0s | 0.9s |
-| ngx-admin | 253 | 2,735 | 0.3s | 0.2s |
-| ng-alain | 138 | 1,755 | 0.2s | 0.2s |
+| gauzy | 8,915 | 120,923 | 6.4s | 2.7s |
+| angular | 7,126 | 79,622 | 4.8s | 2.1s |
+| spartacus | 7,273 | 75,509 | 3.9s | 2.2s |
+| peertube | 2,833 | 43,554 | 25.4s | 0.9s |
+| taiga-ui | 2,985 | 35,498 | 1.7s | 1.0s |
+| angular-components | 2,276 | 31,570 | 1.7s | 0.9s |
+| ngrx | 1,077 | 10,466 | 0.7s | 0.3s |
+| dashboard | 641 | 10,097 | 0.8s | 0.3s |
+| ngx-admin | 254 | 2,818 | 0.2s | 0.1s |
+| ng-alain | 139 | 1,812 | 0.1s | 0.1s |
 
 The corpus is split so that each mechanism has a control, the same way the .NET one is:
 
@@ -358,6 +404,71 @@ template references because the other half name components from a third-party li
 that lives in `node_modules`. Both numbers are reported with the cause named rather
 than folded into a total.
 
+### PHP / Laravel
+
+Five repositories, of which four are new: 6,639 files parsed and 88,923 facts
+across the four, 1,533 Laravel routes. All five reproduce, and the largest peaks at
+83 MiB.
+
+| Repository | Files parsed | Facts | laravel routes | with a handler | bound to a method | models | relations | endpoint reaches a model |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| firefly-iii | 1,600 | 24,953 | 640 | 640 | 633 | 51 | 191 | 91 of 200 |
+| bookstack | 1,118 | 16,519 | 340 | 340 | 339 | 35 | 54 | 150 of 200 |
+| monica | 1,695 | 20,969 | 334 | 333 | 325 | 67 | 206 | 163 of 200 |
+| koel | 2,226 | 26,482 | 219 | 211 | 173 | 25 | 36 | 164 of 200 |
+| cachet | 30 | 161 | 0 | 0 | 0 | 0 | 0 | 0 of 0 |
+
+`bound to a method` counts the routes carrying a `handled_by` edge to a method the
+repository declares. The last column is `enola endpoint` asked about a sample of each
+application's routes, one route per query: it counts the ones whose chain runs from the
+route through its handler to at least one Eloquent model. The rest stop at the
+handler's dependencies, apart from 14 of the 800 that could not be asked about alone:
+the query is a substring match, and a shorter path answered first. None stops at the
+controller.
+
+**cachet's zero row is the control.** Since 3.x it is an application shell: its
+controllers, models and routes live in a package under `vendor/`, which is not indexed.
+
+Each of the four is here for a shape the others lack:
+
+| Repo | What it is the control for |
+|---|---|
+| koel | route files the skeleton does not name (`api.base.php`, `subsonic.php`), loaded by a computed file name; invokable controllers; services and repositories injected by constructor |
+| bookstack | a root namespace that is not `App\`, controllers outside `Http/Controllers`, and an api file required inside a provider's prefixed group |
+| monica | domain folders; actions run as `(new DestroyX)->execute($data)`; Laravel 11's `withRouting` |
+| firefly-iii | the action array (`['uses' => 'Ctrl@method', 'as' => …]`) under `namespace` groups; repositories behind interfaces resolved from the container |
+
+#### What the four new repositories exposed
+
+Before they were cloned the Laravel reader was graded on a fixture written for it, and
+it passed. On the first run over real applications:
+
+- **koel yielded no routes at all.** Only `routes/web.php`, `api.php`, `console.php` and
+  `channels.php` were read, and koel keeps its routes in `api.base.php` and
+  `web.base.php`. Every PHP file under a `routes` directory is read now.
+- **firefly-iii's 640 routes carried 5 handlers.** It writes every action as
+  `['uses' => 'Controller@method', 'as' => 'name']`, a form the reader did not know.
+- **Three of the four served their API one prefix away from where it was reported.**
+  bookstack, monica and firefly-iii register `routes/api.php` under `/api` from a
+  provider or from `bootstrap/app.php`, so 336 routes were stored without it. A routes
+  file is registered under whatever loads it now. koel loads its files by a computed
+  name, which is not resolved, and its paths are as written.
+- **Resource routes were invented.** `apiResource(…)->only([…])` emitted all the
+  actions regardless, every parameter was `{id}`, and koel's nested
+  `albums.songs` was stored as the path `/api/albums.songs`.
+
+**Why firefly-iii reaches a model on fewer than half its routes.** Its controllers
+receive their repositories from the container inside a middleware closure
+(`$this->repository = app(BudgetRepositoryInterface::class)`), and act on route-bound
+models they only pass along. Neither states a type a call can be resolved through, so
+the chain stops one step short. That is reported as a stop, not as an endpoint that
+touches nothing.
+
+**koel's 38 unbound handlers are mostly real.** It registers
+`apiResource('albums', AlbumController::class)` with no `only`, so Laravel registers
+`store` and `destroy` routes for a controller that declares neither. The routes exist
+and would fail when called; enola reports them unbound instead of dropping them.
+
 ## 1. Reproducibility
 
 Each repository was indexed **three times** — once cold, twice warm — and the
@@ -365,9 +476,11 @@ receipt's `snapshot_id` and the SHA-256 of `facts.jsonl` were compared across al
 three. Running cold then warm is the point: it tests that a cached run and a
 from-scratch run agree, not merely that the same code path repeats itself.
 
-> **91 of 91 repositories in this sweep produced a byte-identical `snapshot_id` and a
-> byte-identical `facts.jsonl` across all three runs — 273 runs, 8,194,786 facts,
-> zero drift.** `insights.json` is byte-stable on all 91 as well. This is one sweep:
+> **95 of 95 repositories in this sweep produced a byte-identical `snapshot_id` and a
+> byte-identical `facts.jsonl` across all three runs — 285 runs, 8,355,653 facts,
+> zero drift.** `insights.json` is byte-stable on 90 of the 95; the five where it is
+> not (cognee, superset, airflow, cognee-rs, spark) differed in the previous sweep
+> too, and their facts do not. This is one sweep:
 > the Dart/Flutter rows previously measured separately are folded in.
 
 Two defects had to be fixed for that sentence to be true again, and both had the same
@@ -438,14 +551,14 @@ either way — the delta itself, and the fact that it is exactly one finding.
 | sveltekit-realworld | TypeScript | 3 | PASS · +0 facts | PASS · +2 facts | **FAIL · 1 regression** | PASS · +0 |
 | cachet | PHP | 1 | PASS · +0 facts | PASS · +3 facts | **FAIL · 1 regression** | PASS · +0 |
 
-Read the columns as four separate claims, all of which hold on all twenty:
+Read the columns as four separate claims, all of which hold on all twenty repositories, 20 of 20:
 
 - **No change → +0 facts, +0 edges, PASS.** Exactly zero on all twenty repositories.
   That's what makes a PASS or FAIL on a real change something you can rely on.
 - **Benign addition → PASS**, with the delta naming exactly the 2–3 facts added.
   A new leaf module isn't a structural regression, so there's nothing to report.
-- **Injected cycle → FAIL, exactly 1 regression** — out of **1,620 pre-existing
-  findings across these repositories**, up to 235 in a single one. None of them was
+- **Injected cycle → FAIL, exactly 1 regression** — out of **1,859 pre-existing
+  findings across these repositories**, up to 239 in a single one. None of them was
   repeated. The ratchet holds.
 - **Reverted → PASS again**, +0 facts. The verdict is a function of the tree, not
   of history.
@@ -646,81 +759,153 @@ so the demonstration proves its own limit in the same run.
 
 | | |
 |---|---|
-| Largest repository indexed | **Linux kernel** — 57,423 files, **2,062,288 facts**, 159.2s cold / 29.4s warm |
-| Largest .NET | dotnet/runtime — 23,625 files, 533,390 facts, 67.9s / 33.1s |
-| Largest Ruby | GitLab — 55,949 files, 549,649 facts, 44.6s / 25.3s |
-| Largest Rust | rust-lang/rust — 37,724 files, 404,731 facts, 23.1s / 8.9s |
-| Largest Scala | Spark — 5,749 files, 219,121 facts, 35.5s / 18.8s |
-| Largest Go | Grafana — 11,379 files, 187,076 facts, 8.9s / 4.6s |
-| Throughput | 1,400–37,200 facts/sec depending on language |
-| Parse errors, all 91 repositories | **0** |
-| Memory | peak heap per run is recorded by the sweep (`--memstats`) alongside time and hashes. The Linux kernel is the high-water mark at **6,638 MiB**; only five others exceed 1 GiB (GitLab 2,622, dotnet/runtime 2,016, rust-lang/rust 1,546, roslyn 1,510, dart-sdk 1,401). The largest Angular repository peaks at 385 MiB. No repository required tuning on this machine |
+| Largest repository indexed | **Linux kernel** — 57,480 files, **2,068,619 facts**, 142.1s cold / 37.9s warm |
+| Largest .NET | dotnet/runtime — 23,678 files, 537,421 facts, 54.7s / 27.7s |
+| Largest Ruby | GitLab — 55,949 files, 551,664 facts, 37.4s / 23.0s |
+| Largest Rust | rust-lang/rust — 37,669 files, 391,491 facts, 15.2s / 8.5s |
+| Largest Scala | Spark — 5,749 files, 219,995 facts, 8.4s / 6.5s |
+| Largest Go | Grafana — 11,379 files, 190,048 facts, 8.8s / 4.5s |
+| Throughput | 1,700–40,000 facts/sec depending on language |
+| Parse errors, all 95 repositories | **0** |
+| Memory | peak heap per run is recorded by the sweep (`--memstats`) alongside time and hashes. The Linux kernel is the high-water mark at **6,455 MiB**; only five others exceed 1 GiB (GitLab 2,555, dotnet/runtime 2,049, dart-sdk 1,426, roslyn 1,367, rust-lang/rust 1,340). No repository required tuning on this machine |
 
-Warm runs are 0.38×–33.1× faster than cold (over the 74 repositories whose cold run
+Warm runs are 1.1×–27.0× faster than cold (over the 75 repositories whose cold run
 exceeds 0.5s; below that the timing is noise), from the per-file content-hash cache
 in `snapshot.meta.json`. These numbers establish that the graph the other four
 sections rely on can actually be built on real code. enola isn't benchmarked on
 speed as a competitive claim.
 
-**The memory ratchet passes, and getting there is worth recording.** The sweep that
-first ran at v264 breached both pinned ceilings — `peak_heap_mib` 8,504 against 8,000
-and `mallocs_per_fact` 505.9 against 480. The two claims were not equally strong, and
-the harness's own `mem-ceilings.json` says why: peak has a 23–28% run-to-run spread,
-so one sweep crossing its ceiling is not evidence, while churn per fact has a 1.8%
-spread and is the sensitive instrument. Run the way that file prescribes — both
-binaries cold, back to back — the peak breach turned out to be machine state and the
-churn regression was real: 459.8 to 500.2 on linux, ten times the instrument's spread.
+**The memory ratchet passes, and what it caught this time is worth recording.** Three
+analyzers moved into enola at v268 and became defaults: `package-metrics`,
+`dead-code` and `performance`. The first sweep after that breached a ceiling by six
+times — `runtime` peaked at 13,130 MiB against 2,250 — and the harness is the only
+reason anyone found out, because nothing about the analyzers' output was wrong.
 
-**It was not one extractor, and it was not proportional to output.** The increase
-appeared on Ruby and TypeScript repositories holding no C or C++, while C#, Java,
-Rust and F# were flat. gmsh was the clearest case: +0.5% facts, +27.5% allocations.
-Heap profiles diffed across the two versions named a single mechanism.
-`Node.Child()` in go-tree-sitter allocates a Go object on every call — `newNode`
-returns `&Node{...}` — and **96% of the added allocations arrived through it**. Three
-passes added in v258–v260 each walked the syntax tree again in Go to find a handful of
-nodes, paying an allocation for every node they stepped over to get there.
+Two measurements separated the cause from the noise. The first sweep ALSO reported
+`roslyn` at 3,665s cold against 21.5s and a 30 GB peak, which was not a regression at
+all: that sweep was run while a test suite and a linter were running on the same
+machine, and `mem-ceilings.json` says in its own header to calibrate a ceiling
+against the kind of run it grades. Re-run quiet, the timings came back and the memory
+did not — which is what made the remaining figure a real finding rather than a
+contended one.
 
-No traversal idiom avoids that. Measured on a 92 KB source file, `Node.Child` costs
-32,150 allocations, driving a `TreeCursor` directly and asking it for the node costs
-32,153, and `Node.Children(cursor)` — the form the library documents for this — is
-worse at 43,551. The node has to cross into Go, and crossing is the cost.
+The second was an A/B on rust-lang/rust, same binary, same repository, one explainer
+at a time:
 
-Matching inside tree-sitter avoids the question, because the scan runs in C and only
-the matches cross: **845 allocations instead of 32,150, and 3.2× faster**. The passes
-now use queries, and the three Vue ones share a single match of the tree rather than
-walking it three times. The result on linux, cold and back to back:
+| explainer set | peak heap | wall |
+|---|---|---|
+| the nineteen that shipped before | 1,614 MiB | 27.2s |
+| plus `package-metrics` | 1,535 MiB | 26.1s |
+| plus `performance` | 1,535 MiB | 26.7s |
+| plus `dead-code` | **8,798 MiB** | **51.0s** |
 
-| | v256 | v264 as first measured | v264 shipped |
-|---|---|---|---|
-| `mallocs_per_fact` | 459.8 | 500.2 | **441.9** |
-| peak heap | 7,031 MiB | 7,175 MiB | **6,842 MiB** |
-| facts | 1,908,734 | 2,062,288 | 2,062,288 |
+Two of the three were free. Profiling the third put all of it in one structure: a
+reference index of `map[string]map[string]struct{}` holding **120,897,613 entries
+over 1,625,276 relations**, 75 per relation, retaining 5 GiB. The multiplier is name
+collision rather than volume — the index keys on folded short names, and
+rust-lang/rust carries a UI test corpus declaring `Foo`, `T` and `Struct` in tens of
+thousands of files, so 9,984 names held a thousand sources or more each.
 
-Lower than the version the regression was measured against, on both figures, while
-keeping every fact the C++ work added. **90 of 90 comparable repositories produced a
-byte-identical fact stream** before and after the change, which is what makes it a
-performance fix rather than a behaviour change; the extractors' output is untouched,
-so no cache version moves. The same shape is worth watching for: enola's
-`tsutil.KindTable` exists because `Node.Kind()` had already cost 180 M allocations on
-one repository, and this is the same lesson one level up.
+The fix is that the index was answering a question nobody asked. Both of its readers
+ask only whether *at least one* source satisfies a predicate, so it now stores a
+count that saturates at two, the first source, and up to four sources with distinct
+owners — which answers both EXACTLY rather than approximately, and the exactness is
+what licenses throwing the rest away.
+
+| | before | after |
+|---|---|---|
+| `runtime` peak (ceiling 2,250) | 13,130 MiB | **2,004 MiB** |
+| `linux` peak (ceiling 8,000) | 6,725 MiB | **6,761 MiB** |
+| rust-lang/rust peak | 10,435 MiB | **1,580 MiB** |
+| rust-lang/rust wall | 51.6s | **27.4s** |
+
+No ceiling was raised. The orphan set is byte-identical on four repositories checked
+before and after (golf 1,399, dubbo 7,791, chatwoot 1,408, gmsh 12,194), which is
+what makes it a performance fix rather than a behaviour change.
+
+The lesson is the one the harness exists for: this cost was always there, and it was
+invisible for as long as the analyzer shipped behind a licence that the open-source
+benchmark never exercised. Making it a default is what measured it.
+
+**Six extraction and store changes landed in this build, and what they moved is
+allocation rather than wall clock.** None of them changes what is extracted, so none
+bumped `cacheVersion`: every repository below carries a `facts.jsonl` hash identical
+to the one the previous binary produced, and the route and framework counts in
+section 5 moved by exactly one fact, in a repository whose own commit changed.
+Allocated bytes is the metric this section leans on, because it reproduces: across
+the controlled A/B pairs behind these figures it varied by under 0.05% between runs
+of the same binary, while peak heap varies 23% to 28% run to run (`mem-ceilings.json`
+says so in its own header) and wall clock varies with whatever else the machine is
+doing.
+
+| language | allocated, v268 | v271 | |
+|---|---:|---:|---:|
+| Scala | 446,985 MiB | 310,028 MiB | **-30.6%** |
+| C | 94,430 MiB | 87,474 MiB | **-7.4%** |
+| C++ | 2,364 MiB | 2,178 MiB | **-7.9%** |
+| whole corpus | 755.7 GiB | 615.0 GiB | -18.6% |
+
+The corpus row is the other three and almost nothing else: Scala accounts for 133.7 GiB
+of the 140.7 GiB drop and C with C++ for 7.0 GiB. That is the honest shape of the
+result, because those are the two extractors the work rewrote.
+
+Scala was the outlier the sweep had never named. It parsed every file twice, once for
+the declaration walk and again for the route and storage walks, and its import gates
+copied each whole source to run a substring test. At 50.7 MiB allocated per parsed
+file on Spark it sat about 100x above Java and Kotlin, which use the same parser
+infrastructure and the same package index. Sharing one parse and matching on the bytes
+took nine Scala repositories from 66.3s cold to 48.1s and cut their allocation by
+30.6%, with a byte-identical `facts.jsonl` on every one. The C and C++ figure is a
+second reading of the same mistake: the `#define` pre-pass split every source into a
+string per line so that almost every line could be rejected on a leading `#`, which
+measured 2.1x slower and 11.5x more allocation than scanning the bytes, over 3,000
+kernel sources producing identical results.
+
+One figure that is not in a table because it is not what the sweep records: the name
+index is now a fact index rather than a slice per name, since 98.2% of the kernel's
+1.9M names carry exactly one fact. Measured back to back on the same repository, that
+is 1,421 MiB of steady heap against 1,343 and 1.9M fewer allocations. Steady heap is
+what an MCP server holds for as long as it runs, so it outlives the snapshot the rest
+of this section times.
+
+**Two caveats, stated rather than hidden.** The corpus cold wall reads 757.3s against
+658.7s, and most of that is not this work: Dart, C#, Ruby, Rust and PHP each moved 12%
+to 21% in wall while their allocation stayed flat, which no change here can cause. Only
+the Scala wall figure above is claimed, and it is claimed because a controlled
+alternating-order A/B reproduced it. And the kernel's warm run reads 41.5s against the
+previous sweep's 38.0s, which is machine state rather than code: measured back to back
+four times on a quiet machine the same binary gives 38.3s to 39.1s. The sweep figure is
+the one published, because a restricted re-measurement grades a different quantity than
+a full sweep reaches after forty minutes of load, and `mem-ceilings.json` records what
+conflating the two already cost once.
+
+Every ceiling in `mem-ceilings.json` is unchanged and the ratchet passes: linux at
+6,457 MiB against 8,000 and 443.9 mallocs per fact against 480, runtime at 2,094
+against 2,250 and 663.9 against 740.
+
 
 ## 5. What the extractors see
 
-Across the corpus enola extracted **34,814 routes** (26,805 server, 8,009 client) and
-recognised **50 distinct frameworks** without configuration:
+Across the corpus enola extracted **36,817 routes** (28,732 server, 8,085 client) and
+recognised **54 distinct frameworks** without configuration:
 
 ```
-rails 7963 · wordpress 6668 · axios 2577 · angular 2170 · graphql 2020
-grape 1948 · openapi 1685 · nestjs 1569 · aspnetcore 1192 · play 923
-request-options 802 · chi 751 · spring 578 · symfony 574 · resttemplate 423
-gin 390 · fastapi 381 · flask 297 · fetch 277 · dart 173
-go_router 156 · grpc 136 · axum 133 · vue 131 · auto_route 100
-utoipa 87 · graphql-ruby 81 · net/http 69 · net-http 59 · nuxt 55
-blazor 48 · openapi-fetch 46 · guzzle 44 · navigator 43 · nextjs 41
-http-client 40 · httpclient 36 · pekko-http 29 · faraday 23 · http4s 21
-sveltekit 13 · express 11 · client-seam 10 · file-get-contents 9 · hono 7
-gorilla/mux 5 · retrofit 4 · urlsession 4 · django 4 · razorpages 2
+rails 7963 · wordpress 6668 · axios 2633 · angular 2170 · graphql 2020
+openapi 1998 · grape 1948 · nestjs 1571 · laravel 1533 · aspnetcore 1192
+play 923 · request-options 802 · chi 751 · spring 578 · symfony 574
+fastapi 431 · resttemplate 423 · gin 390 · flask 326 · fetch 278
+dart 173 · go_router 156 · axum 133 · grpc 132 · vue 131
+auto_route 100 · utoipa 87 · graphql-ruby 81 · net/http 67 · nuxt 55
+blazor 48 · openapi-fetch 46 · nextjs 45 · guzzle 44 · navigator 43
+http-client 42 · httpclient 36 · net-http 32 · pekko-http 29 · faraday 23
+requests 21 · http4s 21 · aiohttp 15 · sveltekit 13 · file-get-contents 12
+express 11 · client-seam 10 · httpx 7 · hono 7 · gorilla/mux 5
+retrofit 4 · urlsession 4 · django 4 · razorpages 2
 ```
+
+**`laravel 1533` is new.** The four Laravel applications joined the corpus for this
+run, and the reader that first met them found no routes in one and almost no handlers
+in another: see [the Laravel rows](#php--laravel) for what that turned up.
 
 **`angular 2170` is the fifth-largest framework and was zero.** It counts route facts
 only — 612 page routes composed across files plus the client calls a component makes
@@ -744,9 +929,9 @@ root `config/routes.rb` alone, so every engine and plugin route file went unread
 Grape had no extractor at all, leaving GitLab's entire v4 REST API invisible behind a
 single `mount ::API::API` (`grape 1,948`).
 
-Fact kinds: 5,857,417 symbols · 2,002,347 dependencies · 112,301 file refs ·
-94,694 test refs · 81,122 modules · 34,814 routes · 6,569 associations ·
-5,332 storage · 182 extraction · 8 intent. **`association` is new in 0.4.0** — a
+Fact kinds: 5,947,210 symbols · 2,064,561 dependencies · 114,400 file refs ·
+96,987 test refs · 82,770 modules · 36,817 routes · 7,150 associations ·
+5,550 storage · 190 extraction · 18 intent. **`association` is new in 0.4.0** — a
 model's declared `has_many`/`belongs_to` relations, which is what lets `endpoint`
 walk from a URL to the tables behind it. Service nodes
 are absent here by construction: the sweep indexes one repository at a time, and a
@@ -865,10 +1050,10 @@ $0.31, which bought a tree with a dependency cycle already in it.
 
 Stated so the numbers above are not read as more than they are.
 
-- **Retrieval speed, token counts and cost per query.** Deliberately absent. It is
-  the axis where every tool in this space competes, and enola has no evidence to offer
-  on it. The A/B's cost column is not that evidence: it compares checking against not
-  checking, not one retrieval path against another.
+- **A task-level retrieval A/B.** The real-session measurement above records the
+  workload that occurred; it does not run the same retrieval tasks with and without
+  enola. Section 6's A/B cost column is a third figure: it compares checking against
+  not checking, not one retrieval path against another.
 - **The session hooks in interactive use.** Section 6 exercises them headlessly, under
   `claude -p`. The configuration is the same either way, but interactive sessions were
   not measured.

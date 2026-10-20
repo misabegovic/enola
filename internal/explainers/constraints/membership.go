@@ -81,7 +81,8 @@ type MembershipIndex struct {
 // identity, because none of them is a term of what the rule judges and a
 // snapshot that treats them as one credits a real fix to a change in the law.
 //
-//   - because is the sentence the finding quotes.
+//   - because is the sentence the finding quotes, and said the sentence the
+//     rule was written from; neither is read for meaning.
 //   - source is the file the rule was declared in. Moving a rule between
 //     constraints files judges nothing differently.
 //   - recipe and instance are the provenance a recipe expansion stamps.
@@ -99,6 +100,7 @@ type MembershipIndex struct {
 // cannot attribute a disappeared breach to the code.
 var declarationBookkeeping = map[string]bool{
 	"because":  true,
+	"said":     true,
 	"source":   true,
 	"recipe":   true,
 	"instance": true,
@@ -187,7 +189,7 @@ func (m *MembershipIndex) Declaration(id string) (string, bool) {
 // string: sorted, so the identity is a function of the declaration and never of
 // map order.
 func declarationIdentity(f facts.Fact) string {
-	pairs := make([]string, 0, len(f.Props))
+	pairs := make([]string, 0, f.PropCount())
 	for key, value := range f.Props {
 		if declarationBookkeeping[key] {
 			continue

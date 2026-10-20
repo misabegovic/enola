@@ -26,6 +26,8 @@ func TestDocumentedCommandsAreDispatchable(t *testing.T) {
 	}
 	// What cmd/enola adds for itself.
 	dispatchable["upgrade"] = true
+	// Rewritten by HelpArgs into `<command> --help` before anything dispatches.
+	dispatchable["help"] = true
 
 	spec := cli.DefaultHelp(cli.Binary{Name: "enola"})
 	for _, doc := range spec.Commands {
@@ -59,10 +61,10 @@ func TestDispatchedCommandsAreDocumented(t *testing.T) {
 // the code was written for. A wrapper telling its user to run `enola baseline pin` names
 // a binary they may not have installed.
 func TestDiagnosticsNameTheRunningBinary(t *testing.T) {
-	r := New(cli.Binary{Name: "enola-enterprise"}, "upgrade")
+	r := New(cli.Binary{Name: "acme-arch"}, "upgrade")
 
 	got := r.UnknownArgHelp("chekc")
-	if !strings.Contains(got, "enola-enterprise chekc"[:len("enola-enterprise")]) {
+	if !strings.Contains(got, "acme-arch chekc"[:len("acme-arch")]) {
 		t.Errorf("UnknownArgHelp does not name the running binary:\n%s", got)
 	}
 	if strings.Contains(got, "`enola --help`") {

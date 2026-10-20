@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -59,15 +60,19 @@ func TestESLintProvider_TurnsResultsIntoLintFacts(t *testing.T) {
 	}
 }
 
-// No results anywhere: the provider emits nothing and exits 0, which the seam
-// records as a provider that ran and contributed nothing, never an error.
-func TestESLintProvider_NoResultsIsNothingNotAnError(t *testing.T) {
+// No results anywhere: the provider emits nothing, exits 0 and says it does not
+// apply, which the seam records as not applicable with the missing file named:
+// never an error, and never a clean lint either.
+func TestESLintProvider_NoResultsIsNotApplicable(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node is not installed")
 	}
+	t.Setenv("ENOLA_ESLINT_RESULTS", "")
+	t.Setenv("ENOLA_ESLINT_RUN", "")
 	script, _ := filepath.Abs(filepath.Join("..", "..", "examples", "providers", "js", "eslint", "enola_eslint_provider.mjs"))
 	ff, records := Run(context.Background(), []Provider{{Name: "eslint", Command: []string{"node", script}, ExpectedVersion: "0.1.0"}}, t.TempDir(), nil, nil)
-	if len(ff) != 0 || len(records) != 1 || records[0].Skipped || records[0].FactCount != 0 {
-		t.Fatalf("facts = %d, census = %+v", len(ff), records)
+	if len(ff) != 0 || len(records) != 1 || !records[0].NotApplicable() || records[0].FactCount != 0 ||
+		!strings.Contains(records[0].Reason, "results") {
+		t.Fatalf("facts = %d, census = %+v, want not applicable naming the results file", len(ff), records)
 	}
 }

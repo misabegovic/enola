@@ -942,9 +942,14 @@ without a whole-program pass, and equally what bounds it: a group passed across 
 function boundary is not followed. A group variable in one method never resolves a
 registration in another.
 
-A **method-group** handler (`GetOrderAsync`) binds to the sibling method it names;
-a **lambda** has no symbol to point at, so the route carries no `handler` at all
-rather than a fabricated one.
+A **method-group** handler (`GetOrderAsync`) binds to the sibling method it names.
+A **lambda** or anonymous method is given a symbol of its own,
+`<dir>.<Type>.handler:<VERB>:<line>` (the file's name standing in for the type in
+top-level statements), which carries the calls of its body and is
+`framework_registered`; the route is handled by it. A handler named by a local
+function of the registering method (`router.MapGet("json", RewriteArray)`) is that
+function, given one symbol `<dir>.<Type>.<Method>.<Function>` with its calls for every
+route it serves.
 
 A **string-literal first argument** is the discriminator. That is what keeps
 `MapControllers()`, `MapRazorPages()` and `MapHub<T>()` — none of which take a
@@ -1031,7 +1036,14 @@ and `calls_in_scaling_loop`. `for`/`foreach`/`while`/`do` and LINQ iterator lamb
 (`Select`, `Where`, `ForEach`, `Aggregate`, …) count as loops; a literal-bounded `for
 (var i = 0; i < 3; i++)` or a `foreach` over a collection literal raises `loop_depth` but
 adds **no** scaling depth, so a fixed-size loop never inflates a genuine O(n) into a
-false O(n²).
+false O(n²). Both ends of the `for` have to be constant: `for (var i = items.Count - 1;
+i >= 0; i--)` compares against a literal and still scales.
+
+A `foreach` over what belongs to the enclosing loop's element (`foreach (var op in
+path.Value.Operations)`) adds no scaling depth either. That holds for statement loops; a
+LINQ lambda's parameter is not followed. `calls_in_scaling_loop_depth` gives the scaling
+depth each in-loop call sits at. `base.M()` from an override of `M` is not
+`recursive_self`.
 
 A member that calls a network, file or database primitive — `HttpClient`'s verbs,
 `File.*`, ADO.NET `Execute*`, EF Core `SaveChangesAsync`/`ToListAsync` — is tagged

@@ -1437,3 +1437,31 @@ func TestPatternMetrics_DeclaredOrder(t *testing.T) {
 		t.Errorf("modules_classified = %d, want 2", got)
 	}
 }
+
+// A Rust item import names `<dir>.<item>`: walked up by "/" it reaches the
+// parent directory, no layer here, and the violation was dropped. Read by its
+// carried file it reaches the module the item is declared in.
+func TestDetectViolations_ItemImportResolvesByItsCarriedFile(t *testing.T) {
+	s := facts.NewStore()
+	for _, m := range []string{"domain/entity", "presentation/views", "adapter/rest", "application/svc"} {
+		s.Add(facts.Fact{Kind: facts.KindModule, Name: m})
+	}
+	s.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "presentation/views.render", File: "presentation/views/render.rs"},
+		facts.Fact{Kind: facts.KindDependency, Name: "domain/entity -> crate::presentation::views::render",
+			File:      "domain/entity/model.rs",
+			Props:     map[string]any{facts.PropTargetFile: "presentation/views/render.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "presentation/views.render"}}},
+		facts.Fact{Kind: facts.KindDependency, Name: "domain/entity -> crate::presentation::views::gone",
+			File:      "domain/entity/model.rs",
+			Props:     map[string]any{facts.PropTargetFile: "presentation/views/gone.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "presentation/views.render"}}},
+	)
+	insights, err := New().Explain(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if got := countViolations(insights); got != 1 {
+		t.Fatalf("want 1 violation (domain imports a presentation item), got %d", got)
+	}
+}

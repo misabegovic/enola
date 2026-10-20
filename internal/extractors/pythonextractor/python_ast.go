@@ -2,9 +2,11 @@ package pythonextractor
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -42,16 +44,83 @@ func extractFileAST(src []byte, relFile string, isDjango, isFlask, isFastAPI boo
 		isFastAPI: isFastAPI,
 		idx:       idx,
 	}
+	w.prepareHTTPClients(tree.RootNode())
 	w.walkModule(tree.RootNode())
 
 	// Collected after the walk so the import map is fully populated: a mount
 	// argument is routinely a router imported from another module.
 	topo := collectRouterTopology(tree.RootNode(), src, relFile, module, w.importMap)
 	topo.routes = w.routeRefs
+	topo.paths = w.pathRefs
+	topo.consts = collectConsts(tree.RootNode(), src, module, w.importMap)
 	return w.out, topo
 }
 
+// extractFileIndexed is extractFileAST for the extractor's own path: it parses the
+// file ONCE and returns, besides the facts and the router topology, the index this
+// file contributes and the implementor lookups that need the merged one.
+//
+// extractFileAST above keeps taking a ready-made index, because a single-file test
+// supplies one directly and has no merge step to defer anything to.
+//
+// For an __init__.py it also returns the package's doc: its module docstring.
+func extractFileIndexed(src []byte, relFile string, isDjango, isFlask, isFastAPI bool, fileModules map[string]bool) ([]facts.Fact, pyRouterTopology, *pySymbolIndex, []pyImplCall, string) {
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(sitter.NewLanguage(python.Language())); err != nil {
+		return nil, pyRouterTopology{}, nil, nil, ""
+	}
+	tree := parser.Parse(src, nil)
+	defer tree.Close()
+	root := tree.RootNode()
+
+	module := strings.TrimSuffix(relFile, ".py")
+	local := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool)}
+	indexTree(root, src, relFile, local)
+
+	w := &pyWalker{
+		src:               src,
+		relFile:           relFile,
+		module:            module,
+		dir:               factpath.Dir(relFile),
+		isDjango:          isDjango,
+		isFlask:           isFlask,
+		isFastAPI:         isFastAPI,
+		idx:               local,
+		deferImplementors: true,
+		fileModules:       fileModules,
+	}
+	w.prepareHTTPClients(root)
+	w.walkModule(root)
+
+	topo := collectRouterTopology(root, src, relFile, module, w.importMap)
+	topo.routes = w.routeRefs
+	topo.paths = w.pathRefs
+	topo.consts = collectConsts(root, src, module, w.importMap)
+	local.globals = collectGlobalTypes(root, src, module, w.importMap)
+	var pkgDoc string
+	if relFile == "__init__.py" || strings.HasSuffix(relFile, "/__init__.py") {
+		pkgDoc = pyBlockDocstring(root, src)
+	}
+	return w.out, topo, local, w.pendingImpl, pkgDoc
+}
+
 type pyWalker struct {
+	// httpClients are the names this file binds to an HTTP client instance, mapped
+	// to its library (see collectHTTPClients).
+	httpClients map[string]string
+	// httpAliases are the local names this file imports from an HTTP library,
+	// mapped to what they name ("hx" -> "httpx", "Session" -> "requests.Session").
+	httpAliases map[string]string
+	// httpCallSites maps a request call's start byte to its route in out, so a call
+	// walked twice is emitted once.
+	httpCallSites map[uint]int
+
+	// callRouteHandlers pairs each route an add_api_route-style call emitted (by
+	// index into out) with the handler it names. The handler may be defined further
+	// down the file, so it is bound with handled_by only once the walk is done.
+	callRouteHandlers []pyRouteHandler
+
 	src       []byte
 	relFile   string
 	module    string
@@ -59,6 +128,10 @@ type pyWalker struct {
 	isDjango  bool
 	isFlask   bool
 	isFastAPI bool
+
+	// fileModules is every Python file's module path ("app/internal/admin"), so a
+	// relative import can tell a submodule from a symbol. nil in single-file tests.
+	fileModules map[string]bool
 
 	out []facts.Fact
 
@@ -107,13 +180,41 @@ type pyWalker struct {
 	// used to resolve bare same-class calls.
 	methodSets []map[string]bool
 
-	// idx is the global symbol index, nil when called from tests that do not
-	// need cross-file resolution. All lookups must nil-check.
+	// idx is the symbol index the walk resolves against, nil when called from tests
+	// that do not need cross-file resolution. All lookups must nil-check.
+	//
+	// On the extractor's own path this is the CURRENT FILE's index, not the merged
+	// one: the two lookups made during the walk (resolveCall and the value-reference
+	// check) only ever ask about w.module, which no other file contributes to. The
+	// one lookup that is genuinely cross-file is deferred instead, below.
 	idx *pySymbolIndex
+
+	// deferImplementors records implementor-call lookups rather than answering them,
+	// because they need the merged index. Answering them during the walk is what
+	// forced a whole separate indexing pass, and with it a second parse of every
+	// file in the repository.
+	deferImplementors bool
+	pendingImpl       []pyImplCall
 
 	// localTypes maps a variable name in the current function scope to its
 	// canonical qualified type. Reset at the entry of every handleFunction call.
 	localTypes map[string]string
+
+	// attrTypes maps, per enclosing class (innermost last), an attribute held in
+	// `self` to its declared type. See selfattrs.go.
+	attrTypes []map[string]string
+
+	// returnTypes maps, per enclosing class (innermost last), a method to the
+	// type its return annotation names, and funcReturns a top-level function of
+	// the file to its return annotation. See returntypes.go.
+	returnTypes []map[string]string
+	funcReturns map[string]string
+
+	// callStart is where the call expression being walked begins.
+	callStart uint
+	// inIterable is set while a for statement's iterable is walked: it is
+	// evaluated once, in the loop AROUND that statement. See callScope.
+	inIterable bool
 
 	// localBound is the set of names bound in the current function's own scope
 	// (params + assigned/iterated/aliased names). Guards bare-identifier call
@@ -131,6 +232,16 @@ type pyWalker struct {
 	// It differs from scalingDepth for `while True:`, which adds no factor of n but whose
 	// body still runs many times — so a query inside it is still an N+1 candidate.
 	repeatDepth int
+	// loopScopes are the enclosing loops' variables, for the rule in hierarchy.go.
+	loopScopes []pyLoopScope
+	// paramScope and paramIndex are the function's parameters, and lastCallTarget
+	// the target the call being walked resolved to, for the cross-call rule in
+	// hierarchy.go.
+	paramScope     []pyLoopScope
+	paramIndex     map[string]int
+	lastCallTarget string
+	// constLocals are the locals proven to be literal collections (constbound.go).
+	constLocals map[string]bool
 	selfName    string
 
 	// funcScope is the qualified name of the OUTERMOST enclosing function whose
@@ -143,6 +254,14 @@ type pyWalker struct {
 	// routeRefs ties each emitted route fact (by index into w.out) to the router
 	// variable it was registered on, for composeRouterPrefixes.
 	routeRefs []pyRouteRef
+
+	// emittingPending is set while emitRouteAt emits a route whose path is not
+	// known yet, whose "" is a placeholder rather than the router root.
+	emittingPending bool
+
+	// pathRefs holds the routes emitted with a computed path (a constant, an
+	// f-string), for resolveRoutePaths.
+	pathRefs []pyPathRef
 
 	// routeDecorators is the set of decorator start byte offsets already turned
 	// into route facts, so a decorator reached by two walks emits once. A class
@@ -157,6 +276,8 @@ type pyWalker struct {
 	// emitted as a single KindFileRef fact per file, which the dead-code detector
 	// folds in so top-level/decorator use marks a production symbol used.
 	fileRefs []facts.Relation
+	// commandAttaches are the click add_command calls of the file (noteAddCommand).
+	commandAttaches []string
 }
 
 // pyBodyMetrics accumulates per-function complexity signals during the single
@@ -170,8 +291,19 @@ type pyBodyMetrics struct {
 	inLoopSeen         map[string]bool // dedup set for callsInLoop
 	callsInScalingLoop []string        // distinct call targets invoked at scaling (unbounded) depth >= 1
 	inScalingSeen      map[string]bool // dedup set for callsInScalingLoop
-	recursive          bool            // body directly calls the enclosing function
-	ioDirect           bool            // body directly invokes a network/file/DB I/O primitive
+	scalingCallDepth   map[string]int  // deepest scaling nesting each of those is called at (calldepth.go)
+	// The cross-call hierarchical rule (hierarchy.go): the calls handed a loop
+	// element with the argument position that carries it, and the parameters a
+	// scaling loop of this body walks.
+	callsOnLoopElement    []string
+	callsOnLoopElementArg []int
+	onElementSeen         map[string]bool
+	loopsOverParam        map[int]bool
+	recursive             bool // body directly calls the enclosing function
+	// written are the in-loop calls recorded as the source writes them, because
+	// nothing types their receiver. See recordWrittenIOCall.
+	written  map[string]bool
+	ioDirect bool // body directly invokes a network/file/DB I/O primitive
 }
 
 // recordCallMetrics notes a resolved call target against the current function's
@@ -183,6 +315,136 @@ func (w *pyWalker) recordCallMetrics(target string) {
 	if target == w.selfName {
 		w.metrics.recursive = true
 	}
+	w.recordInLoopCall(target)
+}
+
+// noteLoopOverParam records that a scaling loop of this body walks what the named
+// parameter (or self) holds. root is "" when the loop walks something else.
+func (w *pyWalker) noteLoopOverParam(root string) {
+	if w.metrics == nil || root == "" {
+		return
+	}
+	i, ok := w.paramIndex[root]
+	if !ok {
+		return
+	}
+	if w.metrics.loopsOverParam == nil {
+		w.metrics.loopsOverParam = make(map[int]bool)
+	}
+	w.metrics.loopsOverParam[i] = true
+}
+
+// noteCallOnLoopElement records a call, made inside a scaling loop, that hands its
+// callee an element of an enclosing loop: as a positional argument, or as the
+// receiver. A keyword argument is not followed: its position on the callee's side
+// is not known here.
+func (w *pyWalker) noteCallOnLoopElement(call, fn *sitter.Node, target string) {
+	if w.metrics == nil || target == "" || w.scalingDepth == 0 || len(w.loopScopes) == 0 || w.metrics.onElementSeen[target] {
+		return
+	}
+	pos, found := 0, false
+	if kindOf(fn) == "attribute" && pyReachedThroughElement(fn.ChildByFieldName("object"), w.src, w.loopScopes) {
+		pos, found = pyReceiverParam, true
+	}
+	if args := call.ChildByFieldName("arguments"); !found && args != nil {
+		for i := uint(0); i < uint(args.NamedChildCount()); i++ {
+			a := args.NamedChild(i)
+			if kindOf(a) == "keyword_argument" {
+				break // everything after it is by name too
+			}
+			if pyReachedThroughElement(a, w.src, w.loopScopes) {
+				pos, found = int(i), true
+				break
+			}
+		}
+	}
+	if !found {
+		return
+	}
+	if w.metrics.onElementSeen == nil {
+		w.metrics.onElementSeen = make(map[string]bool)
+	}
+	w.metrics.onElementSeen[target] = true
+	w.metrics.callsOnLoopElement = append(w.metrics.callsOnLoopElement, target)
+	w.metrics.callsOnLoopElementArg = append(w.metrics.callsOnLoopElementArg, pos)
+}
+
+// propCallsAsWritten lists, while a file's facts are being resolved, the in-loop
+// calls that are source text and not import paths. resolveCallTargets drops it.
+const propCallsAsWritten = "calls_as_written"
+
+// recordWrittenIOCall records a call in a loop whose receiver nothing types,
+// when its method is one of pyIODirectMethods: `conn.execute(stmt)` on what
+// `op.get_bind()` returned, `cursor.fetchall()`. Those names already make the
+// function io_direct, on any receiver. But an in-loop call was recorded only
+// where it resolved, so a loop that ran one statement per row on an untyped
+// connection named no call at all, and was reported only if some other call in
+// it happened to resolve. The call is named as written and rests on its name.
+//
+// Only a receiver that is a name or an attribute path is recorded: the text of
+// anything longer is not a name a reader could find.
+func (w *pyWalker) recordWrittenIOCall(objNode *sitter.Node, obj, attr string) {
+	if w.metrics == nil || w.loopDepth == 0 || !pyIODirectMethods[attr] || pyDrainMethods[attr] || !pyIsNamePath(objNode) {
+		return
+	}
+	// `sys.stdout.flush()`: the receiver is reached through a module of the
+	// standard library, and is no client.
+	if root := firstSeg(obj); pyStdlib[root] && !w.localBound[root] {
+		return
+	}
+	target := obj + "." + attr
+	if w.metrics.written == nil {
+		w.metrics.written = make(map[string]bool)
+	}
+	w.metrics.written[target] = true
+	w.recordInLoopCall(target)
+	// Not a target the cross-call rule can look up.
+	w.lastCallTarget = ""
+}
+
+// pyDrainMethods read rows a statement already fetched. In a loop they are the
+// loop's own cursor (`while rows := cur.fetchmany(n)`), which is the batched read
+// and not a round trip per element; the statement is the `execute` beside them.
+var pyDrainMethods = map[string]bool{"fetchone": true, "fetchmany": true, "fetchall": true}
+
+// pyIsNamePath reports whether an expression is a name or an attribute path of
+// names: `conn`, `self.cursor`.
+func pyIsNamePath(n *sitter.Node) bool {
+	for n != nil {
+		switch kindOf(n) {
+		case "identifier":
+			return true
+		case "attribute":
+			n = n.ChildByFieldName("object")
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// callScope returns the loop the call being walked runs in: the innermost one,
+// or, for a call in a for statement's iterable, the one around that statement.
+// The statement's own scope is pushed before its iterable is walked, and the
+// iterable is evaluated once, outside it.
+func (w *pyWalker) callScope() *pyLoopScope {
+	n := len(w.loopScopes)
+	if w.inIterable {
+		n--
+	}
+	if n <= 0 {
+		return nil
+	}
+	return &w.loopScopes[n-1]
+}
+
+// recordInLoopCall is recordCallMetrics without the recursion check, for a call
+// whose edge names the enclosing function but whose form cannot reach it.
+func (w *pyWalker) recordInLoopCall(target string) {
+	if w.metrics == nil || target == "" {
+		return
+	}
+	w.lastCallTarget = target
 	if w.loopDepth > 0 {
 		if w.metrics.inLoopSeen == nil {
 			w.metrics.inLoopSeen = make(map[string]bool)
@@ -196,10 +458,28 @@ func (w *pyWalker) recordCallMetrics(target string) {
 	// candidate. Only a genuinely constant loop (literal collection / range(<const>))
 	// excludes its calls; `while True` repeats, so its calls stay candidates even though
 	// its depth is discounted from the Big-O exponent.
+	//
+	// A call made once per round of a batch loop is the batched call, not an N+1
+	// (batchloop.go). One inside its drain loop has a different innermost loop.
+	scope := w.callScope()
+	if scope != nil && scope.batch {
+		return
+	}
+	// The same for a call made once per round of a poll, a retry or a cursor
+	// (pollloop.go), unless a loop around it walks data: a retry per element is
+	// still a request per element, at that loop's depth.
+	if scope != nil && scope.round && w.scalingDepth == 0 {
+		return
+	}
+	// Nor is a call in a block that ends by leaving the loop (terminal.go).
+	if scope != nil && scope.holdsTerminal(w.callStart) {
+		return
+	}
 	if w.repeatDepth > 0 {
 		if w.metrics.inScalingSeen == nil {
 			w.metrics.inScalingSeen = make(map[string]bool)
 		}
+		w.metrics.scalingCallDepth = noteCallDepth(w.metrics.scalingCallDepth, target, w.scalingDepth)
 		if !w.metrics.inScalingSeen[target] {
 			w.metrics.inScalingSeen[target] = true
 			w.metrics.callsInScalingLoop = append(w.metrics.callsInScalingLoop, target)
@@ -218,6 +498,15 @@ func (w *pyWalker) currentOwner() *facts.Fact {
 		return nil
 	}
 	return &w.out[w.ownerStack[len(w.ownerStack)-1]]
+}
+
+// currentOwnerIdx is currentOwner as an index into w.out, for edges resolved after
+// the walk: a *Fact would dangle as soon as a later append reallocates w.out.
+func (w *pyWalker) currentOwnerIdx() int {
+	if len(w.ownerStack) == 0 {
+		return -1
+	}
+	return w.ownerStack[len(w.ownerStack)-1]
 }
 
 func (w *pyWalker) enclosingType() string { return strings.Join(w.typeStack, ".") }
@@ -241,6 +530,12 @@ func (w *pyWalker) popType() {
 	if len(w.methodSets) > 0 {
 		w.methodSets = w.methodSets[:len(w.methodSets)-1]
 	}
+	if len(w.attrTypes) > len(w.typeStack) {
+		w.attrTypes = w.attrTypes[:len(w.attrTypes)-1]
+	}
+	if len(w.returnTypes) > len(w.typeStack) {
+		w.returnTypes = w.returnTypes[:len(w.returnTypes)-1]
+	}
 }
 
 func (w *pyWalker) currentMethods() map[string]bool {
@@ -252,6 +547,7 @@ func (w *pyWalker) currentMethods() map[string]bool {
 
 // walkModule iterates the top-level statements of a module node.
 func (w *pyWalker) walkModule(root *sitter.Node) {
+	w.funcReturns = collectFuncReturnAnnotations(root, w.src)
 	for i := uint(0); i < uint(root.ChildCount()); i++ {
 		child := root.Child(i)
 		w.walkStatement(child)
@@ -260,16 +556,59 @@ func (w *pyWalker) walkModule(root *sitter.Node) {
 		// detector. Nested class/function bodies are skipped — they own their calls.
 		w.walkTopLevelCalls(child)
 	}
-	if len(w.fileRefs) > 0 {
+	w.bindCallRouteHandlers()
+	table := w.argparseCommands(root)
+	if len(w.fileRefs) > 0 || len(w.commandAttaches) > 0 || len(table) > 0 {
+		props := map[string]any{"language": "python"}
+		if len(w.commandAttaches) > 0 {
+			props[propCommandAttaches] = w.commandAttaches
+		}
+		if len(table) > 0 {
+			props[propCommandTable] = table
+		}
 		w.out = append(w.out, facts.Fact{
 			Kind:      facts.KindFileRef,
 			Name:      w.relFile,
 			File:      w.relFile,
 			Line:      1,
-			Props:     map[string]any{"language": "python"},
+			Props:     props,
 			Relations: w.fileRefs,
 		})
 	}
+}
+
+// noteAddCommand records `group.add_command(cmd)` and `group.add_command(cmd,
+// name="x")` in a click file, both names as targets, for composeCommandNames.
+func (w *pyWalker) noteAddCommand(call *sitter.Node) {
+	fn := call.ChildByFieldName("function")
+	args := call.ChildByFieldName("arguments")
+	if fn == nil || args == nil || kindOf(fn) != "attribute" || !importsCommandLibrary(w.src) {
+		return
+	}
+	obj, attr := fn.ChildByFieldName("object"), fn.ChildByFieldName("attribute")
+	if obj == nil || attr == nil || kindOf(obj) != "identifier" || pyText(attr, w.src) != "add_command" {
+		return
+	}
+	var cmd, name string
+	for i := uint(0); i < args.NamedChildCount(); i++ {
+		a := args.NamedChild(i)
+		switch kindOf(a) {
+		case "identifier":
+			if cmd == "" {
+				cmd = pyText(a, w.src)
+			}
+		case "keyword_argument":
+			k, v := a.ChildByFieldName("name"), a.ChildByFieldName("value")
+			if k != nil && v != nil && pyText(k, w.src) == "name" && kindOf(v) == "string" {
+				name = unquotePyType(pyText(v, w.src))
+			}
+		}
+	}
+	group, target := w.valueRefTarget(pyText(obj, w.src)), w.valueRefTarget(cmd)
+	if group == "" || target == "" {
+		return
+	}
+	w.commandAttaches = append(w.commandAttaches, group+"\t"+target+"\t"+name)
 }
 
 // walkTopLevelCalls scans a module-level statement subtree for call sites,
@@ -286,22 +625,32 @@ func (w *pyWalker) walkTopLevelCalls(node *sitter.Node) {
 		"import_statement", "import_from_statement":
 		return
 	case "call":
+		if rel, ok := w.getattrRefRelation(node); ok {
+			w.fileRefs = append(w.fileRefs, rel)
+		}
 		if fn := node.ChildByFieldName("function"); fn != nil {
 			w.emitFileRefCall(fn)
 		}
+		w.emitCallRoute(node)
+		w.noteAddCommand(node)
 		if args := node.ChildByFieldName("arguments"); args != nil {
 			w.fileRefs = append(w.fileRefs, w.argRefRelations(args)...)
 		}
 	case "assignment":
-		// A module-level assignment whose RHS is a bare def name installs that
-		// symbol as a value (the click monkeypatch idiom `click.echo = handler`,
-		// dispatch-table entries, alias exports). Fold the RHS value-ref so the
-		// referenced def is not mis-flagged dead. resolveCall (via emitFileRefCall)
-		// gates on moduleDefs, so only real defs fold — a plain identifier that
-		// names a variable resolves to nothing. Nested calls in the RHS are still
-		// caught by the generic recursion below.
-		if rhs := node.ChildByFieldName("right"); rhs != nil && kindOf(rhs) == "identifier" {
-			w.emitFileRefCall(rhs)
+		// A module-level assignment whose RHS carries def names installs those
+		// symbols as values (the click monkeypatch idiom `click.echo = handler`,
+		// dispatch-table entries, alias exports, or `run, label = handler, "x"`).
+		// Fold every bare identifier value so the referenced defs are not
+		// mis-flagged dead. resolveCall (via emitFileRefCall) gates on moduleDefs,
+		// so ordinary variables and tuple literals resolve to nothing. Nested calls
+		// in the RHS are still caught by the generic recursion below.
+		right := node.ChildByFieldName("right")
+		if kindOf(right) == "boolean_operator" {
+			w.emitFallbackRefs(right)
+			break
+		}
+		for _, ident := range collectRefValueIdents(right) {
+			w.emitFileRefCall(ident)
 		}
 	case "string":
 		if rel, ok := w.stringRefRelation(node); ok {
@@ -420,6 +769,9 @@ func (w *pyWalker) walkStatement(node *sitter.Node) {
 		}
 		w.registerBodyImports(node)
 		w.importDeferred = prevDeferred
+		if !isTypeCheckingGuard(node, w.src) {
+			w.walkGuardedRoutes(node)
+		}
 	}
 }
 
@@ -460,10 +812,11 @@ func (w *pyWalker) handleImport(node *sitter.Node) {
 			target := w.module + " -> " + name
 			if emit {
 				w.out = append(w.out, facts.Fact{
-					Kind:  facts.KindDependency,
-					Name:  target,
-					File:  w.relFile,
-					Line:  int(node.StartPosition().Row) + 1,
+					Kind:    facts.KindDependency,
+					Name:    target,
+					File:    w.relFile,
+					Line:    int(node.StartPosition().Row) + 1,
+					EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 					Props: w.importProps(nil),
 					Relations: []facts.Relation{
 						{Kind: facts.RelImports, Target: name},
@@ -503,10 +856,11 @@ func (w *pyWalker) handleFromImport(node *sitter.Node) {
 	depProps := w.importProps(map[string]any{"from": true})
 	if w.claimImport(node) {
 		w.out = append(w.out, facts.Fact{
-			Kind:  facts.KindDependency,
-			Name:  target,
-			File:  w.relFile,
-			Line:  int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindDependency,
+			Name:    target,
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: depProps,
 			Relations: []facts.Relation{
 				{Kind: facts.RelImports, Target: moduleName},
@@ -553,12 +907,7 @@ func (w *pyWalker) handleFromImport(node *sitter.Node) {
 		}
 
 		if isRelative {
-			// Relative import → resolve to a local module path.
-			base := moduleName
-			if strings.HasPrefix(base, ".") {
-				base = w.dir + "/" + strings.TrimLeft(base, ".")
-			}
-			w.setImport(localName, base+"."+importedName)
+			w.setImport(localName, w.relativeImportTarget(moduleName, importedName))
 		} else {
 			// Absolute import (e.g. `from airflow.models import DAG`): record the
 			// dotted module path so calls to this name emit an edge. resolveCallTargets
@@ -582,6 +931,23 @@ func (w *pyWalker) noteModalImport(module string) {
 	if module == "modal" || strings.HasPrefix(module, "modal.") {
 		w.importsModal = true
 	}
+}
+
+// relativeImportTarget binds a name imported by a relative from-import. Each dot
+// past the first climbs one package (`from ..deps import f` in app/routers is
+// app/deps.f). An imported name that is itself a module file (`from .internal
+// import admin`, the usual way an application imports its routers) binds to that
+// module's path, so `admin.router` names the router it defines rather than a
+// symbol "admin" inside app/internal.
+func (w *pyWalker) relativeImportTarget(moduleName, importedName string) string {
+	base, _ := resolveRelative(moduleName, w.dir)
+	if base == "." {
+		return importedName // imported from the root package: nothing to qualify it with
+	}
+	if sub := base + "/" + importedName; w.fileModules[sub] || w.fileModules[sub+"/__init__"] {
+		return sub // a submodule, or a subpackage (`from . import explore`)
+	}
+	return base + "." + importedName
 }
 
 func (w *pyWalker) setImport(local, target string) {
@@ -611,12 +977,29 @@ func (w *pyWalker) handleDecoratedDefinition(node *sitter.Node) {
 	// in any form (literal, path= keyword, or computed path). The handler is
 	// dispatched by the framework, so it is tagged as an entry point.
 	var isRouteHandler bool
+	// commandDecorator is the text of a click or typer @<group>.command(...) on
+	// this definition, "" when there is none.
+	var commandDecorator string
+	// groupDecorator is the text of a click @<group>.group(...) on this definition.
+	var groupDecorator string
+	// toolDecorator is the text of an MCP @<server>.tool(...) or @tool(...) on this
+	// definition, "" when there is none.
+	var toolDecorator string
 
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		c := node.Child(i)
 		switch kindOf(c) {
 		case "decorator":
 			text := pyText(c, w.src)
+			if commandDecoratorRe.MatchString(text) {
+				commandDecorator = text
+			}
+			if groupDecoratorRe.MatchString(text) {
+				groupDecorator = text
+			}
+			if toolDecoratorRe.MatchString(text) {
+				toolDecorator = text
+			}
 			// Walk decorator-call arguments for nested calls / value refs, e.g.
 			// @router.get(dependencies=[Depends(requires_access_asset(method="GET"))]).
 			// These expressions are evaluated at import time but live inside the
@@ -662,15 +1045,42 @@ func (w *pyWalker) handleDecoratedDefinition(node *sitter.Node) {
 			}
 			fnIdx := len(w.out)
 			w.handleFunction(c, decorators)
+			if commandDecorator != "" && fnIdx < len(w.out) && w.out[fnIdx].Kind == facts.KindSymbol && importsCommandLibrary(w.src) {
+				if name := commandName(commandDecorator, pyFuncName(c, w.src)); name != "" {
+					w.out[fnIdx].SetProp("command", name)
+					w.out[fnIdx].SetProp(propCommandLeaf, declaredCommandName(commandDecorator, pyFuncName(c, w.src)))
+					if t := w.valueRefTarget(decoratorGroup(commandDecorator, commandDecoratorRe)); t != "" {
+						w.out[fnIdx].SetProp(propCommandParent, t)
+					}
+				}
+			}
+			if groupDecorator != "" && fnIdx < len(w.out) && w.out[fnIdx].Kind == facts.KindSymbol && importsCommandLibrary(w.src) {
+				w.out[fnIdx].SetProp(propCommandGroup, declaredCommandName(groupDecorator, pyFuncName(c, w.src)))
+				if t := w.valueRefTarget(decoratorGroup(groupDecorator, groupDecoratorRe)); t != "" {
+					w.out[fnIdx].SetProp(propCommandParent, t)
+				}
+			}
+			if toolDecorator != "" && fnIdx < len(w.out) && w.out[fnIdx].Kind == facts.KindSymbol && importsMCP(w.src, toolDecorator) {
+				w.out[fnIdx].SetProp("tool", toolName(toolDecorator, pyFuncName(c, w.src)))
+				w.out[fnIdx].SetProp("framework_registered", true)
+			}
 			// Tag a route handler as an entry point (framework-dispatched, no in-code
 			// caller). Covers computed/keyword paths the route-fact regex can't parse.
 			if isRouteHandler && fnIdx < len(w.out) && w.out[fnIdx].Kind == facts.KindSymbol {
-				w.out[fnIdx].Props["web_component"] = "route_handler"
+				w.out[fnIdx].SetProp("web_component", "route_handler")
 			}
 			handlerName := w.module + "." + w.qualify(pyFuncName(c, w.src))
+			// The routes name the handler with handled_by only when handleFunction
+			// emitted the symbol under exactly that name: a wrong edge feeds
+			// impact_analysis and find_path, a missing one only leaves them short.
+			var handledBy []facts.Relation
+			if fnIdx < len(w.out) && w.out[fnIdx].Kind == facts.KindSymbol && w.out[fnIdx].Name == handlerName {
+				handledBy = []facts.Relation{{Kind: facts.RelHandledBy, Target: handlerName}}
+			}
 			// Back-fill handler into pending FastAPI route facts.
 			for _, idx := range pendingRouteIndices {
-				w.out[idx].Props["handler"] = handlerName
+				w.out[idx].SetProp("handler", handlerName)
+				w.out[idx].Relations = append(w.out[idx].Relations, handledBy...)
 			}
 			// A framework-registration decorator (@compiles, @x.register, @sig.connect,
 			// @event.listens_for, Flask hooks) dispatches the function — mark it used.
@@ -684,10 +1094,11 @@ func (w *pyWalker) handleDecoratedDefinition(node *sitter.Node) {
 			if len(pendingApiViewMethods) > 0 {
 				for _, meth := range pendingApiViewMethods {
 					w.out = append(w.out, facts.Fact{
-						Kind: facts.KindRoute,
-						Name: meth + " (view) " + handlerName,
-						File: w.relFile,
-						Line: int(c.StartPosition().Row) + 1,
+						Kind:    facts.KindRoute,
+						Name:    meth + " (view) " + handlerName,
+						File:    w.relFile,
+						Line:    int(c.StartPosition().Row) + 1,
+						EndLine: tsutil.EndLine(c, w.src), Column: tsutil.Column(c), EndColumn: tsutil.EndColumn(c, w.src),
 						Props: map[string]any{
 							facts.PropRole: facts.RoleServer,
 							"method":       meth,
@@ -695,6 +1106,7 @@ func (w *pyWalker) handleDecoratedDefinition(node *sitter.Node) {
 							"handler":      handlerName,
 							"language":     "python",
 						},
+						Relations: handledBy,
 					})
 				}
 			}
@@ -734,32 +1146,26 @@ func (w *pyWalker) emitDecoratorRoute(c *sitter.Node, text string, pending *[]in
 	}
 	// FastAPI/Starlette verb decorator (@r.get) or Flask @app.route / @bp.route.
 	if m := routeDecoratorRe.FindStringSubmatch(text); m != nil {
-		path := m[3]
-		line := int(c.StartPosition().Row) + 1
-		before := len(w.out)
-		if strings.EqualFold(m[2], "route") {
-			// Flask: HTTP verbs come from methods=[...] (default GET); framework
-			// is the @X.route idiom itself, not the project detection.
-			w.emitRoutes(path, routeMethods(text), "flask", line, pending)
-		} else {
-			// Verb shorthand (@r.get). Shared by FastAPI and Flask 2.0, so the
-			// framework is derived from project detection rather than hardcoded.
-			w.emitRoutes(path, []string{strings.ToUpper(m[2])}, w.verbShorthandFramework(), line, pending)
-		}
+		// Flask @X.route takes its verbs from methods=[...] (default GET) and is
+		// labelled flask by the idiom itself; the verb shorthand (@r.get) is shared
+		// by FastAPI and Flask 2.0, so its label comes from project detection.
 		// m[1] is the receiver the route was registered on (the `router` in
-		// `@router.get`). Tie the new facts to it so composeRouterPrefixes can fold
-		// on the prefix it is mounted at.
-		if group := w.routerGroupKey(m[1]); group != "" {
-			for i := before; i < len(w.out); i++ {
-				w.routeRefs = append(w.routeRefs, pyRouteRef{idx: i, group: group})
-			}
-		}
+		// `@router.get`); emitRouteAt ties the facts to it so composeRouterPrefixes
+		// can fold on the prefix it is mounted at.
+		methods, framework, websocket := w.decoratorVerbs(m[2], text)
+		w.emitRouteAt([]pyPathPart{{lit: m[3]}}, methods, framework, websocket, m[1], int(c.StartPosition().Row)+1, pending)
 		w.routeDecorators[c.StartByte()] = true
 		return isRoute, true
 	}
 	// Flask-AppBuilder @expose("/path", methods=[...]).
 	if m := exposeDecoratorRe.FindStringSubmatch(text); m != nil {
 		w.emitRoutes(m[1], routeMethods(text), "flask", int(c.StartPosition().Row)+1, pending)
+		w.routeDecorators[c.StartByte()] = true
+		return isRoute, true
+	}
+	// A path the literal regex cannot read: a constant, an f-string, a `+`
+	// concatenation. Emitted pending, resolved repo-wide by resolveRoutePaths.
+	if isRoute && w.emitComputedDecoratorRoute(c, pending) {
 		w.routeDecorators[c.StartByte()] = true
 		return isRoute, true
 	}
@@ -774,6 +1180,11 @@ func (w *pyWalker) emitDecoratorRoute(c *sitter.Node, text string, pending *[]in
 // Each new fact's index is appended to *pending so handleDecoratedDefinition can
 // back-fill the handler prop once the function name is known.
 func (w *pyWalker) emitRoutes(path string, methods []string, framework string, line int, pending *[]int) {
+	if path == "" && !w.emittingPending {
+		// `@router.get("")` is the router's own root; composing a mount prefix
+		// onto it yields the same as onto "/", and unmounted it must not be "".
+		path = "/"
+	}
 	for _, method := range methods {
 		w.out = append(w.out, facts.Fact{
 			Kind: facts.KindRoute,
@@ -832,6 +1243,9 @@ func (w *pyWalker) handleClass(node *sitter.Node, decorators []string) {
 		// Python has no access keyword; the leading-underscore convention marks
 		// a name as private/internal. Lets the dead-code visibility filter work.
 		"exported": !strings.HasPrefix(name, "_"),
+	}
+	if doc := pyDocstring(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
 	}
 	rels := []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}}
 
@@ -920,10 +1334,11 @@ func (w *pyWalker) handleClass(node *sitter.Node, decorators []string) {
 				props["framework"] = "django"
 				tableName := camelToSnake(name)
 				w.out = append(w.out, facts.Fact{
-					Kind: facts.KindStorage,
-					Name: tableName,
-					File: w.relFile,
-					Line: int(node.StartPosition().Row) + 1,
+					Kind:    facts.KindStorage,
+					Name:    tableName,
+					File:    w.relFile,
+					Line:    int(node.StartPosition().Row) + 1,
+					EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 					Props: map[string]any{
 						"storage_kind": "table",
 						"framework":    "django",
@@ -946,10 +1361,11 @@ func (w *pyWalker) handleClass(node *sitter.Node, decorators []string) {
 	}
 
 	f := facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      qualName,
-		File:      w.relFile,
-		Line:      int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    qualName,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props:     props,
 		Relations: rels,
 	}
@@ -959,6 +1375,8 @@ func (w *pyWalker) handleClass(node *sitter.Node, decorators []string) {
 
 	bodyNode := node.ChildByFieldName("body")
 	w.pushType(name, collectPyMethodNames(bodyNode, w.src))
+	w.attrTypes = append(w.attrTypes, collectSelfAttrTypes(bodyNode, w.src, w.importMap, w.module))
+	w.returnTypes = append(w.returnTypes, collectMethodReturnTypes(bodyNode, w.src, w.importMap, w.module))
 	if bodyNode != nil {
 		w.walkBody(bodyNode)
 		// Walk class-body statements for call / value-reference edges (attrs/pydantic/
@@ -1017,14 +1435,18 @@ func (w *pyWalker) handleFunction(node *sitter.Node, decorators []string) {
 	for _, dec := range decorators {
 		applyDecoratorProps(props, dec, w.importsModal)
 	}
+	if doc := pyDocstring(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 
 	rels := []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}}
 
 	f := facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      qualName,
-		File:      w.relFile,
-		Line:      int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    qualName,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props:     props,
 		Relations: rels,
 	}
@@ -1045,12 +1467,17 @@ func (w *pyWalker) handleFunction(node *sitter.Node, decorators []string) {
 			w.localTypes[k] = v
 		}
 		w.localBound = collectLocalBoundNames(node.ChildByFieldName("parameters"), bodyNode, w.src)
+		w.inferLocalTypes(bodyNode)
 		// Set up per-function complexity tracking for this body walk. The props
 		// map is shared by reference with the fact in w.out, so writing to it
 		// after the walk updates the emitted fact.
 		w.metrics = &pyBodyMetrics{}
 		w.loopDepth = 0
 		w.scalingDepth = 0
+		w.loopScopes = nil
+		paramScope, paramIndex := pyParamScope(node.ChildByFieldName("parameters"), w.src)
+		w.paramScope, w.paramIndex = []pyLoopScope{paramScope}, paramIndex
+		w.constLocals = pyConstLiteralLocals(bodyNode, w.src)
 		w.selfName = qualName
 		// Only the outermost function establishes the router scope: a router
 		// variable is local to the factory that builds it, and collectRouterTopology
@@ -1082,6 +1509,23 @@ func (w *pyWalker) handleFunction(node *sitter.Node, decorators []string) {
 				w.metrics.callsInScalingLoop = []string{}
 			}
 			props["calls_in_scaling_loop"] = w.metrics.callsInScalingLoop
+			props["calls_in_scaling_loop_depth"] = callDepths(w.metrics.callsInScalingLoop, w.metrics.scalingCallDepth)
+		}
+		if len(w.metrics.callsOnLoopElement) > 0 {
+			props["calls_on_loop_element"] = w.metrics.callsOnLoopElement
+			props["calls_on_loop_element_arg"] = w.metrics.callsOnLoopElementArg
+		}
+		if len(w.metrics.loopsOverParam) > 0 {
+			props["loops_over_param"] = true
+			idx := make([]int, 0, len(w.metrics.loopsOverParam))
+			for i := range w.metrics.loopsOverParam {
+				idx = append(idx, i)
+			}
+			sort.Ints(idx)
+			props["loops_over_param_index"] = idx
+		}
+		if len(w.metrics.written) > 0 {
+			props[propCallsAsWritten] = sortedKeys(w.metrics.written)
 		}
 		if w.metrics.recursive {
 			props["recursive_self"] = true
@@ -1207,6 +1651,31 @@ func (w *pyWalker) emitValueRef(node *sitter.Node) {
 	}
 }
 
+// A value selected by a fallback or inspected for metadata is referenced, not
+// called or constructed. Resolve bare names strictly, so uppercase constants do
+// not become invented constructor edges.
+func (w *pyWalker) emitNamedValueRef(node *sitter.Node) {
+	if kindOf(node) != "identifier" {
+		return
+	}
+	target := w.valueRefTarget(pyText(node, w.src))
+	if target == "" {
+		return
+	}
+	rel := facts.Relation{Kind: facts.RelNames, Target: target}
+	if owner := w.currentOwner(); owner != nil {
+		owner.Relations = append(owner.Relations, rel)
+	} else {
+		w.fileRefs = append(w.fileRefs, rel)
+	}
+}
+
+func (w *pyWalker) emitFallbackRefs(node *sitter.Node) {
+	for _, ident := range collectRefValueIdents(node) {
+		w.emitNamedValueRef(ident)
+	}
+}
+
 // emitCollectionValueRefs records value-reference edges for the values of a dict
 // literal or the elements of a list/set/tuple — dispatch tables / registries such
 // as {"ds": ds_filter} or [handler_a, handler_b].
@@ -1256,20 +1725,60 @@ func (w *pyWalker) valueRefTarget(name string) string {
 // stringRefRelation returns a reference edge for a string literal that names an
 // internal symbol by dotted path (e.g. lazy_load_command("airflow.cli.commands.x.y")
 // or a provider "class-name": "airflow.providers….short_circuit_task"). Only plain
-// strings whose content is an identifier-dotted path of ≥3 segments qualify;
+// strings whose content is an identifier-dotted path of ≥3 segments or a
+// module:factory import path qualify;
 // f-strings (which have interpolation children, not a single string_content) and
 // hyphenated/spaced strings are skipped. resolveCallTargets resolves the dotted
 // target to a slash symbol and drops non-internal ones.
 func (w *pyWalker) stringRefRelation(node *sitter.Node) (facts.Relation, bool) {
 	content := firstChildOfKind(node, "string_content")
-	if content == nil {
+	if content == nil || firstChildOfKind(node, "interpolation") != nil {
 		return facts.Relation{}, false
 	}
 	s := pyText(content, w.src)
+	if colon := strings.IndexByte(s, ':'); colon >= 0 {
+		if target := configuredPythonSymbol(s); target != "" {
+			// Keep factory notation until resolution: a colon-delimited data
+			// value such as "en:Japan" is not a call just because "en" happens
+			// to name an internal namespace (e.g. docs/source/en/).
+			return facts.Relation{Kind: facts.RelCalls, Target: s}, true
+		}
+		return facts.Relation{}, false
+	}
 	if !dottedPathRe.MatchString(s) {
 		return facts.Relation{}, false
 	}
 	return facts.Relation{Kind: facts.RelCalls, Target: s}, true
+}
+
+// Literal reflection is a reference when its receiver resolves through imports
+// or type information. Computed attribute names and shadowed builtins are skipped.
+func (w *pyWalker) getattrRefRelation(node *sitter.Node) (facts.Relation, bool) {
+	fn := node.ChildByFieldName("function")
+	if kindOf(fn) != "identifier" || pyText(fn, w.src) != "getattr" || w.localBound["getattr"] || w.importMap["getattr"] != "" || (w.idx != nil && w.idx.moduleDefs[w.module]["getattr"]) {
+		return facts.Relation{}, false
+	}
+	args := node.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() < 2 {
+		return facts.Relation{}, false
+	}
+	obj, attr := args.NamedChild(0), args.NamedChild(1)
+	if kindOf(obj) != "identifier" || kindOf(attr) != "string" || firstChildOfKind(attr, "interpolation") != nil {
+		return facts.Relation{}, false
+	}
+	content := firstChildOfKind(attr, "string_content")
+	if content == nil {
+		return facts.Relation{}, false
+	}
+	name := pyText(content, w.src)
+	if !configuredPythonPath.MatchString(name) || strings.Contains(name, ".") {
+		return facts.Relation{}, false
+	}
+	target := w.resolveVarType(pyText(obj, w.src))
+	if target == "" {
+		return facts.Relation{}, false
+	}
+	return facts.Relation{Kind: facts.RelNames, Target: target + "." + name}, true
 }
 
 // firstChildOfKind returns the first direct child of node with the given kind.
@@ -1293,17 +1802,18 @@ func (w *pyWalker) handleExprStatement(node *sitter.Node) {
 			className = w.module + "." + w.enclosingType()
 		}
 		sf := facts.Fact{
-			Kind: facts.KindStorage,
-			Name: m[1],
-			File: w.relFile,
-			Line: int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindStorage,
+			Name:    m[1],
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: map[string]any{
 				"storage_kind": "table",
 				"framework":    "sqlalchemy",
 			},
 		}
 		if className != "" {
-			sf.Props["class"] = className
+			sf.SetProp("class", className)
 			sf.Relations = []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}}
 		}
 		w.out = append(w.out, sf)
@@ -1366,10 +1876,21 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 	}
 	kind := kindOf(node)
 	if kind == "call" {
+		w.callStart = node.StartByte()
+		if rel, ok := w.getattrRefRelation(node); ok {
+			if owner := w.currentOwner(); owner != nil {
+				owner.Relations = append(owner.Relations, rel)
+			}
+		}
+		w.emitCallRoute(node)
+		w.emitHTTPClientRoute(node)
+		w.noteAddCommand(node)
 		if fn := node.ChildByFieldName("function"); fn != nil {
+			w.lastCallTarget = ""
 			w.emitCallEdge(fn)
+			w.noteCallOnLoopElement(node, fn, w.lastCallTarget)
 			// Tag the body io_direct when it directly invokes a DB/network/file primitive
-			// (session.execute, requests.get, open(...)); computePyPerformsIO then
+			// (session.execute, requests.get, open(...)); ioclosure.Propagate then
 			// propagates it transitively into performs_io across the call graph.
 			if w.metrics != nil && !w.metrics.ioDirect && pyIsIODirectCall(fn, w.src) {
 				w.metrics.ioDirect = true
@@ -1381,6 +1902,12 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 			} else {
 				w.fileRefs = append(w.fileRefs, w.argRefRelations(args)...)
 			}
+		}
+	}
+	if kind == "attribute" {
+		attr := node.ChildByFieldName("attribute")
+		if name := pyText(attr, w.src); name == "__module__" || name == "__name__" {
+			w.emitNamedValueRef(node.ChildByFieldName("object"))
 		}
 	}
 	if kind == "string" {
@@ -1396,14 +1923,54 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 		w.emitCollectionValueRefs(node)
 	}
 	if kind == "assignment" {
-		for _, ident := range collectRefValueIdents(node.ChildByFieldName("right")) {
-			w.emitValueRef(ident)
+		value := node.ChildByFieldName("right")
+		if kindOf(value) == "boolean_operator" {
+			w.emitFallbackRefs(value)
+		} else {
+			for _, ident := range collectRefValueIdents(value) {
+				w.emitValueRef(ident)
+			}
+		}
+		// A local assigned from the current element is still the current element:
+		// `tasks = dag.tasks or []` puts `tasks` one step from `dag`.
+		if len(w.loopScopes) > 0 && pyReachedThroughElement(node.ChildByFieldName("right"), w.src, w.loopScopes) {
+			pyBindTargetNames(node.ChildByFieldName("left"), w.src, &w.loopScopes[len(w.loopScopes)-1])
+		}
+		// The same for a parameter: `tasks = dag.tasks or []` is still dag's.
+		if len(w.paramScope) > 0 {
+			if root := pyElementRoot(node.ChildByFieldName("right"), w.src, w.paramScope); root != "" {
+				var bound pyLoopScope
+				pyBindTargetNames(node.ChildByFieldName("left"), w.src, &bound)
+				for name := range bound.vars {
+					w.paramScope[0].add(name)
+					w.paramIndex[name] = w.paramIndex[root]
+				}
+			}
+		}
+	}
+	if kind == "default_parameter" || kind == "typed_default_parameter" {
+		// A default is evaluated when the def is executed and may install a
+		// function as a callback without calling it: `def walk(fetch=fetch_page)`.
+		// Calls inside the default were already collected above, but a bare value
+		// has no call node and must still keep the referenced definition live.
+		value := node.ChildByFieldName("value")
+		if kindOf(value) == "boolean_operator" {
+			w.emitFallbackRefs(value)
+		} else {
+			for _, ident := range collectRefValueIdents(value) {
+				w.emitValueRef(ident)
+			}
 		}
 	}
 	if kind == "return_statement" {
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
-			for _, ident := range collectRefValueIdents(node.Child(i)) {
-				w.emitValueRef(ident)
+			value := node.Child(i)
+			if kindOf(value) == "boolean_operator" {
+				w.emitFallbackRefs(value)
+			} else {
+				for _, ident := range collectRefValueIdents(value) {
+					w.emitValueRef(ident)
+				}
 			}
 		}
 	}
@@ -1444,9 +2011,49 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 	// repeats, so it raises repeatDepth.
 	isLoop := kind == "for_statement" || kind == "while_statement"
 	bounded, repeats := false, false
+	var once *sitter.Node // the part of a loop statement evaluated before it starts
 	if isLoop {
-		bounded = pyLoopBounded(node, w.src)
-		repeats = pyLoopRepeats(node, w.src)
+		bounded = pyLoopBounded(node, w.src, w.constLocals)
+		repeats = pyLoopRepeats(node, w.src, w.constLocals)
+		scope := pyLoopScope{amortizes: repeats}
+		// A poll, a retry or a cursor goes round on what it fetched, not over
+		// data: no factor of n, and its own calls are the round's (pollloop.go).
+		if pyRoundLoop(node, w.src) {
+			bounded, scope.round = true, true
+		}
+		scope.terminal = pyTerminalBlocks(node.ChildByFieldName("body"))
+		if kind == "for_statement" {
+			if !bounded {
+				w.noteLoopOverParam(pyElementRoot(node.ChildByFieldName("right"), w.src, w.paramScope))
+			}
+			// A loop over what belongs to an enclosing loop's element repeats
+			// without scaling (hierarchy.go).
+			if pyReachedThroughElement(node.ChildByFieldName("right"), w.src, w.loopScopes) {
+				bounded = true
+			}
+			pyBindTargetNames(node.ChildByFieldName("left"), w.src, &scope)
+		}
+		// What a round of a batch loop binds is the round's element, so the loop
+		// draining it is hierarchical (batchloop.go).
+		if pageVars, isBatch := pyBatchLoop(node, w.src); isBatch {
+			scope.batch, scope.amortizes = true, true
+			for _, v := range pageVars {
+				scope.add(v)
+			}
+		}
+		w.loopScopes = append(w.loopScopes, scope)
+		// A for statement evaluates its iterable once, before the first iteration.
+		// Walking it with the body read `for spec in load_engine_specs():` as a
+		// load per spec. (The scope pushed above binds only this loop's own
+		// targets, which the iterable cannot mention.)
+		if kind == "for_statement" {
+			if once = node.ChildByFieldName("right"); once != nil {
+				was := w.inIterable
+				w.inIterable = true
+				w.walkForCalls(once)
+				w.inIterable = was
+			}
+		}
 		if w.metrics != nil {
 			w.metrics.loopCount++
 			w.metrics.decisions++
@@ -1467,10 +2074,13 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 	}
 
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
-		w.walkForCalls(node.Child(i))
+		if c := node.Child(i); once == nil || c.StartByte() != once.StartByte() || c.EndByte() != once.EndByte() {
+			w.walkForCalls(c)
+		}
 	}
 
 	if isLoop {
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		w.loopDepth--
 		if !bounded {
 			w.scalingDepth--
@@ -1504,6 +2114,7 @@ func (w *pyWalker) walkNestedScope(node *sitter.Node) {
 	// a decorator applied inside a function body is a real reference (a bare
 	// @retry_on_exception as much as a @log_usage(...) call).
 	def := node
+	var nestedRoutes []int
 	if kindOf(node) == "decorated_definition" {
 		if d := node.ChildByFieldName("definition"); d != nil {
 			def = d
@@ -1522,11 +2133,9 @@ func (w *pyWalker) walkNestedScope(node *sitter.Node) {
 			// pattern (`def get_x_router(): router = APIRouter(); @router.post("/")
 			// async def handler(): ...`), which module-level walkStatement never
 			// reaches. Emit its routes here, after the reference walk above so the
-			// edges that walk produces are unchanged. The nested def gets no symbol
-			// of its own, so the route carries no handler prop and the handler needs
-			// no route_handler entry-point tag (nothing can read it as dead).
-			// Mounted prefixes are folded on afterwards by composeRouterPrefixes.
-			var nestedRoutes []int
+			// edges that walk produces are unchanged. The handler becomes a symbol of
+			// its own below. Mounted prefixes are folded on afterwards by
+			// composeRouterPrefixes.
 			w.emitDecoratorRoute(c, pyText(c, w.src), &nestedRoutes)
 		}
 		if def == node {
@@ -1578,10 +2187,25 @@ func (w *pyWalker) walkNestedScope(node *sitter.Node) {
 	}
 	w.localBound = bound
 
+	// A route handler is the one nested def the framework calls by itself, so it is
+	// the one that gets a symbol: its body's calls are credited to it rather than to
+	// the factory, and the route names it. Any other nested def stays part of its
+	// enclosing symbol.
+	handlerIdx := -1
+	if len(nestedRoutes) > 0 && kindOf(def) == "function_definition" {
+		handlerIdx = w.emitNestedRouteHandler(def, nestedRoutes)
+	}
+	if handlerIdx >= 0 {
+		w.pushOwner(handlerIdx)
+	}
+
 	// Walk the definition subtree: parameter defaults and the body. Deeper
 	// nested defs re-enter walkNestedScope with a further-extended scope.
 	for i := uint(0); i < uint(def.ChildCount()); i++ {
 		w.walkForCalls(def.Child(i))
+	}
+	if handlerIdx >= 0 {
+		w.popOwner()
 	}
 
 	w.metrics = savedMetrics
@@ -1611,7 +2235,22 @@ func (w *pyWalker) walkComprehension(node *sitter.Node) {
 	}
 	// A comprehension over a literal/constant iterable (`[f(x) for x in (A, B, C)]`) is
 	// bounded, so it does not add a scaling loop level.
-	bounded := firstIter != nil && pyIterableBounded(firstIter, w.src)
+	bounded := firstIter != nil && pyConstantIterable(firstIter, w.src, w.constLocals)
+	// `[t.id for t in dag.tasks]` under a loop over dags repeats without scaling
+	// (hierarchy.go).
+	repeats := !bounded
+	if !bounded {
+		w.noteLoopOverParam(pyElementRoot(firstIter, w.src, w.paramScope))
+	}
+	if pyReachedThroughElement(firstIter, w.src, w.loopScopes) {
+		bounded = true
+	}
+	scope := pyLoopScope{amortizes: repeats}
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		if c := node.Child(i); kindOf(c) == "for_in_clause" {
+			pyBindTargetNames(c.ChildByFieldName("left"), w.src, &scope)
+		}
+	}
 
 	if w.metrics != nil {
 		w.metrics.loopCount++
@@ -1633,8 +2272,11 @@ func (w *pyWalker) walkComprehension(node *sitter.Node) {
 	w.loopDepth++
 	if !bounded {
 		w.scalingDepth++
+	}
+	if repeats {
 		w.repeatDepth++
 	}
+	w.loopScopes = append(w.loopScopes, scope)
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		child := node.Child(i)
 		if kindOf(child) == "for_in_clause" {
@@ -1651,9 +2293,12 @@ func (w *pyWalker) walkComprehension(node *sitter.Node) {
 		}
 		w.walkForCalls(child)
 	}
+	w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 	w.loopDepth--
 	if !bounded {
 		w.scalingDepth--
+	}
+	if repeats {
 		w.repeatDepth--
 	}
 }
@@ -1666,8 +2311,8 @@ func (w *pyWalker) walkComprehension(node *sitter.Node) {
 // loop (driven by external events, not data).
 //
 // It does NOT mean the loop runs a constant number of times — see pyLoopRepeats.
-func pyLoopBounded(node *sitter.Node, src []byte) bool {
-	return pyLoopConstant(node, src) || pyLoopInfinite(node, src)
+func pyLoopBounded(node *sitter.Node, src []byte, consts map[string]bool) bool {
+	return pyLoopConstant(node, src, consts) || pyLoopInfinite(node, src)
 }
 
 // pyLoopRepeats reports whether the loop body runs a non-constant number of times, so a
@@ -1675,18 +2320,18 @@ func pyLoopBounded(node *sitter.Node, src []byte) bool {
 // `while True: row = fetch(id)` is a retry / chain walk that queries once per iteration,
 // even though its depth is discounted from the Big-O exponent. Scaling and repeating are
 // not the same property.
-func pyLoopRepeats(node *sitter.Node, src []byte) bool {
-	return !pyLoopConstant(node, src)
+func pyLoopRepeats(node *sitter.Node, src []byte, consts map[string]bool) bool {
+	return !pyLoopConstant(node, src, consts)
 }
 
 // pyLoopConstant reports whether a for-loop iterates a compile-time-fixed number of
 // times. A while-loop never qualifies: `while True` repeats indefinitely.
-func pyLoopConstant(node *sitter.Node, src []byte) bool {
+func pyLoopConstant(node *sitter.Node, src []byte, consts map[string]bool) bool {
 	if kindOf(node) != "for_statement" {
 		return false
 	}
 	it := node.ChildByFieldName("right")
-	return it != nil && pyIterableBounded(it, src)
+	return it != nil && pyConstantIterable(it, src, consts)
 }
 
 // pyLoopInfinite reports whether a while-loop is the `while True:` / `while 1:` form,
@@ -1708,39 +2353,6 @@ func pyLoopInfinite(node *sitter.Node, src []byte) bool {
 	return false
 }
 
-// pyIterableBounded reports whether an iterable expression has a compile-time-fixed
-// length: a list/tuple/set/dict literal, or range(...) whose arguments are all integer
-// literals. Anything data-derived (a variable, range(len(x)), a call result) is unbounded.
-func pyIterableBounded(it *sitter.Node, src []byte) bool {
-	switch kindOf(it) {
-	case "list", "tuple", "set", "dictionary":
-		return true
-	case "call":
-		fn := it.ChildByFieldName("function")
-		if fn == nil || pyText(fn, src) != "range" {
-			return false
-		}
-		args := it.ChildByFieldName("arguments")
-		if args == nil {
-			return false
-		}
-		sawArg := false
-		for i := uint(0); i < uint(args.ChildCount()); i++ {
-			c := args.Child(i)
-			switch kindOf(c) {
-			case "(", ")", ",":
-				continue
-			}
-			sawArg = true
-			if kindOf(c) != "integer" {
-				return false
-			}
-		}
-		return sawArg
-	}
-	return false
-}
-
 // pyIODirectMethods are Python method names that are unambiguously a DB/session
 // round-trip (SQLAlchemy / DBAPI). Ambiguous verbs (get/save/update/merge) are
 // intentionally excluded — they collide with in-memory helpers — and covered by
@@ -1752,6 +2364,16 @@ var pyIODirectMethods = map[string]bool{
 	"bulk_create": true, "bulk_update": true, "bulk_save_objects": true,
 	"bulk_insert_mappings": true, "add_all": true,
 	"get_or_create": true, "update_or_create": true, "urlopen": true,
+	// Object-store client methods (boto3 S3, google-cloud-storage). They are
+	// called on a client an untyped accessor returned (`self.get_conn().
+	// upload_fileobj(…)`), so no receiver says what they are; the names do, being
+	// the API's own and nobody else's. Without them a hook's upload method carried
+	// no flag, and once the call to it resolved it read as a call that does none.
+	"upload_fileobj": true, "upload_file": true, "download_fileobj": true, "download_file": true,
+	"put_object": true, "get_object": true, "delete_object": true, "delete_objects": true,
+	"head_object": true, "copy_object": true, "list_objects_v2": true,
+	"upload_from_filename": true, "upload_from_file": true, "upload_from_string": true,
+	"download_to_filename": true, "download_to_file": true, "download_as_bytes": true,
 }
 
 // pyIOReceivers are module/object roots whose calls are network I/O regardless of method.
@@ -1812,7 +2434,16 @@ func (w *pyWalker) emitCallEdge(fn *sitter.Node) {
 				Kind:   facts.RelCalls,
 				Target: target,
 			})
-			w.recordCallMetrics(target)
+			// A bare name never reaches a method of the enclosing class: that takes
+			// `self.` or `cls.`. resolveCall binds the edge to a sibling method so
+			// the method stays alive for dead-code analysis, but a method `f` whose
+			// body calls a module-level or locally imported `f(...)` is delegating,
+			// not recursing.
+			if w.currentMethods()[name] {
+				w.recordInLoopCall(target)
+			} else {
+				w.recordCallMetrics(target)
+			}
 		}
 
 	case "attribute":
@@ -1834,9 +2465,17 @@ func (w *pyWalker) emitCallEdge(fn *sitter.Node) {
 			}
 			return
 		}
-		// Resolve the receiver to a qualified type via localTypes or importMap.
+		// Resolve the receiver to a qualified type via localTypes or importMap, or,
+		// for `self.x`, by what the class declares it holds there.
 		qualType := w.resolveVarType(obj)
 		if qualType == "" {
+			qualType = w.selfAttrType(objNode)
+		}
+		if qualType == "" {
+			qualType = w.callResultType(objNode)
+		}
+		if qualType == "" {
+			w.recordWrittenIOCall(objNode, obj, attr)
 			return
 		}
 		target := qualType + "." + attr
@@ -1845,7 +2484,7 @@ func (w *pyWalker) emitCallEdge(fn *sitter.Node) {
 			Target: target,
 		})
 		w.recordCallMetrics(target)
-		w.emitImplementorCalls(owner, attr, qualType)
+		w.emitImplementorCalls(w.currentOwnerIdx(), attr, qualType)
 	}
 }
 
@@ -1868,19 +2507,52 @@ func (w *pyWalker) resolveVarType(obj string) string {
 
 // emitImplementorCalls emits additional RelCalls edges to all concrete classes
 // that implement qualType, when a matching method exists on each implementor.
-func (w *pyWalker) emitImplementorCalls(owner *facts.Fact, methodName, qualType string) {
+func (w *pyWalker) emitImplementorCalls(ownerIdx int, methodName, qualType string) {
+	if ownerIdx < 0 {
+		return
+	}
+	if w.deferImplementors {
+		w.pendingImpl = append(w.pendingImpl, pyImplCall{owner: ownerIdx, method: methodName, qualType: qualType})
+		return
+	}
 	if w.idx == nil {
 		return
 	}
+	addImplementorCalls(&w.out[ownerIdx], methodName, qualType, w.idx)
+}
+
+// pyImplCall is one implementor lookup held back until the merged index exists.
+type pyImplCall struct {
+	owner    int // index into the file's fact slice
+	method   string
+	qualType string
+}
+
+// applyPendingImplementors answers the held-back lookups against the merged index.
+func applyPendingImplementors(ff []facts.Fact, pending []pyImplCall, idx *pySymbolIndex) {
+	if idx == nil {
+		return
+	}
+	for _, p := range pending {
+		if p.owner < 0 || p.owner >= len(ff) {
+			continue
+		}
+		addImplementorCalls(&ff[p.owner], p.method, p.qualType, idx)
+	}
+}
+
+// addImplementorCalls appends a RelCalls edge to every concrete implementor of
+// qualType that declares methodName.
+func addImplementorCalls(owner *facts.Fact, methodName, qualType string, idx *pySymbolIndex) {
 	bare := lastComponent(qualType)
 	seen := make(map[string]bool)
 	for _, key := range []string{bare, qualType} {
-		for _, concreteQual := range w.idx.implMap[key] {
+		for _, concreteQual := range idx.implMap[key] {
 			if seen[concreteQual] {
 				continue
 			}
 			seen[concreteQual] = true
-			info, ok := w.idx.classes[concreteQual]
+			info, ok := idx.classes[concreteQual]
 			if !ok || !info.methods[methodName] {
 				continue
 			}
@@ -2009,8 +2681,8 @@ func walkLocalBoundNames(node *sitter.Node, src []byte, bound map[string]bool) {
 }
 
 // collectRefValueIdents returns the bare identifier(s) a value expression
-// resolves to: itself if it's a plain identifier, or each identifier element
-// of a tuple (expression_list), e.g. `cb = handler` / `a, b = f, g`.
+// resolves to: a plain identifier, tuple elements or boolean fallback operands,
+// e.g. `cb = handler`, `a, b = f, g`, or `cb = provided or default_handler`.
 func collectRefValueIdents(node *sitter.Node) []*sitter.Node {
 	if node == nil {
 		return nil
@@ -2018,12 +2690,10 @@ func collectRefValueIdents(node *sitter.Node) []*sitter.Node {
 	switch kindOf(node) {
 	case "identifier":
 		return []*sitter.Node{node}
-	case "expression_list":
+	case "expression_list", "boolean_operator":
 		var out []*sitter.Node
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
-			if c := node.Child(i); kindOf(c) == "identifier" {
-				out = append(out, c)
-			}
+			out = append(out, collectRefValueIdents(node.Child(i))...)
 		}
 		return out
 	}
@@ -2164,6 +2834,44 @@ func stmtIsDocstring(stmt *sitter.Node) bool {
 	return kindOf(stmt.Child(0)) == "string"
 }
 
+// pyDocstring returns the first paragraph of a function's or class's docstring:
+// the bare string literal that opens its body. Comments before it are skipped,
+// as the interpreter skips them; anything else first means there is none.
+func pyDocstring(def *sitter.Node, src []byte) string {
+	return pyBlockDocstring(def.ChildByFieldName("body"), src)
+}
+
+// pyBlockDocstring returns the first paragraph of the docstring opening a block:
+// a def's or class's body, or a whole module.
+func pyBlockDocstring(body *sitter.Node, src []byte) string {
+	if body == nil {
+		return ""
+	}
+	for i := uint(0); i < uint(body.NamedChildCount()); i++ {
+		stmt := body.NamedChild(i)
+		if kindOf(stmt) == "comment" {
+			continue
+		}
+		if kindOf(stmt) != "expression_statement" || !stmtIsDocstring(stmt) {
+			return ""
+		}
+		return facts.DocText(pyStringBody(pyText(stmt.Child(0), src)))
+	}
+	return ""
+}
+
+// pyStringBody strips a string literal's prefix letters and quotes, leaving its
+// text as written. Escapes are left alone: a docstring is read, not evaluated.
+func pyStringBody(literal string) string {
+	literal = strings.TrimLeft(literal, "rRuUbBfF")
+	for _, quote := range []string{`"""`, "'''", `"`, "'"} {
+		if len(literal) >= 2*len(quote) && strings.HasPrefix(literal, quote) && strings.HasSuffix(literal, quote) {
+			return literal[len(quote) : len(literal)-len(quote)]
+		}
+	}
+	return literal
+}
+
 // hasDecorator reports whether any name in decorators has last as its
 // last dot-separated component (e.g. "overload" matches both "overload"
 // and "typing.overload").
@@ -2183,12 +2891,7 @@ func pyFuncName(node *sitter.Node, src []byte) string {
 	return ""
 }
 
-func pyText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func pyText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
 
 func pyCapitalized(s string) bool {
 	if s == "" {
@@ -2200,11 +2903,11 @@ func pyCapitalized(s string) bool {
 // --- Type resolution helpers ---
 
 // resolveTypeNamePy converts a raw annotation string to a canonical qualified name
-// using the file's importMap. Returns "" for external/unresolvable/built-in types.
+// using the file's importMap. Returns "" for external/unresolvable/built-in types,
+// and for anything stripGenericWrapper does not reduce to a dotted name.
 func resolveTypeNamePy(typeStr, module string, importMap map[string]string) string {
-	typeStr = strings.TrimSpace(typeStr)
 	typeStr = stripGenericWrapper(typeStr)
-	if typeStr == "" || pyBuiltinTypes[typeStr] {
+	if typeStr == "" || pyBuiltinTypes[typeStr] || !isPyDottedName(typeStr) {
 		return ""
 	}
 	if strings.Contains(typeStr, ".") {
@@ -2226,33 +2929,87 @@ func resolveTypeNamePy(typeStr, module string, importMap map[string]string) stri
 	return module + "." + typeStr
 }
 
-// stripGenericWrapper strips the outermost generic wrapper from a type string.
-// Handles bracket generics (Optional[X], List[X], Union[X, None]) and PEP-604
-// union syntax (X | None, X | Y).
+// stripGenericWrapper reduces an annotation to the one type name it is read as,
+// the way pyValueType reads a return annotation. A union is its first part that
+// is not None (X | None, Union[X, None], Optional[X]), type[X] and a qualifier
+// such as Annotated[X, ...] or ClassVar[X] are X, and any other generic is its
+// base: Queue[Job] is a Queue and dict[str, X] a dict. A forward
+// reference is read without its quotes, whether the whole annotation is quoted or
+// only a name inside it.
 func stripGenericWrapper(s string) string {
-	// PEP-604 union: "X | Y" — take the first non-None part.
-	if strings.Contains(s, "|") && !strings.Contains(s, "[") {
-		for _, part := range strings.Split(s, "|") {
-			part = strings.TrimSpace(part)
-			if part != "None" && part != "" {
-				return part
+	s = firstNonNonePy(splitTopLevelPy(unquotePyType(s), '|'))
+	for {
+		base, args, ok := splitGenericPy(s)
+		if !ok {
+			return s
+		}
+		switch lastComponent(base) {
+		case "Optional", "Union", "type", "Type", "Annotated", "Final", "ClassVar",
+			"Required", "NotRequired", "ReadOnly":
+			s = firstNonNonePy(splitTopLevelPy(firstNonNonePy(args), '|'))
+		default:
+			return base
+		}
+	}
+}
+
+func unquotePyType(s string) string {
+	return strings.TrimSpace(strings.Trim(strings.TrimSpace(s), `"'`))
+}
+
+// firstNonNonePy is the first part, unquoted, that is neither empty nor None.
+func firstNonNonePy(parts []string) string {
+	for _, p := range parts {
+		if p = unquotePyType(p); p != "" && p != "None" {
+			return p
+		}
+	}
+	return ""
+}
+
+// splitTopLevelPy splits s on sep where it is outside any brackets.
+func splitTopLevelPy(s string, sep byte) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '[', '(':
+			depth++
+		case ']', ')':
+			depth--
+		case sep:
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
 			}
 		}
-		return ""
 	}
-	i := strings.Index(s, "[")
-	if i < 0 {
-		return s
+	return append(parts, s[start:])
+}
+
+// splitGenericPy splits "Base[a, b]" into its base and top-level arguments.
+func splitGenericPy(s string) (string, []string, bool) {
+	i := strings.IndexByte(s, '[')
+	if i <= 0 || !strings.HasSuffix(s, "]") {
+		return "", nil, false
 	}
-	inner := strings.TrimSpace(s[i+1 : len(s)-1])
-	if comma := strings.Index(inner, ","); comma >= 0 {
-		part := strings.TrimSpace(inner[:comma])
-		if part == "None" {
-			part = strings.TrimSpace(inner[comma+1:])
+	return unquotePyType(s[:i]), splitTopLevelPy(s[i+1:len(s)-1], ','), true
+}
+
+// isPyDottedName reports whether s is an identifier or a dotted run of them.
+func isPyDottedName(s string) bool {
+	for _, part := range strings.Split(s, ".") {
+		if part == "" {
+			return false
 		}
-		return part
+		for i, r := range part {
+			ok := r == '_' || unicode.IsLetter(r) || (i > 0 && unicode.IsDigit(r))
+			if !ok {
+				return false
+			}
+		}
 	}
-	return inner
+	return true
 }
 
 // pyBuiltinTypes is the set of Python built-in and standard-library primitive
@@ -2375,21 +3132,15 @@ type pySymbolIndex struct {
 	// and classes). Used to safely credit a same-module symbol passed by name as a
 	// value (a param/local of the same name is never in this set).
 	moduleDefs map[string]map[string]bool
+	// globals maps a module-level name (`pkg/mod.name`) to its declared type.
+	// See collectGlobalTypes.
+	globals map[string]string
 }
 
-// buildFileIndex scans src for class declarations and populates idx.
-// It does not emit any facts — it is read-only over the AST.
-func buildFileIndex(src []byte, relFile string, idx *pySymbolIndex) {
-	parser := sitter.NewParser()
-	defer parser.Close()
-	if err := parser.SetLanguage(sitter.NewLanguage(python.Language())); err != nil {
-		return
-	}
-	tree := parser.Parse(src, nil)
-	defer tree.Close()
-
+// indexTree is buildFileIndex over a tree the caller already parsed, so the
+// extractor contributes to the index from the same parse that emits the facts.
+func indexTree(root *sitter.Node, src []byte, relFile string, idx *pySymbolIndex) {
 	module := strings.TrimSuffix(relFile, ".py")
-	root := tree.RootNode()
 	for i := uint(0); i < uint(root.ChildCount()); i++ {
 		node := root.Child(i)
 		switch kindOf(node) {
@@ -2575,4 +3326,77 @@ func (w *pyWalker) claimImport(node *sitter.Node) bool {
 	}
 	w.emittedImports[start] = true
 	return true
+}
+
+// pyRouteHandler is one call-registered route awaiting its handled_by edge.
+type pyRouteHandler struct {
+	idx     int
+	handler string
+}
+
+// bindCallRouteHandlers adds handled_by to each call-registered route whose handler
+// this file declares as a symbol under exactly that name. A handler imported from
+// another module, or one the call names in a form the walker does not declare,
+// keeps only its handler prop: a wrong edge feeds impact_analysis and find_path, a
+// missing one only leaves them short.
+func (w *pyWalker) bindCallRouteHandlers() {
+	if len(w.callRouteHandlers) == 0 {
+		return
+	}
+	declared := map[string]bool{}
+	for _, f := range w.out {
+		if f.Kind == facts.KindSymbol {
+			declared[f.Name] = true
+		}
+	}
+	for _, rh := range w.callRouteHandlers {
+		if declared[rh.handler] {
+			w.out[rh.idx].Relations = append(w.out[rh.idx].Relations,
+				facts.Relation{Kind: facts.RelHandledBy, Target: rh.handler})
+		}
+	}
+	w.callRouteHandlers = nil
+}
+
+// emitNestedRouteHandler emits the symbol for a route handler defined inside a
+// function (the router-factory pattern), named under its enclosing symbol, and
+// names it on the routes its decorators emitted. Returns the symbol's index in out,
+// or -1 when there is no enclosing symbol to name it under.
+//
+// The symbol is tagged route_handler, the entry-point tag decorated module-level
+// handlers carry: the framework calls it, nothing in the code does, and the helpers
+// it calls are now credited to it rather than to the factory. It carries no
+// complexity metrics; walkNestedScope suppresses them for every nested scope.
+func (w *pyWalker) emitNestedRouteHandler(def *sitter.Node, routes []int) int {
+	owner := w.currentOwner()
+	name := pyFuncName(def, w.src)
+	if owner == nil || name == "" {
+		return -1
+	}
+	qualName := owner.Name + "." + name
+	props := map[string]any{
+		"symbol_kind":   facts.SymbolFunc,
+		"exported":      false,
+		"language":      "python",
+		"web_component": "route_handler",
+	}
+	if strings.HasPrefix(strings.TrimSpace(pyText(def, w.src)), "async ") {
+		props["async"] = true
+	}
+	if doc := pyDocstring(def, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
+	w.out = append(w.out, facts.Fact{
+		Kind:      facts.KindSymbol,
+		Name:      qualName,
+		File:      w.relFile,
+		Line:      int(def.StartPosition().Row) + 1,
+		Props:     props,
+		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
+	})
+	for _, idx := range routes {
+		w.out[idx].SetProp("handler", qualName)
+		w.out[idx].Relations = append(w.out[idx].Relations, facts.Relation{Kind: facts.RelHandledBy, Target: qualName})
+	}
+	return len(w.out) - 1
 }

@@ -16,6 +16,7 @@ func withMemberProvenance(union, turn facts.SnapshotMeta) facts.SnapshotMeta {
 	m.Extractors = turn.Extractors
 	m.Providers = turn.Providers
 	m.FileHashes = turn.FileHashes
+	m.TestFileHashes = turn.TestFileHashes
 	m.FilesSeen = turn.FilesSeen
 	m.FilesParsed = turn.FilesParsed
 	m.SourceBytes = turn.SourceBytes
@@ -58,4 +59,15 @@ func (e *Engine) MetaFor(repoPath string) facts.SnapshotMeta {
 		return withMemberProvenance(b.snapshot.Meta, turn)
 	}
 	return b.snapshot.Meta
+}
+
+// RestoreMembers publishes each member's meta, keyed by absolute path, beside a
+// union RestoreFromDir read from one member's dir. That dir's meta carries its own
+// member's provenance only, so without this MetaFor would answer every other
+// member with the first one's repository, label and providers. Each member's own
+// snapshot.meta.json is the meta to pass: its provenance fields are exactly the
+// turn that read it.
+func (e *Engine) RestoreMembers(members map[string]facts.SnapshotMeta) {
+	b := e.current.Load()
+	e.current.Store(&snapshotBundle{store: b.store, snapshot: b.snapshot, repoPaths: b.repoPaths, intent: b.intent, members: members})
 }

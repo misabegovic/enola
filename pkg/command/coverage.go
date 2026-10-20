@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/enola-labs/enola/internal/clientspec"
 	"github.com/enola-labs/enola/pkg/coverage"
 )
 
@@ -27,7 +28,7 @@ func (r *Runner) Coverage(ctx context.Context, args []string) {
 	fs.SetOutput(os.Stderr)
 	var (
 		service    = fs.String("repo", "", "report on one service instead of all of them")
-		unresolved = fs.Bool("unresolved", false, "list only services with unresolved outbound call sites")
+		unresolved = fs.Bool("unresolved", false, "list only services with unresolved outbound call sites, and name each call site")
 		asJSON     = fs.Bool("json", false, "emit the report as JSON")
 	)
 	fs.Usage = func() {
@@ -39,6 +40,7 @@ func (r *Runner) Coverage(ctx context.Context, args []string) {
 				"Needs two or more repositories in one graph; point it at a config with `repos:`.\n\n"+
 				"Flags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "coverage")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -65,6 +67,7 @@ func (r *Runner) Coverage(ctx context.Context, args []string) {
 	}
 	if *unresolved {
 		report = onlyUnresolved(report)
+		report.AttachUnresolvedSites(tgt.engine.Store())
 	}
 
 	if *asJSON {
@@ -76,6 +79,17 @@ func (r *Runner) Coverage(ctx context.Context, args []string) {
 		return
 	}
 	fmt.Print(report.RenderText())
+	if *unresolved {
+		fmt.Print(report.RenderUnresolvedSites())
+	}
+	// What each declared in-house client found. Shown with the full report only: a view
+	// narrowed to one service or to its misses is asking about that, not about config.
+	if *service == "" && !*unresolved {
+		fmt.Print(coverage.RenderClientsText(coverage.BuildClients(tgt.engine.Store())))
+		if notice := clientspec.UnsupportedNotice(tgt.engine.Config().Clients); notice != "" {
+			fmt.Print("\n" + notice)
+		}
+	}
 }
 
 func (r *Runner) coverageFatal(format string, args ...any) { r.cmdFatal("coverage", format, args...) }

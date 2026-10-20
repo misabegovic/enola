@@ -88,11 +88,13 @@ type Tracker struct {
 // Identity is the launch context that distinguishes one running server from
 // another in the registry: which binary, from which workspace, with which config.
 type Identity struct {
-	Binary     string // "enola" / "enola-enterprise"
+	Binary     string // the binary's own name
 	Version    string
-	Licensed   bool // enterprise features active
 	ConfigPath string
 	WorkDir    string
+	Socket     string     // the unix socket it also serves on, if any
+	Executable Executable // the file it was started from, as it was then
+	ClientPID  int        // the agent process the server serves; see AgentPID
 }
 
 // GraphState is the snapshot of the engine's graph published in the instance
@@ -207,13 +209,6 @@ func (t *Tracker) PersistStartup() {
 	t.flush(rs)
 	t.persistInstance()
 	t.startHeartbeat()
-}
-
-// OnToolCall records a completed call by name only, crediting it as a successful
-// query. It is retained for callers that cannot describe the outcome; the server
-// uses Record, which prices the call properly.
-func (t *Tracker) OnToolCall(toolName, repo string) {
-	t.Record(ToolCall{Tool: toolName, Repo: repo, OK: true})
 }
 
 // Record accounts for one completed tool call: it increments the call count and
@@ -359,9 +354,9 @@ func (t *Tracker) Self() Instance {
 		Heartbeat:     time.Now(),
 		Binary:        t.ident.Binary,
 		Version:       t.ident.Version,
-		Licensed:      t.ident.Licensed,
 		ConfigPath:    t.ident.ConfigPath,
 		WorkDir:       t.ident.WorkDir,
+		ClientPID:     t.ident.ClientPID,
 		PrimaryRepo:   primary,
 		Repos:         g.Repos,
 		SnapshotID:    g.SnapshotID,
@@ -374,6 +369,12 @@ func (t *Tracker) Self() Instance {
 		LastCallAt:    t.lastCallAt,
 		SessionCounts: session,
 		SessionTokens: sessionTokens,
+
+		Socket:         t.ident.Socket,
+		BinaryPath:     t.ident.Executable.Path,
+		BinarySize:     t.ident.Executable.Size,
+		BinaryModTime:  t.ident.Executable.ModTime,
+		BinaryReplaced: t.ident.Executable.Replaced(),
 	}
 }
 
@@ -381,15 +382,6 @@ func (t *Tracker) Self() Instance {
 // failed write only makes this instance briefly invisible to other dashboards.
 func (t *Tracker) persistInstance() {
 	_ = writeInstance(t.Self())
-}
-
-// GetStatus returns the current status snapshot for a single repo. Caller need
-// not hold the lock.
-func (t *Tracker) GetStatus(repo string) StatusInfo {
-	repo = canonicalRepoPath(repo)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.infoLocked(t.stateLocked(repo))
 }
 
 // stateLocked returns the repoState for repo, lazily creating it and loading
@@ -720,6 +712,9 @@ func printInstances(instances []Instance) {
 		tag := ""
 		if inst.PID == self {
 			tag = " (this)"
+		}
+		if inst.RunsReplacedBinary() {
+			tag += " (binary replaced since it started)"
 		}
 		fmt.Fprintf(os.Stderr, "  %7d  %-*s  %8s  %6d  %s%s\n",
 			inst.PID, maxRepo, inst.RepoLabels(),

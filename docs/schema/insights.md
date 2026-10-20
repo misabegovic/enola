@@ -9,6 +9,7 @@ contains an array; a snapshot with no findings contains `[]`.
 |---|---|---|---|
 | `title` | string | always | One-line finding summary |
 | `source` | string | when set | Explainer that produced the finding, such as `cycles` or `unused-routes` |
+| `identity` | string, 16 lowercase hex chars | current writers: always; earlier writers: never | The finding's identity across snapshots: the key `check` pairs a baseline's findings with the current ones on, the SARIF `partialFingerprints.enola/v1` and the ledger's breach `identity` for the same finding. Findings whose titles differ only in a number share one |
 | `description` | string | always | Presentation text describing the finding; not a stable identifier |
 | `confidence` | number from 0 to 1 | always | `1.0` for structural findings; less than `1.0` for heuristic findings |
 | `evidence` | array of Evidence | always; may be empty | Facts, files, or symbols cited by the finding |

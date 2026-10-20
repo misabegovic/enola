@@ -10,12 +10,7 @@ import (
 
 // ── Node text ───────────────────────────────────────────────────────────────
 
-func nodeText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
 
 func (w *astWalker) nameText(node *sitter.Node) string { return nodeText(node, w.src) }
 
@@ -470,7 +465,11 @@ func syntacticLoopClass(node *sitter.Node, src []byte) loopClass {
 		if cond == nil {
 			return loopInfinite
 		}
-		if constantCondition(cond, src) {
+		// Both ends have to be constant. `for (i = n - 1; i >= 0; i--)` compares against a
+		// literal and walks all n: the bound that scales is where it starts. The
+		// condition alone used to decide, which read every descending loop as a
+		// fixed-count one and dropped it, and the calls inside it, from the analysis.
+		if constantCondition(cond, src) && forStartsAtConstant(node, src) {
 			return loopConstant
 		}
 	case "while_statement", "do_statement":
@@ -488,6 +487,47 @@ func syntacticLoopClass(node *sitter.Node, src []byte) loopClass {
 
 // constantCondition reports whether a for-loop's condition bounds it by a literal
 // (`i < 10`), rather than by something derived from the input (`i < items.Count`).
+// forStartsAtConstant reports whether a for statement initialises its counter to an
+// integer literal or an ALL_CAPS constant. No initialiser, or one computed from
+// anything else (`items.Count - 1`), does not qualify.
+func forStartsAtConstant(node *sitter.Node, src []byte) bool {
+	init := node.ChildByFieldName("initializer")
+	if init == nil {
+		return false
+	}
+	constant := func(v *sitter.Node) bool {
+		if v == nil {
+			return false
+		}
+		switch kindOf(v) {
+		case "integer_literal":
+			return true
+		case "identifier":
+			return isScreamingConst(nodeText(v, src))
+		}
+		return false
+	}
+	switch kindOf(init) {
+	case "assignment_expression":
+		return constant(init.ChildByFieldName("right"))
+	case "variable_declaration":
+		seen := false
+		for i := uint(0); i < uint(init.NamedChildCount()); i++ {
+			d := init.NamedChild(i)
+			if kindOf(d) != "variable_declarator" {
+				continue
+			}
+			// The declarator is `name` then, when initialised, the value.
+			if d.NamedChildCount() < 2 || !constant(d.NamedChild(d.NamedChildCount()-1)) {
+				return false
+			}
+			seen = true
+		}
+		return seen
+	}
+	return false
+}
+
 func constantCondition(cond *sitter.Node, src []byte) bool {
 	if kindOf(cond) != "binary_expression" {
 		return false
@@ -597,7 +637,7 @@ func iteratorReceiverBounded(node *sitter.Node, src []byte) bool {
 // ── I/O vocabulary ──────────────────────────────────────────────────────────
 
 // ioMethods are calls that cross a process boundary — network, disk or database.
-// A member invoking one is tagged io_direct, and computeCSharpPerformsIO
+// A member invoking one is tagged io_direct, and ioclosure.Propagate
 // propagates that up the call graph so a per-iteration call to a wrapper reads as
 // an N+1 rather than as ordinary work.
 var ioMethods = map[string]bool{

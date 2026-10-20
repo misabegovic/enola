@@ -10,6 +10,7 @@
 package routeindex
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -32,12 +33,29 @@ type Matcher struct {
 // New returns a Matcher using the given vocabulary.
 func New(v *vocab.Set) *Matcher { return &Matcher{v: v} }
 
+// ServiceAlias returns the repository label the config's service_aliases maps a service
+// name to. Keys match exactly: the name is the string the client passes, and whoever
+// writes the alias writes that same string.
+func (m *Matcher) ServiceAlias(service string) (string, bool) {
+	if service == "" {
+		return "", false
+	}
+	repo := m.v.ServiceAliases[service]
+	return repo, repo != ""
+}
+
 type RouteRef struct {
 	Repo     string
 	Method   string
 	Path     string
 	FullPath string // the complete normalized server path this ref was indexed from
+	// Spec marks a route a specification declares (an OpenAPI document), as opposed
+	// to one a program registers.
+	Spec bool
 }
+
+// IsSpecRoute reports whether a route fact comes from a specification document.
+func IsSpecRoute(f facts.Fact) bool { return f.PropString("source") == "openapi" }
 
 // IndexServerRoutes builds the suffix+method -> server route index the HTTP linker
 // matches client calls against: every trailing-segment suffix of every server
@@ -48,22 +66,52 @@ type RouteRef struct {
 func (m *Matcher) IndexServerRoutes(all []facts.Fact) map[string][]RouteRef {
 	server := map[string][]RouteRef{}
 	for _, f := range all {
-		if f.Kind != facts.KindRoute || f.Repo == "" || RoleOf(f) == facts.RoleClient || IsUIRoute(f) ||
-			f.PropString(facts.PropRouteType) == facts.RouteTypeGraphQL {
+		if !IsIndexedServerRoute(f) {
 			continue
 		}
 		method := NormalizeMethod(f.PropString("method"))
-		if method == "" {
-			continue
-		}
 		for _, p := range m.ServerPaths(f) {
-			ref := RouteRef{Repo: f.Repo, Method: method, Path: f.Name, FullPath: p}
-			for _, suf := range m.PathMatchKeys(p) {
-				server[RouteKey(suf, method)] = append(server[RouteKey(suf, method)], ref)
-			}
+			m.IndexServerRef(server, RouteRef{Repo: f.Repo, Method: method, Path: f.Name, FullPath: p, Spec: IsSpecRoute(f)})
 		}
 	}
 	return server
+}
+
+// IsIndexedServerRoute reports whether IndexServerRoutes indexes f: a repo-labelled,
+// non-client, non-UI, non-GraphQL route with a usable verb. A pass that needs the
+// facts behind the index's refs selects them with this, so it cannot see a route
+// the index left out or miss one it put in.
+func IsIndexedServerRoute(f facts.Fact) bool {
+	return f.Kind == facts.KindRoute && f.Repo != "" && RoleOf(f) != facts.RoleClient && !IsUIRoute(f) &&
+		!IsNonHTTPRoute(f) && NormalizeMethod(f.PropString("method")) != ""
+}
+
+// IsNonHTTPRoute reports whether a route is no HTTP call or endpoint at all: a
+// GraphQL operation, which the graphql signal joins, or a WordPress hook, which is
+// in-process dispatch. HTTP matching and its coverage leave both alone.
+func IsNonHTTPRoute(f facts.Fact) bool {
+	switch f.PropString(facts.PropRouteType) {
+	case facts.RouteTypeGraphQL, facts.RouteTypeHook:
+		return true
+	}
+	return false
+}
+
+// IndexServerRef adds one server route reference to a server index under every key a
+// client call can reach it by: each trailing-segment suffix and, when literal-against-
+// parameter matching is on, its parameter pattern. Every builder of a server index goes
+// through it, so no pass can match a client under a rule another pass did not index for.
+func (m *Matcher) IndexServerRef(server map[string][]RouteRef, ref RouteRef) {
+	for _, suf := range m.PathMatchKeys(ref.FullPath) {
+		key := RouteKey(suf, ref.Method)
+		server[key] = append(server[key], ref)
+	}
+	if m.v.MatchLiteralAgainstParams {
+		if segs := splitSegments(ref.FullPath); paramPatternAdmissible(segs) {
+			key := paramKey(len(segs), ref.Method)
+			server[key] = append(server[key], ref)
+		}
+	}
 }
 
 // IndexServerPathSuffixes returns the set of server route path-suffixes ignoring
@@ -73,7 +121,7 @@ func (m *Matcher) IndexServerRoutes(all []facts.Fact) map[string][]RouteRef {
 func (m *Matcher) IndexServerPathSuffixes(all []facts.Fact) map[string]bool {
 	set := map[string]bool{}
 	for _, f := range all {
-		if f.Kind != facts.KindRoute || f.Repo == "" || RoleOf(f) == facts.RoleClient {
+		if f.Kind != facts.KindRoute || f.Repo == "" || RoleOf(f) == facts.RoleClient || IsNonHTTPRoute(f) {
 			continue
 		}
 		if NormalizeMethod(f.PropString("method")) == "" {
@@ -160,8 +208,17 @@ func RepoFromIdentity(id string) string {
 // reported as an unused endpoint despite IsUIRoute existing to prevent exactly
 // that.
 func (m *Matcher) IsLinkable(f facts.Fact) bool {
-	if f.Kind != facts.KindRoute || f.Repo == "" || RoleOf(f) == facts.RoleClient ||
-		IsUIRoute(f) || f.PropString(facts.PropRouteType) == facts.RouteTypeGraphQL {
+	return f.Repo != "" && m.IsServableRoute(f)
+}
+
+// IsServableRoute reports whether a server route is one a client call can be matched
+// against at all: a server route with an HTTP verb that is not a UI page route, a
+// GraphQL operation or a generic path. It asks nothing about a repository label.
+// IsLinkable adds the label, which the cross-repo verdicts need and an endpoint's
+// callers in a single repository, where a frontend and its backend share one tree, do
+// not.
+func (m *Matcher) IsServableRoute(f facts.Fact) bool {
+	if f.Kind != facts.KindRoute || RoleOf(f) == facts.RoleClient || IsUIRoute(f) || IsNonHTTPRoute(f) {
 		return false
 	}
 	if NormalizeMethod(f.PropString("method")) == "" {
@@ -191,6 +248,9 @@ func RoleOf(f facts.Fact) string { return f.PropString(facts.PropRole) }
 var uiRouteTypes = map[string]bool{
 	"page": true, "layout": true, "error": true, "loading": true,
 	"router_config": true, "engine_mount": true,
+	// A SvelteKit form action is a POST the page's own form makes, no contract
+	// another service calls.
+	"action": true,
 }
 
 // IsUIRoute reports whether a route fact is a client-side navigation route
@@ -204,7 +264,7 @@ func IsExternalClient(f facts.Fact) bool {
 	if f.Props == nil {
 		return false
 	}
-	v, _ := f.Props["external"].(bool)
+	v, _ := f.PropAny("external").(bool)
 	return v
 }
 
@@ -319,7 +379,7 @@ func (m *Matcher) PathMatchKeys(normPath string) []string {
 	return []string{normPath}
 }
 
-// LookupClientMatches resolves a client path against the server suffix index by
+// exactClientMatches resolves a client path against the server suffix index by
 // trying the client path's own trailing-segment suffixes longest-first and
 // returning the first (most specific) hit, plus the suffix that matched. The
 // longest suffix is the full client path, so an exact full-path match still wins
@@ -327,7 +387,21 @@ func (m *Matcher) PathMatchKeys(normPath string) []string {
 // match a server serving the un-prefixed path ("/x/y"). For sub-m.v.Thresholds.MinSharedSegments
 // paths (no suffixes) it falls back to a single full-path lookup, preserving the
 // original behavior.
-func (m *Matcher) LookupClientMatches(server map[string][]RouteRef, clientPath, method string) ([]RouteRef, string) {
+func (m *Matcher) exactClientMatches(server map[string][]RouteRef, clientPath, method string) ([]RouteRef, string) {
+	return m.suffixClientMatches(server, clientPath, method, true)
+}
+
+// suffixClientMatches is the suffix join itself. sameVersion drops the refs whose
+// version disagrees with the client's (see versionsDisagree); the unmatched pass
+// turns it off to ask whether a call missed ONLY because of that.
+func (m *Matcher) suffixClientMatches(server map[string][]RouteRef, clientPath, method string, sameVersion bool) ([]RouteRef, string) {
+	at := func(suf, verb string) []RouteRef {
+		refs := server[RouteKey(suf, verb)]
+		if !sameVersion {
+			return refs
+		}
+		return sameVersionRefs(refs, clientPath, suf)
+	}
 	sufs := m.pathSuffixes(clientPath)
 	if len(sufs) == 0 {
 		if m := server[RouteKey(clientPath, method)]; len(m) > 0 {
@@ -349,10 +423,10 @@ func (m *Matcher) LookupClientMatches(server map[string][]RouteRef, clientPath, 
 		// Prefer an exact-verb server route at this suffix, then fall back to a
 		// wildcard route (facts.MethodAny — a servlet or verb-less mapping that serves
 		// every method), so a concrete client call still resolves to it.
-		if m := server[RouteKey(suf, method)]; len(m) > 0 {
+		if m := at(suf, method); len(m) > 0 {
 			return m, suf
 		}
-		if m := server[RouteKey(suf, facts.MethodAny)]; len(m) > 0 {
+		if m := at(suf, facts.MethodAny); len(m) > 0 {
 			return m, suf
 		}
 		// The symmetric wildcard: a CLIENT whose method the source does not state
@@ -362,13 +436,205 @@ func (m *Matcher) LookupClientMatches(server map[string][]RouteRef, clientPath, 
 		// deterministic.
 		if method == facts.MethodAny {
 			for _, v := range clientAnyVerbs {
-				if m := server[RouteKey(suf, v)]; len(m) > 0 {
+				if m := at(suf, v); len(m) > 0 {
 					return m, suf
 				}
 			}
 		}
 	}
 	return nil, clientPath
+}
+
+// sameVersionRefs keeps the refs a client suffix may join: all of them, unless the
+// join dropped a leading prefix on BOTH sides and the two prefixes name different
+// API versions.
+//
+// The suffix join is symmetric on purpose. A client carrying a gateway prefix
+// reaches a server serving the bare path, and a base-relative client reaches a
+// server serving the full one. Applied to both sides at once it also joins
+// "/api/v1/orders/{}" to "/api/v2/orders/{}" at "/orders/{}", which is the one
+// case where the dropped segments are not routing detail but the contract: after
+// a route moves to v2, every v1 caller still resolved, as "verified", to an
+// endpoint it does not call.
+//
+// Only a stated disagreement refuses the join. A prefix with no version says
+// nothing about one, so "/gateway/orders/{}" still reaches "/api/v2/orders/{}".
+func sameVersionRefs(refs []RouteRef, clientPath, suf string) []RouteRef {
+	clientVersion := versionIn(strings.TrimSuffix(clientPath, suf))
+	if clientVersion == "" {
+		return refs
+	}
+	var out []RouteRef
+	for _, ref := range refs {
+		if v := versionIn(strings.TrimSuffix(ref.FullPath, suf)); v != "" && v != clientVersion {
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out
+}
+
+// versionIn returns the last API version segment of a path prefix ("v1", "v2.1"),
+// lowercased, or "" when it has none. The last one is the one nearest the joined
+// suffix, which is the version of the resource being called.
+func versionIn(prefix string) string {
+	segs := splitSegments(prefix)
+	for i := len(segs) - 1; i >= 0; i-- {
+		if isVersionSegment(segs[i]) {
+			return strings.ToLower(segs[i])
+		}
+	}
+	return ""
+}
+
+// isVersionSegment reports whether a path segment is an API version: "v" followed
+// by digits, optionally dotted ("v1", "V2", "v2.1"). A bare number is not one: it
+// is as likely an id.
+func isVersionSegment(seg string) bool {
+	if len(seg) < 2 || (seg[0] != 'v' && seg[0] != 'V') {
+		return false
+	}
+	digit := false
+	for i := 1; i < len(seg); i++ {
+		switch c := seg[i]; {
+		case c >= '0' && c <= '9':
+			digit = true
+		case c == '.' && digit && i+1 < len(seg):
+			digit = false
+		default:
+			return false
+		}
+	}
+	return digit
+}
+
+// ServedAtAnotherVersion reports whether a client call misses only because of its
+// version: some server route serves this path and verb, and every one that does
+// states a different version than the call. It is what lets the unmatched pass say
+// version_mismatch where it would otherwise say the verb was wrong.
+func (m *Matcher) ServedAtAnotherVersion(server map[string][]RouteRef, clientPath, method string) bool {
+	if refs, _ := m.suffixClientMatches(server, clientPath, method, true); len(refs) > 0 {
+		return false
+	}
+	refs, _ := m.suffixClientMatches(server, clientPath, method, false)
+	return len(refs) > 0
+}
+
+// LookupClientMatches resolves a client path against a server index: the exact suffix
+// join first, then, only when that finds nothing and match_literal_against_params is on,
+// the parameter fallback. It returns the matching refs and the client suffix that matched.
+func (m *Matcher) LookupClientMatches(server map[string][]RouteRef, clientPath, method string) ([]RouteRef, string) {
+	refs, matched, _ := m.LookupClientMatchesDetailed(server, clientPath, method)
+	return refs, matched
+}
+
+// LookupClientMatchesDetailed is LookupClientMatches, also reporting whether the match
+// needed a server path parameter to absorb a literal client segment.
+func (m *Matcher) LookupClientMatchesDetailed(server map[string][]RouteRef, clientPath, method string) ([]RouteRef, string, bool) {
+	if refs, matched := m.exactClientMatches(server, clientPath, method); len(refs) > 0 {
+		return refs, matched, false
+	}
+	if m.v.MatchLiteralAgainstParams {
+		if refs, matched := m.paramClientMatches(server, clientPath, method); len(refs) > 0 {
+			return refs, matched, true
+		}
+	}
+	return nil, clientPath, false
+}
+
+// paramClientMatches is the opt-in fallback for a client call no server route shares a
+// suffix with: a server path parameter may absorb a literal client segment, so a call to
+// /v1/resources/catalog/items reaches the handler serving /v1/resources/:type/items.
+//
+// A parameter matches anything, so this is held to more than the exact join:
+//   - the whole server path is matched, against an equally long client suffix;
+//   - at least two literal segments agree exactly;
+//   - a parameter never leads the server path, where it would absorb a tenant or a
+//     version and fit half the estate;
+//   - a client placeholder never matches a server literal;
+//   - when more than one server path pattern fits, nothing matches.
+//
+// Every repository serving the one fitting pattern is returned: which of them provides
+// the call is pickProvider's decision, as for any other match.
+func (m *Matcher) paramClientMatches(server map[string][]RouteRef, clientPath, method string) ([]RouteRef, string) {
+	verbs := []string{method, facts.MethodAny}
+	if method == facts.MethodAny {
+		verbs = append([]string{facts.MethodAny}, clientAnyVerbs...)
+	}
+	for _, suf := range m.pathSuffixes(clientPath) {
+		client := splitSegments(suf)
+		for _, verb := range verbs {
+			var fits []RouteRef
+			patterns := map[string]bool{}
+			for _, ref := range server[paramKey(len(client), verb)] {
+				if paramPatternFits(splitSegments(ref.FullPath), client) {
+					fits = append(fits, ref)
+					patterns[ref.FullPath] = true
+				}
+			}
+			switch {
+			case len(patterns) > 1:
+				return nil, clientPath
+			case len(fits) > 0:
+				return fits, suf
+			}
+		}
+	}
+	return nil, clientPath
+}
+
+// paramKey indexes a parameterized server path by segment count and verb. The NUL prefix
+// keeps it out of the suffix key space, which RouteKey never writes into.
+func paramKey(segments int, method string) string {
+	return "\x00param\x00" + strconv.Itoa(segments) + "|" + method
+}
+
+// splitSegments returns a normalized path's non-empty segments.
+func splitSegments(p string) []string {
+	var out []string
+	for _, s := range strings.Split(p, "/") {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// paramPatternAdmissible reports whether a server path may match by parameter at all:
+// it has a parameter, does not lead with one, and has two literal segments to agree on.
+func paramPatternAdmissible(segs []string) bool {
+	if len(segs) == 0 || segs[0] == "{}" {
+		return false
+	}
+	params, literals := 0, 0
+	for _, s := range segs {
+		if s == "{}" {
+			params++
+		} else {
+			literals++
+		}
+	}
+	return params > 0 && literals >= 2
+}
+
+// paramPatternFits reports whether a client suffix fits a server path pattern segment
+// for segment: equal literals, or a server parameter where the client has anything. A
+// client placeholder facing a server literal does not fit.
+func paramPatternFits(server, client []string) bool {
+	if len(server) != len(client) || len(server) == 0 || server[0] == "{}" {
+		return false
+	}
+	literals := 0
+	for i := range server {
+		switch server[i] {
+		case "{}":
+		case client[i]:
+			literals++
+		default:
+			return false
+		}
+	}
+	return literals >= 2
 }
 
 // clientAnyVerbs is the deterministic verb-preference order a method-less

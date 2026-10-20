@@ -15,7 +15,7 @@ import (
 
 func (r *Runner) History(args []string) {
 	if len(args) == 0 {
-		r.historyUsage()
+		r.historyUsage(args)
 		os.Exit(2)
 	}
 	switch strings.ToLower(args[0]) {
@@ -28,12 +28,12 @@ func (r *Runner) History(args []string) {
 	case "gc":
 		r.historyGC(args[1:])
 	default:
-		r.historyUsage()
+		r.historyUsage(args)
 		os.Exit(2)
 	}
 }
 
-func (r *Runner) historyUsage() {
+func (r *Runner) historyUsage(args []string) {
 	fmt.Fprint(os.Stderr,
 		"Usage: "+r.name()+" history <push|pull|verify|gc> [store_dir] [flags] [repo_path|config_path]\n\n"+
 			"Share the architecture history through a directory store — a git repository, a\n"+
@@ -45,6 +45,7 @@ func (r *Runner) historyUsage() {
 			"  gc      apply a retention policy to the store; prints what it would remove\n"+
 			"          and deletes nothing without --apply\n\n"+
 			"The store directory is the first argument, or `history.shared_dir` in the config.\n")
+	r.writeHelpFooter(os.Stderr, args, "history")
 }
 
 func (r *Runner) historyTarget(rest []string) (string, string, *config.Config) {
@@ -93,8 +94,9 @@ func (r *Runner) historyPush(args []string) {
 				"and an entry file already in the store is never rewritten — entries are\n"+
 				"content-addressed, so the same snapshot is the same file everywhere.\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "history push")
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(fs, args)); err != nil {
 		os.Exit(2)
 	}
 	store, repoPath, cfg := r.historyTarget(fs.Args())
@@ -138,8 +140,9 @@ func (r *Runner) historyPull(args []string) {
 				"Idempotent: a revision already recorded locally is never imported twice.\n"+
 				"Imported revisions carry the machine that observed them as their origin.\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "history pull")
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(fs, args)); err != nil {
 		os.Exit(2)
 	}
 	store, repoPath, cfg := r.historyTarget(fs.Args())
@@ -181,8 +184,9 @@ func (r *Runner) historyVerify(args []string) {
 				"record carries, and each payload's facts must match their recorded hash.\n"+
 				"A missing payload covered by a prune record is retention; one that is not\n"+
 				"is a gap. Exits 1 when anything is broken, naming each problem.\n")
+		r.writeHelpFooter(os.Stderr, args, "history verify")
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(fs, args)); err != nil {
 		os.Exit(2)
 	}
 	store, _, _ := r.historyTarget(fs.Args())
@@ -244,8 +248,9 @@ func (r *Runner) historyGC(args []string) {
 				"stay distinguishable forever. Revisions satisfying ANY given keep policy\n"+
 				"are kept.\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "history gc")
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(fs, args)); err != nil {
 		os.Exit(2)
 	}
 	store, _, _ := r.historyTarget(fs.Args())
@@ -301,3 +306,48 @@ func renderSharedGC(rep inthistory.SharedGCReport) string {
 }
 
 func (r *Runner) historyFatal(format string, args ...any) { r.cmdFatal("history", format, args...) }
+
+// flagsFirst reorders args so every flag precedes every positional argument.
+//
+// The standard flag package stops at the first positional, so `history gc
+// /mnt/store --keep-last 500` read --keep-last as a second positional and then
+// refused the command for having no retention policy. That is the order the
+// documentation shows and the natural one to type, with the store as the object of
+// the verb, so both orders are accepted. A flag's value travels with it; everything
+// after a bare "--" is positional, as usual.
+func flagsFirst(fs *flag.FlagSet, args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			positional = append(positional, arg)
+			continue
+		}
+		flags = append(flags, arg)
+		name := strings.TrimLeft(arg, "-")
+		if strings.Contains(name, "=") {
+			continue
+		}
+		// A flag that is not boolean takes the next argument as its value. An
+		// unknown flag is left for Parse to report.
+		f := fs.Lookup(name)
+		if f == nil {
+			continue
+		}
+		if b, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && b.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	if len(positional) == 0 {
+		return flags
+	}
+	return append(append(flags, "--"), positional...)
+}

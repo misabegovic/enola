@@ -12,6 +12,7 @@ import (
 	"github.com/enola-labs/enola/internal/diff"
 	"github.com/enola-labs/enola/internal/explainers/constraints"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/metrics"
 )
 
 // Status is the verdict. Its ExitCode is the process's contract with CI.
@@ -34,6 +35,10 @@ const (
 	StatusPartialClean      Status = "partial_clean"
 	StatusPartialRegression Status = "partial_regression"
 )
+
+// Statuses is every status a verdict takes, for a caller mapping each to its
+// exit code without copying the list.
+var Statuses = []Status{StatusClean, StatusRegression, StatusUsageError, StatusIncomparable, StatusPartialClean, StatusPartialRegression}
 
 // ExitCode maps a status to the process exit code.
 func (s Status) ExitCode() int {
@@ -248,6 +253,10 @@ var blockingKinds = map[diff.WarningKind]bool{
 	// ran-provider set invalidates the fact delta the same way.
 	diff.WarnProviderSet: true,
 	diff.WarnIgnoreGlobs: true,
+	// A union that lost a member. internal/diff declares the delta invalid
+	// (InvalidatesDelta); unregistered here, the gate printed the warning and
+	// graded the pair PASS, with the lost repository's findings as resolved.
+	diff.WarnUnionMembership: true,
 	// Fail closed on a caveat this package cannot categorize — see diff.AddWarning.
 	diff.WarnUnclassified: true,
 }
@@ -267,6 +276,9 @@ var advisoryKinds = map[diff.WarningKind]bool{
 	// silent — a kind in neither map is carried in ComparabilityWarnings but named in
 	// no summary line.
 	diff.WarnExplainerSet: true,
+	// The baseline came from another running agent session. The delta stands; its
+	// "before" is just not this session's, which only the caller can weigh.
+	diff.WarnOtherSession: true,
 }
 
 // Verdict is the graded delta.
@@ -363,6 +375,11 @@ type Verdict struct {
 	// repository declared, and enola fails only what was declared. See AttachReviewers.
 	Reviewers *Reviewers `json:"reviewers,omitempty"`
 
+	// PackageMetrics is what the change did to Ca, Ce, I, A and D per package, with
+	// the population aggregates on both sides. Reported, never graded; nil on a
+	// verdict that graded nothing. See AttachPackageMetrics.
+	PackageMetrics *metrics.Delta `json:"package_metrics,omitempty"`
+
 	// ComparabilityWarnings is every warning, verbatim and in full. Not split by
 	// severity: diff.Comparability records kinds as a set rather than per-message, and
 	// inventing an alignment to sort the prose would be a lie about which message
@@ -402,6 +419,11 @@ type Verdict struct {
 	// Diff is the underlying delta, carried so --json emits one self-contained
 	// document and so Render can delegate the detail view to internal/diff.
 	Diff *diff.SnapshotDiff `json:"diff,omitempty"`
+
+	// sources is where the files the findings name live on disk; see Sources.
+	// Unexported, so it never reaches the JSON verdict: a path on the grading
+	// machine means nothing to whoever reads the document.
+	sources Sources
 }
 
 // ExitCode is the process exit code for this verdict.

@@ -1,6 +1,10 @@
 package facts
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+)
 
 // The wire shape of facts.jsonl.
 //
@@ -39,6 +43,101 @@ type wireFact struct {
 	ID        string         `json:"id"`
 }
 
+// PropMatchedRoutes is the prop on a client route listing the server routes the
+// cross-repo HTTP linker resolved it to. Each entry is a map carrying the target's
+// repo, name and file (plus method and confidence), which is its full identity.
+//
+// It is a prop and not a relation because a relation names its target by NAME, and a
+// client call site and the server route it reaches usually share one: from the
+// client's repository, name resolution prefers the client fact itself, and the graph,
+// which is name-keyed, would draw the link as a self-loop. The entry names the target
+// by identity instead, and the writer adds that identity's id beside it.
+const PropMatchedRoutes = "matched_routes"
+
+// PropCaller is the prop on a client route naming the symbol whose body makes the
+// call: the innermost function or method containing the call site that the
+// extractor emitted as a symbol. That symbol is declared in the call site's own
+// file, so the writer derives its id from the route's repo and file and writes it
+// beside the name as PropCallerID. A prop for the reason PropMatchedRoutes is one:
+// a relation to the route would name it by a name other call sites share.
+const (
+	PropCaller   = "caller"
+	PropCallerID = "caller_id"
+)
+
+// withFactRefIDs returns a route's props with the ids of the facts they name: an
+// "id" on every entry of PropMatchedRoutes, computed from the entry's repo, name and
+// file, and PropCallerID for PropCaller, computed from the route's own repo and file.
+// Each is derived exactly as the named fact's own id is. It returns props unchanged
+// when there is nothing to add, and otherwise a copy: the store's maps are shared and
+// must not be written here.
+//
+// An id already present is recomputed rather than trusted, so a snapshot read back
+// from disk and written again cannot carry an id its entry no longer agrees with.
+func withFactRefIDs(props map[string]any, repo, file string, scratch []byte) (map[string]any, []byte) {
+	refs, hasRefs := props[PropMatchedRoutes].([]any)
+	hasRefs = hasRefs && len(refs) > 0
+	caller, _ := props[PropCaller].(string)
+	_, staleCallerID := props[PropCallerID]
+	if !hasRefs && caller == "" && !staleCallerID {
+		return props, scratch
+	}
+	out := make(map[string]any, len(props)+1)
+	for k, v := range props {
+		out[k] = v
+	}
+	delete(out, PropCallerID)
+	if caller != "" {
+		out[PropCallerID], scratch = factIDInto(scratch, repo, KindSymbol, caller, file)
+	}
+	if !hasRefs {
+		return out, scratch
+	}
+	widened := make([]any, len(refs))
+	for i, r := range refs {
+		entry, ok := r.(map[string]any)
+		if !ok {
+			widened[i] = r
+			continue
+		}
+		repo, _ := entry["repo"].(string)
+		name, _ := entry["name"].(string)
+		file, _ := entry["file"].(string)
+		copied := make(map[string]any, len(entry)+1)
+		for k, v := range entry {
+			copied[k] = v
+		}
+		if repo != "" && name != "" {
+			copied["id"], scratch = factIDInto(scratch, repo, KindRoute, name, file)
+		} else {
+			delete(copied, "id")
+		}
+		widened[i] = copied
+	}
+	out[PropMatchedRoutes] = widened
+	return out, scratch
+}
+
+// dropWireIDs removes from a fact read back from facts.jsonl the ids only the writer
+// adds (PropCallerID, and the id of each PropMatchedRoutes entry), the same way
+// target_id is dropped by decoding into Relation. They are derived on every write and
+// never stored, so a fact read back must equal the fact that was written: kept, they
+// made every client route with a caller or a matched route differ from its in-memory
+// self, and a diff against a snapshot on disk reported those routes as changed on a
+// tree nothing had touched.
+func dropWireIDs(f *Fact) {
+	if f.Kind != KindRoute || f.Props == nil {
+		return
+	}
+	delete(f.Props, PropCallerID)
+	refs, _ := f.Props[PropMatchedRoutes].([]any)
+	for _, r := range refs {
+		if entry, ok := r.(map[string]any); ok {
+			delete(entry, "id")
+		}
+	}
+}
+
 // targetFactFor resolves a relation target NAME to the index of the fact it
 // names, or -1 when the snapshot cannot answer that unambiguously. The caller
 // turns the index into an id, so resolution and hashing stay separable and the
@@ -58,13 +157,17 @@ type wireFact struct {
 //
 // The caller must hold s.mu.
 func (s *Store) targetFactFor(target, fromRepo string) int {
-	idx := s.byName[target]
-	if len(idx) == 0 {
+	first, rest, ok := s.namedIdxs(target)
+	if !ok {
 		return -1
 	}
 
 	pick := -1
-	for _, i := range idx {
+	if s.facts[first].Repo == fromRepo {
+		pick = first
+	}
+	for _, i32 := range rest {
+		i := int(i32)
 		if s.facts[i].Repo != fromRepo {
 			continue
 		}
@@ -80,8 +183,8 @@ func (s *Store) targetFactFor(target, fromRepo string) int {
 	if pick == -1 {
 		// No fact in this repository carries the name, so the reference points
 		// outward: consider the whole snapshot, under the same all-or-nothing rule.
-		pick = idx[0]
-		for _, i := range idx[1:] {
+		pick = first
+		for _, i := range rest {
 			if !sameIdentity(s.facts[pick], s.facts[i]) {
 				return -1
 			}
@@ -89,6 +192,70 @@ func (s *Store) targetFactFor(target, fromRepo string) int {
 	}
 
 	return pick
+}
+
+// keepsTargetID reports whether a relation may carry the id of the fact the
+// lookup named for it. Only a Ruby call can be refused. The Ruby extractor
+// records a receiverless call by its bare method name, and Prism's name-only
+// calls do the same, so a call to `config`, `tags` or `/` names the config/
+// directory, the tags table or the root route whenever that is the only fact
+// of the name. Read at the source on the corpus's Ruby entries, each such id
+// was a coincidence of names. Other languages point calls at routes on
+// purpose (an Ember <LinkTo @route>, router.transitionTo, a React Navigation
+// navigate()) and those ids are right, so the check stops at Ruby.
+//
+// A symbol is what a call reaches, and so is an association: it declares the
+// reader method it names, and a bare call to that reader on the model's own
+// class names it. The check only removes. A name the lookup could not answer
+// gets no id here either, since choosing the one symbol among a class and its
+// table is binding, which this function does not do.
+func keepsTargetID(from Fact, rel Relation, to Fact) bool {
+	if rel.Kind != RelCalls && rel.Kind != RelInstantiates {
+		return true
+	}
+	if to.Kind == KindSymbol || to.Kind == KindAssociation {
+		return true
+	}
+	return !writtenInRuby(from)
+}
+
+// LandsByName reports whether a relation whose target names to by name alone
+// can land on it. A call or an instantiation reaches a symbol or an
+// association wherever it is declared, and anything else only inside the
+// caller's own repository, where the same-named route an Ember link or a
+// navigate() names is the language's own answer. In a union the lookup reaches
+// every repository once the caller's holds nothing of the name, and there a
+// derived Rust default() meets a Ruby job queue named default, or an Ember
+// link meets another application's route: coincidences of names, never what
+// the call reaches. A service node stands for a repository, so no
+// call lands on one even in its own, while a service's depends_on onto another
+// service is what the node is for. Every other relation kind lands as before.
+func LandsByName(from Fact, rel Relation, to Fact) bool {
+	if rel.Kind != RelCalls && rel.Kind != RelInstantiates {
+		return true
+	}
+	if to.Kind == KindSymbol || to.Kind == KindAssociation {
+		return true
+	}
+	return to.Kind != KindService && to.Repo == from.Repo
+}
+
+// writtenInRuby reads a fact's language prop and, when it has none, as a
+// provider's facts do not, the file the fact was read from.
+func writtenInRuby(f Fact) bool {
+	if lang := f.PropString("language"); lang != "" {
+		return lang == "ruby"
+	}
+	file := f.File[strings.LastIndexByte(f.File, '/')+1:]
+	if file == "Rakefile" {
+		return true
+	}
+	for _, ext := range []string{".rb", ".rake", ".ru"} {
+		if len(file) > len(ext) && strings.EqualFold(file[len(file)-len(ext):], ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // The wire shape of insights.json.
@@ -124,6 +291,7 @@ type wireEvidence struct {
 type wireInsight struct {
 	Title         string         `json:"title"`
 	Source        string         `json:"source,omitempty"`
+	Identity      string         `json:"identity,omitempty"`
 	Description   string         `json:"description"`
 	Confidence    float64        `json:"confidence"`
 	Evidence      []wireEvidence `json:"evidence"`
@@ -163,6 +331,7 @@ func (s *Store) MarshalInsights(insights []Insight) ([]byte, error) {
 		out = append(out, wireInsight{
 			Title:         in.Title,
 			Source:        in.Source,
+			Identity:      in.Identity,
 			Description:   in.Description,
 			Confidence:    in.Confidence,
 			Evidence:      ev,
@@ -193,14 +362,18 @@ func (s *Store) evidenceFactFor(e Evidence) int {
 	if ref == "" {
 		return -1
 	}
-	idx := s.byName[ref]
-	if len(idx) == 0 {
+	first, rest, ok := s.namedIdxs(ref)
+	if !ok {
 		return -1
 	}
 
 	pick := -1
 	if e.File != "" {
-		for _, i := range idx {
+		if s.facts[first].File == e.File {
+			pick = first
+		}
+		for _, i32 := range rest {
+			i := int(i32)
 			if s.facts[i].File != e.File {
 				continue
 			}
@@ -215,8 +388,8 @@ func (s *Store) evidenceFactFor(e Evidence) int {
 	}
 
 	if pick == -1 {
-		pick = idx[0]
-		for _, i := range idx[1:] {
+		pick = first
+		for _, i := range rest {
 			if !sameIdentity(s.facts[pick], s.facts[i]) {
 				return -1
 			}
@@ -224,4 +397,27 @@ func (s *Store) evidenceFactFor(e Evidence) int {
 	}
 
 	return pick
+}
+
+// WireFactType is the type each line of facts.jsonl is encoded from, and
+// WireInsightType the type of each entry of insights.json: for a caller
+// stating those shapes, as a schema does, rather than writing them.
+func WireFactType() reflect.Type { return reflect.TypeOf(wireFact{}) }
+
+// WireInsightType: see WireFactType.
+func WireInsightType() reflect.Type { return reflect.TypeOf(wireInsight{}) }
+
+// ReadInsights decodes insights.json into findings as the engine holds them.
+// The identity a writer stamps is left out: it is derived from each finding
+// and stamped again wherever one is written, so a snapshot read back from
+// disk holds the same findings as one just generated.
+func ReadInsights(data []byte) ([]Insight, error) {
+	var ins []Insight
+	if err := json.Unmarshal(data, &ins); err != nil {
+		return nil, err
+	}
+	for i := range ins {
+		ins[i].Identity = ""
+	}
+	return ins, nil
 }

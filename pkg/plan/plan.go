@@ -39,6 +39,7 @@ type Deps struct {
 	RepoPath      string
 	RepoLabel     string
 	Store         *facts.Store
+	FanIn         *FanIn
 	Snapshot      SnapshotInfo
 	OutputDirName string
 	NewEngine     EngineFactory
@@ -93,11 +94,29 @@ type Counterfactual struct {
 }
 
 func ContractStore(repoPath string, measured []facts.Fact, cluster *intent.Declaration) (*facts.Store, error) {
+	declared, err := Declared(repoPath, cluster)
+	if err != nil {
+		return nil, err
+	}
+	return StoreWith(measured, declared), nil
+}
+
+// Declared compiles the declaration in repoPath's working tree, under the
+// cluster config's entry for it when there is one, into the facts the contract
+// is read from. It reads the declaration files and nothing else, so a caller
+// keeping a contract store can ask it on every call to learn whether the law
+// moved.
+func Declared(repoPath string, cluster *intent.Declaration) ([]facts.Fact, error) {
 	fromFile, err := intent.LoadRepoFile(repoPath)
 	if err != nil {
 		return nil, fmt.Errorf("the working tree's declaration is invalid — fix it or run `enola constraints lint`: %w", err)
 	}
-	resolved := intent.Resolve(fromFile, cluster)
+	return intent.CompileFacts(intent.Resolve(fromFile, cluster)), nil
+}
+
+// StoreWith is the store a contract is read from: every measured fact except
+// the intent the snapshot compiled, and the declared facts in its place.
+func StoreWith(measured, declared []facts.Fact) *facts.Store {
 	store := facts.NewStore()
 	for _, f := range measured {
 		if f.Kind == facts.KindIntent {
@@ -105,8 +124,8 @@ func ContractStore(repoPath string, measured []facts.Fact, cluster *intent.Decla
 		}
 		store.Add(f)
 	}
-	store.Add(intent.CompileFacts(resolved)...)
-	return store, nil
+	store.Add(declared...)
+	return store
 }
 
 func Compute(ctx context.Context, req Request, deps Deps) (*Report, error) {
@@ -129,8 +148,16 @@ func Compute(ctx context.Context, req Request, deps Deps) (*Report, error) {
 	report := &Report{Repo: deps.RepoLabel, Snapshot: deps.Snapshot}
 	_, declared := constraints.ContractFor(deps.Store, "")
 	report.ConstraintsDeclared = declared
+	// A caller asking more than once keeps the index; otherwise it is built on
+	// the first measured target, since a plan measuring nothing needs none.
+	fanIn := func() *FanIn {
+		if deps.FanIn == nil {
+			deps.FanIn = IndexFanIn(deps.Store)
+		}
+		return deps.FanIn
+	}
 	for _, target := range pathTargets(req.Paths, patchFiles) {
-		tr := targetReport(deps.Store, deps.RepoLabel, target, TargetPath)
+		tr := targetReport(deps.Store, fanIn, deps.RepoLabel, target, TargetPath)
 		if declared && tr.Measured && len(patchFiles) == 0 && !deps.SkipRadius {
 			radius := constraints.BlastRadiusFor(deps.Store, []string{target})
 			tr.Radius = &radius
@@ -138,7 +165,7 @@ func Compute(ctx context.Context, req Request, deps Deps) (*Report, error) {
 		report.Targets = append(report.Targets, tr)
 	}
 	for _, symbol := range sortedUnique(req.Symbols) {
-		report.Targets = append(report.Targets, targetReport(deps.Store, deps.RepoLabel, symbol, TargetSymbol))
+		report.Targets = append(report.Targets, targetReport(deps.Store, fanIn, deps.RepoLabel, symbol, TargetSymbol))
 	}
 
 	if len(patchFiles) > 0 {
@@ -180,7 +207,7 @@ func sortedUnique(values []string) []string {
 	return out
 }
 
-func targetReport(store *facts.Store, label, target, kind string) TargetReport {
+func targetReport(store *facts.Store, fanIn func() *FanIn, label, target, kind string) TargetReport {
 	components, _ := constraints.ContractFor(store, target)
 	tr := TargetReport{Target: target, Kind: kind, Components: components}
 	tr.NoRuleGoverns = true
@@ -193,7 +220,7 @@ func targetReport(store *facts.Store, label, target, kind string) TargetReport {
 	members := memberNamesFor(store, label, target, kind)
 	tr.Measured = len(members) > 0
 	if tr.Measured {
-		tr.BlastRadius = blastRadius(store, label, target, kind, members)
+		tr.BlastRadius = blastRadius(store, fanIn(), label, target, kind, members)
 	}
 	return tr
 }
@@ -208,14 +235,38 @@ func memberNamesFor(store *facts.Store, label, target, kind string) map[string]b
 		}
 		return names
 	}
-	for _, mk := range memberKinds {
-		for _, f := range store.ByKind(mk) {
-			if fileMatchesTarget(f, label, target) {
-				names[f.Name] = true
-			}
+	for _, f := range inTargetFile(store, label, target) {
+		if isMemberKind(f.Kind) {
+			names[f.Name] = true
 		}
 	}
 	return names
+}
+
+// inTargetFile is the facts whose file the path target names, read through the
+// store's file index. A fact matches the target as written or under its
+// repository's label, the plan's when it carries none, so those files are the
+// only ones that can hold one. Reading every fact of a kind instead copied 2.1M
+// dependency facts on each plan over a 2.3M-fact union to find one file's.
+func inTargetFile(store *facts.Store, label, target string) []facts.Fact {
+	files := []string{target, label + "/" + target}
+	for _, repo := range store.RepoLabels() {
+		files = append(files, repo+"/"+target)
+	}
+	var out []facts.Fact
+	seen := map[string]bool{}
+	for _, file := range files {
+		if seen[file] {
+			continue
+		}
+		seen[file] = true
+		for _, f := range store.ByFile(file) {
+			if fileMatchesTarget(f, label, target) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 func isMemberKind(kind string) bool {
@@ -241,7 +292,7 @@ func fileMatchesTarget(f facts.Fact, label, target string) bool {
 	return strings.TrimPrefix(f.File, prefix+"/") == target
 }
 
-func blastRadius(store *facts.Store, label, target, kind string, members map[string]bool) *BlastRadius {
+func blastRadius(store *facts.Store, fanIn *FanIn, label, target, kind string, members map[string]bool) *BlastRadius {
 	viaSet := map[string]bool{}
 	for _, via := range blastVias {
 		viaSet[via] = true
@@ -263,23 +314,14 @@ func blastRadius(store *facts.Store, label, target, kind string, members map[str
 		}
 	}
 	if kind == TargetPath {
-		for _, f := range store.ByKind(facts.KindDependency) {
-			if fileMatchesTarget(f, label, target) {
+		for _, f := range inTargetFile(store, label, target) {
+			if f.Kind == facts.KindDependency {
 				collectOut(f)
 			}
 		}
 	}
 
-	in := map[string]bool{}
-	for name := range members {
-		for _, via := range blastVias {
-			for _, f := range store.ReverseLookup(name, via) {
-				if !members[f.Name] {
-					in[f.Name] = true
-				}
-			}
-		}
-	}
+	in := fanIn.dependents(members)
 
 	br := &BlastRadius{FanIn: len(in), FanOut: len(out)}
 	br.In = capSorted(in, BlastSampleCap)
@@ -380,7 +422,7 @@ func declaresConstraints(snap *facts.Snapshot) bool {
 		if f.Kind != facts.KindIntent {
 			continue
 		}
-		if k, _ := f.Props["intent_kind"].(string); k == "component" {
+		if k, _ := f.PropAny("intent_kind").(string); k == "component" {
 			return true
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -56,12 +57,34 @@ func extractAxumRoutes(root *sitter.Node, src []byte, relFile, dir string) []fac
 				}
 			}
 		}
+		// A router built inside a #[cfg(test)] module serves a test, at whatever path
+		// the test picked. The attribute is the sibling before the module it marks.
+		cfgTest := false
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
-			walk(node.Child(i))
+			c := node.Child(i)
+			switch kindOf(c) {
+			case "attribute_item":
+				cfgTest = cfgTest || isCfgTestAttribute(nodeText(c, src))
+				continue
+			case "line_comment", "block_comment":
+				continue
+			case "mod_item":
+				if cfgTest {
+					cfgTest = false
+					continue
+				}
+			}
+			cfgTest = false
+			walk(c)
 		}
 	}
 	walk(root)
 	return out
+}
+
+// isCfgTestAttribute reports whether an attribute's text is #[cfg(test)].
+func isCfgTestAttribute(text string) bool {
+	return strings.Join(strings.Fields(text), "") == "#[cfg(test)]"
 }
 
 // axumRouteFacts converts one `.route(path, chain)` call_expression into its
@@ -91,6 +114,7 @@ func axumRouteFacts(call *sitter.Node, src []byte, relFile, dir string) []facts.
 	}
 
 	line := int(call.StartPosition().Row) + 1
+	endLine, col, endCol := tsutil.Span(call, src)
 	out := make([]facts.Fact, 0, len(entries))
 	for _, e := range entries {
 		props := map[string]any{
@@ -106,6 +130,9 @@ func axumRouteFacts(call *sitter.Node, src []byte, relFile, dir string) []facts.
 			Name:      path,
 			File:      relFile,
 			Line:      line,
+			EndLine:   endLine,
+			Column:    col,
+			EndColumn: endCol,
 			Props:     props,
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: dir}},
 		})
@@ -416,7 +443,7 @@ func composeAxumPrefixes(allFacts []facts.Fact, builders []axumBuilder, crates [
 
 	out := make([]facts.Fact, 0, len(allFacts))
 	for _, f := range allFacts {
-		if f.Kind != facts.KindRoute || f.Props["framework"] != "axum" {
+		if f.Kind != facts.KindRoute || f.PropAny("framework") != "axum" {
 			out = append(out, f)
 			continue
 		}

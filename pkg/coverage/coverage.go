@@ -42,6 +42,7 @@ type Service struct {
 	EdgeCoverage    []EdgeCoverage `json:"edge_coverage,omitempty"`
 	UnresolvedTotal int            `json:"unresolved_total"`
 	ExternalTotal   int            `json:"external_total,omitempty"`
+	UnresolvedSites []CallSite     `json:"unresolved_sites,omitempty"`
 }
 
 // Detected and Resolved sum this service's per-edge-type tallies.
@@ -88,16 +89,17 @@ func Build(store *facts.Store, service string) Report {
 		outbound := facts.DependsOnCount(svc)
 
 		cov := readEdgeCoverage(svc)
-		detected, unresolved, external := 0, 0, 0
+		detected, resolved, unresolved, external := 0, 0, 0, 0
 		for _, c := range cov {
 			detected += c.Detected
+			resolved += c.Resolved
 			unresolved += c.Unresolved
 			external += c.External
 		}
 
 		out = append(out, Service{
 			Service:         svc.Name,
-			Classification:  facts.ClassifyService(outbound, detected, unresolved),
+			Classification:  facts.ClassifyService(outbound, detected, resolved, unresolved),
 			OutboundEdges:   outbound,
 			EdgeCoverage:    cov,
 			UnresolvedTotal: unresolved,
@@ -116,7 +118,7 @@ func readEdgeCoverage(svc facts.Fact) []EdgeCoverage {
 		return nil
 	}
 	var raw []map[string]any
-	switch v := svc.Props["edge_coverage"].(type) {
+	switch v := svc.PropAny("edge_coverage").(type) {
 	case []map[string]any:
 		raw = v
 	case []any:
@@ -170,6 +172,12 @@ func (r Report) RenderMarkdown() string {
 	for _, s := range r {
 		fmt.Fprintf(&sb, "| %s | %s | %d | %d | %d | %d | %d |\n",
 			s.Service, s.Classification, s.OutboundEdges, s.Detected(), s.Resolved(), s.UnresolvedTotal, s.ExternalTotal)
+	}
+	for _, s := range r {
+		if s.Classification == facts.ServiceIsolated {
+			sb.WriteString("\n`isolated` means no outbound edges and no detected call sites either: a genuine leaf, not a gap in enola's resolution.\n")
+			break
+		}
 	}
 	return sb.String()
 }

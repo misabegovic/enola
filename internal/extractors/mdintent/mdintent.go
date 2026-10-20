@@ -29,13 +29,14 @@ func New() *Extractor { return &Extractor{} }
 func (e *Extractor) Name() string { return "mdintent" }
 
 func (e *Extractor) OwnsFactFile(relFile string) bool {
-	return strings.HasSuffix(relFile, ".md")
+	return intent.IsPagePath(relFile)
 }
 
-// Detect probes for any markdown file up to five directory levels (wiki trees
-// nest: wiki/<scope>/permanent/<area>/page.md). A page carrying the
-// enola_intent key compiles as intent; every other markdown file is a
-// document, so a repository with a README is in scope.
+// Detect probes for any page up to five directory levels (wiki trees nest:
+// wiki/<scope>/permanent/<area>/page.md). A page carrying the enola_intent key
+// compiles as intent; every other page is a document, so a repository with a
+// README is in scope. A page is a markdown file, or a file of any other
+// extension the build lists, since a tree of those alone is still a wiki.
 func (e *Extractor) Detect(repoPath string) (bool, error) {
 	found := false
 	root := filepath.Clean(repoPath) //factpath:host
@@ -54,7 +55,7 @@ func (e *Extractor) Detect(repoPath string) (bool, error) {
 			}
 			return nil
 		}
-		if strings.HasSuffix(path, ".md") {
+		if intent.IsPagePath(path) {
 			found = true
 			return filepath.SkipAll
 		}
@@ -75,6 +76,11 @@ var mdSkipDirs = map[string]bool{
 // relation per link that resolves against the walked file set, with the links
 // that do not counted on the extraction fact.
 func (e *Extractor) Extract(ctx context.Context, repoPath string, files []string) ([]facts.Fact, error) {
+	// A refused list reads as markdown alone, which would pass for a build that
+	// lists nothing; failing here is what keeps a broken stamp from going unseen.
+	if err := intent.PageExtensionsError(); err != nil {
+		return nil, plugin.Fatalf("%w", err)
+	}
 	var out []facts.Fact
 	var links linkCount
 	documents, sections := 0, 0
@@ -84,7 +90,7 @@ func (e *Extractor) Extract(ctx context.Context, repoPath string, files []string
 	scope := newInScope(files)
 	for _, relFile := range files {
 		slashed := filepath.ToSlash(relFile)
-		if !strings.HasSuffix(slashed, ".md") ||
+		if !intent.IsPagePath(slashed) ||
 			strings.Contains(slashed, "_archive/") || strings.Contains(slashed, "_views/") {
 			continue
 		}

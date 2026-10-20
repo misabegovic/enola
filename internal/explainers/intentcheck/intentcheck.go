@@ -76,7 +76,7 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			continue
 		}
 		hasIntent = true
-		if f.PropString("overridden") != "" || f.Props["overridden"] == true {
+		if f.PropString("overridden") != "" || f.PropAny("overridden") == true {
 			overridden = append(overridden, f)
 		}
 		if f.PropString("intent_kind") != "consumes" {
@@ -110,9 +110,9 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		if len(parts) != 2 {
 			continue
 		}
-		vias, _ := f.Props["via"].([]string)
+		vias, _ := f.PropAny("via").([]string)
 		if vias == nil {
-			if raw, ok := f.Props["via"].([]any); ok {
+			if raw, ok := f.PropAny("via").([]any); ok {
 				for _, v := range raw {
 					if sv, ok := v.(string); ok {
 						vias = append(vias, sv)
@@ -372,7 +372,7 @@ func claimVerdicts(store *facts.Store, present, retired map[string]bool) []facts
 			for _, g := range all {
 				if g.Kind == facts.KindDependency && g.PropString("type") == "cross_repo" &&
 					g.Repo == owner && g.Name == owner+" -> "+provider {
-					if vias, ok := g.Props["via"].([]string); ok {
+					if vias, ok := g.PropAny("via").([]string); ok {
 						for _, v := range vias {
 							if v == via {
 								found = true
@@ -451,16 +451,22 @@ const danglingAnchorConfidence = 0.8
 // measures and does not touch is dangling. Files are joined in both the
 // label-prefixed and repo-relative forms, same as relation targets — a
 // single trimmed form mis-fires when a real path starts with the repo's own
-// name. Anchors on retired pages are historical citations: skipped.
+// name. A symbol anchor asks one question more, of a file the graph touches:
+// whether a fact in it carries that name, and a file without one is dangling
+// at the same cap. Anchors on retired pages are historical citations: skipped.
 func anchorVerdicts(store *facts.Store, present, retired map[string]bool) []facts.Insight {
 	var anchors []facts.Fact
 	measured := map[string]map[string]bool{}
 	measuredExts := map[string]map[string]bool{}
 	measuredBases := map[string]map[string]bool{}
+	symbolAnchors := false
 	for _, f := range store.FactsRef() {
 		if f.Kind == facts.KindIntent {
 			if f.PropString("intent_kind") == "anchor" && !retired[f.PropString("source")] {
 				anchors = append(anchors, f)
+				if f.PropString("symbol") != "" {
+					symbolAnchors = true
+				}
 			}
 			continue
 		}
@@ -478,6 +484,24 @@ func anchorVerdicts(store *facts.Store, present, retired map[string]bool) []fact
 			measuredExts[f.Repo][ext] = true
 		} else {
 			measuredBases[f.Repo][fileBase(f.File)] = true
+		}
+	}
+	// Which names each measured file holds, in both file forms, built only when
+	// a page narrows an anchor to a symbol.
+	var named map[string]map[string]bool
+	if symbolAnchors {
+		named = map[string]map[string]bool{}
+		for _, f := range store.FactsRef() {
+			if f.Kind == facts.KindIntent || f.Repo == "" || f.File == "" || f.Name == "" {
+				continue
+			}
+			for _, form := range []string{f.File, strings.TrimPrefix(f.File, f.Repo+"/")} {
+				key := f.Repo + "\x00" + form
+				if named[key] == nil {
+					named[key] = map[string]bool{}
+				}
+				named[key][f.Name] = true
+			}
 		}
 	}
 	var out []facts.Insight
@@ -521,6 +545,17 @@ func anchorVerdicts(store *facts.Store, present, retired map[string]bool) []fact
 			}
 		}
 		if hit {
+			symbol := f.PropString("symbol")
+			if symbol == "" || named[owner+"\x00"+path][symbol] {
+				continue
+			}
+			out = append(out, facts.Insight{
+				Title:       fmt.Sprintf("Dangling code anchor: %s", f.Name),
+				Description: fmt.Sprintf("The page anchors to %s in %s at %s, the graph measures that file, and no fact in it carries that name. The symbol was renamed, moved to another file or deleted, or this one declaration eluded extraction, so the confidence is capped.", symbol, path, owner),
+				Confidence:  danglingAnchorConfidence,
+				Evidence:    []facts.Evidence{{Fact: f.Name, Detail: "declared in " + f.PropString("source")}},
+				Actions:     []string{"Rename the symbol if the code was renamed", "Move the anchor to the file that declares the symbol now", "Remove the symbol, or the anchor, if the code is gone"},
+			})
 			continue
 		}
 		out = append(out, facts.Insight{
@@ -621,7 +656,7 @@ func fileBase(path string) string {
 // toolchain's job, where the mapping is known.
 
 func intPropOf(f facts.Fact, key string) (int, bool) {
-	switch v := f.Props[key].(type) {
+	switch v := f.PropAny(key).(type) {
 	case int:
 		return v, true
 	case float64:

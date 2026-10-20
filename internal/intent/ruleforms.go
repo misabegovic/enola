@@ -54,35 +54,42 @@ type RuleForm struct {
 	// say which facts in a file carry an edge, so it certifies nothing about a
 	// SOURCE-side subject's own resolution.
 	CensusMeasured bool
+	// Requires names the keys a rule of this form must carry beside id,
+	// because and the form's own key, as groups of which one key is enough:
+	// forbid needs a far end, to or to_name, and a via. It states what the
+	// validator refuses a rule for leaving out, which the requires test in
+	// ruleforms_test.go holds it to, so a caller reads the rule shape here
+	// rather than from the problems a missing key produces.
+	Requires [][]string
 }
 
 // RuleForms is the closed form vocabulary, in the order the arity error names
 // them. Seven walk edges; seven read a member's own props.
 var RuleForms = []RuleForm{
-	{Key: "forbid", Subject: func(r ConstraintRule) string { return r.Forbid }, Set: func(r *ConstraintRule, v string) { r.Forbid = v }, WalksEdges: true, Side: sourceSide},
-	{Key: "forbid_reach", Subject: func(r ConstraintRule) string { return r.ForbidReach }, Set: func(r *ConstraintRule, v string) { r.ForbidReach = v }, WalksEdges: true, Side: sourceSide},
-	{Key: "allow", Subject: func(r ConstraintRule) string { return r.Allow }, Set: func(r *ConstraintRule, v string) { r.Allow = v }, WalksEdges: true, Side: sourceSide},
-	{Key: "protect", Subject: func(r ConstraintRule) string { return r.Protect }, Set: func(r *ConstraintRule, v string) { r.Protect = v }, WalksEdges: true, Side: targetSide},
+	{Key: "forbid", Subject: func(r ConstraintRule) string { return r.Forbid }, Set: func(r *ConstraintRule, v string) { r.Forbid = v }, WalksEdges: true, Side: sourceSide, Requires: [][]string{{"to", "to_name"}, {"via"}}},
+	{Key: "forbid_reach", Subject: func(r ConstraintRule) string { return r.ForbidReach }, Set: func(r *ConstraintRule, v string) { r.ForbidReach = v }, WalksEdges: true, Side: sourceSide, Requires: [][]string{{"to"}}},
+	{Key: "allow", Subject: func(r ConstraintRule) string { return r.Allow }, Set: func(r *ConstraintRule, v string) { r.Allow = v }, WalksEdges: true, Side: sourceSide, Requires: [][]string{{"only"}, {"via"}}},
+	{Key: "protect", Subject: func(r ConstraintRule) string { return r.Protect }, Set: func(r *ConstraintRule, v string) { r.Protect = v }, WalksEdges: true, Side: targetSide, Requires: [][]string{{"owners"}, {"via"}}},
 	{Key: "private", Subject: func(r ConstraintRule) string { return r.Private }, Set: func(r *ConstraintRule, v string) { r.Private = v }, WalksEdges: true, Side: targetSide},
 	{Key: "forbid_fact", Subject: func(r ConstraintRule) string { return r.ForbidFact }, Set: func(r *ConstraintRule, v string) { r.ForbidFact = v }},
-	{Key: "cap", Subject: func(r ConstraintRule) string { return r.Cap }, Set: func(r *ConstraintRule, v string) { r.Cap = v }},
-	{Key: "require", Subject: func(r ConstraintRule) string { return r.Require }, Set: func(r *ConstraintRule, v string) { r.Require = v }},
-	{Key: "require_edge", Subject: func(r ConstraintRule) string { return r.RequireEdge }, Set: func(r *ConstraintRule, v string) { r.RequireEdge = v }, WalksEdges: true, Side: requireEdgeSubjectSide, CensusMeasured: true},
-	{Key: "require_defines", Subject: func(r ConstraintRule) string { return r.RequireDefines }, Set: func(r *ConstraintRule, v string) { r.RequireDefines = v }},
-	{Key: "forbid_cycles", Subject: func(r ConstraintRule) string { return r.ForbidCycles }, Set: func(r *ConstraintRule, v string) { r.ForbidCycles = v }},
+	{Key: "cap", Subject: func(r ConstraintRule) string { return r.Cap }, Set: func(r *ConstraintRule, v string) { r.Cap = v }, Requires: [][]string{{"max_members"}}},
+	{Key: "require", Subject: func(r ConstraintRule) string { return r.Require }, Set: func(r *ConstraintRule, v string) { r.Require = v }, Requires: [][]string{{"must_prop_contain"}}},
+	{Key: "require_edge", Subject: func(r ConstraintRule) string { return r.RequireEdge }, Set: func(r *ConstraintRule, v string) { r.RequireEdge = v }, WalksEdges: true, Side: requireEdgeSubjectSide, CensusMeasured: true, Requires: [][]string{{"via"}, {"direction"}}},
+	{Key: "require_defines", Subject: func(r ConstraintRule) string { return r.RequireDefines }, Set: func(r *ConstraintRule, v string) { r.RequireDefines = v }, Requires: [][]string{{"method", "any_of"}}},
+	{Key: "forbid_cycles", Subject: func(r ConstraintRule) string { return r.ForbidCycles }, Set: func(r *ConstraintRule, v string) { r.ForbidCycles = v }, Requires: [][]string{{"among"}}},
 	// independent reads its own members' edges against the includers resolved
 	// ancestry names; no component resolves as the far end of a measured
 	// relation, so it is not an edge-role form and the concept screen leaves it
 	// to its own refusal.
 	{Key: "independent", Subject: func(r ConstraintRule) string { return r.Independent }, Set: func(r *ConstraintRule, v string) { r.Independent = v }},
-	{Key: "require_name", Subject: func(r ConstraintRule) string { return r.RequireName }, Set: func(r *ConstraintRule, v string) { r.RequireName = v }},
-	{Key: "forbid_name", Subject: func(r ConstraintRule) string { return r.ForbidName }, Set: func(r *ConstraintRule, v string) { r.ForbidName = v }},
-	{Key: "protocol", Subject: func(r ConstraintRule) string { return r.Protocol }, Set: func(r *ConstraintRule, v string) { r.Protocol = v }, WalksEdges: true, Side: sourceSide, CensusMeasured: true},
-	{Key: "guide", Subject: func(r ConstraintRule) string { return r.Guide }, Set: func(r *ConstraintRule, v string) { r.Guide = v }},
+	{Key: "require_name", Subject: func(r ConstraintRule) string { return r.RequireName }, Set: func(r *ConstraintRule, v string) { r.RequireName = v }, Requires: [][]string{{"pattern"}}},
+	{Key: "forbid_name", Subject: func(r ConstraintRule) string { return r.ForbidName }, Set: func(r *ConstraintRule, v string) { r.ForbidName = v }, Requires: [][]string{{"pattern"}}},
+	{Key: "protocol", Subject: func(r ConstraintRule) string { return r.Protocol }, Set: func(r *ConstraintRule, v string) { r.Protocol = v }, WalksEdges: true, Side: sourceSide, CensusMeasured: true, Requires: [][]string{{"via"}, {"steps"}}},
+	{Key: "guide", Subject: func(r ConstraintRule) string { return r.Guide }, Set: func(r *ConstraintRule, v string) { r.Guide = v }, Requires: [][]string{{"message"}}},
 	{Key: "storage_stays_home", Subject: func(r ConstraintRule) string { return r.StorageStaysHome }, Set: func(r *ConstraintRule, v string) { r.StorageStaysHome = v }},
-	{Key: "cap_runtime", Subject: func(r ConstraintRule) string { return r.CapRuntime }, Set: func(r *ConstraintRule, v string) { r.CapRuntime = v }},
+	{Key: "cap_runtime", Subject: func(r ConstraintRule) string { return r.CapRuntime }, Set: func(r *ConstraintRule, v string) { r.CapRuntime = v }, Requires: [][]string{{"metric"}, {"max"}}},
 	{Key: "require_consumer", Subject: func(r ConstraintRule) string { return r.RequireConsumer }, Set: func(r *ConstraintRule, v string) { r.RequireConsumer = v }},
-	{Key: "unique_across", Subject: func(r ConstraintRule) string { return r.UniqueAcross }, Set: func(r *ConstraintRule, v string) { r.UniqueAcross = v }},
+	{Key: "unique_across", Subject: func(r ConstraintRule) string { return r.UniqueAcross }, Set: func(r *ConstraintRule, v string) { r.UniqueAcross = v }, Requires: [][]string{{"by"}}},
 	{Key: "require_governed", Subject: func(r ConstraintRule) string { return r.RequireGoverned }, Set: func(r *ConstraintRule, v string) { r.RequireGoverned = v }},
 }
 
@@ -143,10 +150,24 @@ func counterpartToSide(r ConstraintRule) string {
 	return SideTarget
 }
 
+// CodeRuleVias are the edge kinds that join code to code: what every edge form
+// may walk, and all that the forms walking the whole vocabulary walk (private,
+// independent, and forbid_reach without a via).
+var CodeRuleVias = []string{"calls", "depends_on", "implements", "imports"}
+
+// AccessRuleVias are the edge kinds from a method to a table it reads or
+// writes. Only the forms that judge one edge at a time (forbid, allow and
+// protect) name them: an access edge lands on storage, where no walk continues
+// and no edge is demanded.
+var AccessRuleVias = []string{"reads", "writes"}
+
 // AllRuleVias is the rule-via vocabulary as an ordered slice — the same closed
 // set AllowedRuleVias tests membership in, kept beside it so widening one
 // widens the other in the same change.
-var AllRuleVias = []string{"calls", "depends_on", "implements", "imports"}
+var AllRuleVias = append(append([]string{}, CodeRuleVias...), AccessRuleVias...)
+
+// IsAccessVia reports whether a via names a table access rather than code.
+func IsAccessVia(via string) bool { return via == "reads" || via == "writes" }
 
 // PathTargetVia names the edge kinds whose target is a PATH rather than a fact
 // name in the general case, so a component can only be NAMED by one through the
@@ -160,7 +181,7 @@ func PathTargetVia(via string) bool { return via == "imports" }
 // which forbid_reach also does when it declares no via.
 func RuleVias(r ConstraintRule) []string {
 	if r.Private != "" || r.Independent != "" || (r.ForbidReach != "" && r.Via == "") {
-		return AllRuleVias
+		return CodeRuleVias
 	}
 	if r.Via == "" {
 		return nil
@@ -298,6 +319,12 @@ func edgeRoleProblems(loc string, r ConstraintRule, components map[string]Constr
 		// it resolves against the far end of a measured edge, which is a path
 		// whatever the component's granularity.
 		if c.Kind == "symbol" && role.Subject {
+			continue
+		}
+		// The far end of a reads or writes edge is the storage fact itself, by
+		// name, never a method of it or a path, so a table selected by its
+		// props needs no ownership to be reached.
+		if c.Kind == "storage" && !role.Subject && IsAccessVia(r.Via) {
 			continue
 		}
 		if _, stated := OwnershipPrecedence(c.Owns, overrides[role.Component]); !stated {

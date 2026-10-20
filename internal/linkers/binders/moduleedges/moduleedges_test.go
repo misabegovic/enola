@@ -298,3 +298,110 @@ func TestFormatTopTargets_IsStableAndBounded(t *testing.T) {
 		t.Fatalf("formatTopTargets = %q, want %q", got, want)
 	}
 }
+
+// A call is attributed to the module of the file that declares the caller, not
+// to whichever module won the placement of the caller's name. Two production
+// modules declaring User#save used to give the winner every call the loser
+// made, so the binder derived an edge from a directory that never made it.
+func TestBind_ACallIsAttributedToTheModuleOfItsOwnFile(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("app/models"), module("lib/ext"), module("app/services"),
+		symbol("User#save", "app/models/user.rb"),
+		symbol("User#save", "lib/ext/user.rb", calls("Mailer#deliver")...),
+		symbol("Mailer#deliver", "app/services/mailer.rb"),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	edges := derivedEdges(store)
+	if _, wrong := edges["app/models -> app/services"]; wrong {
+		t.Errorf("credited the call to the module that did not make it: %v", edges)
+	}
+	if got := edges["lib/ext -> app/services"]; got != 1 {
+		t.Errorf("lib/ext -> app/services = %d, want 1: %v", got, edges)
+	}
+}
+
+// A name two production modules of one repository declare resolves to neither.
+// Nothing in the graph says which one a reference means, so no edge is derived;
+// picking the smallest was an order-free tie-break and still a guess.
+func TestBind_ANameTwoModulesDeclareIsRefusedAsATarget(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("app/models"), module("lib/ext"), module("app/services"),
+		symbol("User#save", "app/models/user.rb"),
+		symbol("User#save", "lib/ext/user.rb"),
+		symbol("Mailer#deliver", "app/services/mailer.rb", calls("User#save")...),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	if edges := derivedEdges(store); len(edges) != 0 {
+		t.Errorf("derived an edge to a name two modules declare: %v", edges)
+	}
+}
+
+// A Rust item import names the item, `src/core.count`, and carries its file.
+// Keyed on the raw target it never matched a module pair, so the call rolled
+// up beside it derived an edge that restated the import.
+func TestBind_AnItemImportIsAPairTheExtractorConnected(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		module("src/hooks"), module("src/core"),
+		facts.Fact{Kind: facts.KindDependency, Name: "src/hooks -> crate::core::count", File: "src/hooks/run.rs", Repo: "app",
+			Props:     map[string]any{"language": "rust", facts.PropTargetFile: "src/core/count.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/core.count"}}},
+		symbol("src/hooks.run", "src/hooks/run.rs", calls("src/core.count")...),
+		symbol("src/core.count", "src/core/count.rs"),
+	)
+	if err := New().Bind(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	if got := derivedEdges(store); len(got) != 0 {
+		t.Fatalf("the import already connects src/hooks to src/core: %v", got)
+	}
+}
+
+// An appended repository's files carry its label, and the edge is added after the
+// engine put it there. The edge sits at its source module, so it carries the label
+// too; a repository indexed alone has bare files and a bare edge.
+func TestBind_EdgeFileFollowsHowTheRepositoryNamesPaths(t *testing.T) {
+	repo := func(label, prefix string) []facts.Fact {
+		return []facts.Fact{
+			{Kind: facts.KindModule, Name: "app/models", File: prefix + "app/models", Repo: label},
+			{Kind: facts.KindModule, Name: "app/jobs", File: prefix + "app/jobs", Repo: label},
+			{Kind: facts.KindSymbol, Name: label + "Model", File: prefix + "app/models/m.rb", Repo: label,
+				Relations: []facts.Relation{{Kind: facts.RelCalls, Target: label + "Job"}}},
+			{Kind: facts.KindSymbol, Name: label + "Job", File: prefix + "app/jobs/j.rb", Repo: label},
+		}
+	}
+	files := func(store *facts.Store) map[string]string {
+		out := map[string]string{}
+		for _, f := range store.ByKind(facts.KindDependency) {
+			if f.PropString(DerivedProp) == derivedFromSymbols {
+				out[f.Repo] = f.File
+			}
+		}
+		return out
+	}
+
+	union := facts.NewStore()
+	union.Add(repo("shop", "shop/")...)
+	union.Add(repo("blog", "blog/")...)
+	if err := New().Bind(context.Background(), union); err != nil {
+		t.Fatal(err)
+	}
+	if got := files(union); got["shop"] != "shop/app/models" || got["blog"] != "blog/app/models" {
+		t.Errorf("appended repositories: edge files = %v, want each under its label", got)
+	}
+
+	alone := facts.NewStore()
+	alone.Add(repo("shop", "")...)
+	if err := New().Bind(context.Background(), alone); err != nil {
+		t.Fatal(err)
+	}
+	if got := files(alone); got["shop"] != "app/models" {
+		t.Errorf("a repository indexed alone: edge file = %q, want the bare module", got["shop"])
+	}
+}

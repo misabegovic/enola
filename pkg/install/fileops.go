@@ -33,6 +33,12 @@ type Result struct {
 	Path   string `json:"path"`
 	Action Action `json:"action"`
 	Reason string `json:"reason,omitempty"`
+	// Target is the agent the file was written for, and Hooks names the hooks it
+	// installs, empty for instructions. Together they let the summary say which
+	// agent received which hooks, read from what was written rather than from what
+	// was asked for.
+	Target string `json:"target,omitempty"`
+	Hooks  string `json:"hooks,omitempty"`
 }
 
 // Sentinels delimiting an enola-owned block inside a file the user also edits. HTML

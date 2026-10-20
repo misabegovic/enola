@@ -3,6 +3,7 @@ package goextractor
 import (
 	"go/ast"
 	"go/token"
+	"sort"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -15,16 +16,28 @@ type routeInfo struct {
 	handler   string // e.g. "app.Handlers.User.CreatePasswordReset"
 	framework string // "gorilla/mux", "chi", "net/http"
 	line      int
+	span      goSpan
 }
 
 // extractRoutes walks function bodies in a Go file looking for HTTP route registrations.
-func extractRoutes(fset *token.FileSet, f *ast.File, relFile, pkgDir string, index routePrefixIndex) []facts.Fact {
+func extractRoutes(fset *token.FileSet, f *ast.File, relFile, pkgDir string, routes routeIndex, fileImports map[string]string) []facts.Fact {
 	var result []facts.Fact
+	index := routes.prefixes
 
 	// Detect which router framework is imported
-	framework := detectRouterFramework(f)
+	framework := detectRouterFramework(f, fileImports, routes.wrappers)
 	if framework == "" {
 		return nil
+	}
+	// The package that implements a router registers none of the application's
+	// routes: its `r.Handle("GET", pattern, h)` is the verb's own body.
+	if strings.HasPrefix(routes.wrappers[pkgDir], ownRouterMark) {
+		return nil
+	}
+	strict := importsOwnRouterOnly(f, fileImports, routes.wrappers)
+	var aliases map[string]string
+	if strict {
+		aliases = routerAliases(f, fileImports, routes.wrappers)
 	}
 
 	for _, decl := range f.Decls {
@@ -41,11 +54,25 @@ func extractRoutes(fset *token.FileSet, f *ast.File, relFile, pkgDir string, ind
 		paramName, seeds := seedsFor(index, funcKeyFor(fn, pkgDir))
 		for _, seed := range seeds {
 			prefixes := make(map[string]string)
+			seedStrings(prefixes, fn.Body, pkgDir, fileImports, routes.consts)
 			if paramName != "" && seed != "" {
 				prefixes[paramName] = seed
+				prefixes[seedKey] = seed
 			}
+			recvVar, recvType := receiverOf(fn)
+			if strict {
+				prefixes[strictKey] = "1"
+				if name, _, ok := routerParam(fn, aliases); ok {
+					if _, set := prefixes[name]; !set {
+						prefixes[name] = ""
+					}
+				}
+				seedReceiverRouters(prefixes, pkgDir, recvVar, recvType, routes.routerFields)
+			}
+			seedLocalMounts(prefixes, fn.Body)
+			w := &routeWalk{fset: fset, prefixes: prefixes, closures: map[string]*ast.FuncLit{}, framework: framework, relFile: relFile, pkgDir: pkgDir, result: &result, recvVar: recvVar, recvType: recvType}
 			for _, stmt := range fn.Body.List {
-				extractRoutesFromStmt(fset, stmt, prefixes, framework, relFile, pkgDir, &result)
+				w.stmt(stmt)
 			}
 		}
 	}
@@ -67,7 +94,33 @@ func seedsFor(index routePrefixIndex, key string) (string, []string) {
 
 // detectRouterFramework checks imports to determine which router framework is used.
 // Specific frameworks (gorilla/mux, chi) take priority over net/http.
-func detectRouterFramework(f *ast.File) string {
+//
+// A file that imports none of them but imports one of the module's own router
+// packages (see routerWrapperPackages) registers routes in that package's
+// framework: the wrapper keeps the framework's verbs, and a file that only ever
+// touches the wrapper has no import that names the framework.
+func detectRouterFramework(f *ast.File, fileImports, wrappers map[string]string) string {
+	if fw := detectImportedRouterFramework(f); fw != "" && fw != "net/http" {
+		return fw
+	}
+	aliases := make([]string, 0, len(fileImports))
+	for alias := range fileImports {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	for _, alias := range aliases {
+		switch w := wrappers[fileImports[alias]]; {
+		case w == "chi", strings.HasPrefix(w, ownRouterMark):
+			return "chi"
+		case w == "mux":
+			return "gorilla/mux"
+		}
+	}
+	return detectImportedRouterFramework(f)
+}
+
+// detectImportedRouterFramework is the framework a file's own imports name.
+func detectImportedRouterFramework(f *ast.File) string {
 	hasNetHTTP := false
 	for _, imp := range f.Imports {
 		path := strings.Trim(imp.Path.Value, `"`)
@@ -88,54 +141,236 @@ func detectRouterFramework(f *ast.File) string {
 	return ""
 }
 
-// extractRoutesFromStmt processes a single statement looking for route registrations and subrouter assignments.
-func extractRoutesFromStmt(fset *token.FileSet, stmt ast.Stmt, prefixes map[string]string, framework, relFile, pkgDir string, result *[]facts.Fact) {
+// routeWalk is the state of one walk over a registration function's body: the
+// prefix each router variable carries at the statement being read, and the local
+// closures that register routes when called.
+type routeWalk struct {
+	fset      *token.FileSet
+	prefixes  map[string]string
+	closures  map[string]*ast.FuncLit
+	framework string
+	relFile   string
+	pkgDir    string
+	result    *[]facts.Fact
+	// recvVar and recvType are the receiver of the method being walked, "" in a
+	// plain function.
+	recvVar  string
+	recvType string
+	// localTypes are the function's locals whose type a struct literal states,
+	// `r := artifactRoutes{...}`; "" for a name bound to two types.
+	localTypes map[string]string
+}
+
+func (w *routeWalk) emit(call *ast.CallExpr) {
+	for _, r := range extractRoutesFromCall(w.fset, call, w.prefixes, w.framework) {
+		fact := routeToFact(r, w.relFile, w.pkgDir)
+		// A method value on the receiver, `hs.LoginPost` inside a method of
+		// HTTPServer, names that type's method.
+		if recv, method, ok := strings.Cut(r.handler, "."); ok && token.IsIdentifier(method) && r.method != "USE" {
+			switch {
+			case recv == w.recvVar && w.recvType != "":
+				fact.SetProp(facts.PropHandlerTarget, w.pkgDir+"."+w.recvType+"."+method)
+			case w.localTypes[recv] != "":
+				// A method value on a local of a stated type, `r.uploadArtifact`
+				// after `r := artifactRoutes{...}`, names that type's method.
+				fact.SetProp(facts.PropHandlerTarget, w.pkgDir+"."+w.localTypes[recv]+"."+method)
+			}
+		}
+		*w.result = append(*w.result, fact)
+	}
+}
+
+// noteLocalType records the type of this package that a struct literal, or its
+// address, gives a local. A name bound to two types keeps none.
+func (w *routeWalk) noteLocalType(name string, value ast.Expr) {
+	if u, ok := value.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		value = u.X
+	}
+	lit, ok := value.(*ast.CompositeLit)
+	if !ok {
+		return
+	}
+	typ, ok := lit.Type.(*ast.Ident)
+	if !ok {
+		return
+	}
+	if w.localTypes == nil {
+		w.localTypes = map[string]string{}
+	}
+	if prev, seen := w.localTypes[name]; seen && prev != typ.Name {
+		w.localTypes[name] = ""
+		return
+	}
+	w.localTypes[name] = typ.Name
+}
+
+func (w *routeWalk) block(body *ast.BlockStmt) {
+	for _, inner := range body.List {
+		w.stmt(inner)
+	}
+}
+
+// stmt processes a single statement looking for route registrations and subrouter assignments.
+func (w *routeWalk) stmt(stmt ast.Stmt) {
 	switch s := stmt.(type) {
 	case *ast.ExprStmt:
-		if call, ok := s.X.(*ast.CallExpr); ok {
-			routes := extractRoutesFromCall(fset, call, prefixes, framework)
-			for _, r := range routes {
-				*result = append(*result, routeToFact(r, relFile, pkgDir))
+		call, ok := s.X.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		// A local closure that registers routes, called here: its routes are
+		// registered now, under whatever this statement sits under. Removed while
+		// it is walked so a closure that calls itself ends.
+		if name := identName(call.Fun); name != "" && len(call.Args) == 0 {
+			if lit := w.closures[name]; lit != nil {
+				delete(w.closures, name)
+				w.block(lit.Body)
+				w.closures[name] = lit
+				return
 			}
-			// Recurse into function literal arguments (e.g. r.Group(func(r chi.Router) { r.Get(...) })).
-			// This captures routes registered inside oapi-codegen's HandlerWithOptions pattern.
-			for _, arg := range call.Args {
-				if fn, ok := arg.(*ast.FuncLit); ok && fn.Body != nil {
-					for _, inner := range fn.Body.List {
-						extractRoutesFromStmt(fset, inner, prefixes, framework, relFile, pkgDir, result)
+		}
+		w.emit(call)
+		mounted, scoped := funcLitMount(call, w.prefixes)
+		// Recurse into function literal arguments (e.g. r.Group(func(r chi.Router) { r.Get(...) })).
+		// This captures routes registered inside oapi-codegen's HandlerWithOptions pattern.
+		for _, arg := range call.Args {
+			fn, ok := arg.(*ast.FuncLit)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if fn == mounted {
+				restore := scoped.apply(w.prefixes)
+				w.block(fn.Body)
+				restore()
+				continue
+			}
+			w.block(fn.Body)
+		}
+
+	case *ast.DeclStmt:
+		if gen, ok := s.Decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+			for _, spec := range gen.Specs {
+				if vs, ok := spec.(*ast.ValueSpec); ok && len(vs.Names) == len(vs.Values) {
+					for i, name := range vs.Names {
+						w.noteLocalType(name.Name, vs.Values[i])
 					}
 				}
 			}
 		}
-
 	case *ast.AssignStmt:
+		if len(s.Lhs) == len(s.Rhs) {
+			for i, lhs := range s.Lhs {
+				if name := identName(lhs); name != "" {
+					w.noteLocalType(name, s.Rhs[i])
+				}
+			}
+		}
 		// Track subrouter assignments: apiRouter := router.PathPrefix("/api").Subrouter()
-		applySubrouterAssign(s, prefixes)
+		applySubrouterAssign(s, w.prefixes)
+		trackStringAssign(s, w.prefixes)
+		trackRouterAlias(s, w.prefixes)
+		// `addRoutes := func() { m.Get(...) }` registers nothing until it is called.
+		if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+			if lit, ok := s.Rhs[0].(*ast.FuncLit); ok && lit.Body != nil && lit.Type.Params.NumFields() == 0 {
+				if name := identName(s.Lhs[0]); name != "" {
+					w.closures[name] = lit
+				}
+			}
+		}
 		// Also check for route registrations in assignments (e.g. _ = router.HandleFunc(...))
 		for _, rhs := range s.Rhs {
 			if call, ok := rhs.(*ast.CallExpr); ok {
-				routes := extractRoutesFromCall(fset, call, prefixes, framework)
-				for _, r := range routes {
-					*result = append(*result, routeToFact(r, relFile, pkgDir))
-				}
+				w.emit(call)
 			}
 		}
 
 	case *ast.IfStmt:
 		// Walk into if bodies for conditional route registration
 		if s.Body != nil {
-			for _, inner := range s.Body.List {
-				extractRoutesFromStmt(fset, inner, prefixes, framework, relFile, pkgDir, result)
-			}
+			w.block(s.Body)
 		}
 		if s.Else != nil {
 			if block, ok := s.Else.(*ast.BlockStmt); ok {
-				for _, inner := range block.List {
-					extractRoutesFromStmt(fset, inner, prefixes, framework, relFile, pkgDir, result)
-				}
+				w.block(block)
 			}
 		}
 	}
+}
+
+// mountScope is the prefix a router variable carries inside a mount's function
+// literal, and nowhere else.
+type mountScope struct {
+	name   string
+	prefix string
+}
+
+// apply sets the scoped prefix and returns the function that undoes it.
+func (m mountScope) apply(prefixes map[string]string) func() {
+	old, had := prefixes[m.name]
+	prefixes[m.name] = m.prefix
+	return func() {
+		if had {
+			prefixes[m.name] = old
+		} else {
+			delete(prefixes, m.name)
+		}
+	}
+}
+
+// funcLitMount recognizes a mount that takes the routes under it as a function
+// literal, and returns the literal with the prefix its routes are registered
+// under:
+//
+//	r.Route("/api", func(r chi.Router) { r.Get("/users", list) })   // /api/users
+//	m.Group("/user", func() { m.Post("/login", signIn) }, mw...)    // /user/login
+//	r.Group(func(r chi.Router) { r.Get("/users", list) })           // no new segment
+//	m.PathGroup("/compare/*", func(g *web.RouterPathGroup) { ... }) // /compare
+//
+// The literal's router parameter carries the prefix inside it. A literal that
+// takes no parameter registers on the receiver itself, so the receiver carries
+// it for the length of the literal. A Route whose path is not a literal mounts
+// under something this cannot read, and is left to the caller as before.
+func funcLitMount(call *ast.CallExpr, prefixes map[string]string) (*ast.FuncLit, mountScope) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || (sel.Sel.Name != "Route" && sel.Sel.Name != "Group" && sel.Sel.Name != "PathGroup") {
+		return nil, mountScope{}
+	}
+	recv := routerVarName(sel.X)
+	if recv == "" {
+		return nil, mountScope{}
+	}
+	if _, known := prefixes[recv]; !known && prefixes[strictKey] != "" {
+		return nil, mountScope{}
+	}
+	var lit *ast.FuncLit
+	for _, arg := range call.Args {
+		if fn, ok := arg.(*ast.FuncLit); ok && fn.Body != nil {
+			lit = fn
+			break
+		}
+	}
+	if lit == nil {
+		return nil, mountScope{}
+	}
+	prefix := prefixes[recv]
+	path, known := pathArg(call.Args[0], prefixes)
+	switch {
+	case known:
+		if sel.Sel.Name == "PathGroup" {
+			// The group's own pattern ends in the wildcard its routes match under.
+			path = strings.TrimSuffix(strings.TrimSuffix(path, "*"), "/")
+		}
+		if path != "" {
+			prefix = joinRoutePath(prefix, path)
+		}
+	case sel.Sel.Name != "Group" || call.Args[0] != ast.Expr(lit):
+		return nil, mountScope{}
+	}
+	name := recv
+	if params := lit.Type.Params; params != nil && len(params.List) > 0 && len(params.List[0].Names) > 0 {
+		name = params.List[0].Names[0].Name
+	}
+	return lit, mountScope{name: name, prefix: prefix}
 }
 
 // extractRoutesFromCall extracts route info from a call expression.
@@ -144,11 +379,17 @@ func extractRoutesFromCall(fset *token.FileSet, call *ast.CallExpr, prefixes map
 	case "gorilla/mux":
 		return extractGorillaMuxRoutes(fset, call, prefixes)
 	case "chi":
-		return extractChiRoutes(fset, call, prefixes)
+		routes := extractChiRoutes(fset, call, prefixes)
+		// A file that imports the application's own router package for something
+		// else may still register on net/http.
+		if routes == nil && prefixes[strictKey] != "" {
+			return extractNetHTTPRoutes(fset, call, prefixes)
+		}
+		return routes
 	case "gin":
 		return extractGinRoutes(fset, call, prefixes)
 	case "net/http":
-		return extractNetHTTPRoutes(fset, call)
+		return extractNetHTTPRoutes(fset, call, prefixes)
 	}
 	return nil
 }
@@ -194,6 +435,7 @@ func extractGorillaMuxRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes m
 						handler:   handler,
 						framework: "gorilla/mux",
 						line:      fset.Position(call.Pos()).Line,
+						span:      spanOf(fset, call),
 					}}
 				}
 			}
@@ -208,6 +450,18 @@ func extractChiRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return nil
+	}
+	// Through a self-contained router package a verb counts only on a known router.
+	if prefixes[strictKey] != "" {
+		if _, known := prefixes[routerVarName(sel.X)]; !known {
+			return nil
+		}
+	}
+	if routes := extractComboRoutes(fset, call, prefixes); routes != nil {
+		return routes
+	}
+	if routes := extractMatchPathRoutes(fset, call, prefixes); routes != nil {
+		return routes
 	}
 
 	methodName := sel.Sel.Name
@@ -234,7 +488,7 @@ func extractChiRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 		if len(call.Args) > 0 {
 			handler := exprToString(call.Args[0])
 			if handler != "" {
-				receiverVar := identName(sel.X)
+				receiverVar := routerVarName(sel.X)
 				prefix := prefixes[receiverVar]
 				return []routeInfo{{
 					method:    "USE",
@@ -242,6 +496,7 @@ func extractChiRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 					handler:   handler,
 					framework: "chi",
 					line:      fset.Position(call.Pos()).Line,
+					span:      spanOf(fset, call),
 				}}
 			}
 		}
@@ -250,26 +505,38 @@ func extractChiRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 		return nil
 	}
 
-	if len(call.Args) < 1 {
+	// A registration names a path and what serves it. One argument is a lookup
+	// that happens to share the verb's name: `header.Get("Authorization")`,
+	// `query.Get("expires")`.
+	if len(call.Args) < 2 {
 		return nil
 	}
 
-	path := extractStringArg(call, 0)
-	if path == "" && !isStaticStringArg(call.Args[0]) {
+	path, known := pathArg(call.Args[0], prefixes)
+	if !known {
 		return nil
 	}
-
-	receiverVar := identName(sel.X)
-	if prefix, ok := prefixes[receiverVar]; ok {
-		path = prefix + path
+	receiverVar := routerVarName(sel.X)
+	prefix := prefixes[receiverVar]
+	// A pattern with no leading slash continues the group it is written in:
+	// `m.Get(".diff", h)` under "/{index}" is "/{index}.diff". Written on the router
+	// itself, with no group around it, it is served with the slash.
+	if path != "" && !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "*") &&
+		prefix == prefixes[seedKey] {
+		path = "/" + path
 	}
+	path = prefix + path
 	if path == "" {
 		path = "/"
 	}
 
 	handler := ""
 	if len(call.Args) >= 2 {
-		handler = exprToString(call.Args[1])
+		// chi's verbs take one handler, so it is both the second argument and the
+		// last. A router with chi's verb names that takes middleware before the
+		// handler (`m.Post("/login", bind(form), SignInPost)`) puts it last, and
+		// reading the second argument there names a middleware as the handler.
+		handler = routeHandlerExpr(call.Args[len(call.Args)-1])
 	}
 
 	return []routeInfo{{
@@ -278,7 +545,73 @@ func extractChiRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 		handler:   handler,
 		framework: "chi",
 		line:      fset.Position(call.Pos()).Line,
+		span:      spanOf(fset, call),
 	}}
+}
+
+// chiVerbs maps the verb methods of a chi-style router to their HTTP method.
+var chiVerbs = map[string]string{
+	"Get": "GET", "Post": "POST", "Put": "PUT", "Delete": "DELETE",
+	"Patch": "PATCH", "Head": "HEAD", "Options": "OPTIONS",
+}
+
+// extractComboRoutes reads a path named once with its verbs chained after it:
+//
+//	m.Combo("/new").Get(NewIssue).Post(bind(form), NewIssuePost)
+//
+// One route per verb, all at the Combo's path, each handled by its own last
+// argument. Anything in the chain that is not a verb means this is some other
+// chain, and nothing is read from it.
+func extractComboRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[string]string) []routeInfo {
+	var verbs []*ast.CallExpr
+	for cur := call; ; {
+		sel, ok := cur.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return nil
+		}
+		if sel.Sel.Name == "Combo" {
+			if len(verbs) == 0 || len(cur.Args) == 0 {
+				return nil
+			}
+			path, known := pathArg(cur.Args[0], prefixes)
+			if !known {
+				return nil
+			}
+			if prefix, ok := prefixes[identName(sel.X)]; ok {
+				path = prefix + path
+			}
+			if path == "" {
+				path = "/"
+			}
+			routes := make([]routeInfo, 0, len(verbs))
+			// Collected outermost first; emitted in the order they were written.
+			for i := len(verbs) - 1; i >= 0; i-- {
+				verb := verbs[i]
+				handler := ""
+				if len(verb.Args) > 0 {
+					handler = exprToString(verb.Args[len(verb.Args)-1])
+				}
+				name := verb.Fun.(*ast.SelectorExpr).Sel
+				routes = append(routes, routeInfo{
+					method:    chiVerbs[name.Name],
+					path:      path,
+					handler:   handler,
+					framework: "chi",
+					line:      fset.Position(name.Pos()).Line,
+				})
+			}
+			return routes
+		}
+		if _, isVerb := chiVerbs[sel.Sel.Name]; !isVerb {
+			return nil
+		}
+		inner, ok := sel.X.(*ast.CallExpr)
+		if !ok {
+			return nil
+		}
+		verbs = append(verbs, cur)
+		cur = inner
+	}
 }
 
 // ginVerbs maps gin's registration methods to their HTTP method.
@@ -309,7 +642,7 @@ func extractGinRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 
 	methodName := sel.Sel.Name
 	httpMethod, isVerb := ginVerbs[methodName]
-	pathArg, handlerArg := 0, 1
+	pathIdx, handlerArg := 0, 1
 
 	switch {
 	case isVerb:
@@ -321,7 +654,7 @@ func extractGinRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 		if httpMethod == "" {
 			httpMethod = "ALL"
 		}
-		pathArg, handlerArg = 1, 2
+		pathIdx, handlerArg = 1, 2
 	case methodName == "Use":
 		if len(call.Args) == 0 {
 			return nil
@@ -336,16 +669,17 @@ func extractGinRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 			handler:   handler,
 			framework: "gin",
 			line:      fset.Position(call.Pos()).Line,
+			span:      spanOf(fset, call),
 		}}
 	default:
 		return nil
 	}
 
-	if len(call.Args) <= pathArg {
+	if len(call.Args) <= pathIdx {
 		return nil
 	}
-	path := extractStringArg(call, pathArg)
-	if path == "" && !isStaticStringArg(call.Args[pathArg]) {
+	path, known := pathArg(call.Args[pathIdx], prefixes)
+	if !known {
 		// A computed path is skipped rather than published bare: gin groups mount at
 		// "/" so often that a bare path is frequently the root itself, the same reason
 		// the C# minimal-API pass is stricter here than the Go mux one.
@@ -358,7 +692,7 @@ func extractGinRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 	if len(call.Args) > handlerArg {
 		// gin takes variadic middleware before the final handler; the LAST argument is
 		// the one that serves the request.
-		handler = exprToString(call.Args[len(call.Args)-1])
+		handler = routeHandlerExpr(call.Args[len(call.Args)-1])
 	}
 
 	return []routeInfo{{
@@ -367,6 +701,7 @@ func extractGinRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[stri
 		handler:   handler,
 		framework: "gin",
 		line:      fset.Position(call.Pos()).Line,
+		span:      spanOf(fset, call),
 	}}
 }
 
@@ -391,7 +726,7 @@ func joinRoutePath(prefix, path string) string {
 }
 
 // extractNetHTTPRoutes handles net/http patterns like http.HandleFunc("/path", handler).
-func extractNetHTTPRoutes(fset *token.FileSet, call *ast.CallExpr) []routeInfo {
+func extractNetHTTPRoutes(fset *token.FileSet, call *ast.CallExpr, prefixes map[string]string) []routeInfo {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return nil
@@ -406,8 +741,8 @@ func extractNetHTTPRoutes(fset *token.FileSet, call *ast.CallExpr) []routeInfo {
 		return nil
 	}
 
-	path := extractStringArg(call, 0)
-	if path == "" && !isStaticStringArg(call.Args[0]) {
+	path, known := pathArg(call.Args[0], prefixes)
+	if !known {
 		return nil
 	}
 	if path == "" {
@@ -416,7 +751,7 @@ func extractNetHTTPRoutes(fset *token.FileSet, call *ast.CallExpr) []routeInfo {
 
 	handler := ""
 	if len(call.Args) >= 2 {
-		handler = exprToString(call.Args[1])
+		handler = routeHandlerExpr(call.Args[1])
 	}
 
 	return []routeInfo{{
@@ -425,6 +760,7 @@ func extractNetHTTPRoutes(fset *token.FileSet, call *ast.CallExpr) []routeInfo {
 		handler:   handler,
 		framework: "net/http",
 		line:      fset.Position(call.Pos()).Line,
+		span:      spanOf(fset, call),
 	}}
 }
 
@@ -443,12 +779,12 @@ func extractHandleFuncCall(fset *token.FileSet, call *ast.CallExpr, prefixes map
 		return nil
 	}
 
-	path := extractStringArg(call, 0)
 	// An empty path from a static string literal ("") is an intentional
 	// collection-root registration on a subrouter (e.g. coursesRouter.HandleFunc("",
 	// list)) whose real path is the subrouter's prefix. Only drop when the path is
-	// empty because the argument is dynamic/unresolvable, not a literal.
-	if path == "" && !isStaticStringArg(call.Args[0]) {
+	// unknown because some part of the argument is dynamic.
+	path, known := pathArg(call.Args[0], prefixes)
+	if !known {
 		return nil
 	}
 
@@ -465,19 +801,20 @@ func extractHandleFuncCall(fset *token.FileSet, call *ast.CallExpr, prefixes map
 
 	handler := ""
 	if len(call.Args) >= 2 {
-		handler = exprToString(call.Args[1])
+		handler = routeHandlerExpr(call.Args[1])
 	}
 
 	return &routeInfo{
 		path:    path,
 		handler: handler,
 		line:    fset.Position(call.Pos()).Line,
+		span:    spanOf(fset, call),
 	}
 }
 
 // isStaticStringArg reports whether expr is a statically-known string path — a
-// string literal (possibly empty) or a concatenation of them — versus a dynamic
-// argument whose path can't be determined. An empty path from a static literal is
+// string literal (possibly empty) or a concatenation of nothing but them — versus a
+// dynamic argument whose path can't be determined. An empty path from a static literal is
 // an intentional collection-root registration; an empty path from a non-static
 // arg means the path is unknown and the route must be dropped.
 func isStaticStringArg(expr ast.Expr) bool {
@@ -485,7 +822,9 @@ func isStaticStringArg(expr ast.Expr) bool {
 	case *ast.BasicLit:
 		return e.Kind == token.STRING
 	case *ast.BinaryExpr:
-		return e.Op == token.ADD && (isStaticStringArg(e.X) || isStaticStringArg(e.Y))
+		return e.Op == token.ADD && isStaticStringArg(e.X) && isStaticStringArg(e.Y)
+	case *ast.ParenExpr:
+		return isStaticStringArg(e.X)
 	}
 	return false
 }
@@ -591,15 +930,19 @@ func extractStringExpr(expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		if e.Kind == token.STRING {
-			return strings.Trim(e.Value, `"`)
+			return strings.Trim(e.Value, "\"`")
 		}
+	case *ast.ParenExpr:
+		return extractStringExpr(e.X)
 	case *ast.BinaryExpr:
 		if e.Op == token.ADD {
 			right := extractStringExpr(e.Y)
-			// When the right side is an absolute path ("/..."), use it directly.
-			// This correctly handles `options.BaseURL + "/api/v1/..."` where BaseURL
-			// is a runtime variable that is typically empty or a host prefix.
-			if strings.HasPrefix(right, "/") {
+			// When the right side is an absolute path ("/...") after a part that is
+			// not a literal, use it directly. This handles a client's
+			// `options.BaseURL + "/api/v1/..."` where BaseURL is a runtime variable
+			// that is typically empty or a host prefix. A literal left side is part
+			// of the path: "/v1" + "/items" is /v1/items.
+			if strings.HasPrefix(right, "/") && !isStaticStringArg(e.X) {
 				return right
 			}
 			left := extractStringExpr(e.X)
@@ -650,7 +993,7 @@ func routeToFact(r routeInfo, relFile, pkgDir string) facts.Fact {
 		props["type"] = "middleware"
 	}
 
-	return facts.Fact{
+	route := facts.Fact{
 		Kind:  facts.KindRoute,
 		Name:  r.path,
 		File:  relFile,
@@ -659,5 +1002,94 @@ func routeToFact(r routeInfo, relFile, pkgDir string) facts.Fact {
 		Relations: []facts.Relation{
 			{Kind: facts.RelDeclares, Target: pkgDir},
 		},
+	}
+	r.span.set(&route)
+	return route
+}
+
+// handlerTarget names the function a route's handler expression registers, in the
+// form Go call targets take, when the expression alone settles it: `Home` is the
+// file's own package's function, `repo.Home` the function of the package the file
+// imports as repo. A method value (`h.Home`, a receiver variable) or a call
+// (`routing.Wrap(h.Home)`) names no function by itself and gets "".
+func handlerTarget(handler, pkgDir string, fileImports map[string]string) string {
+	if handler == "" || strings.ContainsAny(handler, "()[]{} *&") {
+		return ""
+	}
+	parts := strings.Split(handler, ".")
+	switch len(parts) {
+	case 1:
+		if !token.IsIdentifier(parts[0]) {
+			return ""
+		}
+		return pkgDir + "." + parts[0]
+	case 2:
+		pkg, ok := fileImports[parts[0]]
+		if !ok || !token.IsIdentifier(parts[1]) {
+			return ""
+		}
+		return pkg + "." + parts[1]
+	}
+	return ""
+}
+
+// seedLocalMounts gives a router held in a local variable the path it is mounted at:
+//
+//	api := chi.NewRouter()
+//	api.Get("/users", ListUsers)   // served at /api/users
+//	r.Mount("/api", api)
+//
+// The Mount usually comes after the routes, so the walk, which reads in source
+// order, would meet them first; the mounts are read ahead of it. A router mounted on
+// a mounted router composes both paths. A mount whose path cannot be read, and a
+// variable mounted twice, seed nothing.
+func seedLocalMounts(prefixes map[string]string, body *ast.BlockStmt) {
+	type mount struct{ parent, path string }
+	mounts := map[string]mount{}
+	twice := map[string]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Mount" || len(call.Args) != 2 {
+			return true
+		}
+		child, ok := call.Args[1].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		path, ok := pathArg(call.Args[0], prefixes)
+		if !ok {
+			twice[child.Name] = true // unreadable: mounted somewhere this cannot name
+			return true
+		}
+		if _, seen := mounts[child.Name]; seen {
+			twice[child.Name] = true
+		}
+		mounts[child.Name] = mount{routerVarName(sel.X), path}
+		return true
+	})
+	var resolve func(name string, depth int) (string, bool)
+	resolve = func(name string, depth int) (string, bool) {
+		m, ok := mounts[name]
+		if !ok || twice[name] || depth > 8 {
+			return "", false
+		}
+		parent := prefixes[m.parent]
+		if up, ok := resolve(m.parent, depth+1); ok {
+			parent = up
+		}
+		// A mount at "" or "/" adds nothing: its routes keep their own paths.
+		return strings.TrimSuffix(joinRoutePath(parent, m.path), "/"), true
+	}
+	for name := range mounts {
+		if _, set := prefixes[name]; set {
+			continue // a parameter or field already seeded keeps its own prefix
+		}
+		if p, ok := resolve(name, 0); ok {
+			prefixes[name] = p
+		}
 	}
 }

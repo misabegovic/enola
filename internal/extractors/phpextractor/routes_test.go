@@ -1,6 +1,8 @@
 package phpextractor
 
 import (
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/enola-labs/enola/internal/facts"
@@ -101,8 +103,9 @@ func TestLaravelRoutes_Resource(t *testing.T) {
 Route::resource('photos', PhotoController::class);
 `
 	ff := extractLaravelRoutes([]byte(src), "routes/web.php")
-	if got := len(serverRoutes(ff)); got != 7 {
-		t.Fatalf("got %d resource routes, want 7: %s", got, routeSummary(ff))
+	// Seven actions; update answers to PUT and PATCH.
+	if got := len(serverRoutes(ff)); got != 8 {
+		t.Fatalf("got %d resource routes, want 8: %s", got, routeSummary(ff))
 	}
 	idx := routeByMethodPath(t, ff, "GET", "/photos")
 	if idx.Props["handler"] != "PhotoController::index" {
@@ -110,10 +113,14 @@ Route::resource('photos', PhotoController::class);
 	}
 	routeByMethodPath(t, ff, "POST", "/photos")
 	routeByMethodPath(t, ff, "GET", "/photos/create")
-	routeByMethodPath(t, ff, "GET", "/photos/{id}")
-	routeByMethodPath(t, ff, "GET", "/photos/{id}/edit")
-	routeByMethodPath(t, ff, "PUT", "/photos/{id}")
-	routeByMethodPath(t, ff, "DELETE", "/photos/{id}")
+	routeByMethodPath(t, ff, "GET", "/photos/{photo}")
+	routeByMethodPath(t, ff, "GET", "/photos/{photo}/edit")
+	routeByMethodPath(t, ff, "DELETE", "/photos/{photo}")
+	for _, verb := range []string{"PUT", "PATCH"} {
+		if got := routeByMethodPath(t, ff, verb, "/photos/{photo}").Props["handler"]; got != "PhotoController::update" {
+			t.Errorf("%s handler = %v, want PhotoController::update", verb, got)
+		}
+	}
 }
 
 func TestLaravelRoutes_ApiResource(t *testing.T) {
@@ -121,15 +128,107 @@ func TestLaravelRoutes_ApiResource(t *testing.T) {
 Route::apiResource('books', BookController::class);
 `
 	ff := extractLaravelRoutes([]byte(src), "routes/api.php")
-	if got := len(serverRoutes(ff)); got != 5 {
-		t.Fatalf("got %d apiResource routes, want 5: %s", got, routeSummary(ff))
+	if got := len(serverRoutes(ff)); got != 6 {
+		t.Fatalf("got %d apiResource routes, want 6: %s", got, routeSummary(ff))
 	}
 	// No HTML form endpoints.
 	for _, f := range serverRoutes(ff) {
-		if f.Name == "/books/create" || f.Name == "/books/{id}/edit" {
+		if f.Name == "/books/create" || f.Name == "/books/{book}/edit" {
 			t.Errorf("apiResource should not emit %s", f.Name)
 		}
 	}
+}
+
+// routeSet lists the server routes as "METHOD path -> handler", sorted.
+func routeSet(ff []facts.Fact) []string {
+	var out []string
+	for _, f := range serverRoutes(ff) {
+		line := f.Props["method"].(string) + " " + f.Name
+		if h, ok := f.Props["handler"]; ok {
+			line += " -> " + h.(string)
+		}
+		out = append(out, line)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func wantRoutes(t *testing.T, ff []facts.Fact, want ...string) {
+	t.Helper()
+	got := routeSet(ff)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("routes =\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("routes =\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+		}
+	}
+}
+
+// TestLaravelRoutes_ResourceOnlyAndExcept: a route for an action the application did
+// not register is a route it does not serve.
+func TestLaravelRoutes_ResourceOnlyAndExcept(t *testing.T) {
+	src := `<?php
+Route::apiResource('applications', ApplicationController::class)->only([
+    'index',
+    'show',
+    'store',
+]);
+Route::resource('tags', TagController::class)->except('create', 'edit', 'update', 'destroy');
+Route::resource('notes', NoteController::class, ['only' => ['destroy']]);
+Route::apiResource('logs', LogController::class, ['except' => 'store'])->only(['index', 'store']);
+`
+	wantRoutes(t, extractLaravelRoutes([]byte(src), "routes/api.php"),
+		"GET /applications -> ApplicationController::index",
+		"GET /applications/{application} -> ApplicationController::show",
+		"POST /applications -> ApplicationController::store",
+		"GET /tags -> TagController::index",
+		"POST /tags -> TagController::store",
+		"GET /tags/{tag} -> TagController::show",
+		"DELETE /notes/{note} -> NoteController::destroy",
+		"GET /logs -> LogController::index",
+	)
+}
+
+// TestLaravelRoutes_NestedAndPrefixedResources: a dot nests a resource under one
+// record of its parent, and a slash is a path prefix.
+func TestLaravelRoutes_NestedAndPrefixedResources(t *testing.T) {
+	src := `<?php
+Route::apiResource('albums.songs', AlbumSongController::class)->only(['index', 'show']);
+Route::apiResource('admin/user-profiles', ProfileController::class)->only('show');
+Route::apiResource('photos.comments', CommentController::class)->shallow()->only(['index', 'show']);
+Route::apiResource('users', UserController::class)->parameters(['users' => 'member'])->only('destroy');
+Route::apiResource('categories', CategoryController::class)->only('show');
+Route::apiResource('media', MediaController::class)->only('show');
+`
+	wantRoutes(t, extractLaravelRoutes([]byte(src), "routes/api.php"),
+		"GET /albums/{album}/songs -> AlbumSongController::index",
+		"GET /albums/{album}/songs/{song} -> AlbumSongController::show",
+		"GET /admin/user-profiles/{user_profile} -> ProfileController::show",
+		"GET /photos/{photo}/comments -> CommentController::index",
+		"GET /comments/{comment} -> CommentController::show",
+		"DELETE /users/{member} -> UserController::destroy",
+		"GET /categories/{category} -> CategoryController::show",
+		// An irregular plural keeps the name it was written with.
+		"GET /media/{media} -> MediaController::show",
+	)
+}
+
+func TestLaravelRoutes_PluralRegistrars(t *testing.T) {
+	src := `<?php
+Route::prefix('v1')->group(function () {
+    Route::apiResources([
+        'photos' => PhotoController::class,
+        'posts' => PostController::class,
+    ], ['only' => ['index']]);
+});
+`
+	wantRoutes(t, extractLaravelRoutes([]byte(src), "routes/api.php"),
+		"GET /v1/photos -> PhotoController::index",
+		"GET /v1/posts -> PostController::index",
+	)
 }
 
 func TestLaravelRoutes_Match(t *testing.T) {
@@ -142,4 +241,95 @@ Route::match(['get', 'post'], '/contact', 'ContactController@handle');
 	}
 	routeByMethodPath(t, ff, "GET", "/contact")
 	routeByMethodPath(t, ff, "POST", "/contact")
+}
+
+func TestLaravelRoutes_HandlerClassIsExpandedThroughImports(t *testing.T) {
+	src := `<?php
+use App\Http\Controllers\OrderController;
+use App\Http\Controllers\{PingController, ReportController as Reports};
+
+Route::get('/orders/{id}', [OrderController::class, 'show']);
+Route::get('/ping', PingController::class);
+Route::get('/reports', [Reports::class, 'index']);
+Route::get('/absolute', [\Vendor\ThingController::class, 'go']);
+Route::get('/closure', function () { return 1; });
+`
+	ff := extractLaravelRoutes([]byte(src), "routes/api.php")
+	for path, want := range map[string]string{
+		"/orders/{id}": `App\Http\Controllers\OrderController::show`,
+		"/ping":        `App\Http\Controllers\PingController::__invoke`,
+		"/reports":     `App\Http\Controllers\ReportController::index`,
+		"/absolute":    `Vendor\ThingController::go`,
+	} {
+		if got := routeByMethodPath(t, ff, "GET", path).Props["handler"]; got != want {
+			t.Errorf("GET %s handler = %v, want %s", path, got, want)
+		}
+	}
+	if h, ok := routeByMethodPath(t, ff, "GET", "/closure").Props["handler"]; ok {
+		t.Errorf("a closure route names no handler, got %v", h)
+	}
+}
+
+func TestLaravelRoutes_ControllerAndNamespaceGroups(t *testing.T) {
+	src := `<?php
+use App\Http\Controllers\OrderController;
+
+Route::controller(OrderController::class)->prefix('orders')->group(function () {
+    Route::get('/', 'index');
+    Route::post('/', 'store');
+});
+Route::group(['controller' => OrderController::class], function () {
+    Route::get('/latest', 'latest');
+});
+Route::namespace('Admin')->group(function () {
+    Route::get('/users', 'UserController@index');
+    Route::get('/root', '\App\RootController@index');
+});
+Route::get('/view', 'welcome');
+`
+	ff := extractLaravelRoutes([]byte(src), "routes/web.php")
+	for route, want := range map[[2]string]string{
+		{"GET", "/orders"}:  `App\Http\Controllers\OrderController::index`,
+		{"POST", "/orders"}: `App\Http\Controllers\OrderController::store`,
+		{"GET", "/latest"}:  `App\Http\Controllers\OrderController::latest`,
+		{"GET", "/users"}:   `Admin\UserController::index`,
+		{"GET", "/root"}:    `App\RootController::index`,
+	} {
+		if got := routeByMethodPath(t, ff, route[0], route[1]).Props["handler"]; got != want {
+			t.Errorf("%s %s handler = %v, want %s", route[0], route[1], got, want)
+		}
+	}
+	if h, ok := routeByMethodPath(t, ff, "GET", "/view").Props["handler"]; ok {
+		t.Errorf("a bare string outside a controller group names no handler, got %v", h)
+	}
+}
+
+// TestLaravelRoutes_ActionArray: the action array names its handler under 'uses' and
+// its route name under 'as'. A class already written under the group's namespace is
+// not placed under it a second time.
+func TestLaravelRoutes_ActionArray(t *testing.T) {
+	src := `<?php
+Route::group(['namespace' => 'Acme\Http\Controllers', 'prefix' => 'profile'], static function (): void {
+    Route::get('/', ['uses' => 'ProfileController@index', 'as' => 'profile.index']);
+    Route::post('/tokens', ['uses' => 'Acme\Http\Controllers\Profile\TokenController@store', 'as' => 'tokens.store']);
+    Route::get('/passport', ['uses' => '\Vendor\Passport\TokenController@show']);
+    Route::get('/inline', ['as' => 'inline', function () { return 1; }]);
+});
+`
+	ff := extractLaravelRoutes([]byte(src), "routes/web.php")
+	for route, want := range map[[2]string]string{
+		{"GET", "/profile"}:          `Acme\Http\Controllers\ProfileController::index`,
+		{"POST", "/profile/tokens"}:  `Acme\Http\Controllers\Profile\TokenController::store`,
+		{"GET", "/profile/passport"}: `Vendor\Passport\TokenController::show`,
+	} {
+		if got := routeByMethodPath(t, ff, route[0], route[1]).Props["handler"]; got != want {
+			t.Errorf("%s %s handler = %v, want %s", route[0], route[1], got, want)
+		}
+	}
+	if got := routeByMethodPath(t, ff, "GET", "/profile").Props["name"]; got != "profile.index" {
+		t.Errorf("route name = %v, want the action array's 'as'", got)
+	}
+	if h, ok := routeByMethodPath(t, ff, "GET", "/profile/inline").Props["handler"]; ok {
+		t.Errorf("an action array holding a closure names no handler, got %v", h)
+	}
 }

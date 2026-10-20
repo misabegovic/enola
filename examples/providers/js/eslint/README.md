@@ -15,7 +15,14 @@ It reads, never lints, unless asked: `ENOLA_ESLINT_RESULTS=<file>` or
 `<repo>/tmp/eslint-results.json` (written by `eslint -f json -o ...` in the
 lint step CI already runs), or `ENOLA_ESLINT_RUN=1` to run `npx eslint -f json`
 in every package that lists eslint. Without any of those it emits nothing and
-the census shows the provider as skipped.
+says it does not apply: the receipt records it with `applicable: false` and
+the missing results file as its `reason`, and the summary that ends the
+generate reads `eslint  not applicable: no ESLint results file`.
+
+In the `every` providers mode (see [PROVIDERS.md](../../../../docs/PROVIDERS.md))
+the engine offers eslint only where a results file exists, and never sets
+`ENOLA_ESLINT_RUN`: `npx` may download ESLint, and a snapshot installs
+nothing.
 
 A constraint then wraps a linter's rule with because-prose and a ratchet:
 

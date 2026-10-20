@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/explainers/common"
-	"github.com/enola-labs/enola/pkg/facts"
+	"github.com/enola-labs/enola/internal/facts"
 )
 
 const (
@@ -62,13 +62,6 @@ type moduleRaw struct {
 	in               int
 }
 
-// buildModuleGraph produces a deliberately bounded architecture map. It ranks
-// production modules by connectedness, keeps the most structurally relevant
-// ones, and renders only imports whose endpoints are both visible.
-func buildModuleGraph(store *facts.Store) *moduleGraphView {
-	return buildModuleGraphFocused(store, "")
-}
-
 func buildModuleGraphFocused(store *facts.Store, focus string) *moduleGraphView {
 	if store == nil {
 		return nil
@@ -80,7 +73,7 @@ func buildModuleGraphFocused(store *facts.Store, focus string) *moduleGraphView 
 
 	byName := make(map[string]*moduleRaw, len(mods))
 	for _, m := range mods {
-		if role, _ := m.Props[facts.PropModuleRole].(string); role == facts.ModuleRoleTest {
+		if role, _ := m.PropAny(facts.PropModuleRole).(string); role == facts.ModuleRoleTest {
 			continue
 		}
 		if _, exists := byName[m.Name]; !exists {
@@ -173,8 +166,8 @@ func buildModuleGraphFocused(store *facts.Store, focus string) *moduleGraphView 
 	const nodeW, nodeH, gapX, gapY, margin = 154, 36, 72, 34, 28
 	layers := make(map[string]int, len(ranked))
 	roles := make(map[string]string, len(ranked))
-	var clusters map[string][]string  // representative name -> sorted member names
-	var clusterOf map[string]string   // member name -> representative name
+	var clusters map[string][]string   // representative name -> sorted member names
+	var clusterOf map[string]string    // member name -> representative name
 	var clusterStats map[string][2]int // representative name -> [external fan-in, external fan-out]
 	if focused {
 		for _, r := range ranked {

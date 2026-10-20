@@ -1,0 +1,5 @@
+law: 1 rule · 1 breach · none excused
+read from the snapshot generated <TIME> — a rule declared since then is not counted here
+
+a-avoids-b [ratchet] — 1 breach reported, 0 excused · declared in enola-intent.yaml
+    because: a must stay deliverable without b

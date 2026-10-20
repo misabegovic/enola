@@ -76,6 +76,14 @@ rules:
 rule produces carries it, so a violation says why the rule exists
 rather than only that it was broken.
 
+`said:` is optional: the sentence a person said that the rule was
+written from. It is carried as written to the rule's findings and to
+its row in `constraints ledger --json`, and never read for meaning; the
+rule is what the form declares. A key the rule's shape does not have
+(a misspelling, or a key written for another tool) is read by nothing,
+so `constraints lint` names it as a warning with its file and line and
+exits as it would without it.
+
 **3. Check that it means what you think.** `constraints lint`
 validates the vocabulary and — when a snapshot exists — resolves each
 component against it, so you find out that a selector matches nothing
@@ -240,13 +248,26 @@ target — exactly as it was when the narrowing could only be one name.
 
 `service` scopes the selector to one repository of a multi-repo
 (append-mode) snapshot, by the exact repo label every appended fact
-carries. It ANDs with the other narrowings — members are facts of
+carries: the last segment of its remote, else its directory name,
+with its case and any dots kept (`web.example.ba`), so the service is
+written exactly as the repository is named, not as a lowercase token.
+It ANDs with the other narrowings — members are facts of
 that repo — and it is the one selector that makes `match` optional: a
 component with a `service` and no patterns is the whole service, and
 then it also contains the synthetic service node the cross-repo
 linker emits, so service-to-service `depends_on` edges are walkable
 like any other. A fact with no repo label matches no service, fail
 closed.
+
+A fact may be a member of more than one component. Membership is each
+selector's own answer, so two selectors that both admit a file both
+hold it, and each rule reads every component it names on its own:
+nothing is subtracted for the overlap. `forbid: a, to: b` therefore
+breaches on an edge from a member of both to another member of `b`,
+because the edge leaves a member of `a` and lands on a member of `b`.
+`forbid_reach` does not count a member of both reaching itself, even
+along a path that returns to it: a fact on both sides of the rule is
+an overlap in the declaration, not a measured reach.
 
 ### Selecting by concept: `where`
 
@@ -584,9 +605,17 @@ mandatory `because:` — the rationale every resulting finding surfaces,
 so a violation always says why the rule exists, not only that it was
 broken. The edge forms (`forbid`, `allow`, `protect`) also need a
 `via:` from the closed edge vocabulary: `calls`, `depends_on`,
-`implements`, `imports`. `implements` walks inheritance and mixin
+`implements`, `imports`, `reads`, `writes`. `implements` walks inheritance and mixin
 inclusion — the include/extend/prepend edges the Ruby extractor
 emits — so who-may-include rules need no form of their own.
+`reads` and `writes` say which table a method reads or writes: a
+method-to-storage edge the Ruby extractor emits only where a call's
+receiver names the model exactly. Only these three forms name them,
+since an access edge lands on storage where no walk continues; their
+far end is a storage component, and one selected by its `table` prop
+needs no `owns:`. A rule over either kind whose subject's repositories
+carry no access edge refuses with the cause `no_access_edges` instead
+of holding over nothing.
 
 ```yaml
 rules:
@@ -818,7 +847,13 @@ declared and each membership is either an exact fact name or a target
 grounded on the measured file it names, and the verdict says which —
 with the rule's `because` in the description. Target resolution fails
 closed: an edge whose target names nothing measured is skipped, never
-guessed into a violation.
+guessed into a violation. For `allow:`, whose breach is any measured
+landing outside `only:`, a target name is read the way a relation's
+`target_id` is: in the source fact's repository first, and in a union a
+`calls` or `instantiates` target counts as measured on another
+repository's fact only when that fact is a symbol, and never on a
+service node, so a Rust `default()` meeting another repository's job
+queue named `default` is skipped rather than read as a landing.
 
 ## Decorator discipline — the cached-getter example
 
@@ -1024,6 +1059,16 @@ the selector that did it, and the edges the file's facts make, read off
 the same membership the evaluator verdicts on, so the sentence and the
 verdict cannot disagree. `--json` prints the same as data.
 
+Given a declared part instead of a path, it names the part's members by
+file, its public face, the edges it makes by kind (`calls`, `imports`,
+`depends_on`, `implements`) with how many of each land on something
+measured, its fan-in and fan-out by part **and by kind**, and the laws
+naming it. The edges are read as the forbid and allow-only verdicts read
+them, so a fan-out of no calls into a part is the count a forbid over
+that pair would breach on; an edge landing on a measured fact in no part
+is counted under `(no part)`, and a fact of a kind no part holds as a
+member (a test reference that shares a member's name) adds nothing.
+
 **A strict Rails arrangement.** `rails-strict` ships as a recipe: the
 Rails laws, the request API kept out of models and services with
 `receiver: none`, no circle among the parts, and concerns that stay
@@ -1143,7 +1188,10 @@ never reads as compliance.
 - `cap_runtime: <component>` with `metric: queries` and `max: N` reads the
   `runtime-queries:` frames a runtime capture measured for files inside
   the component and names every frame over the budget. A snapshot with no
-  capture makes the rule unevaluable with the cause `no_runtime_capture`.
+  capture makes the rule unevaluable with the cause `no_runtime_capture`,
+  and one whose capture holds frames but none in the component's files
+  with the cause `no_frame_in_members`, since a capture keyed by spec files
+  never measured the part.
   Ruby: `billing.must_keep_budget metric: :queries, max: 20`.
 - `require_consumer: <route component>` breaches for every member route
   no loaded client calls, read from the cross-repository route match; a
@@ -1361,6 +1409,23 @@ answer for a repo it does not contain — and one 0.4 advisory
 (`Constraint component … names service … not present in this
 snapshot`) keeps the silence visible, exactly like the dead-selector
 advisory.
+
+The duplicate-name screen runs per repository, so two repositories of
+one snapshot may each declare a component of the same name with
+different selectors. A rule reads a component name in its own
+repository first, the one whose declaration compiled the rule, and
+otherwise in the one other repository that declares it, so a rule may
+still name a component only another repository declares. A name two
+or more other repositories declare, and the rule's own does not, has
+no single reading: the rule emits no verdict and one finding refuses
+it by name (`Constraint rule … cannot be evaluated: component … is
+declared by …, not by …`). Where a name is shared, listings and
+descriptions spell each declaration `name@repository` so the two stay
+apart. What a component selects does not change: `service` is the one
+way to narrow a component to a repository, and a component without
+one ranges over every repository in the snapshot wherever it is
+declared. Rule ids are not scoped this way; an id is the key `check`
+pairs findings on.
 
 ## Modes
 
@@ -1933,6 +1998,91 @@ a constraint proposal. Nothing is written to the repository's plugin
 and no ESLint configuration is touched: the scaffold is a starting
 point the operator reviews, like the would-be declaration.
 
+**Mining over the parts a declaration names.** Directories are the
+default grouping, two levels deep, and a repository whose parts are
+not directories gets nothing from them: a crate whose files all sit
+in `src/` is one group, so nothing between its parts is seen.
+`--by-component` groups by the parts the repository already declares
+instead: every component under `enola/constraints/` and in
+`enola-intent.yaml`, and every layer of a declared layer order, read
+as a part named `layer-<name>` over the layer's paths. Only the edge
+families are mined in this grouping. For each ordered pair of parts
+and each of `calls` and `imports` the reading is the one the forbid
+and allow-only verdicts make (the same membership, the same
+dependency carriers, the same target resolution), so a pair this
+mining reads as uncrossed is a pair a declared forbid over it lints
+clean.
+
+- **A zero is proposed when it rests on something.** Unlike the
+  directory grouping, a forbid with no crossing is proposed, because
+  the source part's outgoing count says whether the zero had the
+  chance to be anything else. Every candidate prints its **support**:
+  how many edges of the kind the source part makes, how many land on
+  something measured (the outgoing count, which is the candidate's
+  denominator and must clear `--min-support`), how many land inside
+  the part, in other parts and elsewhere, and how that kind resolves
+  over every declared part. The same fields are on the candidate's
+  `support` object in the `--jsonl` artifact. Each part also gets an
+  allow-only over the parts its edges do land in, at most four of
+  them, the part itself always allowed.
+- **Under the resolution floor, nothing is proposed.** The resolution
+  of a kind is the share of the declared parts' edges of that kind
+  that land on a measured fact or file. Under `--min-resolution`
+  (default 0.05) a zero is as much the graph's blindness as the
+  code's, so every candidate over that kind is listed as one that
+  **cannot be checked here**, with its support, and is not proposed.
+- **A crossing reads as a seam.** A pair the code already crosses is
+  held back and counted, because between declared parts a few edges
+  are usually the narrow dependency the drawing intends: over three
+  repositories whose pages draw their arrows, 33 of 39 such forbids
+  named a drawn pair. `--with-crossings` proposes them, with the
+  crossings named as exceptions as the directory grouping does.
+- **What is declared is not proposed.** A forbid the declaration
+  already states (a `forbid` or `forbid_reach` of the pair over the
+  kind, an `allow` whose `only:` leaves the target out, or, over
+  `imports`, a layer order placing the source below the target) and
+  an allow-only whose list contains a declared `only:` are listed as
+  **already declared**, with the rules that state them. That list is
+  also the measure of the miner: on a repository with written law it
+  says how much of the law the code alone would have proposed.
+
+The identity of a candidate in this grouping names it, so it never
+meets a directory candidate's: `forbid-edge||component|core|verbs|calls`
+and `allow-only||component|pic|calls`. A would-be rule over declared
+components carries only its `rules:` entry, since the components are
+declared already; one over a layer's part carries the component too.
+
+**A rejected candidate stays rejected.** `enola/mine-rejections.yaml`
+(beside `enola/constraints/`, never inside it, so the constraints
+loader cannot read a rejection as a declaration; `--rejections`
+names another file) holds the candidates a person decided against,
+in either grouping:
+
+```yaml
+rejections:
+  - identity: "forbid-edge||component|doors|entry|calls"
+    owner: "who rejected it"
+    since: "2026-10-14"
+    because: "why, in a sentence the next reader can weigh"
+```
+
+The fields are an exemption's, so the two decisions read alike. A
+candidate a rejection names is not proposed again and is listed as
+**rejected**, with who, when and why; a rejection naming no candidate
+of the run is listed and kept. Every field is required, `since` is a
+date, an identity appears once, and an unknown key is refused: a file
+that does not read whole stops the command with exit `2`, because a
+rejection silently dropped would put the candidate back in front of
+the person who said no. Mining reads the file and never writes it.
+
+The `--jsonl` artifact of a component run carries `grouping`,
+`min_resolution`, `with_crossings`, the parts, the declared edge
+rules and the resolution per kind in its header, and one line per
+candidate found and not proposed: `unchecked`, `declared` (with
+`declared_by`), `rejected` (with the rejection), and
+`stale-rejection`. A directory run writes none of these and reads as
+it always has.
+
 ## `constraints ledger` — how much of the law is being excused
 
 Every excuse this vocabulary admits already demands a signature. A suppression
@@ -1993,6 +2143,18 @@ record rather than to its findings.
 as a `law` object in `--format json`. A repository that declares no rules gets
 no line and no object at all: undeclared is unasked, and a zeroed ledger would
 read as a law with nothing wrong with it.
+
+**The breaches themselves, for a reader that parses.** `--json --breaches`
+adds a `breach_list` to each rule: one entry per breach its `breaches` count
+counted, each with `identity` (the finding identity `check` pairs a
+baseline's findings on, and the `enola/v1` fingerprint its SARIF prints),
+`title`, the evidence `file` and `symbol`, and `suppressed` when a
+suppression matched it. Exempted findings are not breaches and are not
+listed. The list comes from the loop that counts, so its length is the
+count, and it is sorted by identity then title. Titles that differ only in a
+number share an identity, as they do in `check`, and keep one entry each.
+Without the flag the JSON is unchanged, and `--breaches` without `--json` is
+refused: printed as text, the list would bury the rate under every breach.
 
 ## `plan` / `plan_check` — the pre-edit contract
 

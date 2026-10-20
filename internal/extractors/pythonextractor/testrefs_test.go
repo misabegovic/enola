@@ -22,13 +22,21 @@ func writePy(t *testing.T, repo, rel, content string) {
 	}
 }
 
+// testRefs returns the test_ref facts the pass emits; the test_case facts it
+// emits beside them are asserted by their own tests.
 func testRefs(t *testing.T, repo string, testFiles, prodFiles []string) []facts.Fact {
 	t.Helper()
 	ff, err := New().ExtractTestRefs(context.Background(), repo, testFiles, prodFiles)
 	if err != nil {
 		t.Fatalf("ExtractTestRefs: %v", err)
 	}
-	return ff
+	var refs []facts.Fact
+	for _, f := range ff {
+		if f.Kind != facts.KindTestCase {
+			refs = append(refs, f)
+		}
+	}
+	return refs
 }
 
 func targets(f facts.Fact) map[string]bool {
@@ -69,6 +77,27 @@ def test_it():
 	for _, r := range ff[0].Relations {
 		if r.Kind != facts.RelCalls {
 			t.Errorf("relation kind = %q, want only %q", r.Kind, facts.RelCalls)
+		}
+	}
+}
+
+func TestExtractTestRefs_PackageDefinitionsAndReexports(t *testing.T) {
+	repo := t.TempDir()
+	writePy(t, repo, "pkg/__init__.py", "from pkg.service import cognify\ndef package_helper(): pass\n")
+	writePy(t, repo, "pkg/service.py", "def cognify(x): return x\n")
+	writePy(t, repo, "tests/test_package.py", `
+from pkg import package_helper, cognify
+def test_package():
+    package_helper()
+    cognify(1)
+`)
+	ff := testRefs(t, repo, []string{"tests/test_package.py"}, []string{"pkg/__init__.py", "pkg/service.py"})
+	if len(ff) != 1 || ff[0].Kind != facts.KindTestRef {
+		t.Fatalf("expected only one test-ref fact: %+v", ff)
+	}
+	for _, target := range []string{"pkg/__init__.package_helper", "pkg/service.cognify"} {
+		if !targets(ff[0])[target] {
+			t.Errorf("missing package reference %s: %v", target, targets(ff[0]))
 		}
 	}
 }

@@ -90,6 +90,15 @@ func constraintDecl(components []ConstraintComponent, rules []ConstraintRule) *D
 	return &Declaration{Components: components, Rules: rules}
 }
 
+func TestDeclarationValidate_ServiceTakesEveryRepositoryLabel(t *testing.T) {
+	for _, label := range []string{"billing", "example.org", "Example_App-2", "web.example.ba"} {
+		decl := constraintDecl([]ConstraintComponent{{Name: "whole", Service: label}}, nil)
+		if err := decl.Validate(); err != nil {
+			t.Errorf("service %q is a label a repository's remote or directory can carry, got: %v", label, err)
+		}
+	}
+}
+
 func TestDeclarationValidate_ConstraintVocabulary(t *testing.T) {
 	good := ConstraintComponent{Name: "domain", Match: []string{"app/domain/**", "lib/pricing"}}
 	adapters := ConstraintComponent{Name: "adapters", Match: []string{"app/adapters/**"}}
@@ -108,8 +117,12 @@ func TestDeclarationValidate_ConstraintVocabulary(t *testing.T) {
 			[]ConstraintComponent{{Name: "domain", Match: []string{"app/domain/**"}, Kind: "class"}}, nil, "module, route, storage, symbol"},
 		"matchless component rejected": {
 			[]ConstraintComponent{{Name: "domain"}}, nil, "at least one match"},
-		"service must be a lowercase token": {
-			[]ConstraintComponent{{Name: "billing-internal", Service: "Billing"}}, nil, "lowercase token"},
+		"service must be a repository label": {
+			[]ConstraintComponent{{Name: "billing-internal", Service: "billing web"}}, nil, "repository label"},
+		"service path rejected": {
+			[]ConstraintComponent{{Name: "billing-internal", Service: "org/billing"}}, nil, "repository label"},
+		"service of dots alone rejected": {
+			[]ConstraintComponent{{Name: "billing-internal", Service: ".."}}, nil, "repository label"},
 		"via vocabulary is closed": {
 			[]ConstraintComponent{good, adapters},
 			[]ConstraintRule{{ID: "r", Forbid: "domain", To: "adapters", Via: "uses", Because: "x"}}, "calls, depends_on, implements, imports"},

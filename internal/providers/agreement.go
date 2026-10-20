@@ -97,7 +97,7 @@ func pairAcrossProviders(names []string, kept [][]facts.Fact, records []facts.Pr
 	aliasAt := map[string]bool{}
 	for p, ff := range kept {
 		for i, f := range ff {
-			if f.Kind == facts.KindDependency && len(f.Relations) == 0 && f.Props[PropResolutionCause] == "alias" {
+			if f.Kind == facts.KindDependency && len(f.Relations) == 0 && f.PropAny(PropResolutionCause) == "alias" {
 				aliasAt[fmt.Sprintf("%s\x00%d", f.File, f.Line)] = true
 			}
 			for r, rel := range f.Relations {
@@ -114,6 +114,17 @@ func pairAcrossProviders(names []string, kept [][]facts.Fact, records []facts.Pr
 				byKey[key] = append(byKey[key], ref)
 				s := site{file: f.File, method: norm.method, line: f.Line}
 				bySite[s] = append(bySite[s], ref)
+			}
+		}
+	}
+
+	engines := make([]string, len(kept))
+	for p, ff := range kept {
+		engines[p] = names[p]
+		for _, f := range ff {
+			if engine, ok := f.PropAny(PropEngine).(string); ok && engine != "" {
+				engines[p] = engine
+				break
 			}
 		}
 	}
@@ -147,6 +158,10 @@ func pairAcrossProviders(names []string, kept [][]facts.Fact, records []facts.Pr
 			providers = append(providers, p)
 		}
 		sort.Ints(providers)
+		providers = onePerEngine(providers, engines)
+		if len(providers) < 2 {
+			continue
+		}
 		// One-to-one in producer order: a line with two calls of one method
 		// pairs at most as many times as the smallest producer read.
 		rounds := len(byProvider[providers[0]])
@@ -171,7 +186,7 @@ func pairAcrossProviders(names []string, kept [][]facts.Fact, records []facts.Pr
 			if f.Props == nil {
 				f.Props = map[string]any{}
 			}
-			f.Props[PropResolutionAgreement] = AgreementLevel
+			f.SetProp(PropResolutionAgreement, AgreementLevel)
 			for _, p := range providers {
 				ref := byProvider[p][round]
 				paired[ref] = true
@@ -213,9 +228,9 @@ func pairAcrossProviders(names []string, kept [][]facts.Fact, records []facts.Pr
 	})
 	for _, s := range sites {
 		var unpaired []callRef
-		seen := map[int]bool{}
+		seen := map[string]bool{}
 		for _, ref := range bySite[s] {
-			seen[ref.provider] = true
+			seen[engines[ref.provider]] = true
 			if !paired[ref] {
 				unpaired = append(unpaired, ref)
 			}
@@ -282,6 +297,22 @@ func pairAcrossProviders(names []string, kept [][]facts.Fact, records []facts.Pr
 		kept[p] = out
 	}
 	return kept
+}
+
+// onePerEngine keeps the first producer in name order of each engine: two
+// names one engine answers under read a call site once, and pairing them would
+// stamp as agreed what nobody read twice.
+func onePerEngine(providers []int, engines []string) []int {
+	seen := map[string]bool{}
+	out := providers[:0:0]
+	for _, p := range providers {
+		if seen[engines[p]] {
+			continue
+		}
+		seen[engines[p]] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 // sameButForMarkers reports whether the differing receivers are one spelling

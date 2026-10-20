@@ -201,3 +201,32 @@ func TestMineRanksByConfidenceTimesSupport(t *testing.T) {
 		}
 	}
 }
+
+// A Rust call to `src.run`, which validate.rs and search.rs both declare,
+// reaches the laws as a dependency fact carrying the file it resolved into.
+// Mining read the name's first file and would attribute the edge to it.
+func TestCollectEdgesReadsACarriedTargetFile(t *testing.T) {
+	sym := func(name, file string) facts.Fact {
+		return facts.Fact{Kind: facts.KindSymbol, Name: name, File: file}
+	}
+	call := func(targetFile string) facts.Fact {
+		return facts.Fact{Kind: facts.KindDependency, Name: facts.CallByFileName("app/core/drive.rs", "app/verbs.run", targetFile),
+			File: "app/core/drive.rs", Props: map[string]any{facts.PropTargetFile: targetFile},
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "app/verbs.run"}}}
+	}
+	s := newScope([]facts.Fact{
+		sym("app/core.drive", "app/core/drive.rs"),
+		sym("app/verbs.run", "app/aaa/run.rs"),
+		sym("app/verbs.run", "app/verbs/validate.rs"),
+		call("app/verbs/validate.rs"),
+		call("app/zzz/missing.rs"),
+	}, "", Config{}, nil)
+	var got []string
+	for _, e := range s.collectEdges() {
+		got = append(got, e.source+" -> "+e.tgtCluster)
+	}
+	want := []string{facts.CallByFileName("app/core/drive.rs", "app/verbs.run", "app/verbs/validate.rs") + " -> app/verbs"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("edges %v, want %v: the carried file places the target, and a file that does not declare it places nothing", got, want)
+	}
+}

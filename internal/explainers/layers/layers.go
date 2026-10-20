@@ -543,7 +543,7 @@ func (d patternDef) cohort(modules []facts.Fact) ([]facts.Fact, map[string]bool)
 	out := make([]facts.Fact, 0, len(modules))
 	langs := map[string]bool{}
 	for _, m := range modules {
-		lang, _ := m.Props["language"].(string)
+		lang, _ := m.PropAny("language").(string)
 		if !d.describes(lang) {
 			continue
 		}
@@ -1238,7 +1238,7 @@ func thickEnough(best *archPattern) *archPattern {
 func presentFrameworks(ff []facts.Fact) map[string]bool {
 	out := make(map[string]bool)
 	for _, f := range ff {
-		if fw, ok := f.Props["framework"].(string); ok && fw != "" {
+		if fw, ok := f.PropAny("framework").(string); ok && fw != "" {
 			out[fw] = true
 		}
 	}
@@ -1302,6 +1302,7 @@ func (e *LayerExplainer) detectViolations(scoped []facts.Fact, pattern *archPatt
 	seen := make(map[string]bool)
 	var violations []violation
 	var conf conformance
+	imported := facts.NewImportTargets(func() []facts.Fact { return scoped })
 
 	for _, dep := range scoped {
 		if dep.Kind != facts.KindDependency {
@@ -1336,7 +1337,12 @@ func (e *LayerExplainer) detectViolations(scoped []facts.Fact, pattern *archPatt
 
 			rawTarget := rel.Target
 			target := rawTarget
-			if strings.HasPrefix(target, ".") {
+			if dir, carried := imported.Dir(dep, rawTarget); carried {
+				if dir == "" {
+					continue
+				}
+				target = dir
+			} else if strings.HasPrefix(target, ".") {
 				target = common.ResolveRelativeImport(sourceModule, target)
 			}
 
@@ -1508,11 +1514,6 @@ func resolveLayerModuleFor(dep facts.Fact, modules map[string]string) (string, b
 	return "", false
 }
 
-// matchesLayer checks if a module path contains any of the given patterns.
-func matchesLayer(modulePath string, patterns []string) bool {
-	return matchesLayerIn(modulePath, patterns, false)
-}
-
 // matchesLayerIn compares whole path segments, and with dotted=true each
 // dot-separated component of a segment as well.
 func matchesLayerIn(modulePath string, patterns []string, dotted bool) bool {
@@ -1541,7 +1542,7 @@ func moduleProjects(ff []facts.Fact) map[string]string {
 		if m.Kind != facts.KindModule {
 			continue
 		}
-		if p, ok := m.Props["project"].(string); ok && p != "" {
+		if p, ok := m.PropAny("project").(string); ok && p != "" {
 			out[m.Name] = p
 		}
 	}

@@ -1,8 +1,16 @@
 package engine
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/enola-labs/enola/internal/facts"
 )
@@ -29,6 +37,9 @@ type Drift struct {
 	Removed  []string // in the snapshot, absent now
 	Modified []string // present in both, different content hash
 	Unknown  bool     // no recorded hashes to compare against
+	// Reason says why drift is Unknown, when it is for a reason other than the
+	// snapshot recording no hashes.
+	Reason string
 }
 
 // Any reports whether any file was added, removed, or edited. It is false when
@@ -47,6 +58,9 @@ func (d Drift) Count() int {
 // message becoming unbounded on a large refactor.
 func (d Drift) Summary(maxPaths int) string {
 	if d.Unknown {
+		if d.Reason != "" {
+			return d.Reason
+		}
 		return "the snapshot recorded no file hashes, so whether it still matches the working tree cannot be verified"
 	}
 	if !d.Any() {
@@ -103,7 +117,7 @@ func (d Drift) Summary(maxPaths int) string {
 // ABOUT to make a claim about the change — diff_snapshot, and anything else computing
 // its own delta — rather than part of the per-tool-call freshness banner: the banner is
 // a cheap proactive nudge, this is an exact answer at a decision point. See
-// internal/drift for the shared caller.
+// addDriftWarning in internal/server for the caller.
 //
 // The snapshot's recorded hashes cover the repo that snapshot indexed. In multi-repo
 // (append) mode that is the most recently indexed repo, so a caller asking about a
@@ -127,12 +141,22 @@ func (e *Engine) DriftFromMeta(repoPath string, meta facts.SnapshotMeta) (Drift,
 	if len(recorded) == 0 {
 		return Drift{Unknown: true}, nil
 	}
+	// The walk below applies THIS engine's ignore globs. A snapshot taken under
+	// another set recorded files this walk skips, or skipped files it walks, and every
+	// one of them would read as removed or added: a server whose config ignores *.md
+	// reported 139 files of a repository indexed under another config as removed, all
+	// of them on disk. Under a different ignore set the comparison measures the config,
+	// not the tree.
+	if meta.IgnoreGlobHash != "" && meta.IgnoreGlobHash != computeIgnoreGlobHash(e.cfg) {
+		return Drift{Unknown: true, Reason: "the snapshot was taken under different ignore globs than this server's config, " +
+			"so whether it still matches the working tree cannot be verified here"}, nil
+	}
 
-	files, _, _, _, err := e.walkRepo(repoPath)
+	files, _, _, _, err := e.walkRepo(context.Background(), repoPath)
 	if err != nil {
 		return Drift{}, fmt.Errorf("walking %s: %w", repoPath, err)
 	}
-	current := e.computeFileHashes(repoPath, files)
+	current := e.driftHashes(context.Background(), repoPath, files)
 
 	var d Drift
 	for path, curHash := range current {
@@ -155,4 +179,78 @@ func (e *Engine) DriftFromMeta(repoPath string, meta facts.SnapshotMeta) (Drift,
 	sort.Strings(d.Removed)
 	sort.Strings(d.Modified)
 	return d, nil
+}
+
+// driftRacyWindow is how recent a file's modification time may be before its hash
+// is not trusted to stand for it: a coarse filesystem clock can give an edit made
+// after a read the same modification time as the read.
+const driftRacyWindow = 2 * time.Second
+
+type hashedFile struct {
+	size  int64
+	modNs int64
+	hash  string
+}
+
+// driftMemo remembers what the drift walk last hashed, per file, so an engine that
+// keeps running and answers many calls reads a file again only after it changed.
+// Only the drift walk uses it: a snapshot's own hashes are always read from the bytes.
+type driftMemo struct {
+	mu    sync.Mutex
+	files map[string]hashedFile
+	reads atomic.Int64
+}
+
+func (m *driftMemo) known(path string, info os.FileInfo) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.files[path]
+	if !ok || h.size != info.Size() || h.modNs != info.ModTime().UnixNano() {
+		return "", false
+	}
+	return h.hash, true
+}
+
+func (m *driftMemo) remember(path string, info os.FileInfo, hash string) {
+	if time.Since(info.ModTime()) < driftRacyWindow {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.files == nil {
+		m.files = make(map[string]hashedFile)
+	}
+	m.files[path] = hashedFile{size: info.Size(), modNs: info.ModTime().UnixNano(), hash: hash}
+}
+
+// driftHashes is the current content hash of each file named, as computeFileHashes
+// gives it, reading only the files that are not the file last hashed here: a file
+// with the size and modification time it had when it was last read keeps its hash.
+// A file modified within driftRacyWindow of being read is read again next time.
+func (e *Engine) driftHashes(ctx context.Context, repoPath string, files []string) map[string]string {
+	hashes := make(map[string]string, len(files))
+	for _, rel := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		abs := filepath.Join(repoPath, rel)
+		info, err := os.Stat(abs)
+		if err != nil {
+			continue
+		}
+		if hash, ok := e.drift.known(abs, info); ok {
+			hashes[rel] = hash
+			continue
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		hash := hex.EncodeToString(sum[:])
+		e.drift.reads.Add(1)
+		e.drift.remember(abs, info, hash)
+		hashes[rel] = hash
+	}
+	return hashes
 }

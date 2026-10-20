@@ -7,6 +7,601 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.31 — 2026-10-16
+
+**More routes bind to their handlers, more entries reach `enola flows`, and TypeScript extracts twice as fast**
+
+- `--help` anywhere in the arguments prints the command's help instead of running it.
+  `baseline pin`, `constraints lint` and `upgrade` used to run. New: `enola help
+  [command]` and `enola --help <command>`. Every command's help has examples and
+  see-also; `providers` and `hook` have help.
+- TypeScript extraction is about 2x faster with the same output. tree-sitter now uses
+  its own allocator for every language.
+- Route binding:
+  - Scala: http4s case clauses and pekko-http blocks are handler symbols; Scalatra
+    routes are extracted and bound.
+  - .NET: a minimal-API lambda or local-function handler is a symbol that owns its calls.
+  - Java gRPC services extending a generated `ImplBase` (including Dubbo Triple) bind.
+  - Next.js: detected per package, pages bind to their component, re-exported pages
+    bind, `route.ts` is one route per exported verb. Apps under `examples/`, `samples/`
+    or `demos/` are skipped.
+  - SvelteKit form actions are POST routes of type `action`.
+  - Go: a local router attached with `Mount` serves under the mount path; a method
+    value on a local struct names its handler; a concatenated path is kept only when
+    every part is known.
+  - Dart go_router: the handler is the screen, not the page wrapping it.
+  - WordPress: hooks bind to string, array and REST callbacks. Hooks are route type
+    `hook` and stay out of HTTP matching and coverage.
+- Flow entries:
+  - TypeScript MCP tools (`.tool`, `.registerTool`, project wrappers).
+  - Python argparse subcommands and command tables; click commands named by their
+    group path, a root group by its console script, imported click targets followed.
+  - Kotlin: a capitalized call of a declared function is a call (Compose).
+  - Xcode preview apps are `side`. A JVM package's organisation segments no longer
+    mark an app `side`.
+- TypeScript I/O: Drizzle query chains are read, `performs_io` follows calls through
+  interfaces to implementers (`io_members`), a NestJS `setGlobalPrefix` applies to
+  controller routes, name-only I/O into non-ORM packages is dropped, and a setter's
+  I/O stays off its getter. Dart retrofit/chopper methods are I/O.
+- `coverage --unresolved` lists each unresolved call site.
+- Fixed: Python annotations with quoted forward references or nested generics named
+  bogus targets; Svelte/Vue scripts did not resolve namespace member calls.
+- `cacheVersion` moves to `v379`: every repository re-extracts once.
+
+## v0.4.30 — 2026-10-14
+
+**`enola flows` lists the ways into a program and what each one reaches**
+
+- New command `enola flows`. An entry is a served route's handler, a `main`, a command,
+  an MCP tool or a symbol a framework invokes; its flow is every symbol its calls reach.
+  Flows are ranked by reach. `--show` prints one flow with its stages and a summary,
+  `--through` lists the flows that reach a symbol, `--top` limits the list, `--json`
+  emits the report.
+- Ranking: the program's own flows first, `side` flows (examples, scripts, migrations,
+  tooling) last. In a program that serves routes, commands rank after routes. Entries
+  that reach the same symbols fold into one flow (`also`), and a flow at least 90%
+  inside a larger one is marked `inside`. Each flow counts its unresolved calls.
+- `.enola/flows.json`, written by the new `flows` renderer, on by default: every flow,
+  the first 50 with stages and a summary. `external_calls` is the part of the unresolved
+  calls that go into imported packages, filled for Go and TypeScript. Schema in
+  `docs/schema/flows.md`.
+- Entries: commands, named as typed (Go string-keyed dispatch with subcommands, cobra,
+  urfave/cli, click, typer); MCP tools as `tool <name>` (Go `AddTool`, Python `.tool`);
+  Android activities, SwiftUI Apps, XAML Applications, and `Main` on .NET. Rails
+  callbacks are not entries.
+- The walk follows an interface method into its implementations when there are at most
+  three, walks an entry class through its methods, and follows the widgets a Flutter
+  widget constructs.
+- Symbols carry a `doc` prop, the first paragraph of their comment or docstring: Go,
+  Python, TypeScript, Ruby, Java, C# and PHP. `diff_snapshot` ignores a changed `doc`.
+- Go routes: the handler is the last argument after middleware; a mount's function
+  literal and a local route closure compose their path; the module's own router package
+  is recognized, with or without a framework import; `Combo` chains,
+  `Mount("/p", pkg.Routes())`, `PathGroup` with `MatchPath`, paths in constants, locals
+  and raw strings are read. A wrapped handler names the function inside the wrapper. A
+  verb with no handler is not a route.
+- Route binding: `handled_by` names a declared symbol or is not emitted.
+  - Rails: the handler is looked for in the engine's isolated namespace, on the
+    controller's ancestors and under an acronym casing; a singular resource binds to its
+    pluralized controller.
+  - Express, Fastify, Hono, Koa: the handler is bound. A router imported through a
+    barrel composes, and so does a mount prefix that appends a string constant.
+  - Axum and utoipa routes are bound. A router built in `#[cfg(test)]` is not a route.
+  - Nuxt and SvelteKit pages are bound to their component, a SvelteKit page also to its
+    `load`.
+  - Dart and Angular: a page named by a bare or package-qualified name resolves to the
+    one type that fits, or loses the relation. 239 relations named no symbol.
+  - The HTTP linker prefers a repository that registers a path over one that only
+    documents it.
+- Call resolution: Ruby calls on self, constants looked up from the caller's namespace
+  outward, and `Const.new.call`; Laravel static calls on the application's own facades
+  reach the class bound in a service provider; TypeScript calls on a namespace import of
+  the repository, and method calls on a local built with `new C()` or annotated `C`.
+- Fixed: a `doc` from a comment in another encoding is stored as valid UTF-8, the same
+  on a cold run and from the cache.
+- `cacheVersion` moves to `v351`: every repository re-extracts once.
+
+## v0.4.29 — 2026-10-12
+
+**A Laravel endpoint walks from its URL to its tables, and dead-code and impact follow PHP's wiring**
+
+- `enola endpoint` and `endpoint_impact` work on Laravel: route, controller, models,
+  associated models, tables. Every PHP route used to stop at the controller.
+- The endpoint walk starts from the method a route is bound to, not from every method
+  of its controller. Rails routes are walked as before.
+- Laravel routes: every PHP file under a `routes` directory is read, not four fixed
+  names. The handler is the fully-qualified `Class::method`, with a `handled_by` edge
+  to the method, on the parent class or trait for an inherited action. Action arrays
+  (`['uses' => 'Ctrl@method']`), invokable controllers, and `Route::controller` and
+  `Route::namespace` groups are read.
+- A Laravel routes file is registered under whatever loads it: a group handed the
+  file, `withRouting` (the api file under `apiPrefix`), or a `require` inside a group's
+  closure. Its routes carry that prefix. `routes/api.php` was stored without `/api`.
+- Laravel resources register only the actions `->only` and `->except` leave, name each
+  parameter after the singular of its segment, and nest on a dot
+  (`/albums/{album}/songs/{song}`). `update` answers to PUT and PATCH.
+  `Route::resources` and `apiResources` are read.
+- Eloquent: a concrete class that reaches an Eloquent base class is a model, with the
+  table it declares or the one Eloquent derives. Relation methods are associations.
+- PHP calls on `$this`, on a property or parameter of declared type, and on an object
+  created in place resolve to the method they run. The edge is added beside the bare
+  method name. A receiver typed by an interface reaches its implementer when exactly
+  one class implements it.
+- PHP class names resolve through the imports, then the namespace. `extends Controller`
+  in the same namespace matched no symbol.
+- PHP: a class gains an `injects` edge to each class its constructor takes, and a
+  `names` edge from whatever writes `Foo::class`, an enum case, a class constant or a
+  static property, file scope included.
+- `Class::method` belongs to its class in the graph, so `impact` on a PHP or C++ class
+  reaches the callers of its methods. C++ method fan-in rises by one.
+- dead-code: the receiver of a `Class::method` call is a use of the class, a route
+  handler is a use of its controller, and PHP magic methods are not candidates. A Ruby
+  class referenced as `Foo::CONST` is credited too. Candidates on six PHP repositories
+  fell by 32% to 56%.
+- Cycle and dependency-depth findings print paths along real edges. The members of a
+  cyclic component were joined in name order, which named imports that do not exist.
+  A cycle finding prints one cycle walked along edges, with the members beside it when
+  the component holds more than that cycle. A depth chain prints a cyclic component as
+  one braced group. Titles are unchanged; a pinned baseline shows these findings as
+  altered once.
+- The `forbid_cycles` rule picks the edge to cut from every edge of the circle, not
+  only between neighbours in name order.
+- Python: references from configuration files (YAML, INI, Dockerfile) mark configured
+  entry points as used, and test references include names passed without a call.
+- JavaScript: a repository of plain JavaScript with no `package.json` or tsconfig is
+  detected. Declarations inside a wrapper function (a script's immediately called
+  function, a universal-module factory) are extracted, and what the wrapper returns or
+  assigns to the global object or the CommonJS module is exported.
+- Fixed: the Swift, Scala (Play routes), Dart (pubspec), Kotlin and JVM line readers
+  stopped at a line over their length limit and dropped the rest of the file.
+- Benchmarks: the corpus is 95 repositories, with four Laravel applications added, and
+  95 of 95 reproduce. `BENCHMARKS.md` gains a measurement from real agent sessions.
+- `cacheVersion` moves to `v332`: every repository re-extracts once.
+
+Thanks to [Kairo-blei](https://github.com/Kairo-blei) for the four reports behind the
+PHP and cycle work.
+
+## v0.4.28 — 2026-10-11
+
+**Performance findings rest on facts about the callee, and a loop nest states its depth instead of a Big-O**
+
+- `analyze_performance`: a call-in-loop finding is confirmed only by a storage fact or a
+  resolved callee marked `performs_io`. A method name, a receiver token or an
+  association name still reports the call, at medium. Each callee in a finding carries
+  the basis it rests on.
+- `performs_io` is computed by one closure for every language, now including Go, Java
+  and Kotlin. A bodiless interface or abstract method continues to its implementers; a
+  concrete base method does not inherit an override's I/O. Go symbols gain `io_direct`
+  and `io_calls`.
+- Nested-loop and compounded findings state a depth. `big_o` is set only for a call in
+  a single loop and for recursion, and is absent from the other kinds in JSON output.
+  The implied complexity was right for 8 of 181 hand-read findings.
+- A call's scaling depth is the loops around the call, not the function's deepest nest.
+  Loops that add no factor are not counted: a loop over what the outer element holds, a
+  loop fixed by name, a batch or paging loop, a poll, a retry, a cursor walk. A call
+  made once per batch is not per element.
+- A `for` loop is fixed-count only when both ends are constant. Java, C/C++, C# and PHP
+  read a descending loop to a literal as constant and dropped it. This adds findings.
+- Recursion is flagged only from a call form that can reach the function (Rust, Kotlin,
+  PHP, C#, Python), and never in a branch-free function.
+- Findings deeper than O(n²) are held at medium for now: 2 of 291 hand-read ones were
+  correct.
+- One-shot code is recognised in more places: Rails `db/` migrations and rake tasks,
+  `cli` and `docs` directories, CI actions. `zz_generated.*` is generated code.
+- `analyze_performance` takes `kind` (comma-separated finding kinds) and `offset`. The
+  1000 cap made a large repository's result a ranked window; pages are now stable. It
+  lists every query-loops finding, not the explainer's fixed number per repository.
+- Java, C# and Kotlin: a call on a receiver of declared type is a `calls` edge to the
+  declaration in this repository. Kotlin supertypes written by simple name become
+  `implements` edges to the type they name.
+- TypeScript: a default import binds for direct calls, and a call on a same-file
+  function's result resolves by its declared return type. Python: receivers are typed
+  by return annotations, module globals and `self` attributes.
+- Go client routes: a URL built by concatenation is read left to right, each value
+  after the path starts written as a `{}` parameter. It was read as its rightmost
+  absolute literal.
+- Cross-repo HTTP: a suffix join is refused when both dropped prefixes state a version
+  and the versions differ. `/api/v1/orders/{}` matched `/api/v2/orders/{}`. The call is
+  reported with `unmatched_reason: version_mismatch`.
+- Ruby HTTP clients: a client read off a constant (`Billing.client.post(...)`) is a
+  receiver, and constant paths resolve repository-wide (`PATH`, `Foo::PATH`,
+  `self.class::PATH`), one route per subclass that assigns it. Coverage is reported as
+  `ruby:http-client-constants`.
+- OpenAPI: `$ref` path items are followed, so split specs extract their routes. Specs
+  under `openapi/clients/` are client specs; read as server routes they made a
+  repository the provider of every API it calls.
+- Rails: a canonical action declared by symbol (`get :index`) inside a member or
+  collection scope, or with `on:`, is served at the scope's own path.
+- Ruby: an association inside `with_options` takes its `class_name`. It was dropped,
+  along with every `through:` over it.
+- C++: a type name declared in several directories resolves per reference: the only
+  copy with the member, else the caller's directory, else the one copy its includes
+  reach, else unresolved. Every reference used to bind to the last directory indexed.
+- C++: definitions displaced by parse-error recovery are extracted in the enclosing
+  scope. A function the parser could not close swallowed every later definition.
+- Go: struct field edges name every declared type the field mentions, and no longer
+  `pkg.string` for a builtin or `pkg.` for a map, slice, chan or func type. A call
+  through a parameter or a local closure emits no edge.
+- Rust: functions local to test modules stay out of production facts. ABI, framework,
+  `ctor`, `divan` and `starlark` registrations are marked as runtime entrypoints, and
+  calls evaluated by `tracing::instrument` are recorded. A function declared inside a
+  `const` or `static` initializer carries `compile_time_context` and ranks as a
+  low-confidence orphan. Foreign declarations are excluded.
+- Fixed: `enola check --fail-on=intent` exited `0` on a failed claim. The diff filed
+  intent findings as incidental; they never are now, like constraint findings.
+- Fixed: `enola check` printed a warning and exited `0` against a union baseline that
+  lost a member, and `compare_receipts` reported the pair as equivalent inputs.
+- Fixed: history revisions sharing a timestamp were ordered by id, so blame could read
+  two snapshots taken within a second in reverse and `--keep-last` could keep the wrong
+  one. `history gc <store> --keep-last N`, the documented form, failed to parse.
+- `pkg/diff` and `pkg/facts` are removed. They re-exported internal packages.
+- Contract goldens pin every MCP tool's answer and every command's output and exit
+  code, byte for byte. Architecture tests ratchet hub import counts and the longest
+  import chain.
+- README restructured around what a reader wants to do.
+- Built with Go 1.26.9, for the standard library fixes `govulncheck` reports.
+- `cacheVersion` moves to `v318`: every repository re-extracts once.
+
+Thanks to [Gert Lõhmus](https://github.com/GertL) for the Rust work and
+[Vasilije](https://github.com/Vasilije1990) for the README.
+
+## v0.4.27 — 2026-10-05
+
+**`enola impact` answers "what breaks if I change this?" from the command line, and a name resolves the same however the graph was loaded**
+
+- `enola impact <target> [repo|config]`: everything that transitively depends on a
+  symbol, type or module, grouped by hop depth. Until now only an agent holding an MCP
+  session could ask; a pre-commit hook, a CI step or a review bot can ask it too. It
+  prints a summary by default, the dependents by depth with `--list`, and with `--json`
+  the document `impact_analysis` returns as `output_mode=full`. The command and the tool
+  run the same code, and a test holds their output together.
+- `enola impact` takes a source file as its target. A file is not a node, so a path
+  taken from a diff matched nothing. It now walks back from every symbol the file
+  declares and lists them as seeds. A file declaring no symbol is an error, not an empty
+  answer.
+- The command exits `2` when nothing was traversed: the target matched nothing, or too
+  many nodes to pick from. An empty list that exited `0` would read as "nothing depends
+  on this".
+- Name resolution no longer depends on how the graph got into memory. A graph restored
+  from disk and one just generated differ in their label map and in the order of their
+  facts, and `impact_analysis`, `traverse`, `find_path` and `explore` could answer the
+  same question two ways. Fixed: the `<label> <term>` shorthand found nothing straight
+  after `generate_snapshot` on one repository, and an absolute path found nothing in a
+  single repository restored from disk.
+- Candidates rank in a total order (score, then the shorter name, then name, kind, file,
+  repo and line), so a tie no longer falls to store order. A match that keeps the case
+  the term was typed in outranks one that only matches folded, so `edgeRoles` and
+  `EdgeRoles` each resolve to themselves. A scoped query ranks before it cuts to 500
+  matches, so the exact name is never the one dropped.
+- A capped walk admits the same nodes on every run: a node's edges are sorted by
+  neighbour and relation at build instead of sitting in store order. `explore` lists in
+  source order and counts every fact; it summarised the first 100 or 500 under the full
+  total.
+- Go: a method call resolves through the types the source declares. A call on a
+  parameter was recorded as the literal `r.Method`, and a call on a call's result not at
+  all, so the method read as uncalled. Parameters, named results, declared return types,
+  type assertions and variables assigned from a call now give the receiver its type, and
+  a type alias resolves to the type it names.
+- Python and C++: a function used as a value counts as used. Python parameter defaults
+  and module-level assignment values, and C++ file-scope `static_assert` declarations
+  and non-type template defaults, emit edges, so a function reached only through them no
+  longer appears dead.
+- Fixed: a truncated impact summary reported the walk's visited count as the number
+  shown (676 under a cap of 200), fact kinds were pluralised as "dependencys" and
+  "storages", and a derived module edge in an appended repository was written without
+  its repository label.
+- Consumer contract tests run the built binary as a snapshot consumer does and assert
+  invariants across `facts.jsonl`, `receipt.json` and `insights.json`, for one
+  repository and for a cluster.
+- Docs: [Using Enola alongside Cognee](docs/COGNEE.md), for people who got the binary
+  through Cognee's `enola-cli` dependency.
+- `cacheVersion` moves to `v290`: every repository re-extracts once.
+
+Thanks to [Tal Rotbart](https://github.com/redbeard) for `enola impact` and the label
+shorthand fix, his first contribution to enola.
+
+## v0.4.26 — 2026-09-29
+
+**Cross-repo links reach the function that makes a call and the one that serves it**
+
+- Client routes carry `matched_routes`: the server routes the cross-repo HTTP linker
+  resolved each call to, by repo, name, file and method, with a confidence and the
+  target route's fact id. Only the chosen provider's routes are listed, so a call
+  several repositories serve with nothing to choose between them has none.
+- Client routes carry `caller` and `caller_id`: the function whose body makes the call.
+  Written for TypeScript (fetch, axios, Angular `HttpClient`, configured clients),
+  Kotlin Retrofit, Swift URLSession, Java RestTemplate and Feign, Dart and Python. A
+  Retrofit or Feign route's caller is the interface method it annotates.
+- Python: `requests`, `httpx` and `aiohttp` calls are client routes
+  (`python-http-client`). A Python service never appeared as the caller of another
+  repository before.
+- Server routes name their handler with `handled_by`: at extraction for NestJS,
+  Inversify, Spring, Python route decorators and Symfony attributes, and in the binder
+  for Go routes registered with a package function and for Play routes written
+  `<type fqn>.<method>`. On gitea 699 of 758 routes bind (3 before), on lila 912 of 923
+  (0 before). An edge is written only when a symbol carries exactly the handler's name.
+- Python: a route handler defined inside a router factory function is a symbol, so its
+  routes bind and the calls in its body are its own rather than the factory's.
+- TypeScript: a name imported from a package is called by `<package>.<name>`. It fell
+  through to a name in the importing directory, which pointed at unrelated local
+  symbols. Framework aliases (`$lib`, `~`, `@/`, `#`) and baseUrl paths resolve to the
+  file they name.
+- TypeScript: `this.<field>.<method>()` resolves through the field's stated type (a
+  constructor parameter property, an annotation, `new` or `inject()`), and a function
+  held by an object literal is a symbol named `<decl>.<key path>`, so API client
+  objects, store actions and RTK Query endpoints name their calls. On grafana the
+  client calls naming their caller go from 328 to 982 of 1,005.
+- Cross-repo `target_id`: a reference written the way the consumer's source spells it
+  (a Go import path, an npm package, a Java, Scala or .NET qualified name) resolves to
+  the one fact the providing repository declares for it. The target keeps its spelling,
+  so it cannot collide with the consumer's own facts. The graph follows the same
+  aliases, and a restored graph rebuilds them.
+- Java, Scala and .NET clusters: an import names its provider by qualified name, so
+  these clusters get the import dependency they had none of.
+- `enola check`: the verdict reports per-package Ca, Ce, I, A and D before and after,
+  plus population aggregates, as `package_metrics`. Reported, never graded.
+- Orphans rank functions held by TypeScript object literals as low-confidence leads,
+  since an object is reached through references more than by name.
+- Fixed: `caller_id` and the `matched_routes` ids were kept when facts were read back,
+  so the history delta and `diff_snapshot` reported unchanged routes as changed.
+- Fixed: the most-depended-upon package insight named a different package on each run
+  when two packages tied.
+- Across the 91-repository benchmark corpus no fact kind decreases, every repository
+  reproduces across cache states, and cold and warm runs take about as long as on
+  v0.4.25.
+- `cacheVersion` moves to `v287`: every repository re-extracts once.
+
+## v0.4.25 — 2026-09-27
+
+**Scala 3 capture-checked code parses correctly, and Pi runs enola natively**
+
+- Scala: the grammar moves from v0.24.1 to a vendored v0.26.2, regenerated at ABI 14.
+  The old grammar misread capture-checked Scala 3 while reporting `parse_errors: 0`:
+  methods returning `() ->{this} Unit` vanished, members of a class with a capture
+  parameter moved to the enclosing object, and whole objects' members landed at package
+  scope. On a 318-file capture-checked codebase, files with parse errors fall from 33
+  to 0, 94 symbols return to their correct owner and 19 dropped ones reappear.
+- Pi: `enola install --targets pi` writes `.pi/extensions/enola.js`. Pi has no MCP
+  client, so the extension launches enola's server, registers every tool as
+  `enola_<tool>` and runs the session hooks under `--hooks`. The stop hook runs only
+  after a turn with a tree-changing tool call, and tool output defaults to
+  `max_tokens=5000` with a 50 KB hard cap.
+- Files `enola install` owns inside a repository are ignored by every config, so they
+  no longer change the detected languages or leave a baseline ungradable.
+- Performance: an unfiltered `query_facts` summary over 3M facts goes from over five
+  minutes to 0.2 s, counted in one pass straight off the store.
+- Performance: the MCP server serves stdio at once and restores the startup graph in
+  the background, so a large graph no longer blocks the handshake.
+- Performance: `RemoveWhere` no longer copies the whole store to find that nothing
+  matches, which it did at the start of every snapshot.
+- Performance: a cancelled snapshot stops walking and hashing instead of holding the
+  generate lock until it finishes.
+- `generate_snapshot` takes `repo_paths`: several repositories in one call, linked
+  once.
+- MCP tool descriptions are trimmed; caveats move into the responses that need them,
+  and `find_orphans` sends only those for the languages it considered.
+- Fixed: agent sessions started in one directory could restore each other's graph.
+  Each session now keeps its own, and says once when it restored another's.
+- Fixed: `diff_snapshot` says when its baseline belongs to another running session.
+- Fixed: `plan_check` planned every target against the primary repository of a
+  multi-repo graph instead of the target's own.
+- Fixed: the answer to a multi-repository snapshot now names every repository.
+- Fixed: sequential appends duplicated binder output.
+- Fixed: `append=true` without `repo_path` fell back to the server's working directory;
+  it is now refused.
+- Fixed: session hooks and startup restore no longer run on a folder of repositories.
+- Fixed: `query_facts` states the filters it applied, retries repo-labelled names and
+  warns on broad name matches; `explore` finds repo-prefixed modules in a multi-repo
+  graph.
+- Fixed: `names=` queries returned matches in map order, so offset paging could skip or
+  repeat facts.
+- `cacheVersion` moves to `v276`: Scala repositories re-extract once.
+
+## v0.4.24 — 2026-09-24
+
+**FastAPI routes in every registration form, at their full mounted path**
+
+- New route forms: `@x.api_route`, `@x.websocket` / `@x.websocket_route` (GET,
+  `protocol=websocket`), `add_api_route` / `add_route` and their websocket variants
+  (module level and in controller methods), route-decorated defs under a module-level
+  `if` / `try`.
+- Computed paths and prefixes resolve against the repository's string constants,
+  across imports: names, f-strings, `+`, class attributes, and class defaults read
+  through `settings = Settings()`. A path that does not resolve is dropped, not
+  emitted partially.
+- Mounts resolve through relative submodule and subpackage imports,
+  `router = build_router()`, routers defined in a package `__init__`, and routers
+  built from `APIRouter` subclasses.
+- Fixed: `methods=` given as a tuple or set was read as GET.
+- Fixed: `from ..x import y` resolved one package too shallow, leaving the reference
+  dangling.
+- Fixed: `@router.get("")` on an unmounted router was named `""`; it is now `/`.
+- `**/build/**`, `**/tmp/**` and `**/dist/**` no longer skip a directory that holds
+  `.py` files.
+- `--explain` splits routes into served and outbound calls, and says so when a web
+  framework is a dependency but no served route was found.
+- The MCP `query_facts` summary counts every match instead of the first 500.
+- `cacheVersion` moves to `v275`: Python repositories re-extract once, and route
+  names change where a mount prefix now resolves.
+
+## v0.4.23 — 2026-09-24
+
+**Performance findings stop counting loops that cannot grow, and `check` quotes the repository it graded**
+
+- `performance` no longer counts a Go loop that cannot grow with its input: a literal
+  trip count, a loop advancing an index its enclosing loop already advances, and a
+  collection rebuilt from a literal on every iteration. Depth compounds only over
+  calls made in loops that scale, and a function that loops over the element its
+  caller handed it finishes the caller's walk instead of starting a new one per
+  element. High-severity findings on enola itself fall from 250 to 103; ten of the
+  removals were read by hand and all ten were over-counts.
+- The `package-metrics` "zone of pain" finding claims that many packages depend on
+  one, and it used to admit any package coupled at all: four of nine findings on
+  enola had an afferent coupling of three or less. The bar is now the larger of 5
+  and the repository's 90th percentile, and both renderers print it. The "zone of
+  uselessness" corner keeps its old gate, because it claims the opposite.
+- Fixed: `enola check` quoted the source line under a finding from the working
+  directory instead of the repository it graded. Run on a path from elsewhere it
+  printed no excerpt, and from another checkout with the same file names it printed
+  that checkout's line under the graded tree's finding. The excerpt now comes from
+  the graded repository, a cluster member is found by the label its files carry, and
+  nothing is quoted from a file that no longer matches the hash the snapshot
+  recorded. Annotation and SARIF paths are resolved the same way, relative to the
+  directory the host runs in. The stop hook gets the same fix.
+- Fixed: the TypeScript extractor panicked on an absent optional child node. Ten
+  extractors carried their own copy of the node-text helper and this one had no nil
+  guard; they now share one.
+- The ignore globs are compiled once per walk instead of once per file. A cold
+  snapshot of a 1 GB repository goes from 2.25s to 2.10s, with `facts.jsonl` and the
+  snapshot ID byte-identical.
+- `cacheVersion` moves to `v273`: Go repositories re-extract once, and pinned
+  baselines over Go code may show a one-time change as performance findings move.
+- The README is rewritten around what enola is: one graph of a software system, used
+  directly, by a coding agent, or as a foundation for other tools. The material it
+  used to carry moved to new pages: [docs/GRAPH.md](docs/GRAPH.md) (what the graph
+  contains, how it is built, what it writes to disk), [docs/GATING.md](docs/GATING.md)
+  (what a verdict contains and what can fail a build) and
+  [docs/LANGUAGES.md](docs/LANGUAGES.md). The documentation checks now require every
+  fact kind and relation kind to be documented in docs/GRAPH.md and
+  docs/schema/facts.md.
+
+## v0.4.22 — 2026-09-22
+
+**enola installs as a Claude Code plugin, and Go stops reading a function used as a value as dead**
+
+- The repository now ships a Claude Code plugin with a marketplace entry
+  (`.claude-plugin/`, `plugins/enola/`). Installing it registers the `enola` MCP
+  server, the SessionStart and Stop hooks, and two skills: one routing architecture
+  questions to the right tool, and a setup skill that checks for — or installs — the
+  CLI. The plugin configures, it does not install: `enola` must be on PATH, and the
+  setup skill runs `enola doctor` or the install script.
+- A Go function referenced as a value now records a call edge to its callee. The body
+  walk followed `CallExpr` only, so a dispatch-table entry, a callback argument, and a
+  package-level `var` or `const` initializer all left the callee with no incoming edge,
+  and it read as dead code at high confidence — the tier documented as the safest to
+  delete. On enola itself, 23 of 27 first-party high-confidence findings were one of
+  those two shapes, every one false. Resolution stays narrow: only a bare identifier
+  naming the package's own top-level function binds, a redeclared name suppresses the
+  edge, and package-level references hang on the package fact, whose holding var has no
+  symbol of its own.
+- `cacheVersion` moves to `v271`: Go repositories re-extract once and pinned
+  baselines over Go code may show a one-time change — callees that read as dead gain
+  an incoming edge and the findings that rested on them move.
+- An allocation pass over the extraction core, output-identical with no cache effect:
+  Scala parses each file once instead of twice, the C++ `#define` scan materialises a
+  line only when its first physical line can be a directive (the Linux kernel tree
+  allocates 4.8GB and 26M allocations less), and Python builds its symbol index from
+  the extraction parse instead of rereading and reparsing every file. Facts route
+  every `Props` access through accessors, the engine positions insights without
+  deep-copying the fact set, and the name index spends no slice header on the 98% of
+  names that hold one fact. Kernel steady heap falls 1,421 to 1,343MiB;
+  `facts.jsonl` and `insights.json` hashes are unchanged.
+- Fixed: the MCP `generate_snapshot` schema required `repo_path` even though it
+  defaults to the configured path; it is now optional, so a host that omits it no
+  longer fails validation before the default applies.
+- Unused seams in the public `pkg/` surface are removed: `Runner.With*`, the dashboard
+  overlay, `RegisterToolWeights`, `pkg/status` footprint, `pkg/facts` re-exports and
+  the unwired helpers. `Server.MCP` stays; extension authors linking a removed seam
+  need to update.
+
+## v0.4.21 — 2026-09-18
+
+**Dead code, performance and package metrics become part of enola**
+
+- Three analyzers that previously shipped only in a licensed wrapper are now part of
+  this repository, with no licence check and no feature flag: `find_orphans`
+  (`dead-code`), `analyze_performance` (`performance`) and `package_metrics`
+  (`package-metrics`). enola serves twenty-two MCP tools and runs twenty-two
+  explainers.
+- `dead-code`, `performance` and `package-metrics` are all nameable in
+  `enola check --fail-on`. Like every other inferred
+  explainer they cap below `1.00`, so naming one changes nothing without
+  `--min-confidence`.
+- `enola --explain` gains Package metrics, Dead code and Performance sections.
+  Package metrics renders beside the hotspot table it shares import edges with;
+  the other two render with Code health.
+- The dashboard gains a Package Metrics card and its main-sequence scatter, and the
+  Insights modal admits findings from all of them.
+- The narrower explainers keep their ground: `performance` files no `call-in-loop`
+  finding against a symbol `query-loops` already reports, and `dead-code` stays
+  silent on a method `dead-methods` already reports. On a large Rails application
+  that is a quarter of the `call-in-loop` findings.
+- `performance` reports at most 50 findings individually plus a rollup, as
+  `dead-code` and `package-metrics` already did. `analyze_performance` still returns
+  the full set.
+- Rust joins Swift, the JVM, TypeScript and Dart in having its own expensive-call
+  gate, so a channel `send` or a constructor in a loop is no longer reported as
+  per-iteration I/O. Cargo's `benches/` tree counts as test code.
+- A Go package's own top-level function now shadows the predeclared identifier of
+  the same name, so a repository carrying its own `min` or `max` helper no longer
+  has it reported as dead code while it is being called.
+- Dead-code candidates under a directory conventionally holding other projects'
+  code rank last, so the capped list is your own code first. Nothing is excluded.
+- Every explainer that can flood a findings list now reports at most 50 individually
+  plus a rollup naming the remainder, from one shared definition: `dead-methods`
+  (955 on a large Rails application), `query-loops` (419), `import-closure` (219)
+  and `domain` join the three analyzers. The tool behind each still returns
+  everything.
+- `cycles`, declared `layers`, `intent` and `constraints` are deliberately NOT
+  capped. A diff identifies a finding by explainer and title, so one past a cap
+  never reaches `check --fail-on`; on a repository with hundreds of cycles a cap
+  would rank a newly introduced one out of sight and the gate would silently stop
+  firing.
+- `performance` annotates the symbols it reports at high severity (`perf_risk`), so
+  a diff can name the function a change made expensive rather than only report that
+  a counter moved. `dead-code` and `package-metrics` already did this.
+- A `tsconfig.json` that declares no `paths` of its own now follows its `extends`
+  chain, rebasing the inherited targets onto the declaring file. A SvelteKit
+  repository whose tsconfig extends the generated `.svelte-kit/tsconfig.json` had no
+  aliases at all, so every aliased import read as an external dependency. A child's
+  own `paths` still replaces the inherited map, as TypeScript does, and an `extends`
+  cycle yields no aliases rather than a partial set.
+- `kit.alias` literals in `svelte.config.js` fill the aliases the effective tsconfig
+  does not declare, and `$lib` falls back to `src/lib`. Computed entries
+  (`path.resolve(...)`, spreads) and an `alias` map outside `kit` are skipped.
+- SvelteKit's virtual modules (`$app/*`, `$env/*`, `$service-worker`) are recorded as
+  framework-provided dependencies instead of unpinned third-party ones.
+- `cacheVersion` moves to `v270`: extraction caches are rebuilt and pinned baselines
+  may show a one-time change.
+
+**Upgrading:** the added explainers change the insight set, so the snapshot ID
+moves and every pinned baseline will report new findings on the first snapshot after
+upgrading. That is the new analysis, not a regression. Re-pin with
+`enola baseline pin` when you have read them.
+
+## v0.4.20 — 2026-09-15
+
+**A folder of repositories indexes as a cluster, and in-house HTTP clients can be declared**
+
+- `--generate` and MCP `generate_snapshot` on a folder with two or more git repositories
+  directly under it index them as a cluster, writing `cluster.yaml` there or reusing the
+  existing one. `--no-cluster` (`no_cluster=true` over MCP) indexes the folder as one
+  repository. A folder that is itself a git repository is still indexed as one, with a
+  warning.
+- New `enola cluster init [--dry-run] [dir]` writes `cluster.yaml` for a folder of
+  repositories.
+- New `clients:` config declares in-house HTTP client wrappers by receiver type, method and
+  argument positions. The TypeScript extractor reads their calls as client routes.
+- Each declared client gets a coverage account. `enola coverage` prints a Declared clients
+  table and flags a client that matched no call site in any loaded repository.
+- A `clients:` spec for a language with no client reader yet (`python`, `go`) is skipped
+  with a warning instead of failing config load, and does not change the snapshot ID.
+- New `service_aliases:` maps a service name passed to a declared client to a repository
+  label. It only picks among repositories already serving the path; if the aliased one
+  serves none, no edge is drawn (`unmatched_reason: alias_not_serving`).
+- New opt-in `linking.match_literal_against_params` lets a server path parameter match a
+  literal client segment when no exact match exists. Such endpoints are listed in
+  `param_segment_endpoints`.
+- `enola endpoint` and `endpoint_impact` report as callers the call sites the cross-repo
+  linker matched to the route, under the same config.
+- Fixed: a scoped `package.json` dependency was taken as the repository's own npm scope and
+  hid the import edge to the repository publishing it.
+- Fixed: coverage counts and unmatched reasons now agree for verb-less or generic-path calls
+  in a repository with one declared seam (`attributed_by_intent`).
+- New example: `examples/custom-client`.
+- `cacheVersion` moves to `v267`: extraction caches are rebuilt and pinned baselines may
+  show a one-time change.
+
 ## v0.4.19 — 2026-09-12
 
 **The Stop hook reports once per session instead of at every stop**

@@ -130,7 +130,7 @@ func incomingGroups(store *facts.Store, defined map[string]bool, inFile func(fac
 			continue
 		}
 		for _, rel := range f.Relations {
-			if rel.Kind == facts.RelDeclares || !defined[rel.Target] {
+			if rel.Kind == facts.RelDeclares || facts.IsStorageAccess(rel.Kind) || !defined[rel.Target] {
 				continue
 			}
 			parts := partsOf[f.Name]
@@ -174,10 +174,74 @@ type PartFile struct {
 	Members []string `json:"members"`
 }
 
-// PartEdges is the count of edges between the part and one other part.
+// PartEdges is the count of edges between the part and one other part, in
+// all and by edge kind.
 type PartEdges struct {
-	Component string `json:"component"`
-	Count     int    `json:"count"`
+	Component string         `json:"component"`
+	Count     int            `json:"count"`
+	Kinds     map[string]int `json:"kinds"`
+}
+
+// PartMade is how many edges of one kind the part makes, and how many of them
+// land on something the snapshot measured.
+type PartMade struct {
+	Kind     string `json:"kind"`
+	Made     int    `json:"made"`
+	Resolved int    `json:"resolved"`
+}
+
+// ExplainedKinds are the edge kinds a part explanation counts: the ones a
+// rule between parts is written over.
+var ExplainedKinds = []string{facts.RelCalls, facts.RelImports, facts.RelDependsOn, facts.RelImplements}
+
+// partFlowsByKind reads the part's edges in and out through the same reading
+// a mined candidate and a forbid verdict use, so a count here and a breach
+// count over the same pair agree, kind by kind. An edge landing in no part
+// but on a measured fact is counted under NoPart; one landing on nothing
+// measured is in Made and nowhere else.
+func partFlowsByKind(store *facts.Store, part string) (in, out []PartEdges, made []PartMade) {
+	reading := ReadParts(store, ExplainedKinds, 0)
+	inCounts := map[string]map[string]int{}
+	outCounts := map[string]map[string]int{}
+	add := func(m map[string]map[string]int, component, kind string, n int) {
+		if n == 0 {
+			return
+		}
+		if m[component] == nil {
+			m[component] = map[string]int{}
+		}
+		m[component][kind] += n
+	}
+	for _, f := range reading.Flows {
+		if f.Part == part {
+			made = append(made, PartMade{Kind: f.Via, Made: f.Made, Resolved: f.Resolved})
+			for _, l := range f.Into {
+				add(outCounts, l.Part, f.Via, l.Count)
+			}
+			add(outCounts, NoPart, f.Via, f.Elsewhere)
+			continue
+		}
+		add(inCounts, f.Part, f.Via, f.Landed(part))
+	}
+	return kindEdges(inCounts), kindEdges(outCounts), made
+}
+
+func kindEdges(counts map[string]map[string]int) []PartEdges {
+	edges := make([]PartEdges, 0, len(counts))
+	for name, kinds := range counts {
+		e := PartEdges{Component: name, Kinds: kinds}
+		for _, n := range kinds {
+			e.Count += n
+		}
+		edges = append(edges, e)
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].Count != edges[j].Count {
+			return edges[i].Count > edges[j].Count
+		}
+		return edges[i].Component < edges[j].Component
+	})
+	return edges
 }
 
 // PartLaw is one declared rule naming the part.
@@ -200,6 +264,7 @@ type PartExplanation struct {
 	PublicFace []string    `json:"public_face"`
 	FanIn      []PartEdges `json:"fan_in"`
 	FanOut     []PartEdges `json:"fan_out"`
+	Made       []PartMade  `json:"made"`
 	Laws       []PartLaw   `json:"laws"`
 }
 
@@ -212,8 +277,8 @@ func ExplainPart(store *facts.Store, part string) (PartExplanation, bool) {
 		return PartExplanation{}, false
 	}
 	out := PartExplanation{Part: part, Selector: selectorSummary(c), Source: c.source,
-		Files: []PartFile{}, PublicFace: []string{}, FanIn: []PartEdges{}, FanOut: []PartEdges{}, Laws: []PartLaw{}}
-	names, members := resolveMembership(store, c)
+		Files: []PartFile{}, PublicFace: []string{}, FanIn: []PartEdges{}, FanOut: []PartEdges{}, Made: []PartMade{}, Laws: []PartLaw{}}
+	_, members := resolveMembership(store, c)
 	byFile := map[string][]string{}
 	for _, m := range members {
 		byFile[m.File] = append(byFile[m.File], m.Name)
@@ -228,39 +293,7 @@ func ExplainPart(store *facts.Store, part string) (PartExplanation, bool) {
 	sort.Slice(out.Files, func(i, j int) bool { return out.Files[i].File < out.Files[j].File })
 	sort.Strings(out.PublicFace)
 
-	partsOf := map[string][]string{}
-	for name, other := range components {
-		if name == part {
-			continue
-		}
-		_, otherMembers := resolveMembership(store, other)
-		for _, m := range otherMembers {
-			partsOf[m.Name] = append(partsOf[m.Name], name)
-		}
-	}
-	in, outCounts := map[string]int{}, map[string]int{}
-	for _, f := range store.All() {
-		if f.Kind == facts.KindIntent {
-			continue
-		}
-		for _, rel := range f.Relations {
-			if rel.Kind == facts.RelDeclares {
-				continue
-			}
-			switch {
-			case names[f.Name] && !names[rel.Target]:
-				for _, p := range partsOrNone(partsOf[rel.Target]) {
-					outCounts[p]++
-				}
-			case !names[f.Name] && names[rel.Target]:
-				for _, p := range partsOrNone(partsOf[f.Name]) {
-					in[p]++
-				}
-			}
-		}
-	}
-	out.FanIn = partEdges(in)
-	out.FanOut = partEdges(outCounts)
+	out.FanIn, out.FanOut, out.Made = partFlowsByKind(store, part)
 	for _, r := range rules {
 		if !r.names(part) {
 			continue
@@ -273,25 +306,4 @@ func ExplainPart(store *facts.Store, part string) (PartExplanation, bool) {
 	}
 	sort.Slice(out.Laws, func(i, j int) bool { return out.Laws[i].Rule < out.Laws[j].Rule })
 	return out, true
-}
-
-func partsOrNone(parts []string) []string {
-	if len(parts) == 0 {
-		return []string{NoPart}
-	}
-	return parts
-}
-
-func partEdges(counts map[string]int) []PartEdges {
-	edges := make([]PartEdges, 0, len(counts))
-	for name, n := range counts {
-		edges = append(edges, PartEdges{Component: name, Count: n})
-	}
-	sort.Slice(edges, func(i, j int) bool {
-		if edges[i].Count != edges[j].Count {
-			return edges[i].Count > edges[j].Count
-		}
-		return edges[i].Component < edges[j].Component
-	})
-	return edges
 }

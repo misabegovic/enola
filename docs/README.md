@@ -6,7 +6,9 @@ Start with the page closest to what you need:
 - **Installing, configuring or scripting it?** Use [CLI.md](CLI.md).
 - **Want to see the loop once, end to end?** Follow [FIRST-CHANGE.md](FIRST-CHANGE.md).
 - **More than one repository?** Follow [CLUSTERS.md](CLUSTERS.md).
+- **Want to know what the graph is?** Read [GRAPH.md](GRAPH.md).
 - **Building a tool on Enola's graph?** Read [INTEGRATING.md](INTEGRATING.md).
+- **Got Enola with Cognee?** Read [COGNEE.md](COGNEE.md).
 - **Using Rails specifically?** Follow [RAILS.md](RAILS.md).
 - **Understanding the engine?** Read [ARCHITECTURE.md](../ARCHITECTURE.md).
 
@@ -15,6 +17,7 @@ Start with the page closest to what you need:
 | Page | Covers |
 |---|---|
 | [CLI.md](CLI.md) | Installation, agent integration, commands, flags, exit codes, scope controls, reviewer routing and the dashboard. |
+| [LANGUAGES.md](LANGUAGES.md) | Every supported language and format, what marks it in a repository, and the frameworks each extractor understands. |
 | [FIRST-CHANGE.md](FIRST-CHANGE.md) | The loop end to end on a module small enough to read: declare a layer order, pin, change, grade, and hold the change to its declared scope. The same rule is shown in Go and TypeScript. |
 | [CLUSTERS.md](CLUSTERS.md) | Two services in one graph: how client calls are matched to server routes across repositories, and how unresolved calls are reported. |
 | [DASHBOARD.md](DASHBOARD.md) | Reviewing a change visually, following dependencies, verifying snapshot provenance and judging analysis completeness. |
@@ -24,7 +27,8 @@ Start with the page closest to what you need:
 
 | Page | Covers |
 |---|---|
-| [EXPLAINERS.md](EXPLAINERS.md) | The nineteen structural checks, confidence levels, and how before/after comparison isolates findings introduced by a change. |
+| [GATING.md](GATING.md) | What a verdict contains, where the check runs, and exactly what can fail a build: policies, confidence floors and scope. |
+| [EXPLAINERS.md](EXPLAINERS.md) | The twenty-two structural checks (explainers), confidence levels, and how before/after comparison isolates findings introduced by a change. |
 | [SNAPSHOTS.md](SNAPSHOTS.md) | Why Enola computes addressable snapshots instead of maintaining one continuously updated graph. |
 | [HISTORY.md](HISTORY.md) | `log`, `show`, `diff`, `blame`, `gc` and `history` - the recorded timeline of a repository's architecture, what it costs to keep, and how to share it across machines. |
 
@@ -46,7 +50,9 @@ Start with the page closest to what you need:
 
 | Page | Covers |
 |---|---|
-| [INTEGRATING.md](INTEGRATING.md) | Run Enola as a subprocess and load its snapshot artifacts into another store. |
+| [GRAPH.md](GRAPH.md) | What the graph contains, how it is built, how facts are identified, every file a snapshot writes and which are a stable contract, and the ways to consume it. |
+| [INTEGRATING.md](INTEGRATING.md) | Run Enola as a subprocess and load its snapshot artifacts into another store, with Cognee as the named reference implementation. |
+| [COGNEE.md](COGNEE.md) | For Cognee users: where the Enola binary that came with Cognee is, how to connect it to a coding agent over MCP, how to grade a change with it, and how your runs coexist with Cognee's. |
 
 ## Extending the graph
 
@@ -54,7 +60,7 @@ Start with the page closest to what you need:
 |---|---|
 | [PROVIDERS.md](PROVIDERS.md) | Adding facts from Rubydex, runtime observations, RBS and Sorbet through the fail-closed provider interface. |
 | [extraction/](extraction/README.md) | What each language extractor records, with examples from committed fixtures and its known limits. |
-| [EXTENDING.md](EXTENDING.md) | Teaching Enola a connection it does not know through binders, cross-repository signals and `linking:` configuration. |
+| [EXTENDING.md](EXTENDING.md) | Teaching Enola a connection it does not know through binders, cross-repository signals, `linking:` configuration and declared in-house HTTP clients (`clients:`). |
 
 ## Reference
 

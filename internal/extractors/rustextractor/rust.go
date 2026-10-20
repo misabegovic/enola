@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/extcoverage"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
@@ -94,34 +96,56 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 		moduleDirs[factpath.Dir(relFile)] = true
 	}
 
+	isRust := make(map[string]bool, len(rustFiles))
+	for _, relFile := range rustFiles {
+		isRust[relFile] = true
+	}
+	rustCrates := buildRustCrates(repoPath, cargoFiles, isRust)
+
 	perFileFacts := parallel.MapFiles(ctx, rustFiles, func(relFile string) fileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[rust-extractor] error reading %s: %v", relFile, err)
 			return fileResult{}
 		}
-		ff, impls, builders := extractFileASTFull(src, relFile, crates, moduleDirs)
-		return fileResult{facts: ff, impls: impls, builders: builders}
+		ff, impls, builders, recs, doc := extractFileASTRecords(src, relFile, crates, moduleDirs)
+		return fileResult{facts: ff, impls: impls, builders: builders, recs: recs, doc: doc}
 	})
 
 	var allFacts []facts.Fact
 	var allImpls []implPair
 	var allBuilders []axumBuilder
-	for _, r := range perFileFacts {
+	allRecs := make([]*rustFileRecs, 0, len(perFileFacts))
+	bases := make([]int, 0, len(perFileFacts))
+	fileDocs := make(map[string]string)
+	for i, r := range perFileFacts {
+		allRecs = append(allRecs, r.recs)
+		bases = append(bases, len(allFacts))
+		if r.doc != "" {
+			fileDocs[rustFiles[i]] = r.doc
+		}
 		allFacts = append(allFacts, r.facts...)
 		allImpls = append(allImpls, r.impls...)
 		allBuilders = append(allBuilders, r.builders...)
 	}
 
+	resolution := resolveRustCrate(allFacts, allRecs, bases, rustCrates, moduleDirs)
+	allFacts = append(allFacts, resolution.facts...)
+	allFacts = append(allFacts, resolution.testCases...)
 	applyImplements(allFacts, allImpls)
-	computeRustPerformsIO(allFacts)
+	ioclosure.Propagate(allFacts)
 	// Compose `.nest(prefix, module::router())` mount prefixes onto Axum route
 	// facts interprocedurally, so a route registered on a sub-router is stored at
 	// its true runtime path for cross-repo client↔route matching.
 	allFacts = composeAxumPrefixes(allFacts, allBuilders, crates)
+	bindRustRouteHandlers(allFacts, crates)
 
+	docs := moduleDocs(moduleDirs, fileDocs)
 	for dir := range moduleDirs {
 		props := map[string]any{"language": "rust"}
+		if doc := docs[dir]; doc != "" {
+			facts.SetDocProp(props, doc)
+		}
 		if crateDir := nearestCrateDir(dir, crates); crateDir != "" {
 			if name, ok := crateNameByDir(crateDir, crates); ok {
 				props["crate"] = name
@@ -135,68 +159,16 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 		})
 	}
 
+	if f, ok := extcoverage.Fact(repoPath, "rust:calls", "call", resolution.callsResolved, resolution.callCauses); ok {
+		allFacts = append(allFacts, f)
+	}
+	if f, ok := extcoverage.Fact(repoPath, "rust:imports", "import", resolution.importsResolved, resolution.importCauses); ok {
+		allFacts = append(allFacts, f)
+	}
+	if f, ok := extcoverage.Fact(repoPath, "rust:test_cases", "test_case", len(resolution.testCases), resolution.testCauses); ok {
+		allFacts = append(allFacts, f)
+	}
 	return allFacts, nil
-}
-
-// computeRustPerformsIO propagates the direct-I/O signal (io_direct, set by the
-// walker on functions making a filesystem/DB/HTTP call) transitively over the
-// intra-repo call graph: a function is marked performs_io when it, or anything
-// it reaches through RelCalls edges to known symbols, does I/O. This lets the
-// performance analyzer recognise an in-loop call to a wrapper that itself calls
-// I/O as an N+1. It mirrors the Python extractor's computePyPerformsIO fixpoint.
-func computeRustPerformsIO(allFacts []facts.Fact) {
-	exists := make(map[string]bool)
-	for i := range allFacts {
-		if allFacts[i].Kind == facts.KindSymbol {
-			exists[allFacts[i].Name] = true
-		}
-	}
-
-	io := make(map[string]bool)      // name → performs I/O (directly or transitively)
-	adj := make(map[string][]string) // name → called names that are known symbols
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		if b, _ := f.Props["io_direct"].(bool); b {
-			io[f.Name] = true
-		}
-		seen := make(map[string]bool)
-		for _, r := range f.Relations {
-			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
-				continue
-			}
-			seen[r.Target] = true
-			adj[f.Name] = append(adj[f.Name], r.Target)
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for name, callees := range adj {
-			if io[name] {
-				continue
-			}
-			for _, c := range callees {
-				if io[c] {
-					io[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind == facts.KindSymbol && io[f.Name] {
-			if f.Props == nil {
-				f.Props = map[string]any{}
-			}
-			f.Props["performs_io"] = true
-		}
-	}
 }
 
 // fileResult holds one file's extracted facts plus its impl-block
@@ -205,4 +177,7 @@ type fileResult struct {
 	facts    []facts.Fact
 	impls    []implPair
 	builders []axumBuilder
+	recs     *rustFileRecs
+	// doc is the file's inner doc (`//!`).
+	doc string
 }

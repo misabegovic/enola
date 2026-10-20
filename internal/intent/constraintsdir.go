@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
@@ -30,6 +31,11 @@ type ConstraintsFile struct {
 	Components []ConstraintComponent `yaml:"components"`
 	Rules      []ConstraintRule      `yaml:"rules"`
 	UseRecipe  []RecipeInstantiation `yaml:"use_recipe"`
+
+	// UnknownKeys are the keys in this file the decoder read into nothing,
+	// recorded at load so a lint surface can name them; the declaration they
+	// sit in compiles as if they were absent, exactly as it always did.
+	UnknownKeys []UnknownKey `yaml:"-"`
 }
 
 // dirAbsent reports whether a ReadDir error means the directory is simply not
@@ -102,6 +108,9 @@ func LoadConstraintsDir(repoPath string) ([]ConstraintsFile, []string, error) {
 		}
 		f.Normalize()
 		f.Path = relPath
+		if !strings.HasSuffix(name, ".rb") {
+			f.UnknownKeys = unknownKeys(data, relPath, reflect.TypeOf(ConstraintsFile{}))
+		}
 		for i := range f.Components {
 			f.Components[i].SourceFile = relPath
 		}

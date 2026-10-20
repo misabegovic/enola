@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/extractors/jvmsrc"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
@@ -161,17 +162,19 @@ func (e *ScalaExtractor) Extract(ctx context.Context, repoPath string, files []s
 	// import of a Java type in a sibling Maven module resolves to the directory
 	// that declares it instead of being written off as an external dependency.
 	packageIndex := jvmsrc.BuildPackageIndex(repoPath, files)
+	scalatra := usesScalatra(repoPath)
 
-	// extractFileAST is a pure function of (src, relFile); parse in parallel and
+	// extractFileFacts is a pure function of (src, relFile); parse in parallel and
 	// merge in file order so the output is deterministic regardless of scheduling.
+	// It parses each file ONCE and runs both the declaration walk and the DSL
+	// route/storage walks over that one tree.
 	perFileFacts := parallel.MapFiles(ctx, scalaFiles, func(relFile string) fileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[scala-extractor] error reading %s: %v", relFile, err)
 			return fileResult{}
 		}
-		ff, pkg := extractFileASTFull(src, relFile, packageIndex)
-		ff = append(ff, extractDSLRoutes(src, relFile)...)
+		ff, pkg := extractFileFacts(src, relFile, packageIndex, scalatra)
 		return fileResult{facts: ff, pkg: pkg}
 	})
 
@@ -195,7 +198,7 @@ func (e *ScalaExtractor) Extract(ctx context.Context, repoPath string, files []s
 	// After canonicalization, so the closure walks edges that point at real facts:
 	// run before it and every cross-file call target would still be a bare name and
 	// the propagation would stop at the first hop.
-	computeScalaPerformsIO(allFacts)
+	ioclosure.Propagate(allFacts)
 
 	for dir := range modules {
 		props := map[string]any{

@@ -12,7 +12,7 @@ import (
 
 // An enola MCP server is launched once per agent/terminal session, so a user
 // commonly has several running at the same time — different repos, different
-// binaries (enola / enola-enterprise), each with its own in-memory graph and its
+// binaries (enola, or a wrapper built on it), each with its own in-memory graph and its
 // own dashboard on its own ephemeral port.
 //
 // The instance registry is what makes that fleet observable. Every server writes
@@ -58,11 +58,11 @@ type Instance struct {
 
 	// Identity of the binary and the launch context — what distinguishes two
 	// instances at a glance.
-	Binary     string `json:"binary"`                // "enola" / "enola-enterprise"
+	Binary     string `json:"binary"`                // the binary's own name
 	Version    string `json:"version,omitempty"`     // build version
-	Licensed   bool   `json:"licensed,omitempty"`    // enterprise features active
 	ConfigPath string `json:"config_path,omitempty"` // resolved mcp-arch.yaml
 	WorkDir    string `json:"work_dir,omitempty"`    // cwd, i.e. which workspace launched it
+	ClientPID  int    `json:"client_pid,omitempty"`  // the agent process this server serves (its parent)
 
 	// Graph state, refreshed after each generate_snapshot.
 	PrimaryRepo  string         `json:"primary_repo,omitempty"` // abs cfg.Repo
@@ -82,6 +82,20 @@ type Instance struct {
 	LastCallAt    time.Time      `json:"last_call_at,omitempty"`
 	SessionCounts map[string]int `json:"session_counts,omitempty"`
 	SessionTokens map[string]int `json:"session_tokens,omitempty"` // token credit earned this session, per tool
+
+	// Socket is the unix socket this server also accepts sessions on, each a
+	// session over the graph it holds, so another process can share it rather
+	// than load its own. Empty when it serves stdio alone.
+	Socket string `json:"socket,omitempty"`
+
+	// The file this process was started from, as it was then, and whether the
+	// file at that path has been replaced since. After an install a running
+	// server still answers from the build it loaded, and its version above
+	// still names that build, so this is what says the two have parted.
+	BinaryPath     string    `json:"binary_path,omitempty"`
+	BinarySize     int64     `json:"binary_size,omitempty"`
+	BinaryModTime  time.Time `json:"binary_mod_time,omitzero"`
+	BinaryReplaced bool      `json:"binary_replaced,omitempty"`
 }
 
 // URL is the instance's dashboard URL, or "" when it serves no dashboard.
@@ -90,6 +104,20 @@ func (i Instance) URL() string {
 		return ""
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d", i.DashboardPort)
+}
+
+// RunsReplacedBinary reports whether the file this instance was started from
+// has been replaced: as the instance last recorded, or as the file at that path
+// reads now, which a reader sees before the instance's next heartbeat does.
+func (i Instance) RunsReplacedBinary() bool {
+	if i.BinaryReplaced {
+		return true
+	}
+	if i.BinaryPath == "" {
+		return false
+	}
+	info, err := os.Stat(i.BinaryPath)
+	return err != nil || info.Size() != i.BinarySize || !info.ModTime().Equal(i.BinaryModTime)
 }
 
 // SessionCalls is the total number of tool calls this instance has served.
@@ -225,13 +253,7 @@ func instanceAlive(inst Instance, now time.Time) bool {
 	return now.Sub(hb) <= staleAfter
 }
 
-// FrontDoorInstance returns the live instance currently serving the stable
-// dashboard port, if any.
-func FrontDoorInstance() (Instance, bool) {
-	for _, inst := range LiveInstances() {
-		if inst.FrontDoor {
-			return inst, true
-		}
-	}
-	return Instance{}, false
+// ProcessAlive reports whether a process with the given PID is running.
+func ProcessAlive(pid int) bool {
+	return isProcessAlive(pid)
 }

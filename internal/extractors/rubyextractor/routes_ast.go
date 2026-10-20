@@ -4,19 +4,11 @@ import (
 	"regexp"
 	"strings"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
-
-// parseRouteFileAST parses a Rails route file with tree-sitter and emits KindRoute
-// facts. Block boundaries come from the grammar (do_block) rather than counting
-// `do`/`end`, so nested namespaces/resources/scopes are tracked precisely.
-func parseRouteFileAST(src []byte, relFile string) []facts.Fact {
-	ff, _ := parseRouteFile(src, relFile, "", jsonapiContext{format: jsonapiRouteDasherized})
-	return ff
-}
 
 // routeMount records a `mount SomeEngine, at: '/x'` site: the constant that was
 // mounted and the full URL prefix it was mounted under (including any enclosing
@@ -39,6 +31,8 @@ type routeFileResult struct {
 	// could not expand, keyed by macro name, so the coverage fact can account for
 	// them rather than letting the absence read as "no routes here".
 	unresolved map[string]int
+	// drawOn is the engine class the file draws its routes on, or "".
+	drawOn string
 }
 
 // parseRouteFile parses a Rails route file, seeding the scope stack with
@@ -67,7 +61,7 @@ func parseRouteFile(src []byte, relFile, initialPrefix string, jsonapi jsonapiCo
 		jsonapi:   jsonapi,
 	}
 	rw.walk(tree.RootNode(), stack)
-	return rw.out, routeFileResult{draws: rw.draws, mounts: rw.mounts, unresolved: rw.unhandled}
+	return rw.out, routeFileResult{draws: rw.draws, mounts: rw.mounts, unresolved: rw.unhandled, drawOn: rw.drawOn}
 }
 
 type routeWalker struct {
@@ -96,6 +90,9 @@ type routeWalker struct {
 	// this repository formats route segments, why it could not be read when it
 	// could not, and the resolver from declaration to resource class.
 	jsonapi jsonapiContext
+	// drawOn is the constant this file's `X.routes.draw` is called on: the engine
+	// class, for an engine's route file.
+	drawOn string
 }
 
 // routeWrappers are macros that take a block and *contain* routes rather than
@@ -200,7 +197,8 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// action is served at. Reading only the action name emits a path the app
 		// does not serve AND misses the one it does — one declaration reported as
 		// two defects, which is the shape this comparison keeps finding.
-		if override, present := pairStringPresent(args, "path", rw.src); present {
+		override, pathGiven := pairStringPresent(args, "path", rw.src)
+		if pathGiven {
 			path = override
 		}
 		if path == "" {
@@ -215,11 +213,24 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// already supplied; `on: :member` addresses the resource itself and
 		// uses `:id` (`/steps/:id/audit`); `on: :collection` stays at the
 		// collection path.
-		switch pairSymbol(args, "on", rw.src) {
+		on := pairSymbol(args, "on", rw.src)
+		switch on {
 		case "collection":
 			prefix = collectionPrefix(stack)
 		case "member":
 			prefix = collectionPrefix(stack) + memberSegment(stack)
+		}
+		// Rails' path_for_action: inside a member/collection scope — the block form
+		// or the `on:` option — an action given as a SYMBOL that is one of the
+		// canonical actions is served at the scope's own path. `collection do
+		// get :index, to: 'reviews#show' end` is GET /orders/:id/review,
+		// not /review/index. A string path (`get 'index'`) or an explicit `path:`
+		// keeps its segment, as Rails does.
+		inMethodScope := on == "collection" || on == "member" ||
+			(len(stack) > 0 && stack[len(stack)-1].resourceMethodScope)
+		if inMethodScope && !pathGiven && firstPositionalIsSymbol(args) &&
+			canonicalResourceActions[strings.TrimPrefix(path, "/")] {
+			path = ""
 		}
 		props := map[string]any{
 			"method":    strings.ToUpper(method),
@@ -471,6 +482,10 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			}
 			if qualifiedController != "" {
 				resourceProps["handler"] = qualifiedController + "#" + a.name
+			} else if singular && !given && !jsonapi {
+				// Offered to bindRouteHandlers, which keeps it only when the
+				// controller it names is declared.
+				resourceProps[singularCandidateProp] = composeController(pluralize(name), mod, false) + "#" + a.name
 			}
 			rw.emit(routePath, line(call), resourceProps)
 		}
@@ -610,7 +625,7 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		}
 		if body != nil {
 			rw.walk(body, append(stack, routeScope{
-				pathPrefix: memberPrefix, dropParentMember: true,
+				pathPrefix: memberPrefix, dropParentMember: true, resourceMethodScope: true,
 			}))
 		}
 
@@ -688,6 +703,9 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		// engine routers, etc.) — recurse into the block. `draw(:pkg)` with no
 		// block is a packwerk delegation — emit a DRAW route.
 		if body != nil {
+			if rw.drawOn == "" {
+				rw.drawOn = drawReceiver(call, rw.src)
+			}
 			rw.walk(body, stack)
 			return
 		}
@@ -728,8 +746,9 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 }
 
 // emit appends a route fact with a declares relation to the file's directory, plus a
-// handled_by relation to the controller action serving it when the handler resolves to
-// one. That second edge is what makes a Rails route reachable from its controller:
+// handled_by relation to the controller action its handler names. bindRouteHandlers
+// settles that relation against the repository's symbols afterwards and removes it
+// when it names none. That second edge is what makes a Rails route reachable from its controller:
 // without it a route is an isolated node, impact analysis from a controller cannot see
 // the endpoints it serves, and a controller referenced only by the route table looks
 // like dead code.

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -63,11 +64,12 @@ func extractFileASTFull(src []byte, relFile string) ([]facts.Fact, aspnetScaffol
 	root := tree.RootNode()
 	w.walkTopLevelChildren(root)
 	w.scaffold.minimal = collectMinimalAPIRoutes(root, src, relFile, w.dir)
+	w.lambdaHandlerSymbols(w.scaffold.minimal)
 	// APPEND: noteRefit already added this file's Refit declarations during the
 	// walk above, and assigning here would discard them.
 	w.scaffold.clients = append(w.scaffold.clients, collectHTTPClientCalls(root, src, relFile, w.dir)...)
 	w.scaffold.conventional, w.scaffold.conventionalSkipped = collectConventionalRoutes(root, src, relFile, w.dir)
-	return w.out, w.scaffold
+	return append(w.out, w.testCases...), w.scaffold
 }
 
 type astWalker struct {
@@ -91,7 +93,10 @@ type astWalker struct {
 	// method in class Foo is named "<dir>.Foo.method" and a nested type is
 	// "<dir>.Outer.Inner". methodStack is parallel and holds each enclosing type's
 	// own method-name set, used to resolve same-type bare calls.
-	typeStack   []string
+	typeStack []string
+	// testCases are appended after the walk; see finding 0034 for why a walk's
+	// growing fact slice is not where they go.
+	testCases   []facts.Fact
 	methodStack []map[string]bool
 	// interfaceStack is parallel to typeStack: whether that type is an interface,
 	// whose members are public by default and carry no access modifier.
@@ -129,14 +134,23 @@ type astWalker struct {
 	// query inside one still runs many times and stays an N+1 candidate.
 	scalingDepth int
 	repeatDepth  int
-	selfName     string
-	selfShort    string
-	selfParams   int
+	// loopScopes are the enclosing loops' variables, for the rule in hierarchy.go.
+	loopScopes []csLoopScope
+	// memberTypes are the declared types of the enclosing types' fields, properties
+	// and primary-constructor parameters, innermost last; localTypes those of the
+	// current member's parameters and locals (nil outside one). See receivers.go.
+	memberTypes []map[string]string
+	localTypes  map[string]string
+	selfName    string
+	selfShort   string
+	selfParams  int
 }
 
 // bodyMetrics accumulates per-member complexity signals during the single body
 // traversal — mirrors the other AST extractors.
 type bodyMetrics struct {
+	// typedCalls are the calls made on a receiver of declared type (receivers.go).
+	typedCalls         []typedCall
 	loopDepth          int
 	loopCount          int
 	decisions          int
@@ -145,6 +159,7 @@ type bodyMetrics struct {
 	scalingLoopDepth   int
 	callsInScalingLoop []string
 	inScalingSeen      map[string]bool
+	scalingCallDepth   map[string]int // deepest scaling nesting each of those is called at (calldepth.go)
 	recursive          bool
 	ioDirect           bool
 }
@@ -348,10 +363,11 @@ func (w *astWalker) handleUsing(node *sitter.Node) {
 		props["alias"] = alias
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind:  facts.KindDependency,
-		Name:  w.dir + " -> " + path,
-		File:  w.relFile,
-		Line:  int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindDependency,
+		Name:    w.dir + " -> " + path,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: props,
 		Relations: []facts.Relation{
 			{Kind: facts.RelImports, Target: path},
@@ -371,10 +387,11 @@ func (w *astWalker) handleTypeDecl(node *sitter.Node, kind string) {
 	qualified := w.qualify(name)
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.canonicalName(qualified),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(qualified),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": kind,
 			"exported":    w.exported(mods, true),
@@ -385,22 +402,25 @@ func (w *astWalker) handleTypeDecl(node *sitter.Node, kind string) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := csharpDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if ns := w.namespace(); ns != "" {
-		f.Props["namespace"] = ns
+		f.SetProp("namespace", ns)
 	}
 	for _, m := range []string{"abstract", "sealed", "static", "partial"} {
 		if mods[m] {
-			f.Props[m] = true
+			f.SetProp(m, true)
 		}
 	}
 	if kindOf(node) == "record_declaration" {
-		f.Props["record"] = true
+		f.SetProp("record", true)
 	}
 	// State and no behaviour: a DTO, a constants holder, an attribute. Read by the
 	// package-metrics explainer, which spares such packages advice that only makes
 	// sense for types with behaviour to abstract.
 	if kind != facts.SymbolInterface && isDataHolderBody(node.ChildByFieldName("body")) {
-		f.Props["data_holder"] = true
+		f.SetProp("data_holder", true)
 	}
 
 	for _, t := range w.baseTypes(node) {
@@ -421,6 +441,7 @@ func (w *astWalker) handleTypeDecl(node *sitter.Node, kind string) {
 
 	body := node.ChildByFieldName("body")
 	w.typeStack = append(w.typeStack, name)
+	w.memberTypes = append(w.memberTypes, w.collectMemberTypes(node, body))
 	w.methodStack = append(w.methodStack, collectMemberNames(body, w.src))
 	w.interfaceStack = append(w.interfaceStack, kind == facts.SymbolInterface)
 	w.ctorStack = append(w.ctorStack, countConstructors(body))
@@ -444,6 +465,7 @@ func (w *astWalker) handleTypeDecl(node *sitter.Node, kind string) {
 	w.ctorStack = w.ctorStack[:len(w.ctorStack)-1]
 	w.interfaceStack = w.interfaceStack[:len(w.interfaceStack)-1]
 	w.methodStack = w.methodStack[:len(w.methodStack)-1]
+	w.memberTypes = w.memberTypes[:len(w.memberTypes)-1]
 	w.typeStack = w.typeStack[:len(w.typeStack)-1]
 	w.popOwner()
 }
@@ -459,10 +481,11 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 	exported := w.exported(mods, true)
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.canonicalName(qualified),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(qualified),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolEnum,
 			"exported":    exported,
@@ -474,7 +497,7 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 		},
 	}
 	if ns := w.namespace(); ns != "" {
-		f.Props["namespace"] = ns
+		f.SetProp("namespace", ns)
 	}
 	w.out = append(w.out, f)
 
@@ -502,10 +525,11 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 			props["namespace"] = ns
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind:  facts.KindSymbol,
-			Name:  w.canonicalName(qualified + "." + member),
-			File:  w.relFile,
-			Line:  int(c.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.canonicalName(qualified + "." + member),
+			File:    w.relFile,
+			Line:    int(c.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(c, w.src), Column: tsutil.Column(c), EndColumn: tsutil.EndColumn(c, w.src),
 			Props: props,
 			Relations: []facts.Relation{
 				{Kind: facts.RelDeclares, Target: w.dir},
@@ -533,10 +557,11 @@ func (w *astWalker) handleDelegate(node *sitter.Node) {
 		props["namespace"] = ns
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind:  facts.KindSymbol,
-		Name:  w.canonicalName(qualified),
-		File:  w.relFile,
-		Line:  int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(qualified),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: props,
 		Relations: []facts.Relation{
 			{Kind: facts.RelDeclares, Target: w.dir},
@@ -587,10 +612,25 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 	mods := modifierSet(node, w.src)
 	qualified := w.qualify(name)
 
+	// A test project the test globs leave to production (Google.Protobuf.Test is
+	// not a *.Tests tree) still names its tests, beside the symbols it emits.
+	if kindOf(node) == "method_declaration" && len(w.typeStack) > 0 && csTestMethod(node, w.src) {
+		runner := strings.Join(w.typeStack, "+") + "." + name
+		if ns := strings.Join(w.ns, "."); ns != "" {
+			runner = ns + "." + runner
+		}
+		endLine, col, endCol := tsutil.Span(node, w.src)
+		w.testCases = append(w.testCases, facts.NewTestCase("csharp", w.relFile, append([]string(nil), w.typeStack...), name, runner,
+			int(node.StartPosition().Row)+1, endLine, col, endCol))
+	}
+
 	props := map[string]any{
 		"symbol_kind": facts.SymbolMethod,
 		"exported":    w.exported(mods, false),
 		"language":    "csharp",
+	}
+	if doc := csharpDoc(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
 	}
 	if ns := w.namespace(); ns != "" {
 		props["namespace"] = ns
@@ -614,10 +654,11 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 	}
 
 	w.out = append(w.out, facts.Fact{
-		Kind:  facts.KindSymbol,
-		Name:  w.canonicalName(qualified),
-		File:  w.relFile,
-		Line:  int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(qualified),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: props,
 		Relations: []facts.Relation{
 			{Kind: facts.RelDeclares, Target: w.dir},
@@ -682,10 +723,11 @@ func (w *astWalker) handleProperty(node *sitter.Node) {
 		}
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind:  facts.KindSymbol,
-		Name:  w.canonicalName(qualified),
-		File:  w.relFile,
-		Line:  int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(qualified),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: props,
 		Relations: []facts.Relation{
 			{Kind: facts.RelDeclares, Target: w.dir},
@@ -744,10 +786,11 @@ func (w *astWalker) handleField(node *sitter.Node) {
 			props["event"] = true
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind:  facts.KindSymbol,
-			Name:  w.canonicalName(w.qualify(name)),
-			File:  w.relFile,
-			Line:  int(c.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.canonicalName(w.qualify(name)),
+			File:    w.relFile,
+			Line:    int(c.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(c, w.src), Column: tsutil.Column(c), EndColumn: tsutil.EndColumn(c, w.src),
 			Props: props,
 			Relations: []facts.Relation{
 				{Kind: facts.RelDeclares, Target: w.dir},
@@ -785,10 +828,11 @@ func (w *astWalker) recordPositionalProperties(params *sitter.Node) {
 			props["receiver"] = t
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind:  facts.KindSymbol,
-			Name:  w.canonicalName(w.qualify(name)),
-			File:  w.relFile,
-			Line:  int(p.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.canonicalName(w.qualify(name)),
+			File:    w.relFile,
+			Line:    int(p.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(p, w.src), Column: tsutil.Column(p), EndColumn: tsutil.EndColumn(p, w.src),
 			Props: props,
 			Relations: []facts.Relation{
 				{Kind: facts.RelDeclares, Target: w.dir},
@@ -846,7 +890,16 @@ func (w *astWalker) walkBodyWithMetrics(node *sitter.Node, idx int, shortName st
 	savedScaling, savedRepeat := w.scalingDepth, w.repeatDepth
 	savedName, savedShort, savedParams := w.selfName, w.selfShort, w.selfParams
 
+	savedLoopScopes := w.loopScopes
+	w.loopScopes = nil
+	defer func() { w.loopScopes = savedLoopScopes }()
 	w.metrics = &bodyMetrics{}
+	savedLocals := w.localTypes
+	w.localTypes = make(map[string]string)
+	defer func() { w.localTypes = savedLocals }()
+	if params := findChildByKind(node, "parameter_list"); params != nil {
+		w.bindParameterList(w.localTypes, params)
+	}
 	w.loopDepth, w.scalingDepth, w.repeatDepth = 0, 0, 0
 	w.selfName = w.out[idx].Name
 	w.selfShort = shortName
@@ -869,6 +922,9 @@ func (w *astWalker) walkBodyWithMetrics(node *sitter.Node, idx int, shortName st
 
 	m := w.metrics
 	props := w.out[idx].Props
+	if len(m.typedCalls) > 0 {
+		props[propTypedCalls] = m.typedCalls
+	}
 	props["cyclomatic"] = 1 + m.decisions
 	if m.loopDepth > 0 {
 		props["loop_depth"] = m.loopDepth
@@ -883,6 +939,7 @@ func (w *astWalker) walkBodyWithMetrics(node *sitter.Node, idx int, shortName st
 			m.callsInScalingLoop = []string{}
 		}
 		props["calls_in_scaling_loop"] = m.callsInScalingLoop
+		props["calls_in_scaling_loop_depth"] = callDepths(m.callsInScalingLoop, m.scalingCallDepth)
 	}
 	if m.recursive {
 		props["recursive_self"] = true
@@ -901,12 +958,26 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	}
 	kind := kindOf(node)
+	w.noteDeclaration(node, kind)
 
 	// A lambda is a deferred scope: its body runs when the delegate is invoked,
 	// not once per iteration of the loops it was created inside. An iterator's own
 	// lambda is handled at the invocation below, which walks it at depth+1.
+	// A local initialised from the current element is still the current element:
+	// `var ops = path.Value.Operations;` puts `ops` one step from `path`.
+	if kind == "variable_declarator" && len(w.loopScopes) > 0 && node.NamedChildCount() >= 2 {
+		name := node.ChildByFieldName("name")
+		value := node.NamedChild(node.NamedChildCount() - 1)
+		if name != nil && kindOf(name) == "identifier" && csReachedThroughElement(value, w.src, w.loopScopes) {
+			w.loopScopes[len(w.loopScopes)-1].add(nodeText(name, w.src))
+		}
+	}
+
 	if w.metrics != nil && (kind == "lambda_expression" || kind == "anonymous_method_expression") {
 		saved, savedScaling, savedRepeat := w.loopDepth, w.scalingDepth, w.repeatDepth
+		savedScopes := w.loopScopes
+		w.loopScopes = nil
+		defer func() { w.loopScopes = savedScopes }()
 		w.loopDepth, w.scalingDepth, w.repeatDepth = 0, 0, 0
 		w.walkChildren(node)
 		w.loopDepth, w.scalingDepth, w.repeatDepth = saved, savedScaling, savedRepeat
@@ -943,6 +1014,16 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	case "for_statement", "foreach_statement", "while_statement", "do_statement":
 		class := syntacticLoopClass(node, w.src)
+		scope := csLoopScope{amortizes: class.repeats()}
+		if kindOf(node) == "foreach_statement" {
+			// A loop over what belongs to an enclosing loop's element repeats
+			// without scaling (hierarchy.go).
+			if class.scales() && csReachedThroughElement(node.ChildByFieldName("right"), w.src, w.loopScopes) {
+				class = loopInfinite
+			}
+			scope.amortizes = class.repeats()
+			csBindIdentifiers(node.ChildByFieldName("left"), w.src, &scope)
+		}
 		// The parts evaluated in the ENCLOSING scope are walked outside the loop.
 		// A `foreach (x in items.Where(p))` enumerates its iterable once — the
 		// lambda runs per element of `items`, which is the same n the loop itself
@@ -961,11 +1042,13 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 			w.walkForCalls(n)
 		}
 		w.enterLoop(class)
+		w.loopScopes = append(w.loopScopes, scope)
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
 			if c := node.Child(i); !containsAny(outer, c) {
 				w.walkForCalls(c)
 			}
 		}
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		w.exitLoop(class)
 		return
 	case "object_creation_expression":
@@ -1110,13 +1193,27 @@ func (w *astWalker) handleInvocation(node *sitter.Node) {
 		if ioMethods[name] || ioStaticTypes[recv] {
 			w.markIO()
 		}
+		// A receiver whose type is declared (receivers.go). Read before the
+		// type-name test below: a property is conventionally named for its type
+		// (`ILibraryManager LibraryManager`), and it is the property being called.
+		declared := w.receiverType(recvNode)
 		switch {
 		case recv == "this" || recv == "base":
+			if recv == "base" {
+				w.noteBaseCall(name)
+			}
 			if target, ok := w.resolveOwnMember(name); ok {
 				w.addEdge(facts.RelCalls, target)
-				w.recordCallMetrics(target, name, args)
+				// `base.M()` from an override of M binds to this type's M, which is
+				// the only M the resolver knows, and is the one call that provably
+				// is not M calling itself.
+				if recv == "base" {
+					w.recordCallMetrics(target, name, notSelfCall)
+				} else {
+					w.recordCallMetrics(target, name, args)
+				}
 			}
-		case recvNode != nil && isTypeNameShaped(recvNode, recv):
+		case declared == "" && recvNode != nil && isTypeNameShaped(recvNode, recv):
 			// `Type.Method(...)` — a static call. Emitted as "<Type>.<Method>" and
 			// bound only if Type resolves to a declared type; an unresolved one is
 			// left as written and matches nothing.
@@ -1135,6 +1232,7 @@ func (w *astWalker) handleInvocation(node *sitter.Node) {
 			// implementation: the interface member and the class method serving it.
 			w.addEdge(facts.RelCalls, name)
 			w.recordInLoop(recv, name)
+			w.noteTypedCall(recv+"."+name, declared, name)
 		}
 	}
 }
@@ -1185,6 +1283,10 @@ func (w *astWalker) markIO() {
 	}
 }
 
+// notSelfCall is an argument count no member has, passed to recordCallMetrics for
+// a call that cannot be the enclosing member calling itself.
+const notSelfCall = -1
+
 // recordCallMetrics flags direct recursion and records in-loop call targets.
 // Recursion needs the argument count to match the enclosing member's parameter
 // count, so a call to a same-named overload is not read as self-recursion.
@@ -1230,6 +1332,7 @@ func (w *astWalker) noteInLoop(target string) {
 	if m.inScalingSeen == nil {
 		m.inScalingSeen = map[string]bool{}
 	}
+	m.scalingCallDepth = noteCallDepth(m.scalingCallDepth, target, w.scalingDepth)
 	if !m.inScalingSeen[target] {
 		m.inScalingSeen[target] = true
 		m.callsInScalingLoop = append(m.callsInScalingLoop, target)

@@ -1,0 +1,1099 @@
+{
+  "$defs": {
+    "check.Breach": {
+      "properties": {
+        "fatal": {
+          "type": "boolean"
+        },
+        "measurement": {
+          "$ref": "#/$defs/check.Measurement"
+        }
+      },
+      "required": [
+        "fatal",
+        "measurement"
+      ],
+      "type": "object"
+    },
+    "check.Census": {
+      "properties": {
+        "dead_exemptions": {
+          "type": "integer"
+        },
+        "dirs_excluded_by_ignore": {
+          "type": "integer"
+        },
+        "dynamic_feature_classes": {
+          "type": "integer"
+        },
+        "files_excluded_by_ignore": {
+          "type": "integer"
+        },
+        "outside_graph": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "provider_overlap": {
+          "items": {
+            "$ref": "#/$defs/check.ProviderOverlapLine"
+          },
+          "type": "array"
+        },
+        "provider_skips": {
+          "items": {
+            "$ref": "#/$defs/facts.ProviderSkip"
+          },
+          "type": "array"
+        },
+        "recorded": {
+          "type": "boolean"
+        },
+        "unused_suppressions": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dead_exemptions",
+        "dirs_excluded_by_ignore",
+        "dynamic_feature_classes",
+        "files_excluded_by_ignore",
+        "recorded",
+        "unused_suppressions"
+      ],
+      "type": "object"
+    },
+    "check.ExcludedProducer": {
+      "properties": {
+        "baseline_facts_excluded": {
+          "type": "integer"
+        },
+        "baseline_findings_excluded": {
+          "type": "integer"
+        },
+        "current_facts_excluded": {
+          "type": "integer"
+        },
+        "current_findings_excluded": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "lacked_by": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "baseline_facts_excluded",
+        "baseline_findings_excluded",
+        "current_facts_excluded",
+        "current_findings_excluded",
+        "kind",
+        "lacked_by",
+        "name"
+      ],
+      "type": "object"
+    },
+    "check.IntersectionGrading": {
+      "properties": {
+        "excluded": {
+          "items": {
+            "$ref": "#/$defs/check.ExcludedProducer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "shared_extractors": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "shared_providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "excluded",
+        "shared_extractors"
+      ],
+      "type": "object"
+    },
+    "check.LedgerSummary": {
+      "properties": {
+        "breaches": {
+          "type": "integer"
+        },
+        "by_mode": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "excused": {
+          "type": "integer"
+        },
+        "exempted": {
+          "type": "integer"
+        },
+        "idle_excuses": {
+          "type": "integer"
+        },
+        "oldest_excuse_days": {
+          "type": "integer"
+        },
+        "rules": {
+          "type": "integer"
+        },
+        "suppressed": {
+          "type": "integer"
+        },
+        "undatable_excuses": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "breaches",
+        "excused",
+        "exempted",
+        "rules",
+        "suppressed"
+      ],
+      "type": "object"
+    },
+    "check.MajorMinorDependency": {
+      "properties": {
+        "dependent": {
+          "type": "string"
+        },
+        "share": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "dependent",
+        "share"
+      ],
+      "type": "object"
+    },
+    "check.Measurement": {
+      "properties": {
+        "count": {
+          "type": "integer"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "count",
+        "label",
+        "name"
+      ],
+      "type": "object"
+    },
+    "check.Policy": {
+      "properties": {
+        "fail_explainers": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "min_confidence": {
+          "type": "number"
+        },
+        "suppressions": {
+          "items": {
+            "$ref": "#/$defs/check.Suppression"
+          },
+          "type": "array"
+        },
+        "thresholds": {
+          "items": {
+            "$ref": "#/$defs/check.Threshold"
+          },
+          "type": "array"
+        },
+        "warn_only": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "fail_explainers",
+        "min_confidence",
+        "warn_only"
+      ],
+      "type": "object"
+    },
+    "check.ProviderOverlapLine": {
+      "properties": {
+        "already_resolved": {
+          "type": "integer"
+        },
+        "conflict": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "respelled": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "already_resolved",
+        "conflict",
+        "name",
+        "respelled"
+      ],
+      "type": "object"
+    },
+    "check.ReviewerRoute": {
+      "properties": {
+        "actor_is_minor": {
+          "type": "boolean"
+        },
+        "actor_share": {
+          "type": "number"
+        },
+        "commits": {
+          "type": "integer"
+        },
+        "minor": {
+          "type": "integer"
+        },
+        "module": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "owner_share": {
+          "type": "number"
+        },
+        "total": {
+          "type": "integer"
+        },
+        "via_dependents": {
+          "items": {
+            "$ref": "#/$defs/check.MajorMinorDependency"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "commits",
+        "minor",
+        "module",
+        "total"
+      ],
+      "type": "object"
+    },
+    "check.Reviewers": {
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "actor_unknown": {
+          "type": "boolean"
+        },
+        "cause": {
+          "type": "string"
+        },
+        "routes": {
+          "items": {
+            "$ref": "#/$defs/check.ReviewerRoute"
+          },
+          "type": "array"
+        },
+        "window": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "window"
+      ],
+      "type": "object"
+    },
+    "check.Suppression": {
+      "properties": {
+        "date": {
+          "type": "string"
+        },
+        "finding_title_prefix": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "date",
+        "owner",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "check.Threshold": {
+      "properties": {
+        "fail_at": {
+          "type": "integer"
+        },
+        "measurement": {
+          "type": "string"
+        },
+        "warn_at": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "measurement"
+      ],
+      "type": "object"
+    },
+    "constraints.ExemplarStatus": {
+      "properties": {
+        "exemplar": {
+          "type": "string"
+        },
+        "presence": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exemplar",
+        "presence"
+      ],
+      "type": "object"
+    },
+    "constraints.GuidanceMatch": {
+      "properties": {
+        "because": {
+          "type": "string"
+        },
+        "component": {
+          "type": "string"
+        },
+        "exemplars": {
+          "items": {
+            "$ref": "#/$defs/constraints.ExemplarStatus"
+          },
+          "type": "array"
+        },
+        "matched_files": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "because",
+        "component",
+        "matched_files",
+        "message",
+        "mode",
+        "rule"
+      ],
+      "type": "object"
+    },
+    "diff.Comparability": {
+      "properties": {
+        "comparable": {
+          "type": "boolean"
+        },
+        "warning_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "comparable"
+      ],
+      "type": "object"
+    },
+    "diff.Edge": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "target"
+      ],
+      "type": "object"
+    },
+    "diff.FactChange": {
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/facts.Fact"
+        },
+        "before": {
+          "$ref": "#/$defs/facts.Fact"
+        }
+      },
+      "required": [
+        "after",
+        "before"
+      ],
+      "type": "object"
+    },
+    "diff.InsightChange": {
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/facts.Insight"
+        },
+        "before": {
+          "$ref": "#/$defs/facts.Insight"
+        }
+      },
+      "required": [
+        "after",
+        "before"
+      ],
+      "type": "object"
+    },
+    "diff.SnapshotDiff": {
+      "properties": {
+        "baseline_generated_at": {
+          "type": "string"
+        },
+        "baseline_repo": {
+          "type": "string"
+        },
+        "comparability": {
+          "$ref": "#/$defs/diff.Comparability"
+        },
+        "current_generated_at": {
+          "type": "string"
+        },
+        "current_repo": {
+          "type": "string"
+        },
+        "edges_added": {
+          "items": {
+            "$ref": "#/$defs/diff.Edge"
+          },
+          "type": "array"
+        },
+        "edges_removed": {
+          "items": {
+            "$ref": "#/$defs/diff.Edge"
+          },
+          "type": "array"
+        },
+        "facts_added": {
+          "items": {
+            "$ref": "#/$defs/facts.Fact"
+          },
+          "type": "array"
+        },
+        "facts_changed": {
+          "items": {
+            "$ref": "#/$defs/diff.FactChange"
+          },
+          "type": "array"
+        },
+        "facts_removed": {
+          "items": {
+            "$ref": "#/$defs/facts.Fact"
+          },
+          "type": "array"
+        },
+        "findings_changed": {
+          "items": {
+            "$ref": "#/$defs/diff.InsightChange"
+          },
+          "type": "array"
+        },
+        "findings_declared": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_new": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_new_incidental": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_resolved": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_resolved_incidental": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_silenced": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_unattributed": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        },
+        "findings_undeclared": {
+          "items": {
+            "$ref": "#/$defs/facts.Insight"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "facts.CensusCause": {
+      "properties": {
+        "cause": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cause",
+        "count"
+      ],
+      "type": "object"
+    },
+    "facts.Evidence": {
+      "properties": {
+        "column": {
+          "type": "integer"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "end_column": {
+          "type": "integer"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "fact": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "facts.Fact": {
+      "properties": {
+        "column": {
+          "type": "integer"
+        },
+        "end_column": {
+          "type": "integer"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "props": {
+          "additionalProperties": {},
+          "type": "object"
+        },
+        "relations": {
+          "items": {
+            "$ref": "#/$defs/facts.Relation"
+          },
+          "type": "array"
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ],
+      "type": "object"
+    },
+    "facts.Insight": {
+      "properties": {
+        "confidence": {
+          "type": "number"
+        },
+        "description": {
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/facts.Evidence"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "identity": {
+          "type": "string"
+        },
+        "informational": {
+          "type": "boolean"
+        },
+        "metrics": {
+          "additionalProperties": {},
+          "type": "object"
+        },
+        "source": {
+          "type": "string"
+        },
+        "suggested_actions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "confidence",
+        "description",
+        "evidence",
+        "title"
+      ],
+      "type": "object"
+    },
+    "facts.ProviderSkip": {
+      "properties": {
+        "causes": {
+          "items": {
+            "$ref": "#/$defs/facts.CensusCause"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "facts.Relation": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "target"
+      ],
+      "type": "object"
+    },
+    "metrics.Delta": {
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/metrics.DeltaAggregate"
+        },
+        "before": {
+          "$ref": "#/$defs/metrics.DeltaAggregate"
+        },
+        "improved": {
+          "type": "integer"
+        },
+        "packages": {
+          "items": {
+            "$ref": "#/$defs/metrics.DeltaRow"
+          },
+          "type": "array"
+        },
+        "worsened": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "after",
+        "before",
+        "improved",
+        "worsened"
+      ],
+      "type": "object"
+    },
+    "metrics.DeltaAggregate": {
+      "properties": {
+        "analyzed": {
+          "type": "integer"
+        },
+        "avg_distance": {
+          "type": "number"
+        },
+        "avg_instability": {
+          "type": "number"
+        },
+        "off_main_sequence": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "analyzed",
+        "avg_distance",
+        "avg_instability",
+        "off_main_sequence"
+      ],
+      "type": "object"
+    },
+    "metrics.DeltaRow": {
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/metrics.PackageMetric"
+        },
+        "before": {
+          "$ref": "#/$defs/metrics.PackageMetric"
+        },
+        "package": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "zone_after": {
+          "type": "string"
+        },
+        "zone_before": {
+          "type": "string"
+        },
+        "zone_incidental": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "package"
+      ],
+      "type": "object"
+    },
+    "metrics.PackageMetric": {
+      "properties": {
+        "abstractness": {
+          "type": "number"
+        },
+        "afferent_couplings": {
+          "type": "integer"
+        },
+        "classes_interfaces": {
+          "type": "integer"
+        },
+        "data_holder_ratio": {
+          "type": "number"
+        },
+        "distance": {
+          "type": "number"
+        },
+        "efferent_couplings": {
+          "type": "integer"
+        },
+        "instability": {
+          "type": "number"
+        },
+        "package": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "abstractness",
+        "afferent_couplings",
+        "classes_interfaces",
+        "data_holder_ratio",
+        "distance",
+        "efferent_couplings",
+        "instability",
+        "package"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "added_by_kind": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "type": "object"
+    },
+    "advisories": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "advisory_kinds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "blocking_kinds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "breaches": {
+      "items": {
+        "$ref": "#/$defs/check.Breach"
+      },
+      "type": "array"
+    },
+    "census": {
+      "$ref": "#/$defs/check.Census"
+    },
+    "comparability_warnings": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "declared": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "descriptive": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "diff": {
+      "$ref": "#/$defs/diff.SnapshotDiff"
+    },
+    "edge_kinds_added": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "type": "object"
+    },
+    "edge_kinds_removed": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "type": "object"
+    },
+    "edges_added": {
+      "type": "integer"
+    },
+    "edges_removed": {
+      "type": "integer"
+    },
+    "exempted": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "facts_added": {
+      "type": "integer"
+    },
+    "facts_changed": {
+      "type": "integer"
+    },
+    "facts_removed": {
+      "type": "integer"
+    },
+    "failures": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "findings_changed": {
+      "items": {
+        "$ref": "#/$defs/diff.InsightChange"
+      },
+      "type": "array"
+    },
+    "guidance": {
+      "items": {
+        "$ref": "#/$defs/constraints.GuidanceMatch"
+      },
+      "type": "array"
+    },
+    "incidental": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "intersection_grading": {
+      "$ref": "#/$defs/check.IntersectionGrading"
+    },
+    "law": {
+      "$ref": "#/$defs/check.LedgerSummary"
+    },
+    "measurements": {
+      "items": {
+        "$ref": "#/$defs/check.Measurement"
+      },
+      "type": "array"
+    },
+    "package_metrics": {
+      "$ref": "#/$defs/metrics.Delta"
+    },
+    "policy": {
+      "$ref": "#/$defs/check.Policy"
+    },
+    "removed_by_kind": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "type": "object"
+    },
+    "resolved": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "reviewers": {
+      "$ref": "#/$defs/check.Reviewers"
+    },
+    "silenced": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "status": {
+      "type": "string"
+    },
+    "suppressed": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "unattributed": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    },
+    "undeclared": {
+      "items": {
+        "$ref": "#/$defs/facts.Insight"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "edges_added",
+    "edges_removed",
+    "facts_added",
+    "facts_changed",
+    "facts_removed",
+    "policy",
+    "status"
+  ],
+  "title": "check --json",
+  "type": "object"
+}

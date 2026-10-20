@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
+
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 )
 
 // This file holds the tree-sitter navigation helpers. They are collected here rather
@@ -331,3 +333,20 @@ var builtinTypes = map[string]bool{
 }
 
 func isBuiltinType(t string) bool { return builtinTypes[t] }
+
+// dartEndLine and dartEndColumn end a function or method at its body, which the
+// grammar makes the signature's sibling rather than its child; one declared
+// without a body (abstract, external) ends with its signature.
+func dartEndLine(sig, body *sitter.Node, src []byte) int {
+	if body != nil {
+		return tsutil.EndLine(body, src)
+	}
+	return tsutil.EndLine(sig, src)
+}
+
+func dartEndColumn(sig, body *sitter.Node, src []byte) int {
+	if body != nil {
+		return tsutil.EndColumn(body, src)
+	}
+	return tsutil.EndColumn(sig, src)
+}

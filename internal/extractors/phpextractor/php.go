@@ -18,6 +18,8 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/extcoverage"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
@@ -104,37 +106,69 @@ func (e *PHPExtractor) Extract(ctx context.Context, repoPath string, files []str
 		}
 	}
 
+	// A Laravel routes file is registered under whatever loads it, so the loads are
+	// read first, from every file, and handed to the route walk below.
+	var routeStacks map[string][][]phpRouteScope
+	if fw == frameworkLaravel {
+		found := parallel.MapFiles(ctx, phpFiles, func(relFile string) []routeMount {
+			src, err := os.ReadFile(filepath.Join(repoPath, relFile))
+			if err != nil || !mentionsRouteMount(src) {
+				return nil
+			}
+			return extractLaravelMounts(src, relFile)
+		})
+		mounts := map[string][]routeMount{}
+		for i, m := range found {
+			if len(m) > 0 {
+				mounts[phpFiles[i]] = m
+			}
+		}
+		routeStacks = laravelMountStacks(phpFiles, mounts)
+	}
+
 	// Per-file parsing is independent. Parse in parallel and merge in file order
 	// for deterministic output.
-	perFileFacts := parallel.MapFiles(ctx, phpFiles, func(relFile string) []facts.Fact {
+	perFileFacts := parallel.MapFiles(ctx, phpFiles, func(relFile string) phpFileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[php-extractor] error reading %s: %v", relFile, err)
-			return nil
+			return phpFileResult{}
 		}
 		// extractFileAST emits symbols, use-imports, inheritance, calls, and
 		// complexity. extractPHPHTTPClientFacts adds outbound HTTP-client routes
 		// (framework-independent). The framework switch adds server routes.
-		ff := extractFileAST(src, relFile)
+		ff, unlabelled := extractFileCountingTests(src, relFile)
 		ff = append(ff, extractPHPHTTPClientFacts(src, relFile)...)
 		switch fw {
 		case frameworkWordPress:
 			ff = append(ff, extractHooks(src, relFile)...)
 		case frameworkLaravel:
 			if isLaravelRouteFile(relFile) {
-				ff = append(ff, extractLaravelRoutes(src, relFile)...)
+				ff = append(ff, extractLaravelRoutes(src, relFile, routeStacks[relFile]...)...)
 			}
 		case frameworkSymfony:
-			ff = append(ff, extractSymfonyRoutes(src, relFile)...)
+			ff = append(ff, bindSymfonyHandlers(extractSymfonyRoutes(src, relFile), ff)...)
 		}
-		return ff
+		return phpFileResult{facts: ff, unlabelled: unlabelled}
 	})
 
 	var allFacts []facts.Fact
 	modules := make(map[string]bool)
-	for i, ff := range perFileFacts {
-		allFacts = append(allFacts, ff...)
+	named, unlabelled := 0, 0
+	for i, r := range perFileFacts {
+		allFacts = append(allFacts, r.facts...)
 		modules[factpath.Dir(phpFiles[i])] = true
+		for _, f := range r.facts {
+			if f.Kind == facts.KindTestCase {
+				named++
+			}
+		}
+		unlabelled += r.unlabelled
+	}
+	if unlabelled > 0 {
+		if f, ok := extcoverage.Fact(repoPath, "php:test_cases", "test_case", named, map[string]int{"label_not_literal": unlabelled}); ok {
+			allFacts = append(allFacts, f)
+		}
 	}
 
 	// Symfony YAML/XML route config lives outside the PHP source tree and is
@@ -158,77 +192,39 @@ func (e *PHPExtractor) Extract(ctx context.Context, repoPath string, files []str
 		})
 	}
 
+	// A Laravel route names a controller declared in another file, so its handler is
+	// resolved here, once every file's symbols are known; so does a WordPress hook
+	// registration its callback.
+	if fw == frameworkLaravel {
+		bindLaravelHandlers(allFacts)
+	}
+	if isWordPress {
+		bindWordPressHooks(allFacts)
+	}
+
+	// A model's base class may be declared in another file, so Eloquent models and
+	// their relations are emitted here too.
+	allFacts = append(allFacts, eloquentFacts(allFacts)...)
+
+	// An instance call names its method only once the receiver's class is known, and
+	// that class is declared in another file.
+	bindReceiverCalls(allFacts)
+
 	// Resolve `use` imports and namespaced references (inheritance, calls,
 	// instantiations) into internal module-coupling edges. Without this, PHP
 	// imports never match module Names downstream and coupling collapses to zero.
+	// A static call on one of the application's own facades runs the method of the
+	// class the facade's key is bound to.
+	resolveFacadeCalls(allFacts, facadeTargets(repoPath, phpFiles))
+
 	allFacts = append(allFacts, resolveImports(allFacts, isWordPress)...)
 
 	// Propagate the direct-I/O signal (io_direct) transitively over the call graph
 	// so a function that reaches a DB/HTTP call through a wrapper is also performs_io
 	// — lets the performance analyzer recognize an in-loop wrapper call as an N+1.
-	computePhpPerformsIO(allFacts)
+	ioclosure.Propagate(allFacts)
 
 	return allFacts, nil
-}
-
-// computePhpPerformsIO seeds performs_io from io_direct and propagates it over
-// RelCalls edges whose target is a known symbol Name, via a monotone false->true
-// fixpoint (a verbatim port of the Python/Rust extractors' pass). WordPress core
-// global functions carry bare Names and bare call targets, so the exists-gated
-// match propagates cleanly; namespaced/class code matches where the names align.
-func computePhpPerformsIO(allFacts []facts.Fact) {
-	exists := make(map[string]bool)
-	for i := range allFacts {
-		if allFacts[i].Kind == facts.KindSymbol {
-			exists[allFacts[i].Name] = true
-		}
-	}
-
-	io := make(map[string]bool)      // name -> performs I/O (directly or transitively)
-	adj := make(map[string][]string) // name -> called names that are known symbols
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		if b, _ := f.Props["io_direct"].(bool); b {
-			io[f.Name] = true
-		}
-		seen := make(map[string]bool)
-		for _, r := range f.Relations {
-			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
-				continue
-			}
-			seen[r.Target] = true
-			adj[f.Name] = append(adj[f.Name], r.Target)
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for name, callees := range adj {
-			if io[name] {
-				continue
-			}
-			for _, c := range callees {
-				if io[c] {
-					io[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind == facts.KindSymbol && io[f.Name] {
-			if f.Props == nil {
-				f.Props = map[string]any{}
-			}
-			f.Props["performs_io"] = true
-		}
-	}
 }
 
 // OwnsFile implements plugin.FileOwner for incremental caching.
@@ -241,4 +237,9 @@ func isPHPFile(path string) bool {
 		return true
 	}
 	return false
+}
+
+type phpFileResult struct {
+	facts      []facts.Fact
+	unlabelled int
 }

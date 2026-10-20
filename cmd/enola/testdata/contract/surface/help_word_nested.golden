@@ -1,0 +1,70 @@
+$ enola help constraints mine
+exit: 2
+--- stdout
+--- stderr
+Usage: enola constraints mine [flags] [repo_path|config_path]
+
+Mine the current snapshot's fact store for near-invariants — high-regularity
+properties with named exceptions — and report them as candidate constraint
+declarations. Every candidate carries its regularity as numerator/denominator,
+names every exception, and renders a would-be rule `constraints lint` accepts.
+Candidates are proposals for operator review: mining never writes a
+declaration, never touches enola/constraints/, and never feeds the check path.
+With --by-component, the edge candidates are about the parts the repository
+declares rather than its directories: each ordered pair of parts and each of
+calls and imports gets a forbid when none of the source part's resolved edges
+of that kind land in the target part, and each part an allow-only over the
+parts its edges do land in (--with-crossings admits named exceptions too).
+Every candidate prints its support (the source part's outgoing count and how
+that kind resolves over the declared parts); a candidate over a kind resolving
+under --min-resolution is listed as one that cannot be checked here, and one a
+declared rule already states is listed as declared. Neither is proposed.
+A candidate whose identity enola/mine-rejections.yaml names is not proposed
+in either grouping; the file is written by people, never by mine.
+With --scaffold-eslint DIR, candidates whose statement is a file-local syntactic
+check (a naming regularity over JS/TS declarations, a forbidden import between
+two directories) are also written as ESLint rule scaffolds under DIR, so an
+AST-shaped rule starts life in the linter and a graph-shaped one in enola.
+
+Exit codes:
+  0  report produced (even with zero candidates)
+  2  the command could not run (no snapshot, bad flag)
+
+Flags:
+  -by-component
+    	mine edge candidates over the parts the repository's declaration names (components in enola/constraints/ and enola-intent.yaml, and the layers of a layer order) instead of directories; a pair of parts with no crossing is proposed when the source part's outgoing count clears --min-support, with that support printed beside it
+  -include-tautologies
+    	also print candidates whose statement holds by construction; suppressed and counted by default
+  -jsonl string
+    	also write the full report as a JSONL artifact to this path
+  -max-exceptions int
+    	most named exceptions a candidate may carry; families above it are suppressed and counted (default 20)
+  -min-confidence float
+    	smallest regularity ratio a candidate may carry (0..1] (default 0.9)
+  -min-resolution float
+    	with --by-component, the share of an edge kind's edges that must land on something measured before candidates over that kind are proposed; under it they are listed as ones that cannot be checked here (default 0.05)
+  -min-support int
+    	smallest denominator a candidate may rest on; families below it are suppressed and counted (default 10)
+  -rejections string
+    	the file of rejected candidates, relative to the repository: identity, owner, since and because per entry; a candidate it names is not proposed, and mine never writes it (default "enola/mine-rejections.yaml")
+  -scaffold-eslint string
+    	write ESLint rule scaffolds (rule, RuleTester test, index.js) for the candidates a file-local rule can express into this directory; the rest are listed with the reason they stay constraint proposals
+  -top int
+    	how many ranked candidates the text report prints (0 = all) (default 50)
+  -with-crossings
+    	with --by-component, also propose a forbid or allow-only the code already crosses, naming the crossings as exceptions; off by default, because a crossing between declared parts reads as a seam the declaration may intend
+
+Examples:
+  # Propose rules from the current snapshot
+  enola constraints mine
+
+  # Only near-certain candidates, all of them
+  enola constraints mine --min-confidence 0.98 --top 0
+
+  # Keep the full report as JSONL
+  enola constraints mine --jsonl candidates.jsonl
+
+  # Write the file-local candidates as ESLint rules instead
+  enola constraints mine --scaffold-eslint eslint-rules
+
+See also: enola help constraints init, enola help constraints

@@ -1,0 +1,57 @@
+{
+  "summary": {
+    "rules": 3,
+    "by_mode": {
+      "advisory": 1,
+      "ratchet": 1,
+      "strict": 1
+    },
+    "breaches": 5,
+    "suppressed": 1,
+    "exempted": 1,
+    "excused": 2,
+    "oldest_excuse_days": 236
+  },
+  "rules": [
+    {
+      "id": "company-fk",
+      "mode": "ratchet",
+      "source": "enola/constraints/billing.yaml",
+      "because": "tenant isolation rides the FK",
+      "verdicted": true,
+      "breaches": 2,
+      "suppressed": 0,
+      "exempted": 1,
+      "excuses": [
+        {
+          "kind": "exemption",
+          "owner": "alice",
+          "reason": "legacy tables migrate in Q4",
+          "date": "2026-01-01",
+          "age_days": 236,
+          "witness": "users must have fk_constraints",
+          "matched": true
+        }
+      ]
+    },
+    {
+      "id": "domain-pure",
+      "mode": "strict",
+      "because": "the domain must not know its delivery mechanisms",
+      "verdicted": true,
+      "breaches": 3,
+      "suppressed": 1,
+      "exempted": 0
+    },
+    {
+      "id": "quiet-rule",
+      "mode": "advisory",
+      "source": "enola/constraints/quiet.yaml",
+      "because": "nothing breaches it here",
+      "verdicted": true,
+      "breaches": 0,
+      "suppressed": 0,
+      "exempted": 0
+    }
+  ]
+}

@@ -8,10 +8,11 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/extractors/extcoverage"
+	scala "github.com/enola-labs/enola/internal/extractors/scalaextractor/grammar"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 )
 
 // ExtractTestRefs implements plugin.TestRefExtractor. It parses test sources for the
@@ -45,18 +46,31 @@ func (e *ScalaExtractor) ExtractTestRefs(ctx context.Context, repoPath string, t
 		return nil, nil
 	}
 
-	perFile := parallel.MapFiles(ctx, scalaFiles, func(relFile string) []facts.Fact {
+	type testFile struct {
+		refs  []facts.Fact
+		cases testCaseReading
+	}
+	perFile := parallel.MapFiles(ctx, scalaFiles, func(relFile string) testFile {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[scala-extractor] error reading test file %s: %v", relFile, err)
-			return nil
+			return testFile{}
 		}
-		return testRefsFromFile(src, relFile)
+		return testFile{refs: testRefsFromFile(src, relFile), cases: scalaTestCases(src, relFile)}
 	})
 
 	var out []facts.Fact
-	for _, ff := range perFile {
-		out = append(out, ff...)
+	named, unlabelled := 0, 0
+	for _, tf := range perFile {
+		out = append(out, tf.refs...)
+		out = append(out, tf.cases.cases...)
+		named += len(tf.cases.cases)
+		unlabelled += tf.cases.unlabelled
+	}
+	if unlabelled > 0 {
+		if f, ok := extcoverage.Fact(repoPath, "scala:test_cases", "test_case", named, map[string]int{"label_not_literal": unlabelled}); ok {
+			out = append(out, f)
+		}
 	}
 	return out, nil
 }

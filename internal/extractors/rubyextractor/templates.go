@@ -3,10 +3,10 @@ package rubyextractor
 import (
 	"strings"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
 
 // refsFromRuby parses Ruby source and returns a single reference-only fact of the
@@ -22,7 +22,12 @@ func refsFromRuby(src []byte, relFile, kind string) []facts.Fact {
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
+	return refsFromRubyTree(tree, src, relFile, kind)
+}
 
+// refsFromRubyTree is refsFromRuby over a tree already parsed, so a test file read
+// for its references and its test cases is parsed once.
+func refsFromRubyTree(tree *sitter.Tree, src []byte, relFile, kind string) []facts.Fact {
 	w := &rubyWalker{src: src, relFile: relFile, dir: factpath.Dir(relFile), fileRefIdx: -1}
 	seen := make(map[string]bool)
 	var rels []facts.Relation

@@ -11,8 +11,42 @@ for external snapshot consumers.
 | `facts.jsonl` | JSON Lines, one fact per line | [facts.md](facts.md) |
 | `insights.json` | JSON array of findings | [insights.md](insights.md) |
 | `receipt.json` | JSON object with provenance and extraction quality | [receipt.md](receipt.md) |
+| `flows.json` | JSON object ranking the ways into the program | [flows.md](flows.md) |
+| `docs.jsonl` | JSON Lines, one documented fact's whole comment per line | [docs.md](docs.md) |
 | `snapshot.meta.json` | Internal superset of the receipt | Not stable |
 | `llm_context.md` | Rendered text | Not stable |
+
+## Schemas
+
+Each artefact above that is a contract, and each JSON answer a program reads
+from the binary, has a JSON Schema checked in beside this file. They are
+generated from the Go types the JSON is written from, and a test regenerates
+them and fails when a type changes without its schema, so they describe what
+the current build writes. `contract --json` prints the same schemas together
+with the closed sets (rule forms, vias, kinds, statuses and the rest) the
+engine validates with.
+
+| Schema | Describes |
+|---|---|
+| `facts-record.schema.json` | One line of `facts.jsonl` |
+| `receipt.schema.json` | `receipt.json` |
+| `insights.schema.json` | `insights.json` |
+| `ledger.schema.json` | `constraints ledger --json` |
+| `check.schema.json` | `check --json` |
+| `lint.schema.json` | `constraints lint --json` |
+| `contract.schema.json` | `contract --json` |
+
+The MCP server's `constraints_ledger`, `constraints_lint` and `grade` tools
+list the ledger, lint and check schemas as their output schemas and return
+those documents as structured content, since the commands call the tools for
+their answers. The other tools that answer as typed data ([CLI.md](../CLI.md#answers-a-program-reads)) list output schemas generated the same way
+from the types their answers are written from; `tools/list` carries them, and
+each also admits the `freshness` field a stale snapshot adds.
+
+The schemas do not close objects with `additionalProperties: false`: a reader
+accepts fields it does not know, as the versioning rule below requires. A field
+is required when the writer always writes it, and a list or object that may be
+empty admits `null` where the writer writes `null` for it.
 
 ## Contract scope
 
@@ -46,7 +80,7 @@ Reject unsupported versions. Treat `format_version: 0` as unknown.
 
 ## Determinism
 
-`facts.jsonl` and `insights.json` are byte-stable when the source tree,
+`facts.jsonl`, `insights.json` and `flows.json` are byte-stable when the source tree,
 effective configuration, enola build, and repository labels are unchanged.
 `snapshot_id` hashes the fact serialization, enola version, and effective
 configuration hash.

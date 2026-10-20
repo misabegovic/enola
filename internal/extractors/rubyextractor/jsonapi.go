@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
 
 // jsonapiResolver answers the questions a `jsonapi_resources` declaration cannot

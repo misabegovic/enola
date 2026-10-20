@@ -8,11 +8,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 )
@@ -148,6 +150,14 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// Pass 2: build a global field-type map from ALL packages in the module.
 	// This allows cross-package field-chain resolution (e.g., a subpackage can
 	// look up fields of a root-package struct).
+	// Aliases first: a field or a result declared as an alias is a value of the type
+	// the alias names, and that is where its methods are.
+	aliases := make(map[string]string)
+	for _, pkgDir := range pkgDirs {
+		for k, v := range collectAliases(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames) {
+			aliases[k] = v
+		}
+	}
 	globalFieldTypes := make(map[string]string)
 	for _, pkgDir := range pkgDirs {
 		select {
@@ -155,10 +165,36 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 			return allFacts, ctx.Err()
 		default:
 		}
-		for k, v := range collectFieldTypes(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames) {
+		for k, v := range collectFieldTypes(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames, aliases) {
 			globalFieldTypes[k] = v
 		}
 	}
+
+	// Pass 2a: what every function in the module is declared to return, so a call
+	// on a call's result (`eng.Resolver().NodeName(x)`) and a variable assigned from
+	// one (`r := eng.Resolver()`) resolve to the method they reach.
+	callTypes := callTypeTables{returns: make(map[string][]string), aliases: aliases}
+	for _, pkgDir := range pkgDirs {
+		for k, v := range collectReturnTypes(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames, aliases) {
+			callTypes.returns[k] = v
+		}
+	}
+
+	// Pass 2a': the interface assertions of every package, which are the only
+	// statement of what implements what. They let a call on an interface reach the
+	// I/O behind it: see markGoDirectIO and the closure at the end.
+	callTypes.implementers = make(map[string][]string)
+	callTypes.embeds = make(map[string][]string)
+	for _, pkgDir := range pkgDirs {
+		for iface, impls := range collectInterfaceAssertions(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames, aliases) {
+			callTypes.implementers[iface] = append(callTypes.implementers[iface], impls...)
+		}
+		for typ, embedded := range collectEmbeddedTypes(parsedPkgs[pkgDir].parsedFiles, pkgDir, modulePath, pkgNames, aliases) {
+			callTypes.embeds[typ] = append(callTypes.embeds[typ], embedded...)
+		}
+	}
+
+	promoteReturnTypes(callTypes.returns, callTypes.embeds)
 
 	// Pass 2b: build the gRPC client stub index (generated concrete clients →
 	// method wire paths) so consumer call sites in any package resolve to the
@@ -173,7 +209,15 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// prefix a router parameter carries at its call sites, so routes registered on
 	// a subrouter passed into a per-file/per-package function are stored at their
 	// true runtime path (e.g. "/api/settings/courses", not the bare "/courses").
-	routePrefixes := buildRoutePrefixIndex(parsedPkgs, modulePath, pkgNames, globalFieldTypes)
+	routerWrappers := routerWrapperPackages(parsedPkgs)
+	stringConstants := buildStringConsts(parsedPkgs)
+	routerFields := ownRouterFields(globalFieldTypes, routerWrappers)
+	routePrefixes := routeIndex{
+		prefixes:     buildRoutePrefixIndex(parsedPkgs, modulePath, pkgNames, globalFieldTypes, routerWrappers, stringConstants, routerFields),
+		wrappers:     routerWrappers,
+		consts:       stringConstants,
+		routerFields: routerFields,
+	}
 
 	// Pass 3: extract facts per package using the global field types.
 	for _, pkgDir := range pkgDirs {
@@ -186,14 +230,31 @@ func (e *GoExtractor) Extract(ctx context.Context, repoPath string, files []stri
 		if pp.pkgName == "" {
 			continue
 		}
-		pkgFacts := e.extractPackage(fset, pkgDir, pp, modulePath, globalFieldTypes, pkgNames, grpcStubs, routePrefixes)
+		pkgFacts := e.extractPackage(fset, pkgDir, pp, modulePath, globalFieldTypes, callTypes, pkgNames, grpcStubs, routePrefixes)
 		allFacts = append(allFacts, pkgFacts...)
 	}
+
+	resolvePromotedCalls(allFacts, callTypes.embeds)
+
+	// The commands a program declares, settled once every function is known.
+	var commandLits []string
+	for _, pkgDir := range pkgDirs {
+		pp := parsedPkgs[pkgDir]
+		for _, f := range pp.parsedFiles {
+			commandLits = append(commandLits, commandLiterals(f, pkgDir, buildFileImports(f, modulePath, pkgNames))...)
+		}
+	}
+	bindCommands(allFacts, commandLits, modulePath)
+	bindTools(allFacts)
+
+	// Carry io_direct to every function that reaches one, across packages, and
+	// through an interface to the types asserted to implement it.
+	ioclosure.PropagateWith(allFacts, ioclosure.Options{Declared: callTypes.implementers, Opaque: goObservability})
 
 	return allFacts, nil
 }
 
-func (e *GoExtractor) extractPackage(fset *token.FileSet, pkgDir string, pp *parsedPkg, modulePath string, fieldTypes map[string]string, pkgNames map[string]string, grpcStubs *goGRPCStubIndex, routePrefixes routePrefixIndex) []facts.Fact {
+func (e *GoExtractor) extractPackage(fset *token.FileSet, pkgDir string, pp *parsedPkg, modulePath string, fieldTypes map[string]string, callTypes callTypeTables, pkgNames map[string]string, grpcStubs *goGRPCStubIndex, routePrefixes routeIndex) []facts.Fact {
 	var result []facts.Fact
 
 	// Package-scoped map of top-level `var x = NewXxxClient(...)` bindings, so a
@@ -215,13 +276,14 @@ func (e *GoExtractor) extractPackage(fset *token.FileSet, pkgDir string, pp *par
 	// reachability walk had to find the seam by another route and found only
 	// part of it.
 	pkgFuncs := collectPackageFuncs(pp.parsedFiles)
+	pkgScope := collectPackageScope(pp.parsedFiles)
 
 	for _, relFile := range pp.relFiles {
 		f, ok := pp.fileMap[relFile]
 		if !ok {
 			continue
 		}
-		result = append(result, e.extractFile(fset, f, relFile, pkgDir, modulePath, fieldTypes, pkgNames, grpcStubs, pkgVarClients, baseURLLits, routePrefixes, pkgFuncs)...)
+		result = append(result, e.extractFile(fset, f, relFile, pkgDir, modulePath, fieldTypes, callTypes, pkgNames, grpcStubs, pkgVarClients, baseURLLits, routePrefixes, pkgFuncs, pkgScope)...)
 	}
 
 	moduleFact := facts.Fact{
@@ -233,17 +295,71 @@ func (e *GoExtractor) extractPackage(fset *token.FileSet, pkgDir string, pp *par
 			"language": "go",
 		},
 	}
+	// Functions referenced by the package's own var and const initializers. They hang
+	// on the package rather than on a symbol because the table that holds them is
+	// usually unexported and so has no symbol of its own — `var builtIns = map[string]
+	// providerFunc{"rubydex": runRubydex}` is the shape, and runRubydex read as dead
+	// with it unrecorded. Package-level initialization IS the package's work, so the
+	// package is the honest source for the edge.
+	if refs := packageLevelInitRefs(pp, pkgDir, modulePath, pkgNames, pkgFuncs); len(refs) > 0 {
+		for _, ref := range refs {
+			moduleFact.Relations = append(moduleFact.Relations, facts.Relation{
+				Kind:   facts.RelCalls,
+				Target: ref,
+			})
+		}
+	}
 	// Store the full Go module path on the root package fact so that the graph
 	// layer can normalise cross-repo call targets (Bug 2).
 	if pkgDir == "." && modulePath != "" {
-		moduleFact.Props["modulePath"] = modulePath
+		moduleFact.SetProp("modulePath", modulePath)
+	}
+	if doc := packageDoc(pp); doc != "" {
+		facts.SetDoc(&moduleFact, doc)
 	}
 	result = append(result, moduleFact)
 
 	return result
 }
 
-func (e *GoExtractor) extractFile(fset *token.FileSet, f *ast.File, relFile, pkgDir, modulePath string, fieldTypes map[string]string, pkgNames map[string]string, grpcStubs *goGRPCStubIndex, pkgVarClients map[string]string, baseURLLits map[string][]string, routePrefixes routePrefixIndex, pkgFuncs map[string]bool) []facts.Fact {
+// packageDoc returns the doc prop for a package: its package comment, from doc.go
+// when that file has one, else from the first file by name that does. Test files
+// are skipped, and so is a licence written directly above the package clause.
+func packageDoc(pp *parsedPkg) string {
+	names := make([]string, 0, len(pp.relFiles))
+	for _, rel := range pp.relFiles {
+		if !strings.HasSuffix(rel, "_test.go") {
+			names = append(names, rel)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		di, dj := isDocGo(names[i]), isDocGo(names[j])
+		if di != dj {
+			return di
+		}
+		return names[i] < names[j]
+	})
+	for _, rel := range names {
+		f := pp.fileMap[rel]
+		if f == nil || f.Doc == nil {
+			continue
+		}
+		text := f.Doc.Text()
+		if first := facts.DocSummary(text); strings.HasPrefix(first, "Copyright") || strings.Contains(first, "SPDX-License-Identifier") {
+			continue
+		}
+		if doc := facts.DocText(text); doc != "" {
+			return doc
+		}
+	}
+	return ""
+}
+
+func isDocGo(rel string) bool {
+	return rel == "doc.go" || strings.HasSuffix(rel, "/doc.go")
+}
+
+func (e *GoExtractor) extractFile(fset *token.FileSet, f *ast.File, relFile, pkgDir, modulePath string, fieldTypes map[string]string, callTypes callTypeTables, pkgNames map[string]string, grpcStubs *goGRPCStubIndex, pkgVarClients map[string]string, baseURLLits map[string][]string, routePrefixes routeIndex, pkgFuncs, pkgScope map[string]bool) []facts.Fact {
 	var result []facts.Fact
 
 	// Build per-file import alias map for call resolution.
@@ -265,7 +381,7 @@ func (e *GoExtractor) extractFile(fset *token.FileSet, f *ast.File, relFile, pkg
 			}
 		}
 
-		result = append(result, facts.Fact{
+		dep := facts.Fact{
 			Kind: facts.KindDependency,
 			Name: pkgDir + " -> " + importPath,
 			File: relFile,
@@ -277,21 +393,29 @@ func (e *GoExtractor) extractFile(fset *token.FileSet, f *ast.File, relFile, pkg
 			Relations: []facts.Relation{
 				{Kind: facts.RelImports, Target: relTarget},
 			},
-		})
+		}
+		spanOf(fset, imp).set(&dep)
+		result = append(result, dep)
 	}
 
 	// Walk declarations
 	for _, decl := range f.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			result = append(result, e.extractFunc(fset, d, relFile, pkgDir, modulePath, fileImports, fieldTypes, pkgFuncs)...)
+			result = append(result, e.extractFunc(fset, d, relFile, pkgDir, modulePath, fileImports, fieldTypes, callTypes, pkgFuncs, pkgScope)...)
 		case *ast.GenDecl:
-			result = append(result, e.extractGenDecl(fset, d, relFile, pkgDir, modulePath, fileImports)...)
+			result = append(result, e.extractGenDecl(fset, d, relFile, pkgDir, modulePath, fileImports, pkgScope)...)
 		}
 	}
 
 	// Extract route registrations
-	result = append(result, extractRoutes(fset, f, relFile, pkgDir, routePrefixes)...)
+	routes := extractRoutes(fset, f, relFile, pkgDir, routePrefixes, fileImports)
+	for i := range routes {
+		if t := handlerTarget(routes[i].PropString("handler"), pkgDir, fileImports); t != "" {
+			routes[i].SetProp(facts.PropHandlerTarget, t)
+		}
+	}
+	result = append(result, routes...)
 
 	// Extract outbound HTTP-client calls
 	result = append(result, extractHTTPClientFacts(fset, f, relFile, pkgDir, baseURLLits)...)
@@ -308,7 +432,7 @@ func (e *GoExtractor) extractFile(fset *token.FileSet, f *ast.File, relFile, pkg
 	return result
 }
 
-func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile, pkgDir, modulePath string, fileImports map[string]string, fieldTypes map[string]string, pkgFuncs map[string]bool) []facts.Fact {
+func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile, pkgDir, modulePath string, fileImports map[string]string, fieldTypes map[string]string, callTypes callTypeTables, pkgFuncs, pkgScope map[string]bool) []facts.Fact {
 	var result []facts.Fact
 
 	name := fn.Name.Name
@@ -344,9 +468,12 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 		},
 	}
 
+	spanOf(fset, fn).set(&symbolFact)
+
 	if receiver != "" {
-		symbolFact.Props["receiver"] = receiver
+		symbolFact.SetProp("receiver", receiver)
 	}
+	facts.SetDoc(&symbolFact, fn.Doc.Text())
 
 	// An HTTP handler is exactly func(http.ResponseWriter, *http.Request). Tag it, so a
 	// route can be bound to the symbol that actually serves it.
@@ -364,12 +491,12 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 	// parses with go/ast, so fn.Type.Params is exact. Set only when true — a positive
 	// marker, so the goldens do not gain a line per function.
 	if isHTTPHandlerSignature(fn.Type) {
-		symbolFact.Props["http_handler"] = true
+		symbolFact.SetProp("http_handler", true)
 	}
 
 	// Extract function calls and per-function complexity metrics in a single
 	// body walk. The metrics ride on Props (map[string]any) and feed the
-	// enterprise performance analyzer; they are parser-derived, never inferred.
+	// performance analyzer; they are parser-derived, never inferred.
 	if fn.Body != nil {
 		ctx := resolveCtx{
 			pkgDir:     pkgDir,
@@ -379,13 +506,42 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 			recvType:   receiver,
 			fieldTypes: fieldTypes,
 			pkgFuncs:   pkgFuncs,
+			pkgScope:   pkgScope,
+
+			returnTypes: callTypes.returns,
+			aliases:     callTypes.aliases,
 		}
-		ctx.localTypes = collectLocalTypes(fn.Body, ctx)
-		m := analyzeBody(fn.Body, ctx, qualifiedName)
+		typeParams := typeParamNames(fn.Recv, fn.Type)
+		ctx.localTypes = collectLocalTypesFrom(fn.Body, ctx, signatureTypes(fn.Type, ctx, typeParams), typeParams)
+		if dispatches := stringDispatches(fn.Body, ctx); len(dispatches) > 0 {
+			symbolFact.SetProp(dispatchProp, dispatches)
+		}
+		toolFacts, namedTools := mcpTools(fset, fn.Body, ctx, relFile, pkgDir)
+		result = append(result, toolFacts...)
+		if len(namedTools) > 0 {
+			symbolFact.SetProp(toolsProp, namedTools)
+		}
+		m := analyzeBody(fn.Body, ctx, qualifiedName, funcParamNames(fn))
 		for _, call := range m.calls {
 			symbolFact.Relations = append(symbolFact.Relations, facts.Relation{
 				Kind:   facts.RelCalls,
 				Target: call,
+			})
+		}
+		// A function handed somewhere as a value rather than called: a dispatch-table
+		// entry, a callback argument, a struct field. analyzeBody only looks for
+		// CallExpr, so without this the callee has no incoming edge at all.
+		called := make(map[string]bool, len(m.calls))
+		for _, call := range m.calls {
+			called[call] = true
+		}
+		for _, ref := range funcValueRefs(fn.Body, ctx) {
+			if called[ref] {
+				continue // already recorded as a call from this same body
+			}
+			symbolFact.Relations = append(symbolFact.Relations, facts.Relation{
+				Kind:   facts.RelCalls,
+				Target: ref,
 			})
 		}
 		for _, inst := range m.instantiates {
@@ -396,21 +552,21 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 		}
 		// Only emit non-trivial metrics so existing snapshots and facts from
 		// other extractors (which don't compute these) stay clean.
-		symbolFact.Props["cyclomatic"] = m.cyclomatic
+		symbolFact.SetProp("cyclomatic", m.cyclomatic)
 		if m.loopDepth > 0 {
-			symbolFact.Props["loop_depth"] = m.loopDepth
+			symbolFact.SetProp("loop_depth", m.loopDepth)
 			// Emit the scaling depth (bounded loops discounted) alongside — even when 0 —
 			// so the consumer distinguishes "all loops bounded" from "signal absent".
-			symbolFact.Props["scaling_loop_depth"] = m.scalingLoopDepth
+			symbolFact.SetProp("scaling_loop_depth", m.scalingLoopDepth)
 		}
 		if m.loopCount > 0 {
-			symbolFact.Props["loop_count"] = m.loopCount
+			symbolFact.SetProp("loop_count", m.loopCount)
 		}
 		if len(m.clientPathCalls) > 0 {
-			symbolFact.Props["client_path_calls"] = m.clientPathCalls
+			symbolFact.SetProp("client_path_calls", m.clientPathCalls)
 		}
 		if len(m.callsInLoop) > 0 {
-			symbolFact.Props["calls_in_loop"] = m.callsInLoop
+			symbolFact.SetProp("calls_in_loop", m.callsInLoop)
 			// Emit the N+1 subset alongside — even when EMPTY — so the consumer
 			// distinguishes "no call repeats" from "signal absent". An omitted key makes
 			// perf.scalingLoopCalls() fall back to the unfiltered calls_in_loop, which
@@ -419,10 +575,26 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 			if m.callsInScalingLoop == nil {
 				m.callsInScalingLoop = []string{}
 			}
-			symbolFact.Props["calls_in_scaling_loop"] = m.callsInScalingLoop
+			symbolFact.SetProp("calls_in_scaling_loop", m.callsInScalingLoop)
+			symbolFact.SetProp("calls_in_scaling_loop_depth", callDepths(m.callsInScalingLoop, m.scalingCallDepth))
+			// Emitted even when empty, for the same reason as calls_in_scaling_loop:
+			// an absent key cannot be told from "no such call".
+			if m.callsOnLoopElement == nil {
+				m.callsOnLoopElement = []string{}
+			}
+			symbolFact.SetProp("calls_on_loop_element", m.callsOnLoopElement)
+		}
+		if m.loopsOverParam {
+			symbolFact.SetProp("loops_over_param", true)
 		}
 		if m.recursiveSelf {
-			symbolFact.Props["recursive_self"] = true
+			symbolFact.SetProp("recursive_self", true)
+		}
+		markGoDirectIO(&symbolFact, callTypes, m.callsPerCall)
+		// What the body calls only from inside a once.Do. The edge is real and
+		// stays; the closure reads this to not carry I/O across it.
+		if once := onceOnly(m.calls, m.callsPerCall); len(once) > 0 {
+			symbolFact.SetProp("calls_once", once)
 		}
 	}
 
@@ -430,13 +602,13 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 	return result
 }
 
-func (e *GoExtractor) extractGenDecl(fset *token.FileSet, gd *ast.GenDecl, relFile, pkgDir, modulePath string, fileImports map[string]string) []facts.Fact {
+func (e *GoExtractor) extractGenDecl(fset *token.FileSet, gd *ast.GenDecl, relFile, pkgDir, modulePath string, fileImports map[string]string, pkgScope map[string]bool) []facts.Fact {
 	var result []facts.Fact
 
 	for _, spec := range gd.Specs {
 		switch s := spec.(type) {
 		case *ast.TypeSpec:
-			result = append(result, e.extractTypeSpec(fset, gd, s, relFile, pkgDir, modulePath, fileImports)...)
+			result = append(result, e.extractTypeSpec(fset, gd, s, relFile, pkgDir, modulePath, fileImports, pkgScope)...)
 		case *ast.ValueSpec:
 			result = append(result, e.extractValueSpec(fset, gd, s, relFile, pkgDir)...)
 		}
@@ -463,7 +635,7 @@ func (e *GoExtractor) extractValueSpec(fset *token.FileSet, gd *ast.GenDecl, vs 
 		if !ident.IsExported() {
 			continue
 		}
-		result = append(result, facts.Fact{
+		value := facts.Fact{
 			Kind: facts.KindSymbol,
 			Name: pkgDir + "." + ident.Name,
 			File: relFile,
@@ -473,12 +645,14 @@ func (e *GoExtractor) extractValueSpec(fset *token.FileSet, gd *ast.GenDecl, vs 
 				"exported":    true,
 				"language":    "go",
 			},
-		})
+		}
+		spanBetween(fset, ident.Pos(), vs.End()).set(&value)
+		result = append(result, value)
 	}
 	return result
 }
 
-func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *ast.TypeSpec, relFile, pkgDir, modulePath string, fileImports map[string]string) []facts.Fact {
+func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *ast.TypeSpec, relFile, pkgDir, modulePath string, fileImports map[string]string, pkgScope map[string]bool) []facts.Fact {
 	var result []facts.Fact
 
 	name := ts.Name.Name
@@ -493,6 +667,14 @@ func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *
 	switch t := ts.Type.(type) {
 	case *ast.StructType:
 		kind = facts.SymbolStruct
+		typeParams := map[string]bool{}
+		if ts.TypeParams != nil {
+			for _, field := range ts.TypeParams.List {
+				for _, n := range field.Names {
+					typeParams[n.Name] = true
+				}
+			}
+		}
 		if t.Fields != nil {
 			for _, field := range t.Fields.List {
 				if len(field.Names) == 0 {
@@ -502,11 +684,19 @@ func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *
 					}
 					continue
 				}
-				// A named field of an internal struct type USES that type. Emit a
-				// usage edge so a struct referenced only as a field type is not a
-				// dead-code false positive (type usage is otherwise not edge-tracked).
-				if target := resolveTypeName(typeExprToString(field.Type), ctx); target != "" && isInternalTypeTarget(target, pkgDir) {
-					instantiates = append(instantiates, target)
+				// A named field USES every internal type its type mentions, however
+				// it is wrapped: `[]Layer` and `map[Key]*Value` use Layer, Key and
+				// Value. Emit a usage edge so a struct referenced only as a field
+				// type is not a dead-code false positive (type usage is otherwise
+				// not edge-tracked).
+				for _, typeStr := range namedTypesIn(field.Type, nil) {
+					if !strings.Contains(typeStr, ".") && (!pkgScope[typeStr] || typeParams[typeStr]) {
+						continue // predeclared, or a type parameter: nothing declared
+					}
+					target := resolveTypeName(typeStr, ctx)
+					if isInternalTypeTarget(target, pkgDir) && !slices.Contains(instantiates, target) {
+						instantiates = append(instantiates, target)
+					}
 				}
 			}
 		}
@@ -532,12 +722,23 @@ func (e *GoExtractor) extractTypeSpec(fset *token.FileSet, gd *ast.GenDecl, ts *
 		},
 	}
 
+	spanOf(fset, ts).set(&symbolFact)
+
 	for _, impl := range implements {
 		symbolFact.Relations = append(symbolFact.Relations, facts.Relation{
 			Kind:   facts.RelImplements,
 			Target: impl,
 		})
 	}
+
+	// A type declared alone carries its comment on the declaration, a type in a
+	// group on its own spec.
+	typeDoc := ts.Doc
+	if typeDoc == nil && !gd.Lparen.IsValid() {
+		typeDoc = gd.Doc
+	}
+	facts.SetDoc(&symbolFact, typeDoc.Text())
+
 	for _, inst := range instantiates {
 		symbolFact.Relations = append(symbolFact.Relations, facts.Relation{
 			Kind:   facts.RelInstantiates,
@@ -563,7 +764,7 @@ func interfaceMethodSymbols(fset *token.FileSet, iface *ast.InterfaceType, relFi
 	}
 	for _, field := range iface.Methods.List {
 		for _, methodIdent := range field.Names {
-			result = append(result, facts.Fact{
+			method := facts.Fact{
 				Kind: facts.KindSymbol,
 				Name: pkgDir + "." + ifaceName + "." + methodIdent.Name,
 				File: relFile,
@@ -577,7 +778,9 @@ func interfaceMethodSymbols(fset *token.FileSet, iface *ast.InterfaceType, relFi
 				Relations: []facts.Relation{
 					{Kind: facts.RelDeclares, Target: pkgDir},
 				},
-			})
+			}
+			spanBetween(fset, methodIdent.Pos(), field.End()).set(&method)
+			result = append(result, method)
 		}
 	}
 	return result
@@ -592,12 +795,22 @@ type resolveCtx struct {
 	recvType   string            // receiver type (star stripped), e.g. "AuthHandler"
 	fieldTypes map[string]string // "pkgDir.TypeName.fieldName" → pre-qualified typeString
 	localTypes map[string]string // local variable name → qualified type, e.g. "svc" → "internal/auth.Service"
-	pkgFuncs   map[string]bool   // this package's top-level function names
+	// "pkgDir.Func" / "pkgDir.Type.Method" → declared result types, module-wide. See calltypes.go.
+	returnTypes map[string][]string
+	// "pkgDir.Alias" → the type `type Alias = T` names, module-wide. See calltypes.go.
+	aliases  map[string]string
+	pkgFuncs map[string]bool // this package's top-level function names
+	// Every name this package declares at top level: functions, types, variables
+	// and constants. nil where a pass does not collect it.
+	pkgScope map[string]bool
 }
 
 // bodyMetrics holds the call list and the per-function complexity signals
 // derived from a single walk of a function body.
 type bodyMetrics struct {
+	// callsPerCall are the calls made each time the function runs: calls less
+	// those that sit only inside a `once.Do(func() { … })`.
+	callsPerCall []string
 	calls        []string // resolved call targets, deduped, in source order
 	instantiates []string // resolved internal struct types constructed as composite literals, deduped
 	callsInLoop  []string // subset of calls invoked at loop nesting depth >= 1
@@ -607,11 +820,23 @@ type bodyMetrics struct {
 	// lives in another package and this pass sees one. The seam binder decides.
 	clientPathCalls    []string
 	callsInScalingLoop []string // subset of calls invoked at scaling (unbounded) nesting depth >= 1
-	loopDepth          int      // max nesting depth of for/range loops
-	scalingLoopDepth   int      // max nesting counting only unbounded (input-scaling) loops
-	loopCount          int      // total number of for/range loops
-	cyclomatic         int      // McCabe complexity (1 + decision points)
-	recursiveSelf      bool     // body directly calls the enclosing function
+	// scalingCallDepth is the deepest scaling nesting each of those is called at
+	// (calldepth.go).
+	scalingCallDepth map[string]int
+	// callsOnLoopElement is the subset of callsInScalingLoop handed an element of an
+	// enclosing loop — as an argument or as the receiver. Paired with the callee's
+	// own loopsOverParam it is the cross-call form of the hierarchical rule: the
+	// callee is continuing this walk, not starting one per element.
+	callsOnLoopElement []string
+	// loopsOverParam records that a scaling loop in this body walks something reached
+	// through a parameter or the receiver, which is what makes it a continuation of
+	// the caller's walk rather than an independent traversal.
+	loopsOverParam   bool
+	loopDepth        int  // max nesting depth of for/range loops
+	scalingLoopDepth int  // max nesting counting only unbounded (input-scaling) loops
+	loopCount        int  // total number of for/range loops
+	cyclomatic       int  // McCabe complexity (1 + decision points)
+	recursiveSelf    bool // body directly calls the enclosing function
 }
 
 // analyzeBody walks a function body once and extracts both the call edges
@@ -623,13 +848,14 @@ type bodyMetrics struct {
 // is inside every loop on the stack whose body it lexically falls within. Calls
 // inside func literals are attributed by lexical nesting; interface-dispatch
 // targets remain unresolved exactly as before.
-func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
+func analyzeBody(body ast.Node, ctx resolveCtx, selfName string, params map[string]bool) bodyMetrics {
 	var m bodyMetrics
 	decisions := 0
 	seen := make(map[string]bool)
 	instSeen := make(map[string]bool)
 	inLoopSeen := make(map[string]bool)
 	inScalingSeen := make(map[string]bool)
+	onElementSeen := make(map[string]bool)
 	var loopEnds []token.Pos // end positions of enclosing loops
 	// scalingEnds tracks only the enclosing loops that scale with input (a `for {}` event
 	// loop and a `range` over a composite literal are excluded), so len(scalingEnds) is
@@ -647,14 +873,28 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 	// independent/same collection (all-pairs). A hierarchical loop visits each element
 	// once across the whole nest, so it adds no factor of n to the Big-O exponent.
 	var loopScopes []loopScope
+	// loopHeads are, per enclosing loop, the part of its statement evaluated once
+	// before the first iteration: a range's operand, a for's init clause.
+	var loopHeads []loopHead
+	// Locals whose contents cannot grow with the input, resolved once for the body
+	// so the range case below is a lookup rather than a second walk per loop.
+	boundedVars := boundedLocals(body)
+	// onceEnds are the ends of the enclosing `once.Do(func() { … })` calls. What
+	// runs in one runs once per process, not once per call of this function.
+	var onceEnds []token.Pos
+	repeatedSeen := make(map[string]bool)
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			return false
 		}
+		for len(onceEnds) > 0 && n.Pos() >= onceEnds[len(onceEnds)-1] {
+			onceEnds = onceEnds[:len(onceEnds)-1]
+		}
 		// Pop loops whose extent we have now left.
 		for len(loopEnds) > 0 && n.Pos() >= loopEnds[len(loopEnds)-1] {
 			loopEnds = loopEnds[:len(loopEnds)-1]
+			loopHeads = loopHeads[:len(loopHeads)-1]
 		}
 		for len(scalingEnds) > 0 && n.Pos() >= scalingEnds[len(scalingEnds)-1] {
 			scalingEnds = scalingEnds[:len(scalingEnds)-1]
@@ -673,15 +913,49 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 			if len(loopEnds) > m.loopDepth {
 				m.loopDepth = len(loopEnds)
 			}
-			if !goForBounded(x) {
+			// A loop whose trip count is fixed at compile time, and one that merely
+			// advances a cursor an enclosing loop already advances, both leave the
+			// exponent alone. They differ in whether the BODY repeats: a constant
+			// loop runs a constant number of times, so a query inside it is not an
+			// N+1 candidate, while a shared-cursor loop runs as many times as the
+			// scan it is part of and stays one.
+			constBounded := goForConstBounded(x)
+			sharesCursor := goForSharesOuterCursor(x, loopScopes)
+			// A loop draining what an enclosing batch loop fetched this round is
+			// that loop's hierarchical inner loop (batchloop.go).
+			forScales := !goForBounded(x) && !constBounded && !sharesCursor && !drainsBatch(x, loopScopes)
+			if forScales && referencesParam(x.Cond, params) {
+				// `for i := 0; i < len(s); i++` walks s just as `range s` does; the
+				// parameter is named in the bound rather than in a range expression.
+				m.loopsOverParam = true
+			}
+			if forScales {
 				scalingEnds = append(scalingEnds, x.End())
 				if len(scalingEnds) > m.scalingLoopDepth {
 					m.scalingLoopDepth = len(scalingEnds)
 				}
 			}
 			// A `for {}` is infinite, not constant: it repeats.
-			repeatEnds = append(repeatEnds, x.End())
-			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: forLoopVars(x)})
+			if !constBounded {
+				repeatEnds = append(repeatEnds, x.End())
+			}
+			var init ast.Node
+			if x.Init != nil {
+				init = x.Init
+			}
+			head := newLoopHead(init, forScales, !constBounded)
+			head.once = terminalBlocks(x.Body)
+			loopHeads = append(loopHeads, head)
+			scope := loopScope{end: x.End(), vars: forLoopVars(x), cursor: forCursor(x), amortizes: forScales}
+			if pageVars, isBatch, isWalk := goBatchLoop(x); isBatch || isWalk {
+				// What a round binds is the round's element, and a `for {}` that
+				// pages amortizes its drain loop though it adds no depth itself. A
+				// cursor walk binds per row and amortizes the same way, but its
+				// fetch is one per row and not the batching.
+				scope.batch, scope.fetches, scope.amortizes = isBatch, true, true
+				scope.vars = append(scope.vars, pageVars...)
+			}
+			loopScopes = append(loopScopes, scope)
 		case *ast.RangeStmt:
 			m.loopCount++
 			decisions++
@@ -689,14 +963,23 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 			if len(loopEnds) > m.loopDepth {
 				m.loopDepth = len(loopEnds)
 			}
-			if !goRangeBounded(x) {
+			// A range whose trip count is not constant amortizes inner hierarchical
+			// loops whether or not it scales itself; see loopScope.amortizes.
+			rangeAmortizes := false
+			rangeScales := false
+			if !goRangeBounded(x) && !goRangeBoundedLocal(x, boundedVars) {
+				rangeAmortizes = true
 				// A hierarchical loop — one whose ranged collection is reached THROUGH
 				// an enclosing loop variable (`range pkg.Files`, `range pkgs[pkgDir]…`)
 				// — visits each element once across the whole nest, so it adds no factor
 				// of n to the scaling exponent. Only a loop over an independent or same
 				// collection (all-pairs) multiplies. Derived loops still repeat, so they
 				// stay N+1 candidates (repeatEnds) — only the scaling depth is spared.
+				if referencesParam(x.X, params) {
+					m.loopsOverParam = true
+				}
 				if !referencesLoopVar(x.X, loopScopes) {
+					rangeScales = true
 					scalingEnds = append(scalingEnds, x.End())
 					if len(scalingEnds) > m.scalingLoopDepth {
 						m.scalingLoopDepth = len(scalingEnds)
@@ -704,7 +987,25 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 				}
 				repeatEnds = append(repeatEnds, x.End())
 			}
-			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: rangeLoopVars(x)})
+			head := newLoopHead(x.X, rangeScales, rangeAmortizes)
+			head.once = terminalBlocks(x.Body)
+			loopHeads = append(loopHeads, head)
+			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: rangeLoopVars(x), amortizes: rangeAmortizes})
+		case *ast.AssignStmt:
+			// A value computed from the current element is still the current element
+			// as far as the traversal is concerned: `rel := norm(f); use(rel)` hands
+			// `use` what the loop is walking, one indirection later. Without this the
+			// cross-call hierarchical rule only ever fires on a bare loop variable,
+			// which is the minority of call sites.
+			if len(loopScopes) > 0 && referencesLoopVar(rhsExpr(x), loopScopes) {
+				top := &loopScopes[len(loopScopes)-1]
+				for _, lhs := range x.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name != "_" {
+						top.vars = append(top.vars, id.Name)
+					}
+				}
+			}
+			decisions += 0
 		case *ast.IfStmt:
 			decisions++
 		case *ast.CaseClause:
@@ -731,11 +1032,9 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 					callee = idx.X
 				}
 			}
-			chain := flattenSelector(callee)
-			if chain == nil {
-				return true
-			}
-			resolved := resolveChain(chain, ctx)
+			// callTarget is resolveChain for a plain selector chain, and reads through
+			// one that passes over a call or an assertion where the type is declared.
+			resolved := callTarget(callee, ctx)
 			if resolved == "" {
 				return true
 			}
@@ -743,7 +1042,29 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 				seen[resolved] = true
 				m.calls = append(m.calls, resolved)
 			}
-			if len(loopEnds) > 0 && !inLoopSeen[resolved] {
+			if len(onceEnds) == 0 && !repeatedSeen[resolved] {
+				repeatedSeen[resolved] = true
+				m.callsPerCall = append(m.callsPerCall, resolved)
+			}
+			if isOnceDo(x, resolved) {
+				onceEnds = append(onceEnds, x.End())
+			}
+			// A call in the innermost loop's head runs once per iteration of the
+			// loops AROUND that one, not of it: `for _, x := range load()` calls
+			// load once.
+			inLoops, inRepeating, inScaling := len(loopEnds), len(repeatEnds), len(scalingEnds)
+			if len(loopHeads) > 0 {
+				if h := loopHeads[len(loopHeads)-1]; h.contains(x.Pos()) {
+					inLoops--
+					if h.repeats {
+						inRepeating--
+					}
+					if h.scales {
+						inScaling--
+					}
+				}
+			}
+			if inLoops > 0 && !inLoopSeen[resolved] {
 				inLoopSeen[resolved] = true
 				m.callsInLoop = append(m.callsInLoop, resolved)
 			}
@@ -751,9 +1072,22 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 			// candidate. A call only ever inside a constant loop (range over a composite
 			// literal) runs a fixed number of times and is not — but a `for {}` DOES
 			// repeat, so its calls stay candidates even though its depth is discounted.
-			if len(repeatEnds) > 0 && !inScalingSeen[resolved] {
+			// A call made once per round of a batch loop is the batched call, not an
+			// N+1 (batchloop.go). One inside its drain loop has a different
+			// innermost loop and is unaffected.
+			if len(loopScopes) > 0 && loopScopes[len(loopScopes)-1].batch {
+				inRepeating = 0
+			}
+			if inRepeating > 0 {
+				m.scalingCallDepth = noteCallDepth(m.scalingCallDepth, resolved, inScaling)
+			}
+			if inRepeating > 0 && !inScalingSeen[resolved] {
 				inScalingSeen[resolved] = true
 				m.callsInScalingLoop = append(m.callsInScalingLoop, resolved)
+			}
+			if inScaling > 0 && !onElementSeen[resolved] && passesLoopElement(x, loopScopes) {
+				onElementSeen[resolved] = true
+				m.callsOnLoopElement = append(m.callsOnLoopElement, resolved)
 			}
 			if resolved == selfName {
 				m.recursiveSelf = true
@@ -786,11 +1120,60 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 	return m
 }
 
+// loopHead is the span of a loop statement evaluated once, before the first
+// iteration, with which of the nesting counters that loop raised.
+type loopHead struct {
+	pos, end        token.Pos
+	scales, repeats bool
+	// once are the runs of the body that end by leaving the loop (terminal.go). A
+	// call in one is made at most once per entry, as a call in the head is.
+	once []posSpan
+}
+
+// newLoopHead takes nil for a loop with no such part (`for cond {}`, `for {}`).
+func newLoopHead(n ast.Node, scales, repeats bool) loopHead {
+	h := loopHead{scales: scales, repeats: repeats}
+	if n != nil {
+		h.pos, h.end = n.Pos(), n.End()
+	}
+	return h
+}
+
+func (h loopHead) contains(p token.Pos) bool {
+	if h.pos != token.NoPos && p >= h.pos && p < h.end {
+		return true
+	}
+	for _, s := range h.once {
+		if p >= s.pos && p < s.end {
+			return true
+		}
+	}
+	return false
+}
+
 // loopScope records the variables an enclosing loop introduces, with the loop's
 // end position so it can be popped by the position-based nesting walk.
 type loopScope struct {
 	end  token.Pos
 	vars []string
+	// cursor is the index variable a three-clause for loop declares and steps, or ""
+	// for a range loop and for a for loop that declares none. An inner loop testing
+	// this variable is advancing the same cursor; see goForSharesOuterCursor.
+	cursor string
+	// amortizes records whether an inner hierarchical loop may be discounted against
+	// this one. Reaching a collection through an outer loop's variable cancels a
+	// factor only when the outer loop contributed one: under a CONSTANT outer there
+	// is nothing to cancel, and discounting anyway reported a plain walk as O(1).
+	//
+	// A hierarchical loop amortizes even though it does not scale itself, because it
+	// passes the hierarchy on — the elements it yields still belong to the
+	// collection the scaling loop at the root of the chain is walking.
+	amortizes bool
+	// batch marks a loop that takes its input a batch at a time; see batchloop.go.
+	batch bool
+	// fetches marks a loop whose round binds what it then drains: a batch loop,
+	// or a cursor walk that fetches per row. The drain is hierarchical in both.
+	fetches bool
 }
 
 // rangeLoopVars returns the key/value variable names a range loop introduces.
@@ -823,8 +1206,14 @@ func forLoopVars(x *ast.ForStmt) []string {
 // enclosing loop — i.e. the collection is reached through an outer loop element
 // (a hierarchical walk) rather than being independent of the outer loops.
 func referencesLoopVar(expr ast.Expr, scopes []loopScope) bool {
+	if expr == nil {
+		return false
+	}
 	vars := map[string]bool{}
 	for _, s := range scopes {
+		if !s.amortizes {
+			continue
+		}
 		for _, v := range s.vars {
 			if v != "" && v != "_" {
 				vars[v] = true
@@ -995,11 +1384,11 @@ func buildFileImports(f *ast.File, modulePath string, pkgNames map[string]string
 // named fields. Types are pre-qualified at collection time using each struct's
 // source-package context so they remain correct when looked up from a different
 // package (e.g. an adapters package looking up root-package struct fields).
-func collectFieldTypes(files []*ast.File, pkgDir, modulePath string, pkgNames map[string]string) map[string]string {
+func collectFieldTypes(files []*ast.File, pkgDir, modulePath string, pkgNames map[string]string, aliases map[string]string) map[string]string {
 	m := make(map[string]string)
 	for _, f := range files {
 		fileImports := buildFileImports(f, modulePath, pkgNames)
-		ctx := resolveCtx{pkgDir: pkgDir, imports: fileImports}
+		ctx := resolveCtx{pkgDir: pkgDir, imports: fileImports, aliases: aliases}
 		for _, decl := range f.Decls {
 			gd, ok := decl.(*ast.GenDecl)
 			if !ok {
@@ -1055,7 +1444,22 @@ func resolveChain(chain []string, ctx resolveCtx) string {
 	case 1:
 		// Builtins and predeclared type conversions (len, make, string(...), etc.)
 		// are not symbols — emitting them produces dangling phantom nodes.
-		if goBuiltins[chain[0]] {
+		//
+		// Unless this package declares a function of that name, which SHADOWS the
+		// predeclared identifier: Go resolves `min(a, b)` to the package's own min,
+		// and so must this. Repositories written before Go 1.21 carry their own min
+		// and max helpers by the hundred, and dropping those calls left the helper
+		// with no incoming edge at all — reported as dead code at HIGH confidence,
+		// the tier documented as the safest to delete, while being called seventeen
+		// times. Measured on one Go service: 4 of 41 high-confidence findings.
+		if goBuiltins[chain[0]] && !ctx.pkgFuncs[chain[0]] {
+			return ""
+		}
+		// A bare name the package does not declare is a parameter, a closure
+		// bound to a local, or a type parameter. Calling it calls no function
+		// this name could identify, and pkgDir.name would be a node nothing
+		// declares.
+		if ctx.pkgScope != nil && !ctx.pkgScope[chain[0]] {
 			return ""
 		}
 		return ctx.pkgDir + "." + chain[0]
@@ -1112,13 +1516,93 @@ func resolveChain(chain []string, ctx resolveCtx) string {
 //   - `var x T` / `var x *T` declarations
 //   - `x := &Foo{}` / `x := Foo{}` composite literals
 //   - `x := NewFoo(...)` / `x := pkg.NewFoo(...)` constructor conventions
+//   - `x := f(...)` and `x, err := f(...)` where f is declared in this module
 //
 // Variable names are recorded so that calls like `svc.Do()` resolve to the
 // canonical method fact name instead of dangling on a raw join.
 func collectLocalTypes(body ast.Node, ctx resolveCtx) map[string]string {
-	locals := make(map[string]string)
+	return collectLocalTypesFrom(body, ctx, nil, nil)
+}
+
+// collectLocalTypesFrom is collectLocalTypes for a body whose enclosing signature is
+// known: declared holds the types of its parameters and named results.
+//
+// The map is one per function and knows nothing of scope, so a name is only as
+// good as its being used for one thing. A declared name that the body declares
+// AGAIN, as another type or as one that cannot be read off the source, is dropped
+// for the whole function: `func f(r Resolver) { for _, r := range rows { r.Scan() } }`
+// must not send Scan to Resolver. The same holds for a closure's own parameters.
+func collectLocalTypesFrom(body ast.Node, ctx resolveCtx, declared map[string]string, typeParams map[string]bool) map[string]string {
+	locals := make(map[string]string, len(declared))
+	fromSignature := make(map[string]bool, len(declared))
+	dropped := make(map[string]bool)
+	for name, t := range declared {
+		locals[name] = t
+		fromSignature[name] = true
+	}
+	// A later declaration resolves against the earlier ones: `r := eng.Resolver()`
+	// needs eng.
+	ctx.localTypes = locals
+
+	// set records a declaration of name in the body. qual is "" when its type is
+	// not knowable.
+	set := func(name, qual string) {
+		if name == "_" || dropped[name] {
+			return
+		}
+		if fromSignature[name] {
+			if qual != locals[name] {
+				delete(locals, name)
+				dropped[name] = true
+			}
+			return
+		}
+		if qual != "" {
+			locals[name] = qual
+		}
+	}
+	// declare is set for a parameter list met inside the body, a closure's.
+	declare := func(ft *ast.FuncType) {
+		for name, t := range signatureTypes(ft, ctx, typeParams) {
+			if dropped[name] {
+				continue
+			}
+			if have, known := locals[name]; known && have != t {
+				delete(locals, name)
+				dropped[name] = true
+				continue
+			}
+			locals[name] = t
+			fromSignature[name] = true
+		}
+		// A closure parameter of no nameable type still redeclares the name.
+		if ft != nil && ft.Params != nil {
+			for _, field := range ft.Params.List {
+				if declaredType(field.Type, ctx, typeParams) != "" {
+					if _, variadic := field.Type.(*ast.Ellipsis); !variadic {
+						continue
+					}
+				}
+				for _, n := range field.Names {
+					set(n.Name, "")
+				}
+			}
+		}
+	}
+
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch stmt := n.(type) {
+		case *ast.FuncLit:
+			declare(stmt.Type)
+		case *ast.RangeStmt:
+			// What a range yields is never stated in the source.
+			if stmt.Tok == token.DEFINE {
+				for _, e := range []ast.Expr{stmt.Key, stmt.Value} {
+					if id, ok := e.(*ast.Ident); ok {
+						set(id.Name, "")
+					}
+				}
+			}
 		case *ast.DeclStmt:
 			gd, ok := stmt.Decl.(*ast.GenDecl)
 			if !ok || gd.Tok != token.VAR {
@@ -1133,9 +1617,11 @@ func collectLocalTypes(body ast.Node, ctx resolveCtx) map[string]string {
 					if typeStr := typeExprToString(vs.Type); typeStr != "" {
 						qual := resolveTypeName(typeStr, ctx)
 						for _, name := range vs.Names {
-							if name.Name != "_" {
-								locals[name.Name] = qual
-							}
+							set(name.Name, qual)
+						}
+					} else {
+						for _, name := range vs.Names {
+							set(name.Name, "")
 						}
 					}
 					continue
@@ -1143,27 +1629,39 @@ func collectLocalTypes(body ast.Node, ctx resolveCtx) map[string]string {
 				// `var x = <rhs>` — infer from the initializer.
 				if len(vs.Names) == len(vs.Values) {
 					for i, name := range vs.Names {
-						if name.Name == "_" {
-							continue
-						}
-						if qual := inferRHSType(vs.Values[i], ctx); qual != "" {
-							locals[name.Name] = qual
-						}
+						set(name.Name, inferRHSType(vs.Values[i], ctx))
 					}
 				}
 			}
 		case *ast.AssignStmt:
-			if stmt.Tok != token.DEFINE || len(stmt.Lhs) != len(stmt.Rhs) {
+			if stmt.Tok != token.DEFINE {
+				return true
+			}
+			if len(stmt.Lhs) != len(stmt.Rhs) {
+				// `x, err := f()`: one call, its declared results in order.
+				var results []string
+				if call, ok := stmt.Rhs[0].(*ast.CallExpr); ok && len(stmt.Rhs) == 1 {
+					if rt := callResultTypes(call, ctx); len(rt) == len(stmt.Lhs) {
+						results = rt
+					}
+				}
+				for i, lhs := range stmt.Lhs {
+					if ident, ok := lhs.(*ast.Ident); ok {
+						qual := ""
+						if results != nil {
+							qual = results[i]
+						}
+						set(ident.Name, qual)
+					}
+				}
 				return true
 			}
 			for i, lhs := range stmt.Lhs {
 				ident, ok := lhs.(*ast.Ident)
-				if !ok || ident.Name == "_" {
+				if !ok {
 					continue
 				}
-				if qual := inferRHSType(stmt.Rhs[i], ctx); qual != "" {
-					locals[ident.Name] = qual
-				}
+				set(ident.Name, inferRHSType(stmt.Rhs[i], ctx))
 			}
 		}
 		return true
@@ -1185,8 +1683,8 @@ func inferRHSType(expr ast.Expr, ctx resolveCtx) string {
 		// Foo{} or pkg.Foo{}
 		return compositeLitType(e, ctx)
 	case *ast.CallExpr:
-		// NewFoo(...) / pkg.NewFoo(...)
-		return constructorReturnType(e.Fun, ctx)
+		// What the callee is declared to return, or NewFoo(...) / pkg.NewFoo(...).
+		return callResultType(e, ctx)
 	}
 	return ""
 }
@@ -1245,11 +1743,11 @@ func newConventionType(name string) string {
 // passed through unchanged when their alias part is not in the import map.
 func resolveTypeName(typeStr string, ctx resolveCtx) string {
 	if !strings.Contains(typeStr, ".") {
-		return ctx.pkgDir + "." + typeStr
+		return aliasTarget(ctx.pkgDir+"."+typeStr, ctx.aliases)
 	}
 	parts := strings.SplitN(typeStr, ".", 2)
 	if resolvedPkg, ok := ctx.imports[parts[0]]; ok {
-		return resolvedPkg + "." + parts[1]
+		return aliasTarget(resolvedPkg+"."+parts[1], ctx.aliases)
 	}
 	return typeStr
 }
@@ -1363,6 +1861,81 @@ func typeExprToString(expr ast.Expr) string {
 	return ""
 }
 
+// namedTypesIn appends the named types a type expression mentions, as written
+// ("Layer", "other.Thing"), looking through whatever wraps them: pointers, slices,
+// arrays, maps, channels, generic arguments, function signatures and anonymous
+// structs. An interface literal names methods, not types it stores, and is skipped.
+func namedTypesIn(expr ast.Expr, out []string) []string {
+	fields := func(list *ast.FieldList) {
+		if list == nil {
+			return
+		}
+		for _, f := range list.List {
+			out = namedTypesIn(f.Type, out)
+		}
+	}
+	switch t := expr.(type) {
+	case *ast.Ident:
+		out = append(out, t.Name)
+	case *ast.SelectorExpr:
+		if x, ok := t.X.(*ast.Ident); ok {
+			out = append(out, x.Name+"."+t.Sel.Name)
+		}
+	case *ast.StarExpr:
+		out = namedTypesIn(t.X, out)
+	case *ast.ParenExpr:
+		out = namedTypesIn(t.X, out)
+	case *ast.Ellipsis:
+		out = namedTypesIn(t.Elt, out)
+	case *ast.ArrayType:
+		out = namedTypesIn(t.Elt, out)
+	case *ast.MapType:
+		out = namedTypesIn(t.Key, out)
+		out = namedTypesIn(t.Value, out)
+	case *ast.ChanType:
+		out = namedTypesIn(t.Value, out)
+	case *ast.IndexExpr:
+		out = namedTypesIn(t.X, out)
+		out = namedTypesIn(t.Index, out)
+	case *ast.IndexListExpr:
+		out = namedTypesIn(t.X, out)
+		for _, arg := range t.Indices {
+			out = namedTypesIn(arg, out)
+		}
+	case *ast.FuncType:
+		fields(t.Params)
+		fields(t.Results)
+	case *ast.StructType:
+		fields(t.Fields)
+	}
+	return out
+}
+
+// collectPackageScope returns every name a package declares at top level:
+// functions (methods excluded), types, variables and constants.
+func collectPackageScope(files []*ast.File) map[string]bool {
+	out := collectPackageFuncs(files)
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					out[s.Name.Name] = true
+				case *ast.ValueSpec:
+					for _, n := range s.Names {
+						out[n.Name] = true
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 // collectPackageFuncs returns the names of every top-level function declared in
 // a package, methods excluded — a method is never called as a bare identifier,
 // so including one could only add a false positive.
@@ -1378,4 +1951,369 @@ func collectPackageFuncs(files []*ast.File) map[string]bool {
 		}
 	}
 	return out
+}
+
+// --- bounded-loop rules -----------------------------------------------------
+//
+// A loop only belongs in the Big-O exponent when its trip count grows with the
+// input. Counting lexical nesting instead reports a cubic worst case for code that
+// is linear, and on this repository's own tree that was most of the high tier: a
+// hand-labeled sample of 35 high findings held 3 that scaled and 32 that counted a
+// loop which cannot (internal/perf/testdata/high_tier_labels.jsonl).
+//
+// goForBounded and goRangeBounded were the first two rules. These are the next
+// three. Each is a syntactic proof, and each fails closed: a loop it cannot prove
+// bounded keeps counting, so the effect is only ever to remove an over-count.
+
+// goForConstBounded reports whether a three-clause for loop runs a number of times
+// fixed when it is written: `for d := 1; d <= 10; d++`. The constant may be large,
+// which does not matter — it does not grow with the input, so it contributes no
+// factor of n.
+//
+// Only a literal bound counts. A named constant would be sound too, but an
+// identifier here cannot be told from a variable without type information, and
+// reading `for i := 0; i < n; i++` as bounded would discount the commonest real
+// loop there is.
+func goForConstBounded(x *ast.ForStmt) bool {
+	if x.Init == nil || x.Cond == nil || x.Post == nil {
+		return false
+	}
+	as, ok := x.Init.(*ast.AssignStmt)
+	if !ok || as.Tok != token.DEFINE || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+		return false
+	}
+	name, ok := identNameOf(as.Lhs[0])
+	if !ok || !isIntLiteral(as.Rhs[0]) {
+		return false
+	}
+	// The step has to move the variable the bound is about, or the bound proves
+	// nothing about how often the body runs.
+	inc, ok := x.Post.(*ast.IncDecStmt)
+	if !ok {
+		return false
+	}
+	if n, ok := identNameOf(inc.X); !ok || n != name {
+		return false
+	}
+	cmp, ok := x.Cond.(*ast.BinaryExpr)
+	if !ok {
+		return false
+	}
+	switch cmp.Op {
+	case token.LSS, token.LEQ, token.GTR, token.GEQ, token.NEQ:
+	default:
+		return false
+	}
+	l, lok := identNameOf(cmp.X)
+	return lok && l == name && isIntLiteral(cmp.Y)
+}
+
+// goForSharesOuterCursor reports whether a for loop advances an index that an
+// enclosing for loop is already advancing.
+//
+//	for i := 0; i < len(b); i++ {
+//	        if b[i] != '"' { continue }
+//	        for i++; i < len(b) && b[i] != '"'; i++ { … }
+//	}
+//
+// That is one pass over b, not a pass per byte: the inner loop moves the same
+// cursor forward, so across the whole nest the body runs len(b) times. Lexically it
+// is two levels, and counting it as two is what reported O(n²) for a scanner.
+//
+// The loop must declare no index of its own, and its condition must test the outer
+// loop's induction variable. Both halves matter: a loop with its own init counts
+// normally, and a condition that merely mentions some outer variable (a chain walk
+// like `for x != nil { x = x.next }`) does not share a cursor.
+func goForSharesOuterCursor(x *ast.ForStmt, scopes []loopScope) bool {
+	if x.Init != nil || x.Cond == nil {
+		return false
+	}
+	cursors := map[string]bool{}
+	for _, s := range scopes {
+		if s.cursor != "" {
+			cursors[s.cursor] = true
+		}
+	}
+	if len(cursors) == 0 {
+		return false
+	}
+	shared := false
+	ast.Inspect(x.Cond, func(n ast.Node) bool {
+		if shared {
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok && cursors[id.Name] {
+			shared = true
+		}
+		return !shared
+	})
+	return shared
+}
+
+// forCursor returns the index variable a for loop declares and steps, or "" when it
+// has none. It is what goForSharesOuterCursor matches an inner loop against.
+func forCursor(x *ast.ForStmt) string {
+	as, ok := x.Init.(*ast.AssignStmt)
+	if !ok || as.Tok != token.DEFINE || len(as.Lhs) != 1 {
+		return ""
+	}
+	name, ok := identNameOf(as.Lhs[0])
+	if !ok {
+		return ""
+	}
+	// Stepped in the post clause, or in the body — a scanner routinely advances its
+	// own index and leaves the post clause empty.
+	if inc, isInc := x.Post.(*ast.IncDecStmt); isInc {
+		if n, ok := identNameOf(inc.X); ok && n == name {
+			return name
+		}
+	}
+	if x.Post == nil {
+		return name
+	}
+	return ""
+}
+
+// goRangeBoundedLocal reports whether a range loop walks a local collection that
+// cannot grow with the input — one built from a composite literal and appended to a
+// fixed number of times, like the at-most-two path forms in
+// internal/facts.Graph.GovernedByPage:
+//
+//	forms := []string{mf.File}
+//	if trimmed := …; trimmed != mf.File { forms = append(forms, trimmed) }
+//	for _, form := range forms { … }
+//
+// Ranging that adds a factor of two, not a factor of n, however many facts the graph
+// holds. bounded is the set boundedLocals proved for this body.
+func goRangeBoundedLocal(x *ast.RangeStmt, bounded map[string]bool) bool {
+	if len(bounded) == 0 {
+		return false
+	}
+	name, ok := identNameOf(x.X)
+	return ok && bounded[name]
+}
+
+// boundedLocals returns the local variables whose contents cannot grow with the
+// input: every assignment to them is a composite literal, every append adds a fixed
+// number of elements, and no append happens anywhere the literal is not re-applied.
+//
+// That last condition is what separates `forms` above from an accumulator. Both are
+// assigned a literal and appended to; the difference is WHERE. `forms` is rebuilt
+// from its literal on every iteration of the loop that appends to it, so it never
+// carries more than a couple of entries. An accumulator is initialised once outside
+// the loop that fills it, and grows with whatever the loop walks. So an append
+// counts only when the same loop body also re-initialises the variable.
+//
+// Name-based, and therefore approximate in the presence of shadowing — the same
+// approximation the rest of this walker makes. It fails closed: an unproven
+// variable is simply not in the set.
+func boundedLocals(body ast.Node) map[string]bool {
+	// For each name, the enclosing-loop extents (0 = function level) in which it is
+	// assigned a composite literal, and in which it is appended to.
+	inits := map[string]map[token.Pos]bool{}
+	appends := map[string]map[token.Pos]bool{}
+	disqualified := map[string]bool{}
+
+	var loopEnds []token.Pos
+	innermost := func() token.Pos {
+		if len(loopEnds) == 0 {
+			return 0
+		}
+		return loopEnds[len(loopEnds)-1]
+	}
+	note := func(m map[string]map[token.Pos]bool, name string) {
+		if m[name] == nil {
+			m[name] = map[token.Pos]bool{}
+		}
+		m[name][innermost()] = true
+	}
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return false
+		}
+		for len(loopEnds) > 0 && n.Pos() >= loopEnds[len(loopEnds)-1] {
+			loopEnds = loopEnds[:len(loopEnds)-1]
+		}
+		switch x := n.(type) {
+		case *ast.ForStmt:
+			loopEnds = append(loopEnds, x.End())
+		case *ast.RangeStmt:
+			loopEnds = append(loopEnds, x.End())
+			// A variable that receives loop elements is whatever the loop walks.
+			for _, v := range rangeLoopVars(x) {
+				disqualified[v] = true
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				name, ok := identNameOf(lhs)
+				if !ok {
+					// Writing through an index or a field grows a collection in a way
+					// this rule cannot see; refuse the variable entirely.
+					if id, found := rootIdent(lhs); found {
+						disqualified[id] = true
+					}
+					continue
+				}
+				if i >= len(x.Rhs) {
+					// A multi-value call (`a, b := f()`): the contents come from
+					// somewhere this rule cannot follow.
+					disqualified[name] = true
+					continue
+				}
+				switch rhs := x.Rhs[i].(type) {
+				case *ast.CompositeLit:
+					note(inits, name)
+				case *ast.CallExpr:
+					if isFixedAppendTo(rhs, name) {
+						note(appends, name)
+					} else {
+						disqualified[name] = true
+					}
+				default:
+					disqualified[name] = true
+				}
+			}
+		}
+		return true
+	})
+
+	out := map[string]bool{}
+	for name, initScopes := range inits {
+		if disqualified[name] {
+			continue
+		}
+		ok := true
+		for scope := range appends[name] {
+			if !initScopes[scope] {
+				ok = false // appended where the literal is not re-applied: an accumulator
+				break
+			}
+		}
+		if ok {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// isFixedAppendTo reports whether call is `append(name, a, b, …)` with a fixed
+// number of elements. A spread (`append(a, b...)`) adds however many b holds, which
+// is exactly the growth this rule must not wave through.
+func isFixedAppendTo(call *ast.CallExpr, name string) bool {
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok || id.Name != "append" || call.Ellipsis.IsValid() || len(call.Args) == 0 {
+		return false
+	}
+	first, ok := identNameOf(call.Args[0])
+	return ok && first == name
+}
+
+// identNameOf returns the name of a bare identifier expression.
+func identNameOf(e ast.Expr) (string, bool) {
+	id, ok := e.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	return id.Name, true
+}
+
+// rootIdent returns the identifier at the base of an index or selector chain, so an
+// assignment through `m[k]` or `s.field` can be charged to `m` and `s`.
+func rootIdent(e ast.Expr) (string, bool) {
+	for {
+		switch x := e.(type) {
+		case *ast.Ident:
+			return x.Name, true
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.SelectorExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.ParenExpr:
+			e = x.X
+		default:
+			return "", false
+		}
+	}
+}
+
+// isIntLiteral reports whether e is an integer literal, optionally signed.
+func isIntLiteral(e ast.Expr) bool {
+	if u, ok := e.(*ast.UnaryExpr); ok && (u.Op == token.SUB || u.Op == token.ADD) {
+		e = u.X
+	}
+	lit, ok := e.(*ast.BasicLit)
+	return ok && lit.Kind == token.INT
+}
+
+// referencesParam reports whether expr reaches into a parameter or the receiver.
+// A loop over one of those walks something the CALLER handed in, which is what makes
+// it a continuation of the caller's traversal rather than a traversal of its own.
+func referencesParam(expr ast.Expr, params map[string]bool) bool {
+	// A for statement may have no condition (`for i := 0; ; i++`), and ast.Inspect
+	// panics on a nil node rather than ignoring it.
+	if expr == nil || len(params) == 0 {
+		return false
+	}
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok && params[id.Name] {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// passesLoopElement reports whether a call hands the callee an element of an
+// enclosing loop, as an argument or as the receiver it is invoked on.
+func passesLoopElement(call *ast.CallExpr, scopes []loopScope) bool {
+	for _, arg := range call.Args {
+		if referencesLoopVar(arg, scopes) {
+			return true
+		}
+	}
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+		return referencesLoopVar(sel.X, scopes)
+	}
+	return false
+}
+
+// funcParamNames returns the parameter and receiver names of a function
+// declaration, the set referencesParam matches a ranged collection against.
+func funcParamNames(fn *ast.FuncDecl) map[string]bool {
+	out := map[string]bool{}
+	add := func(fl *ast.FieldList) {
+		if fl == nil {
+			return
+		}
+		for _, f := range fl.List {
+			for _, n := range f.Names {
+				if n.Name != "" && n.Name != "_" {
+					out[n.Name] = true
+				}
+			}
+		}
+	}
+	add(fn.Recv)
+	if fn.Type != nil {
+		add(fn.Type.Params)
+	}
+	return out
+}
+
+// rhsExpr wraps an assignment's right-hand side so it can be inspected as one node.
+// A multi-value assignment has several, and any of them carrying the loop element is
+// enough to taint the whole statement's targets — which is the conservative direction
+// for a rule whose only effect is to REMOVE an over-count.
+func rhsExpr(x *ast.AssignStmt) ast.Expr {
+	if len(x.Rhs) == 1 {
+		return x.Rhs[0]
+	}
+	return &ast.CompositeLit{Elts: x.Rhs}
 }

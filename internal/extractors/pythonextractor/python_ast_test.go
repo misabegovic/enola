@@ -571,6 +571,80 @@ def consume(q: Queue):
 	}
 }
 
+func TestAST_QuotedAnnotation_AttributeCall(t *testing.T) {
+	src := `
+from typing import Optional
+
+class Entry:
+    def answer(self):
+        pass
+
+class Store:
+    current: "Entry"
+
+    def __init__(self, e: "Entry"):
+        self.last: 'Entry' = e
+
+    def recall(self, e: "Entry", f: Optional["Entry"], g: "Optional[Entry]"):
+        local: "Entry" = e
+        e.answer()
+        f.answer()
+        g.answer()
+        local.answer()
+        self.last.answer()
+        self.current.answer()
+`
+	result := astExtract(t, "app/remember.py", src, false)
+	idx := byName(result)
+
+	fn, ok := idx["app/remember.Store.recall"]
+	if !ok {
+		t.Fatalf("missing app/remember.Store.recall; keys: %v", keys(idx))
+	}
+	calls := relsByKind(fn, facts.RelCalls)
+	found := false
+	for _, c := range calls {
+		if strings.ContainsAny(c, `"'`) {
+			t.Errorf("recall: call target %q keeps the quotes of a forward reference", c)
+		}
+		if c == "app/remember.Entry.answer" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("recall: RelCalls = %v, want app/remember.Entry.answer", calls)
+	}
+}
+
+func TestResolveTypeNamePy_NamesOneTypeOrNone(t *testing.T) {
+	cases := map[string]string{
+		`Entry`:                            "app.Entry",
+		`"Entry"`:                          "app.Entry",
+		`Optional["Entry"]`:                "app.Entry",
+		`"Optional[Entry]"`:                "app.Entry",
+		`Entry | None`:                     "app.Entry",
+		`Union[None, Entry]`:               "app.Entry",
+		`Queue[Job] | None`:                "app.Queue",
+		`Optional[Queue[Job]]`:             "app.Queue",
+		`List[Entry]`:                      "",
+		`Annotated[Entry, Depends(f)]`:     "app.Entry",
+		`ClassVar[Optional[Entry]]`:        "app.Entry",
+		`type[Validator]`:                  "app.Validator",
+		`Optional[type[Validator]]`:        "app.Validator",
+		`Optional[dict[str, Entry]]`:       "",
+		`Optional[Callable[[], Entry]]`:    "",
+		`Optional[int | str | None]`:       "",
+		`dict[str, list[Entry]] | None`:    "",
+		`QuerySet[Line] | list[OrderLine]`: "app.QuerySet",
+		"Optional[\n    Entry\n]":          "app.Entry",
+	}
+	for ann, want := range cases {
+		if got := resolveTypeNamePy(ann, "app", nil); got != want {
+			t.Errorf("resolveTypeNamePy(%q) = %q, want %q", ann, got, want)
+		}
+	}
+}
+
 func TestAST_ConstructorAssignment_AttributeCall(t *testing.T) {
 	src := `
 from .repo import UserRepo
@@ -1036,6 +1110,22 @@ def handler(body = Depends(parse_login_body)):
 	}
 	if !found {
 		t.Errorf("handler: RelCalls (incl. param defaults) = %v, want %q", calls, want)
+	}
+}
+
+func TestAST_ParameterDefaultFunctionValueEmitsEdge(t *testing.T) {
+	src := `
+def list_commits_page(anchor, page):
+    return []
+
+def extend_commits(anchor, list_page=list_commits_page):
+    return list_page(anchor, 1)
+`
+	result := astExtractIdx(t, "history.py", src)
+	fn := byName(result)["history.extend_commits"]
+	want := "history.list_commits_page"
+	if !hasCallTo(fn, want) {
+		t.Errorf("extend_commits: RelCalls = %v, want default function-value ref to %q", relsByKind(fn, facts.RelCalls), want)
 	}
 }
 
@@ -1676,6 +1766,59 @@ def get_handler():
 	}
 	if calls := relsByKind(getFact, facts.RelCalls); len(calls) == 0 || calls[0] != "svc.handler" {
 		t.Errorf("get_handler: RelCalls = %v, want [svc.handler]", calls)
+	}
+}
+
+func TestAST_TupleAssignedCallbacksEmitEdges(t *testing.T) {
+	src := `
+def run_codex_once(prompt):
+    pass
+
+def run_copilot_once(prompt):
+    pass
+
+def choose(agent):
+    if agent == "codex":
+        run_once, agent_name = run_codex_once, "Codex"
+    else:
+        run_once, agent_name = run_copilot_once, "Copilot"
+    return run_once, agent_name
+`
+	result := astExtractIdx(t, "review.py", src)
+	fn := byName(result)["review.choose"]
+	for _, want := range []string{"review.run_codex_once", "review.run_copilot_once"} {
+		if !hasCallTo(fn, want) {
+			t.Errorf("choose: RelCalls = %v, want tuple-assignment function-value ref to %q", relsByKind(fn, facts.RelCalls), want)
+		}
+	}
+}
+
+func TestAST_MainGuardTupleAssignedCallbacksEmitFileRefs(t *testing.T) {
+	src := `
+import sys
+
+def run_codex_once(prompt):
+    pass
+
+def run_copilot_once(prompt):
+    pass
+
+if __name__ == "__main__":
+    if "--codex" in sys.argv:
+        run_once, agent_name = run_codex_once, "Codex"
+    else:
+        run_once, agent_name = run_copilot_once, "Copilot"
+    run_once("review")
+`
+	result := astExtractIdx(t, "review.py", src)
+	fr, ok := firstOfKind(result, facts.KindFileRef)
+	if !ok {
+		t.Fatal("expected a file_ref for main-guard callback assignments")
+	}
+	for _, want := range []string{"review.run_codex_once", "review.run_copilot_once"} {
+		if !hasCallTo(fr, want) {
+			t.Errorf("file_ref: RelCalls = %v, want tuple-assignment function-value ref to %q", relsByKind(fr, facts.RelCalls), want)
+		}
 	}
 }
 

@@ -261,3 +261,29 @@ func TestDetect_IgnoresTestdataFixtures(t *testing.T) {
 		t.Errorf("Detect = %v, %v; want true, nil (first-party .proto present)", ok, err)
 	}
 }
+
+// TestSymbolSpanGRPC: a service and a message run from their keyword to their
+// closing brace, an rpc to its semicolon or to the brace closing its options,
+// and the route an rpc serves carries the rpc's span. A // comment on a line
+// before the declaration does not move its columns.
+func TestSymbolSpanGRPC(t *testing.T) {
+	src := "syntax = \"proto3\";\npackage shop.v1; // the shop\n\n/* a service */ service Cart {\n  rpc Add(AddRequest) returns (AddReply);\n  rpc Get(GetRequest) returns (stream GetReply) {\n    option (google.api.http) = { get: \"/v1/cart\" };\n  }\n}\n\nmessage AddRequest {\n  string id = 1;\n}\n\nmessage Unclosed {\n"
+	ff := extractAll(t, map[string]string{"proto/cart.proto": src})
+	spans := map[string][4]int{}
+	for _, f := range ff {
+		spans[f.Kind+" "+f.Name] = [4]int{f.Line, f.EndLine, f.Column, f.EndColumn}
+	}
+	want := map[string][4]int{
+		"symbol proto.Cart":       {4, 9, 17, 2},
+		"symbol proto.Cart.Add":   {5, 5, 3, 42},
+		"symbol proto.Cart.Get":   {6, 8, 3, 4},
+		"route /shop.v1.Cart/Get": {6, 8, 3, 4},
+		"symbol proto.AddRequest": {11, 13, 1, 2},
+		"symbol proto.Unclosed":   {15, 0, 0, 0},
+	}
+	for key, span := range want {
+		if spans[key] != span {
+			t.Errorf("%s span = %v, want %v", key, spans[key], span)
+		}
+	}
+}

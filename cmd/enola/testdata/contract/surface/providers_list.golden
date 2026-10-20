@@ -1,0 +1,12 @@
+$ enola providers list
+exit: 0
+--- stdout
+mode: declared (the default)
+scripts: no providers directory; set ENOLA_PROVIDERS_DIR
+  prism     built-in  0.4.1     applies to a repository with a Gemfile; cannot run: the Rubydex library is not installed at <TMP>/.cache/enola/rubydex/0.4.1/librubydex_sys.so; run `enola providers fetch rubydex`
+  rubydex   built-in  0.4.1     applies to a repository with a Gemfile; cannot run: the Rubydex library is not installed at <TMP>/.cache/enola/rubydex/0.4.1/librubydex_sys.so; run `enola providers fetch rubydex`
+  rbs       script    -         applies to Ruby, RBS or RBI files; cannot run: no providers directory: set ENOLA_PROVIDERS_DIR to one laid out as examples/providers
+  zeitwerk  script    -         applies to Ruby files; cannot run: no providers directory: set ENOLA_PROVIDERS_DIR to one laid out as examples/providers
+  runtime   script    -         applies to a .enola-runtime/*.json capture; cannot run: no providers directory: set ENOLA_PROVIDERS_DIR to one laid out as examples/providers
+  eslint    script    -         applies to an ESLint results file (ENOLA_ESLINT_RESULTS, else tmp/eslint-results.json); cannot run: no providers directory: set ENOLA_PROVIDERS_DIR to one laid out as examples/providers
+--- stderr

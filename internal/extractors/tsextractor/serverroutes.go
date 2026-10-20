@@ -63,24 +63,59 @@ type serverBinding struct {
 
 // serverBindings maps identifier -> binding for every app/router constructed in this
 // file, with same-file mounts already resolved.
+var (
+	appFactoryNames  = [][]byte{[]byte("express"), []byte("fastify"), []byte("Fastify"), []byte("Hono"), []byte("Koa")}
+	requireAppNames  = [][]byte{[]byte("express"), []byte("fastify"), []byte("koa"), []byte("hono")}
+	requireCall      = []byte("require(")
+	routerIdentifier = []byte("Router")
+)
+
+func containsAny(src []byte, words [][]byte) bool {
+	for _, w := range words {
+		if bytes.Contains(src, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func serverBindings(src []byte) map[string]serverBinding {
 	out := map[string]serverBinding{}
-	for _, re := range []*regexp.Regexp{appFactory, appFactoryRequire} {
+	var appRes, routerRes []*regexp.Regexp
+	hasRequire := bytes.Contains(src, requireCall)
+	if containsAny(src, appFactoryNames) {
+		appRes = append(appRes, appFactory)
+	}
+	if hasRequire && containsAny(src, requireAppNames) {
+		appRes = append(appRes, appFactoryRequire)
+	}
+	if bytes.Contains(src, routerIdentifier) {
+		routerRes = append(routerRes, routerFactory)
+		if hasRequire {
+			routerRes = append(routerRes, routerFactoryRequire)
+		}
+	}
+	for _, re := range appRes {
 		for _, m := range re.FindAllSubmatch(src, -1) {
 			out[string(m[1])] = serverBinding{framework: frameworkOf[string(m[2])], mounted: true}
 		}
 	}
-	for _, re := range []*regexp.Regexp{routerFactory, routerFactoryRequire} {
+	hasRouter := false
+	for _, re := range routerRes {
 		for _, m := range re.FindAllSubmatch(src, -1) {
 			name := string(m[1])
 			if _, taken := out[name]; taken {
 				continue // an app binding of the same name wins; do not downgrade it
 			}
 			out[name] = serverBinding{framework: "express", isRouter: true}
+			hasRouter = true
 		}
 	}
+	if !hasRouter {
+		return out
+	}
 	// Resolve mounts declared in this file: app.use('/webhooks', router).
-	for _, m := range mountCall.FindAllSubmatch(src, -1) {
+	for _, m := range findAllSubmatchIf(hasMemberAccess(src, useMember), mountCall, src) {
 		prefix := firstNonEmpty(m[2], m[3], m[4])
 		child := string(m[5])
 		b, ok := out[child]
@@ -139,17 +174,21 @@ func extractServerRouteFacts(src []byte, relFile string) []facts.Fact {
 			continue
 		}
 		seen[key] = true
+		props := map[string]any{
+			facts.PropRole: facts.RoleServer,
+			"method":       verb,
+			"framework":    b.framework,
+			"language":     "typescript",
+		}
+		if handler := routeHandlerName(lastCallArgument(src, m[1])); handler != "" {
+			props["handler"] = handler
+		}
 		out = append(out, facts.Fact{
-			Kind: facts.KindRoute,
-			Name: full,
-			File: relFile,
-			Line: line,
-			Props: map[string]any{
-				facts.PropRole: facts.RoleServer,
-				"method":       verb,
-				"framework":    b.framework,
-				"language":     "typescript",
-			},
+			Kind:      facts.KindRoute,
+			Name:      full,
+			File:      relFile,
+			Line:      line,
+			Props:     props,
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: dir}},
 		})
 	}

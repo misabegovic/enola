@@ -25,8 +25,20 @@ repos:
   - web
 ```
 
+For a folder whose subfolders are the repositories, `enola cluster init <folder>` writes
+this file for you.
+
 Pass this config wherever a command accepts a repository: a directory selects one
-repository, while a config file can select several.
+repository, while a config file can select several. The exception is a folder whose
+immediate subfolders include two or more git repositories. `--generate` and the MCP
+`generate_snapshot` tool index it as a cluster without being asked: they say they
+detected the repositories, write `cluster.yaml` there (or use the one already there),
+and link them. Settings from the config in force still apply to that run. Pass
+`--no-cluster` (`no_cluster=true` over MCP) to index the folder as one repository. A
+folder that is itself a git repository is not treated this way, since nested checkouts
+belong to it; it is indexed as one repository with a warning naming the command that
+makes a cluster, as every other command does. Over MCP, repositories that do not share
+a folder are indexed together in one call with `repo_paths=[...]`.
 
 ```
 $ enola --generate cluster.yaml
@@ -121,9 +133,9 @@ func fetchDynamic(tenant string) {
 }
 ```
 
-The path is assembled at runtime from a value enola cannot see, so there is no complete
-path to match against a route. enola records the outbound call and reports it unresolved
-rather than guessing. Reporting unresolved calls gives the resolved count context.
+The tenant is a value enola cannot see, so the call is recorded as `/api/v2/{}/orders`,
+and no route is served at that shape. enola records the outbound call and reports it
+unresolved rather than guessing. Reporting unresolved calls gives the resolved count context.
 `coverage` exits `0` because it is a report, not a gate.
 
 Three things put an entry on that list, and they need different responses:
@@ -133,6 +145,7 @@ Three things put an entry on that list, and they need different responses:
 | A repository you have not loaded | Add it to `repos:` and re-run — the count moves |
 | A genuinely third-party endpoint | Nothing; it is correct |
 | A blind spot in enola's extraction | [BLIND-SPOTS.md](BLIND-SPOTS.md) records how these are found, including one found in enola itself |
+| Calls through your own HTTP wrapper | Declare the client under `clients:`, see [EXTENDING.md](EXTENDING.md#teaching-enola-your-http-client); worked through in [examples/custom-client](../examples/custom-client/README.md) |
 
 If you suspect a missing service, add its repository and re-run. A resolved call confirms
 that the service was outside the original graph.
@@ -181,5 +194,6 @@ The full rules — what links, what does not, and how to tune it — are in
 | The single-repository loop first | [FIRST-CHANGE.md](FIRST-CHANGE.md) |
 | Coverage, scale and precision measured on public repositories | [BENCHMARKS.md](BENCHMARKS.md) |
 | To teach enola a link it does not know | [EXTENDING.md](EXTENDING.md) |
+| To make enola read calls through your in-house HTTP client | [examples/custom-client](../examples/custom-client/README.md) |
 | Declaring seams instead of inferring them | [INTENT.md](INTENT.md) |
 | Every flag `coverage` takes | [CLI.md](CLI.md#command-line-reference) |

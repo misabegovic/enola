@@ -1,10 +1,8 @@
 // Package explain produces a human-readable statistical summary of an Enola
 // architectural snapshot — the data behind `enola --explain <repository>`.
 //
-// It is intentionally a public package (not internal/) so that enola-enterprise
-// can reuse the base Report and append its own license-gated sections (dead code,
-// package metrics) before rendering. Compute works purely off the exported
-// bootstrap.Engine API, so it sees whatever the engine currently holds: run
+// Report is exported data and Render turns it into text. Compute works purely off
+// the Source it is handed, so it sees whatever the engine currently holds: run
 // GenerateSnapshot (or auto-load a snapshot) first.
 package explain
 
@@ -16,7 +14,9 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
-	"github.com/enola-labs/enola/pkg/bootstrap"
+	"github.com/enola-labs/enola/internal/metrics"
+	"github.com/enola-labs/enola/internal/orphans"
+	"github.com/enola-labs/enola/internal/perf"
 )
 
 // Criticality thresholds for a module hotspot, scored by fan-in + fan-out.
@@ -51,13 +51,6 @@ type Hotspot struct {
 	BlastRadius int    `json:"blast_radius"` // transitive reverse-dependents within blastDepth
 }
 
-// Section is an extra block appended to the report by enterprise code. Body is
-// pre-rendered text (the lines under the Title heading).
-type Section struct {
-	Title string
-	Body  string
-}
-
 // RankedItem is one offender in a code-health finding group: a symbol or module
 // plus a pre-formatted metric (e.g. "147 dependents", "depth 11").
 type RankedItem struct {
@@ -87,8 +80,8 @@ type VendoredReport struct {
 }
 
 // Report is the full statistical picture of a snapshot. Fields are plain types
-// only, so consumers in other modules (enola-enterprise) can read them without
-// importing enola's internal packages.
+// only, so consumers in other modules can read them without importing enola's
+// internal packages.
 // ArchitectureStatement is one named layer order the snapshot recognised. There
 // is one per language cohort, so a repository written in two things has two.
 type ArchitectureStatement struct {
@@ -114,7 +107,17 @@ type Report struct {
 
 	Routes         int          `json:"routes"`
 	RoutesByMethod []LabelCount `json:"routes_by_method,omitempty"`
-	Storage        int          `json:"storage"`
+	// Routes splits into the endpoints this repository SERVES and the outbound
+	// HTTP calls it makes (client-role route facts). A full-stack repository's
+	// frontend calls used to be counted as its API: one read 993 routes while
+	// serving 597.
+	RoutesServed   int `json:"routes_served"`
+	RoutesOutbound int `json:"routes_outbound"`
+	// RouteGapFramework names a web framework the manifests declare as a
+	// dependency when no served route was found: either the service really has
+	// none, or it registers them in a form enola does not read.
+	RouteGapFramework string `json:"route_gap_framework,omitempty"`
+	Storage           int    `json:"storage"`
 
 	// Architecture and ArchConfidence are the STRONGEST statement, kept as scalars
 	// so the existing JSON shape does not move. Architectures holds all of them,
@@ -149,14 +152,33 @@ type Report struct {
 	// with the code, and nothing has been excluded from the snapshot.
 	Vendored *VendoredReport `json:"vendored_candidates,omitempty"`
 
-	// ExtraSections are appended (e.g. by enterprise) and rendered after the
-	// base report.
-	ExtraSections []Section `json:"-"`
+	// PackageMetrics, DeadCode and Performance are the three analyzers' aggregate
+	// blocks. They are data rather than pre-rendered text, like everything above:
+	// Render decides how the report reads, in one place.
+	//
+	// They are placed by ALTITUDE rather than in the order they were added.
+	// PackageMetrics renders straight after Impact analysis because both describe
+	// module coupling over the same edges, and reading Ca and Ce beside fan-in and
+	// fan-out is how a reader sees they are the same numbers seen two ways. DeadCode
+	// and Performance render straight after Code health because all three are
+	// symbol-level findings.
+	PackageMetrics *metrics.Summary `json:"package_metrics,omitempty"`
+	DeadCode       *orphans.Summary `json:"dead_code,omitempty"`
+	Performance    *perf.Summary    `json:"performance,omitempty"`
+}
+
+// Source is what a report is computed from: the published fact store and the
+// snapshot that describes it. *bootstrap.Engine satisfies it. An interface, so
+// this package does not import the composition root and, through it, every
+// extractor the binary carries.
+type Source interface {
+	Store() *facts.Store
+	Snapshot() *facts.Snapshot
 }
 
 // Compute reads the engine's current fact store and snapshot and builds a Report.
 // It does not generate a snapshot — callers do that first.
-func Compute(eng *bootstrap.Engine) *Report {
+func Compute(eng Source) *Report {
 	store := eng.Store()
 	snap := eng.Snapshot()
 
@@ -200,7 +222,7 @@ func Compute(eng *bootstrap.Engine) *Report {
 	// Symbol-kind breakdown (function/method/struct/…).
 	skCount := map[string]int{}
 	for _, f := range store.ByKind(facts.KindSymbol) {
-		sk, _ := f.Props["symbol_kind"].(string)
+		sk, _ := f.PropAny("symbol_kind").(string)
 		if sk == "" {
 			sk = "unknown"
 		}
@@ -213,7 +235,7 @@ func Compute(eng *bootstrap.Engine) *Report {
 	r.Routes = len(routes)
 	methodCount := map[string]int{}
 	for _, f := range routes {
-		m, _ := f.Props["method"].(string)
+		m, _ := f.PropAny("method").(string)
 		if m == "" {
 			m = "(unspecified)"
 		} else {
@@ -224,13 +246,28 @@ func Compute(eng *bootstrap.Engine) *Report {
 	if r.Routes > 0 {
 		r.RoutesByMethod = sortedCounts(methodCount)
 	}
+	for _, f := range routes {
+		if role, _ := f.PropAny(facts.PropRole).(string); role == facts.RoleClient {
+			r.RoutesOutbound++
+		} else {
+			r.RoutesServed++ // no role means server, as the cross-repo linker reads it
+		}
+	}
+	if r.RoutesServed == 0 {
+		for _, f := range store.ByKind(facts.KindDependency) {
+			if fw, ok := routeFrameworkDeps[f.Name]; ok {
+				r.RouteGapFramework = fw
+				break
+			}
+		}
+	}
 
 	r.Storage = len(store.ByKind(facts.KindStorage))
 
 	// Dependency facts grouped by their declared source (external/internal/stdlib).
 	srcCount := map[string]int{}
 	for _, f := range store.ByKind(facts.KindDependency) {
-		s, _ := f.Props["source"].(string)
+		s, _ := f.PropAny("source").(string)
 		if s == "" {
 			s = "unclassified"
 		}
@@ -335,6 +372,20 @@ func Compute(eng *bootstrap.Engine) *Report {
 	}
 
 	computeHotspots(store, r)
+
+	// The three analyzers, each computed by the same core as its MCP tool so the
+	// report and the tool cannot disagree. A block with nothing in it is left nil
+	// rather than printed empty: a repository with no typed package has nothing to
+	// say about the main sequence, and saying it in zeroes is worse than silence.
+	if m := metrics.Summarize(store); m.Analyzed > 0 {
+		r.PackageMetrics = &m
+	}
+	if d := orphans.Summarize(store); d.Candidates > 0 {
+		r.DeadCode = &d
+	}
+	if p := perf.Summarize(store); p.FunctionsAnalyzed > 0 {
+		r.Performance = &p
+	}
 	return r
 }
 
@@ -347,7 +398,7 @@ func Compute(eng *bootstrap.Engine) *Report {
 func languagesByPrevalence(store *facts.Store) []string {
 	counts := map[string]int{}
 	for _, f := range store.ByKind(facts.KindModule) {
-		if l, _ := f.Props["language"].(string); l != "" {
+		if l, _ := f.PropAny("language").(string); l != "" {
 			counts[l]++
 		}
 	}
@@ -427,11 +478,19 @@ func computeHotspots(store *facts.Store, r *Report) {
 	revAdj := map[string]map[string]bool{}
 	resolvedEdges := 0
 	deps := store.ByKind(facts.KindDependency)
+	imported := facts.NewImportTargets(func() []facts.Fact { return store.ByKind(facts.KindSymbol) })
 	for _, dep := range deps {
 		src := fileDir(dep.File)
 		for _, rel := range dep.Relations {
 			if rel.Kind != facts.RelImports {
 				continue
+			}
+			target := rel.Target
+			if dir, carried := imported.Dir(dep, target); carried {
+				if dir == "" {
+					continue
+				}
+				target = dir
 			}
 			// Resolve the import target to its nearest enclosing module. Some
 			// extractors (e.g. Kotlin) emit type-level targets one segment below the
@@ -439,7 +498,7 @@ func computeHotspots(store *facts.Store, r *Report) {
 			// resolve here too rather than requiring an exact module match. External
 			// targets are dotted (no '/'), so the walk-up finds nothing and they are
 			// correctly ignored.
-			if dst := resolveToModule(rel.Target, modules); dst != "" {
+			if dst := resolveToModule(target, modules); dst != "" {
 				fanOut[src]++
 				fanIn[dst]++
 				resolvedEdges++
@@ -545,6 +604,18 @@ func criticalityLabel(score int) string {
 
 // sortedCounts converts a tally map into a slice ordered by count desc, then
 // label asc, for deterministic output.
+// routeFrameworkDeps are the server frameworks whose routes enola extracts,
+// keyed by the dependency fact the manifests extractor emits for them. Declaring
+// one while no served route was found is worth saying out loud: a report that
+// reads "routes 0" for a FastAPI service is otherwise indistinguishable from a
+// service without an API.
+var routeFrameworkDeps = map[string]string{
+	"pkg:pypi/fastapi":   "FastAPI",
+	"pkg:pypi/starlette": "Starlette",
+	"pkg:pypi/flask":     "Flask",
+	"pkg:pypi/django":    "Django",
+}
+
 func sortedCounts(m map[string]int) []LabelCount {
 	out := make([]LabelCount, 0, len(m))
 	for k, v := range m {
@@ -656,11 +727,4 @@ func fileDir(file string) string {
 		return "."
 	}
 	return strings.Join(parts[:len(parts)-1], "/")
-}
-
-// AddSection appends an extra section (used by enterprise code) and returns the
-// report for chaining.
-func (r *Report) AddSection(title, body string) *Report {
-	r.ExtraSections = append(r.ExtraSections, Section{Title: title, Body: body})
-	return r
 }

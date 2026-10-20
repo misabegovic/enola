@@ -10,8 +10,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/clientspec"
 	"github.com/enola-labs/enola/internal/config"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/providers"
 )
 
 // parseErrorSampleCap bounds the number of parse errors retained on the receipt.
@@ -53,6 +55,15 @@ func computeIgnoreGlobHash(cfg *config.Config) string {
 // change rather than a code change. Each list is sorted so ordering never affects
 // the hash.
 func computeConfigHash(cfg *config.Config) string {
+	return configHashWith(cfg, providers.FromSpecs(cfg.Providers))
+}
+
+// configHashWith is computeConfigHash over the providers a snapshot actually
+// runs, which in every mode is the catalogue beside the config's list: two
+// snapshots generated with different providers must not share a hash, whether
+// a config or the build chose them. In declared mode the list is the config's
+// own, so the hash is exactly what it was.
+func configHashWith(cfg *config.Config, provs []providers.Provider) string {
 	var sb strings.Builder
 	writeSortedSection := func(label string, vals []string) {
 		sb.WriteString(label)
@@ -72,8 +83,8 @@ func computeConfigHash(cfg *config.Config) string {
 	writeSortedSection("test_globs", cfg.TestGlobs)
 	// Providers contribute facts, so the configured set — command and pinned
 	// version included — is part of what a snapshot was generated over.
-	provLines := make([]string, 0, len(cfg.Providers))
-	for _, p := range cfg.Providers {
+	provLines := make([]string, 0, len(provs))
+	for _, p := range provs {
 		provLines = append(provLines, p.Name+"\x00"+strings.Join(p.Command, "\x00")+"\x00"+p.ExpectedVersion)
 	}
 	writeSortedSection("providers", provLines)
@@ -91,6 +102,15 @@ func computeConfigHash(cfg *config.Config) string {
 		sb.WriteString(v.Fingerprint())
 	} else {
 		sb.WriteString("linking:invalid:" + err.Error() + "\n")
+	}
+	// Client specs decide which call sites become client routes, and service aliases
+	// decide which repository such a route links to, so both change emitted facts.
+	// Written only when declared, so a config declaring neither hashes exactly as before.
+	if fp := clientspec.Fingerprint(cfg.Clients); fp != "" {
+		sb.WriteString("clients:\n" + fp)
+	}
+	if fp := clientspec.AliasFingerprint(cfg.ServiceAliases); fp != "" {
+		sb.WriteString("service_aliases:\n" + fp)
 	}
 	return sha256Prefixed([]byte(sb.String()))
 }
@@ -190,7 +210,7 @@ func coverageSummary(store *facts.Store) *facts.CoverageSummary {
 		unresolved := readCoverageField(svc, "unresolved")
 		sum.UnresolvedEdges += unresolved
 		sum.ExternalEdges += readCoverageField(svc, "external")
-		if facts.ClassifyService(facts.DependsOnCount(svc), detected, unresolved) == facts.ServiceCoverageGap {
+		if facts.ClassifyService(facts.DependsOnCount(svc), detected, readCoverageField(svc, "resolved"), unresolved) == facts.ServiceCoverageGap {
 			sum.CoverageGaps++
 		}
 	}
@@ -206,7 +226,7 @@ func readCoverageField(svc facts.Fact, field string) int {
 		return 0
 	}
 	var raw []map[string]any
-	switch v := svc.Props["edge_coverage"].(type) {
+	switch v := svc.PropAny("edge_coverage").(type) {
 	case []map[string]any:
 		raw = v
 	case []any:
@@ -252,6 +272,41 @@ func finishSnapshotID(h hash.Hash, enolaVersion, configHash string) string {
 	h.Write([]byte(enolaVersion))
 	h.Write([]byte(configHash))
 	return hashPrefix + hex.EncodeToString(h.Sum(nil))
+}
+
+// filesReadInPart is one parse error per file an extractor's extraction fact
+// names as read only in part. It is read from the facts rather than returned
+// by the extractor, so a run that reuses cached facts counts what the run that
+// computed them saw.
+func filesReadInPart(extracted []facts.Fact) []facts.ParseError {
+	var errs []facts.ParseError
+	for _, f := range extracted {
+		if f.Kind != facts.KindExtraction {
+			continue
+		}
+		extractor, _, _ := strings.Cut(f.Name, ":")
+		var files []string
+		switch v := f.PropAny(facts.PropParsedWithErrors).(type) {
+		case []string:
+			files = v
+		case []any:
+			for _, item := range v {
+				if file, ok := item.(string); ok {
+					files = append(files, file)
+				}
+			}
+		}
+		for _, file := range files {
+			errs = append(errs, facts.ParseError{Extractor: extractor, File: file, Msg: "the parser left an error node; what follows it may be unread"})
+		}
+	}
+	sort.SliceStable(errs, func(i, j int) bool {
+		if errs[i].Extractor != errs[j].Extractor {
+			return errs[i].Extractor < errs[j].Extractor
+		}
+		return errs[i].File < errs[j].File
+	})
+	return errs
 }
 
 // capParseErrors trims a parse-error slice to the sample cap for the receipt.

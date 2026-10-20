@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/enola-labs/enola/internal/diff"
@@ -16,8 +18,10 @@ import (
 	"github.com/enola-labs/enola/internal/filelock"
 	"github.com/enola-labs/enola/internal/hookstate"
 	"github.com/enola-labs/enola/internal/updatecheck"
+	"github.com/enola-labs/enola/internal/workspace"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
+	"github.com/enola-labs/enola/pkg/status"
 )
 
 // hookInput is the subset of the agent's hook payload enola reads. Unknown fields are
@@ -33,6 +37,12 @@ type hookInput struct {
 	// SessionID scopes the once-per-report rule to a single session, so a suppression
 	// cannot outlive the session it was decided in. See hookstate.Record.LastSession.
 	SessionID string `json:"session_id"`
+
+	// TurnID is a Codex extension no other harness sends, and it is how this hook
+	// knows it is answering Codex, whose Stop hook reads a different output field.
+	// Told apart from the payload, not from the installed command, so an install
+	// made before this needs no rewrite.
+	TurnID string `json:"turn_id"`
 }
 
 // stopHookOutput is the response shape for handing the model something to act on at the
@@ -42,11 +52,39 @@ type hookInput struct {
 // from ending: the harness feeds the text back to the model and stops again afterwards.
 // This comment used to claim the opposite, as a stated fact that was never checked, and
 // the whole defect in runStopHook grew out of believing it.
+//
+// SystemMessage is the other channel: shown to the user, never to the model, and it does
+// not extend the turn. Claude Code and Codex both read it. A report about enola's own
+// setup goes there, because the model can do nothing useful with it (see runStopHook).
+//
+// Codex reads neither: its Stop hook ignores additionalContext, so a report sent that
+// way reached no model. It continues the turn on decision "block" and uses reason as
+// the next prompt, which is the same effect by another field. See stopOutput.
 type stopHookOutput struct {
-	HookSpecificOutput struct {
-		HookEventName     string `json:"hookEventName"`
-		AdditionalContext string `json:"additionalContext"`
-	} `json:"hookSpecificOutput"`
+	SystemMessage      string              `json:"systemMessage,omitempty"`
+	Decision           string              `json:"decision,omitempty"`
+	Reason             string              `json:"reason,omitempty"`
+	HookSpecificOutput *stopHookContextOut `json:"hookSpecificOutput,omitempty"`
+}
+
+// stopOutput shapes a report for the harness that sent in: context for the model,
+// notice for the user. Codex takes the context as decision "block" with reason;
+// Claude Code, and Pi through its extension, take it as additionalContext.
+func stopOutput(in hookInput, context, notice string) stopHookOutput {
+	out := stopHookOutput{SystemMessage: notice}
+	switch {
+	case context == "":
+	case in.TurnID != "":
+		out.Decision, out.Reason = "block", context
+	default:
+		out.HookSpecificOutput = &stopHookContextOut{HookEventName: "Stop", AdditionalContext: context}
+	}
+	return out
+}
+
+type stopHookContextOut struct {
+	HookEventName     string `json:"hookEventName"`
+	AdditionalContext string `json:"additionalContext"`
 }
 
 // runHook dispatches `enola hook <event>`.
@@ -62,6 +100,23 @@ type stopHookOutput struct {
 // verdict it actually is.
 func (r *Runner) Hook(ctx context.Context, args []string) {
 	if len(args) == 0 {
+		os.Exit(0)
+	}
+	// A harness passes its payload on stdin, never --help, so this only ever answers a
+	// person. It still exits 0, like every other path through here.
+	if HelpRequested(args) {
+		fmt.Fprint(os.Stderr, "Usage: "+r.name()+" hook <session-start|stop>\n\n"+
+			"Run by your coding agent, not by you: `"+r.name()+" install --hooks` registers it.\n"+
+			"Each event reads the agent's JSON payload on stdin.\n\n"+
+			"  session-start  pin a baseline of the session's repository, in a detached\n"+
+			"                 process, so the session's start never waits on a snapshot\n"+
+			"  stop           grade what the session changed against that baseline and,\n"+
+			"                 only when it introduced a regression, report it back to the\n"+
+			"                 agent\n\n"+
+			"It never breaks, delays or clutters a session: every failure, and every\n"+
+			"event this build does not know, exits 0 and says nothing. Run\n"+
+			"`"+r.name()+" doctor` to see whether the hooks are firing.\n"+
+			r.HelpFooter("hook"))
 		os.Exit(0)
 	}
 	switch args[0] {
@@ -86,6 +141,9 @@ func (r *Runner) Hook(ctx context.Context, args []string) {
 func (r *Runner) runStopHook(ctx context.Context) {
 	in, err := readHookInput()
 	if err != nil || in.CWD == "" {
+		return
+	}
+	if skipFolderOfRepos(r, in.CWD, hookstate.EventStop) {
 		return
 	}
 
@@ -120,8 +178,9 @@ func (r *Runner) runStopHook(ctx context.Context) {
 
 	// One switch decides both what to say and what identifies it. A non-empty key means
 	// there is something to say, which is what lets the once-per-report rule below cover
-	// every path rather than only the decline it started on.
-	var key, context string
+	// every path rather than only the decline it started on. context goes to the model;
+	// notice goes to the user only.
+	var key, context, notice string
 	switch {
 	case ok && verdict.Status == check.StatusRegression:
 		key = verdict.ReportKey()
@@ -133,19 +192,30 @@ func (r *Runner) runStopHook(ctx context.Context) {
 		key = verdict.ReportKey()
 		context = unenforcedReport(r.name(), verdict)
 
+	case ok && hasKind(verdict.AdvisoryKinds, diff.WarnOtherSession):
+		// Graded clean, but against a "before" another running session pinned. Silence
+		// would read as "this session's change is clean", which the grade cannot say.
+		key = verdict.ReportKey() + "|" + string(diff.WarnOtherSession)
+		notice = "enola graded this session's change against a baseline another agent session, still running " +
+			"on this repository, pinned. The result can include that session's changes, so treat it as a caveat, not a clean bill."
+
 	case ok && verdict.Status == check.StatusIncomparable:
 		// The gate could not grade at all, and saying nothing would be indistinguishable
 		// from grading it clean. `enola check` spends a whole exit code (3) keeping those
 		// apart so "I refuse to grade this" is never read as "your change is bad"; a hook
 		// that stays silent collapses the same distinction in the other direction, and
 		// leaves someone believing the loop is protecting them when it is not.
+		//
+		// Said to the USER, not the model. It is a fact about enola's setup, true of a
+		// read-only session as much as of an edit, and handing it to the model bought a
+		// turn it spent "fixing" it: it re-pinned over a deliberate baseline, which is the
+		// "before" the user chose to keep, and then chased the CLI, which in an agent's
+		// shell can resolve to a different enola build than the one grading.
 		key = verdict.ReportKey()
-		context = "enola could NOT grade the architectural change made in this session: " +
-			verdict.DeclineReason() + ".\n\n" +
-			"This is NOT a statement about your change. The comparison itself was untrustworthy, " +
-			"so no verdict was reached in either direction. Re-pin the baseline to restore grading " +
-			fmt.Sprintf("(`%s baseline pin`, or the set_baseline tool), and `%s doctor` reports whether ", r.name(), r.name()) +
-			"the hooks are grading again."
+		notice = "enola could not grade this session's architectural change: " +
+			verdict.DeclineReason() + ". This is not a verdict on the change. " +
+			fmt.Sprintf("To restore grading, re-pin the baseline (`%s baseline pin`); ", r.name()) +
+			fmt.Sprintf("`%s doctor` shows whether the hooks grade again.", r.name())
 	}
 
 	// Recorded on EVERY path, and the silent paths are the ones worth recording: a hook
@@ -163,15 +233,34 @@ func (r *Runner) runStopHook(ctx context.Context) {
 		return
 	}
 
-	var out stopHookOutput
-	out.HookSpecificOutput.HookEventName = "Stop"
-	out.HookSpecificOutput.AdditionalContext = context
+	out := stopOutput(in, context, notice)
 
 	encoded, err := json.Marshal(out)
 	if err != nil {
 		return
 	}
 	fmt.Println(string(encoded))
+}
+
+func hasKind(kinds []diff.WarningKind, k diff.WarningKind) bool {
+	for _, x := range kinds {
+		if x == k {
+			return true
+		}
+	}
+	return false
+}
+
+// skipFolderOfRepos reports whether dir is a folder of repositories, recording the
+// skip so `doctor` can say why the hooks do nothing there. Both hooks snapshot their
+// directory as one repository, and over a folder holding every repository a user has
+// that is hundreds of thousands of files, per session start and per graded turn.
+func skipFolderOfRepos(r *Runner, dir string, e hookstate.Event) bool {
+	if !workspace.IsFolderOfRepos(dir) {
+		return false
+	}
+	hookstate.RecordFired(r.outputDirFor(dir), e, hookstate.OutcomeNotARepo)
+	return true
 }
 
 // detachedRunFlag marks the re-invocation that does the actual pinning. The hook the
@@ -201,13 +290,22 @@ func (r *Runner) runSessionStartHook(ctx context.Context, args []string) {
 	if len(args) > 0 && args[0] == detachedRunFlag {
 		// The detached child: the only place any work happens.
 		if len(args) > 1 {
-			r.pinBaselineSingleFlight(ctx, args[1])
+			agent := 0
+			if len(args) > 2 {
+				agent, _ = strconv.Atoi(args[2])
+			}
+			r.pinBaselineSingleFlight(ctx, args[1], agent)
 		}
 		return
 	}
 
 	in, err := readHookInput()
 	if err != nil || in.CWD == "" || !isDirectory(in.CWD) {
+		return
+	}
+	// Decided here, not in the detached child, so a folder of repositories costs one
+	// directory read and no process at all.
+	if skipFolderOfRepos(r, in.CWD, hookstate.EventSessionStart) {
 		return
 	}
 	if !detachable {
@@ -219,7 +317,9 @@ func (r *Runner) runSessionStartHook(ctx context.Context, args []string) {
 		return
 	}
 
-	cmd := exec.Command(exe, "hook", "session-start", detachedRunFlag, in.CWD)
+	// The agent session is resolved here, not in the child: detached, the child is
+	// re-parented and can no longer walk up to the agent it was started for.
+	cmd := exec.Command(exe, "hook", "session-start", detachedRunFlag, in.CWD, strconv.Itoa(status.AgentPID()))
 	// No stdio: the child must not write to the agent's streams, and an inherited pipe
 	// would keep the hook's descriptors open after it returns.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
@@ -233,7 +333,10 @@ func (r *Runner) runSessionStartHook(ctx context.Context, args []string) {
 //
 // Everything here is silent. It has no terminal, nobody is reading its output, and a hook
 // that cannot fail loudly must not try.
-func (r *Runner) pinBaselineSingleFlight(ctx context.Context, repoDir string) {
+func (r *Runner) pinBaselineSingleFlight(ctx context.Context, repoDir string, agent int) {
+	if workspace.IsFolderOfRepos(repoDir) {
+		return
+	}
 	// Refreshed here because this is already the one place enola does slow, unattended
 	// work that nobody is waiting on — so the update check costs no extra process spawn
 	// and cannot delay anything. It runs BEFORE the pin lock and every early return
@@ -249,6 +352,8 @@ func (r *Runner) pinBaselineSingleFlight(ctx context.Context, repoDir string) {
 		return
 	}
 	cfg.Repo, cfg.Repos = repoDir, nil
+	// Stamped on the run and the pin this writes, so other sessions can tell it is ours.
+	eng.SetSessionClient(agent)
 	repoPaths, err := cfg.RepoPaths()
 	if err != nil || len(repoPaths) == 0 {
 		return
@@ -276,11 +381,20 @@ func (r *Runner) pinBaselineSingleFlight(ctx context.Context, repoDir string) {
 	defer lock.Release()
 
 	baselineDir := engine.ResolveBaselineDir(outDir, "pinned")
+	// Another agent session still working here is grading against this baseline. Its
+	// tree is dirty with its own edits, which shouldAutoPin reads as "refresh": re-pinning
+	// now would fold those edits into its "before" and hide them from its grade.
+	if otherSessionPin(baselineDir, agent) != nil {
+		return
+	}
 	if !shouldAutoPin(baselineDir, anchor, cfg.Output.Dir, eng.CurrentMeta(anchor)) {
 		return
 	}
 
 	for i, p := range repoPaths {
+		// Only the last turn's union is written; an earlier turn's facts would be
+		// staged for a write that never takes them.
+		eng.SetWritesArtifacts(i == len(repoPaths)-1)
 		if _, err := eng.GenerateSnapshot(ctx, p, i > 0); err != nil {
 			return
 		}
@@ -297,6 +411,45 @@ func (r *Runner) pinBaselineSingleFlight(ctx context.Context, repoDir string) {
 	// replaced by us. Written after SetBaseline, which republishes the directory.
 	_ = os.WriteFile(filepath.Join(baselineDir, autoPinMarker), nil, 0o644)
 	outcome = hookstate.OutcomePinned
+}
+
+// otherSessionPin returns the pin mark of a baseline pinned by another agent session
+// that is still running, or nil: no mark, an unknown pinner, this session (agent), or a
+// session that has ended.
+func otherSessionPin(baselineDir string, agent int) *engine.SessionMark {
+	m := engine.ReadSessionMark(baselineDir, engine.PinMarkFile)
+	if !isOtherRunningSession(m, agent) {
+		return nil
+	}
+	return m
+}
+
+// isOtherRunningSession reports whether a session mark names an agent session other
+// than agent that is still running. An unknown writer (zero) is never "other".
+func isOtherRunningSession(m *engine.SessionMark, agent int) bool {
+	return m != nil && m.AgentPID > 0 && m.AgentPID != agent && status.ProcessAlive(m.AgentPID)
+}
+
+// otherSessionBefore describes a baseline whose "before" came from another running agent
+// session: the pin it made, or the previous run it took. Empty for an explicit baseline
+// path, which the caller chose knowingly, and whenever the session is this one or unknown.
+func otherSessionBefore(dir, selector string, agent int) string {
+	name := engine.PinMarkFile
+	switch strings.ToLower(strings.TrimSpace(selector)) {
+	case "", "pinned":
+	case "previous":
+		name = engine.RunMarkFile
+	default:
+		return ""
+	}
+	m := engine.ReadSessionMark(dir, name)
+	if !isOtherRunningSession(m, agent) {
+		return ""
+	}
+	if name == engine.RunMarkFile {
+		return fmt.Sprintf("the previous run was taken at %s by another agent session that is still running on this repository", m.At)
+	}
+	return fmt.Sprintf("the baseline was pinned at %s by another agent session that is still running on this repository", m.At)
 }
 
 // shouldAutoPin decides whether to replace the existing baseline.
@@ -460,9 +613,14 @@ func (r *Runner) gradeQuietly(ctx context.Context, repoDir string) (check.Verdic
 	if suppressions, err := check.LoadSuppressions(anchor); err == nil {
 		policy.Suppressions = suppressions
 	}
-	verdict := check.EvaluateCurrent(diff.Compute(base, current), policy, current.Insights)
+	d := diff.Compute(base, current)
+	if note := otherSessionBefore(engine.ResolveBaselineDir(outDir, "pinned"), "pinned", status.AgentPID()); note != "" {
+		d.AddWarningKind(diff.WarnOtherSession, note)
+	}
+	verdict := check.EvaluateCurrent(d, policy, current.Insights)
 	verdict = check.AttachCensus(verdict, current.Meta, policy, current.Insights)
-	return check.AttachLedger(verdict, eng.Store(), policy, current.Insights, time.Now()), outDir, true
+	verdict = check.AttachLedger(verdict, eng.Store(), policy, current.Insights, time.Now())
+	return check.AttachSources(verdict, repoPaths, eng.MetaFor), outDir, true
 }
 
 // outputDirFor resolves just the engine's output directory, for a path that must record

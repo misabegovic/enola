@@ -215,38 +215,63 @@ const objectScanCap = 4096
 // suffix); the cross-repo linker's normalization reconciles prefixes and format
 // suffixes.
 func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
+	out, _ := extractHTTPClientFactsCounted(src, relFile)
+	return out
+}
+
+// A refused host leaves no fact behind, so this count is the only trace that the
+// pass saw the call.
+const clientHostInterpolated = "host-interpolated"
+
+type clientHosts struct {
+	kept, interpolated int
+}
+
+func (c *clientHosts) merge(o clientHosts) {
+	c.kept += o.kept
+	c.interpolated += o.interpolated
+}
+
+func extractHTTPClientFactsCounted(src []byte, relFile string) ([]facts.Fact, clientHosts) {
 	dir := factpath.Dir(relFile)
 	api := tsAPIHint(relFile)
-	bases := fileBaseLiterals(src)
-
-	folds := litfold.NewAssignments()
-	declared := map[int]bool{}
-	for _, m := range urlAssignDecl.FindAllSubmatchIndex(src, -1) {
-		folds.Add(string(src[m[2]:m[3]]), firstNonEmptyGroup(src, m, 2, 3, 4))
-		declared[m[2]] = true
-	}
-	for _, m := range bareAssign.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		if declared[m[2]] || name == "const" || name == "let" || name == "var" ||
-			name == "return" || name == "typeof" || name == "await" {
-			continue
+	var bases map[string]string
+	var folds *litfold.Assignments
+	resolveFold := func(name string) (string, bool) {
+		if folds == nil {
+			folds = fileAssignments(src)
 		}
-		folds.Add(name, "")
+		return folds.Resolve(name)
 	}
 
 	var out []facts.Fact
+	var hosts clientHosts
 	seen := map[string]bool{}
+	refusedAt := map[string]bool{}
 	// add appends a client-route fact, de-duplicating on method+path+line so the
 	// passes below cannot double-emit the same call site. A non-empty derived
 	// names the litfold derivation form that produced the raw path, so a reader
 	// can tell a derived literal from an inline one.
 	add := func(rawPath, method, framework string, off int, derived string) {
-		path, ok := cleanTSPath(rawPath, bases)
-		if !ok {
+		if bases == nil {
+			bases = fileBaseLiterals(src)
+		}
+		path, host, ok, refused := tsClientURL(rawPath, bases)
+		if (host != "" || refused) && tsCommentLineAt(src, off) {
 			return
 		}
 		line := 1 + bytes.Count(src[:off], []byte("\n"))
-		key := method + "\x00" + path + "\x00" + strconv.Itoa(line)
+		if refused {
+			if key := rawPath + "\x00" + strconv.Itoa(line); !refusedAt[key] {
+				refusedAt[key] = true
+				hosts.interpolated++
+			}
+			return
+		}
+		if !ok {
+			return
+		}
+		key := method + "\x00" + host + "\x00" + path + "\x00" + strconv.Itoa(line)
 		if seen[key] {
 			return
 		}
@@ -276,6 +301,11 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 		if h := tsBaseHint(rawPath); h != "" {
 			props["target_hint"] = h
 		}
+		if host != "" {
+			props["external"] = true
+			props["host"] = host
+			hosts.kept++
+		}
 		out = append(out, facts.Fact{
 			Kind:      facts.KindRoute,
 			Name:      path,
@@ -290,7 +320,8 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 	// Group 1 is the verb, so the URL literal is in groups 2-4 and the reported
 	// offset is the verb start (m[2]) — not m[0], which now includes the leading
 	// word-boundary char and would mis-count the line when that char is a newline.
-	for _, m := range httpClientCall.FindAllSubmatchIndex(src, -1) {
+	hasFetch := containsAny(src, fetchNames)
+	for _, m := range findAllSubmatchIndexIf(hasFetch, httpClientCall, src) {
 		raw := firstNonEmptyGroup(src, m, 2, 3, 4)
 		method := "GET"
 		if opts := optionsObjectAfter(src, m[1]); opts != nil {
@@ -306,8 +337,8 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 	// single-assignment rule). The resolved literal flows through cleanTSPath
 	// exactly as an inline argument would, so `const url = ` + "`${config.HOST}/mcp`" + `;
 	// fetch(url)` models identically to the inline form.
-	for _, m := range identArgCall.FindAllSubmatchIndex(src, -1) {
-		raw, ok := folds.Resolve(string(src[m[4]:m[5]]))
+	for _, m := range findAllSubmatchIndexIf(hasFetch, identArgCall, src) {
+		raw, ok := resolveFold(string(src[m[4]:m[5]]))
 		if !ok {
 			continue
 		}
@@ -337,9 +368,15 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 	// extractServerRouteFacts owns those, so skip them here or the call site would be
 	// emitted twice, once in each direction. Only known server receivers are skipped:
 	// an unknown one stays a client call, exactly as before this pass existed.
-	serverRecv := serverBindings(src)
+	var serverRecv map[string]serverBinding
+	isServer := func(recv string) bool {
+		if serverRecv == nil {
+			serverRecv = serverBindings(src)
+		}
+		return isServerReceiver(serverRecv, recv)
+	}
 	for _, m := range lowerVerbCall.FindAllSubmatchIndex(src, -1) {
-		if isServerReceiver(serverRecv, identifierEndingAt(src, m[0])) {
+		if isServer(identifierEndingAt(src, m[0])) {
 			continue
 		}
 		method := strings.ToUpper(string(src[m[2]:m[3]]))
@@ -351,7 +388,7 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 	// template with a "/"-rooted literal tail (litfold's template-tail rule).
 	// cleanTSPath resolves or strips the base; the tail is the path.
 	for _, m := range lowerVerbTemplateCall.FindAllSubmatchIndex(src, -1) {
-		if isServerReceiver(serverRecv, identifierEndingAt(src, m[0])) {
+		if isServer(identifierEndingAt(src, m[0])) {
 			continue
 		}
 		raw := string(src[m[4]:m[5]])
@@ -366,7 +403,8 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 	// that also carries a request-descriptor key, with the verb from a sibling
 	// `type:`/`method:` (default GET). The scan is scoped to the enclosing object so
 	// a neighbouring object's verb cannot bleed in.
-	for _, m := range urlProperty.FindAllSubmatchIndex(src, -1) {
+	hasURL := bytes.Contains(src, urlWord)
+	for _, m := range findAllSubmatchIndexIf(hasURL, urlProperty, src) {
 		window := enclosingObject(src, m[0], m[1])
 		if window == nil {
 			continue // no enclosing object literal
@@ -387,14 +425,17 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 			continue // a plain link / config / SEO-metadata object
 		}
 		raw := firstNonEmptyGroup(src, m, 1, 2, 3)
+		if !haveVerb && isAbsoluteURL(raw) {
+			continue
+		}
 		add(raw, method, "request-options", m[0], "")
 	}
 
 	// Pass 3b — a `url:` property whose value is a bare identifier, resolved
 	// through the single-assignment store; the enclosing-object discipline is
 	// pass 3's, unchanged.
-	for _, m := range urlPropertyIdent.FindAllSubmatchIndex(src, -1) {
-		raw, ok := folds.Resolve(string(src[m[2]:m[3]]))
+	for _, m := range findAllSubmatchIndexIf(hasURL, urlPropertyIdent, src) {
+		raw, ok := resolveFold(string(src[m[2]:m[3]]))
 		if !ok {
 			continue
 		}
@@ -418,10 +459,82 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 		if !haveVerb && !requestPayloadKey.Match(window) {
 			continue
 		}
+		if !haveVerb && isAbsoluteURL(raw) {
+			continue
+		}
 		add(raw, method, "request-options", m[0], "single-assignment")
 	}
 
-	return out
+	return out, hosts
+}
+
+// Mirrors rubyextractor.rubyClientURL, as cleanTSPath and cleanRubyPath mirror
+// each other: an absolute URL keeps its host as written, the rule the Go, Scala,
+// Swift and Kotlin extractors already follow.
+func tsClientURL(raw string, bases map[string]string) (path, host string, ok, hostRefused bool) {
+	host, rest, absolute := splitAbsoluteURL(raw)
+	if !absolute {
+		path, ok = cleanTSPath(raw, bases)
+		return path, "", ok, false
+	}
+	if host == "" {
+		return "", "", false, false
+	}
+	if strings.Contains(host, "${") || strings.Contains(host, "#{") {
+		return "", "", false, true
+	}
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" || rest == "/" {
+		return "/", host, true, false
+	}
+	path, ok = cleanTSPath(rest, nil)
+	return path, host, ok, false
+}
+
+// An object carrying a url: and a payload key but no verb is how data looks as often
+// as how a request looks: measured on the corpus, the one such object holding an
+// absolute URL was test data, a review comment's link beside its body. A relative
+// path from it was always read; a third-party host is read only when a verb says
+// the object is a request.
+func isAbsoluteURL(raw string) bool {
+	_, _, absolute := splitAbsoluteURL(raw)
+	return absolute
+}
+
+// A commented-out call names a host nobody calls; see rubyCommentLine.
+func tsCommentLineAt(src []byte, off int) bool {
+	start := bytes.LastIndexByte(src[:off], '\n') + 1
+	end := bytes.IndexByte(src[off:], '\n')
+	if end < 0 {
+		end = len(src) - off
+	}
+	text := bytes.TrimSpace(src[start : off+end])
+	return bytes.HasPrefix(text, []byte("//")) || bytes.HasPrefix(text, []byte("/*")) || bytes.HasPrefix(text, []byte("*"))
+}
+
+// splitAbsoluteURL cuts an http(s) URL into its host and the rest. The host ends
+// at the first slash or query, so an interpolation that runs past the authority
+// stays in the host and is refused rather than read as a path.
+func splitAbsoluteURL(raw string) (host, rest string, absolute bool) {
+	p := strings.TrimSpace(raw)
+	for _, scheme := range []string{"https://", "http://"} {
+		after, found := strings.CutPrefix(p, scheme)
+		if !found {
+			continue
+		}
+		end := strings.IndexAny(after, "/?")
+		if end < 0 {
+			end = len(after)
+		}
+		host = after[:end]
+		if at := strings.LastIndexByte(host, '@'); at >= 0 {
+			host = host[at+1:]
+		}
+		return host, after[end:], true
+	}
+	return "", p, false
 }
 
 // enclosingObject returns the bytes of the object literal that immediately

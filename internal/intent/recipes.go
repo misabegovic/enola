@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -43,6 +44,10 @@ type Recipe struct {
 	Roles     []RecipeRole     `yaml:"roles"`
 	Rules     []ConstraintRule `yaml:"rules"`
 	UseRecipe yaml.Node        `yaml:"use_recipe"`
+
+	// UnknownKeys are this file's keys the decoder read into nothing; see
+	// ConstraintsFile.UnknownKeys.
+	UnknownKeys []UnknownKey `yaml:"-"`
 }
 
 type RecipeBinding struct {
@@ -106,6 +111,7 @@ func LoadRecipesDir(repoPath string) ([]Recipe, []string, error) {
 		}
 		rec.Normalize()
 		rec.Path = relPath
+		rec.UnknownKeys = unknownKeys(data, relPath, reflect.TypeOf(Recipe{}))
 		recipes = append(recipes, rec)
 	}
 	return recipes, problems, nil

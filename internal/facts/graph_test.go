@@ -542,6 +542,16 @@ func TestImpactSet_TotalDependents(t *testing.T) {
 	}
 }
 
+// A cap of one node holds only the target, so there is no breakdown to append.
+func TestImpactSet_SummaryWithNothingShown(t *testing.T) {
+	g, _ := buildTestGraph()
+
+	result := g.ImpactSet("C", 10, 1, false)
+	if want := "3 total dependents (showing 0)"; result.Summary != want {
+		t.Errorf("Summary = %q, want %q", result.Summary, want)
+	}
+}
+
 func TestImpactSet_TotalDependents_Truncated(t *testing.T) {
 	g, _ := buildTestGraph()
 
@@ -556,6 +566,41 @@ func TestImpactSet_TotalDependents_Truncated(t *testing.T) {
 	}
 	if !strings.Contains(result.Summary, "3 total dependents (showing 1)") {
 		t.Errorf("summary should report accurate total and showing count; got %q", result.Summary)
+	}
+}
+
+// TestImpactSet_SummaryOrdersKindsByCountThenName pins the per-depth kind list:
+// it was written by ranging over a map, so the same question over the same
+// graph could list tied kinds in a different order on each call.
+func TestImpactSet_SummaryOrdersKindsByCountThenName(t *testing.T) {
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindSymbol, Name: "T", File: "t.go", Line: 1},
+		Fact{Kind: KindSymbol, Name: "S1", File: "s1.go", Relations: []Relation{{Kind: RelCalls, Target: "T"}}},
+		Fact{Kind: KindSymbol, Name: "S2", File: "s2.go", Relations: []Relation{{Kind: RelCalls, Target: "T"}}},
+		Fact{Kind: KindModule, Name: "M1", File: "m1.go", Relations: []Relation{{Kind: RelImports, Target: "T"}}},
+		Fact{Kind: KindModule, Name: "M2", File: "m2.go", Relations: []Relation{{Kind: RelImports, Target: "T"}}},
+		Fact{Kind: KindRoute, Name: "R", File: "r.go", Relations: []Relation{{Kind: RelCalls, Target: "T"}}},
+		Fact{Kind: KindDependency, Name: "D", File: "go.mod", Relations: []Relation{{Kind: RelDependsOn, Target: "T"}}},
+		Fact{Kind: KindTestRef, Name: "X1", File: "x1_test.go", Relations: []Relation{{Kind: RelCalls, Target: "S1"}}},
+		Fact{Kind: KindTestRef, Name: "X2", File: "x2_test.go", Relations: []Relation{{Kind: RelCalls, Target: "S2"}}},
+		Fact{Kind: KindModule, Name: "M3", File: "m3.go", Relations: []Relation{{Kind: RelImports, Target: "M1"}}},
+	)
+	s.BuildGraph()
+	g := s.Graph()
+
+	// Depth 1 ties two pairs of kinds, which a sort on count alone leaves to
+	// chance, and depth 2 puts the larger count on the later name, which a sort
+	// on name alone reverses.
+	want := "depth 1: 2 modules, 2 symbols, 1 dependency, 1 route; depth 2: 2 test_refs, 1 module"
+	// Go randomises map iteration on every range, so a single call can print
+	// the right order by chance; asking many times is what makes the order a
+	// property rather than a draw.
+	for i := 0; i < 50; i++ {
+		got := g.ImpactSet("T", 3, 100, false).Summary
+		if !strings.HasSuffix(got, want) {
+			t.Fatalf("call %d: summary = %q, want it to end %q", i+1, got, want)
+		}
 	}
 }
 
@@ -842,12 +887,14 @@ func TestNewGraph_CrossRepoCallNormalisation(t *testing.T) {
 
 // TestNormalizeExternalTarget verifies the helper directly.
 func TestNormalizeExternalTarget(t *testing.T) {
-	mods := map[string]struct{}{"github.com/dejo1307/go-auth": {}}
+	// Longest first, as NewGraph orders them, so the nested module claims its targets.
+	mods := []string{"github.com/dejo1307/go-auth/tools", "github.com/dejo1307/go-auth"}
 
 	cases := []struct {
 		target string
 		want   string
 	}{
+		{"github.com/dejo1307/go-auth/tools.Run", "..Run"},
 		{"github.com/dejo1307/go-auth/adapters.Handler.Login", "adapters.Handler.Login"},
 		{"github.com/dejo1307/go-auth.SecurityHeaders", "..SecurityHeaders"},
 		{"github.com/other/lib/pkg.Type.Method", ""}, // no matching module
@@ -1205,6 +1252,23 @@ func TestArchitecturalReverse_ExcludesReferenceKinds(t *testing.T) {
 	// In a reverse edge, Edge.Target holds the SOURCE fact name.
 	if arch[0].Target != "Caller" {
 		t.Errorf("surviving dependent = %q, want Caller (the symbol source)", arch[0].Target)
+	}
+}
+
+func TestNamedReferencesDoNotCountAsCallCoupling(t *testing.T) {
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindSymbol, Name: "Target"},
+		Fact{Kind: KindSymbol, Name: "Reader", Relations: []Relation{{Kind: RelNames, Target: "Target"}}},
+		Fact{Kind: KindSymbol, Name: "Caller", Relations: []Relation{{Kind: RelCalls, Target: "Target"}}},
+	)
+	s.BuildGraph()
+	g := s.Graph()
+	if len(g.ReverseEdges("Target")) != 2 || len(g.ForwardEdges("Reader")) != 1 {
+		t.Fatal("ordinary traversal must preserve named references")
+	}
+	if g.ArchitecturalFanIn("Target") != 1 || g.ArchitecturalFanOut("Reader") != 0 {
+		t.Fatal("named references must not inflate call coupling")
 	}
 }
 
@@ -1627,5 +1691,223 @@ func TestGovernedByPage(t *testing.T) {
 	}
 	if NewGraph([]Fact{{Kind: KindSymbol, Repo: "backend", File: "a.rb", Name: "A"}}).HasCompiledPages() {
 		t.Fatal("a graph without page nodes must not report compiled pages")
+	}
+}
+
+// A symbol anchor narrows the reverse query for a symbol and nothing else. The
+// page about one method governs that method and not its sibling in the same
+// file; a page about the class governs its methods through has_method; a file
+// anchor governs every symbol in the file as before; and every file-level answer
+// still counts the symbol anchor as governing its file, naming the symbol.
+func TestGoverningIntent_SymbolAnchorNarrows(t *testing.T) {
+	anchor := func(page, path, symbol string) Fact {
+		props := map[string]any{"intent_kind": "anchor", "intent_owner": "backend", "path": path, "source": page}
+		name := "anchor: backend " + path
+		if symbol != "" {
+			props["symbol"] = symbol
+			name += " " + symbol
+		}
+		return Fact{Kind: KindIntent, Repo: "wiki", File: page, Name: name, Props: props,
+			Relations: []Relation{{Kind: RelDependsOn, Target: "backend/" + path}}}
+	}
+	file := "app/models/profile.rb"
+	ff := []Fact{
+		{Kind: KindSymbol, Repo: "backend", File: file, Name: "Profile", Props: map[string]any{"symbol_kind": SymbolClass}},
+		{Kind: KindSymbol, Repo: "backend", File: file, Name: "Profile#record_ledger", Props: map[string]any{"symbol_kind": SymbolMethod}},
+		{Kind: KindSymbol, Repo: "backend", File: file, Name: "Profile#publish", Props: map[string]any{"symbol_kind": SymbolMethod}},
+		anchor("wiki/adrs/file.md", file, ""),
+		anchor("wiki/adrs/ledger.md", file, "Profile#record_ledger"),
+		anchor("wiki/adrs/class.md", file, "Profile"),
+		anchor("wiki/adrs/publish.md", file, "Profile#publish"),
+		{Kind: KindIntent, Repo: "wiki", File: "wiki/adrs/ledger.md", Name: "page: wiki/adrs/ledger.md",
+			Props: map[string]any{"intent_kind": "page", "page_type": "decision", "status": "accepted"}},
+	}
+	g := NewGraph(ff)
+
+	pages := func(got []GoverningPage) []string {
+		var out []string
+		for _, p := range got {
+			out = append(out, p.Page)
+		}
+		return out
+	}
+	for target, want := range map[string][]string{
+		"Profile#record_ledger": {"wiki/adrs/class.md", "wiki/adrs/file.md", "wiki/adrs/ledger.md"},
+		"Profile#publish":       {"wiki/adrs/class.md", "wiki/adrs/file.md", "wiki/adrs/publish.md"},
+		"Profile":               {"wiki/adrs/class.md", "wiki/adrs/file.md"},
+	} {
+		if got := pages(g.GoverningIntent(target)); !reflect.DeepEqual(got, want) {
+			t.Fatalf("GoverningIntent(%q) = %v, want %v", target, got, want)
+		}
+	}
+	if got := pages(g.GoverningIntentForFact("backend", file, "Profile#publish")); !reflect.DeepEqual(got, []string{"wiki/adrs/class.md", "wiki/adrs/file.md", "wiki/adrs/publish.md"}) {
+		t.Fatalf("the fact-level answer by repo, file and name narrows the same way, got %v", got)
+	}
+
+	forFile := g.GoverningIntentForFile("backend", file)
+	if got := pages(forFile); !reflect.DeepEqual(got, []string{"wiki/adrs/class.md", "wiki/adrs/file.md", "wiki/adrs/ledger.md", "wiki/adrs/publish.md"}) {
+		t.Fatalf("the file-level answer keeps every page on the file, got %v", got)
+	}
+	for _, p := range forFile {
+		switch p.Page {
+		case "wiki/adrs/ledger.md":
+			if !reflect.DeepEqual(p.Symbols, []string{"Profile#record_ledger"}) {
+				t.Fatalf("the file-level answer names the symbol a page anchors, got %+v", p)
+			}
+		case "wiki/adrs/file.md":
+			if len(p.Symbols) != 0 {
+				t.Fatalf("a file anchor names no symbol, got %+v", p)
+			}
+		}
+	}
+
+	cov, found := g.GovernedByPage("wiki/adrs/ledger.md")
+	if !found || len(cov) != 1 || cov[0].Symbol != "Profile#record_ledger" || cov[0].Path != file || cov[0].MeasuredFacts != 3 {
+		t.Fatalf("the forward half keeps the file's coverage and names the symbol, got found=%v %+v", found, cov)
+	}
+}
+
+// A method's table access names the storage fact, which shares its name with
+// the model's class, so as a graph edge it would read as the method depending on
+// the class. It stays on the fact and out of the graph: fan-in, impact and paths
+// are what they were.
+func TestGraph_StorageAccessIsNotAnEdge(t *testing.T) {
+	ff := []Fact{
+		{Kind: KindSymbol, Repo: "app", File: "app/models/account.rb", Name: "Account", Props: map[string]any{"symbol_kind": SymbolClass}},
+		{Kind: KindStorage, Repo: "app", File: "app/models/account.rb", Name: "Account", Props: map[string]any{"storage_kind": "model", "table": "accounts"}},
+		{Kind: KindSymbol, Repo: "app", File: "app/services/ledger.rb", Name: "Ledger#close", Props: map[string]any{"symbol_kind": SymbolMethod},
+			Relations: []Relation{{Kind: RelReads, Target: "Account"}, {Kind: RelWrites, Target: "Account"}}},
+	}
+	g := NewGraph(ff)
+	if n := g.ArchitecturalFanIn("Account"); n != 0 {
+		t.Fatalf("an access edge is not fan-in, got %d", n)
+	}
+	if got := g.ImpactSet("Account", 3, 100, false); len(got.ByDepth) != 0 {
+		t.Fatalf("an access edge is not a dependent, got %+v", got.ByDepth)
+	}
+	if got := g.FindPath("Ledger#close", "Account", nil, 5); got.Found {
+		t.Fatalf("an access edge is not a path, got %+v", got)
+	}
+}
+
+// TestTestCaseIsReferenceOnly_NotACouplingSource: a test is not architecture, so a
+// test_case that named a production symbol would still not count as its dependent
+// in the fan-in god-class and hotspots read, while traversal keeps seeing it.
+func TestTestCaseIsReferenceOnly_NotACouplingSource(t *testing.T) {
+	if !isReferenceOnlyKind(KindTestCase) {
+		t.Fatal("test_case is not a reference-only kind")
+	}
+	s := NewStore()
+	s.Add(Fact{Kind: KindSymbol, Name: "pkg.Area", File: "pkg/area.go"})
+	s.Add(Fact{Kind: KindSymbol, Name: "pkg.caller", File: "pkg/caller.go",
+		Relations: []Relation{{Kind: RelCalls, Target: "pkg.Area"}}})
+	s.Add(Fact{Kind: KindTestCase, Name: TestCaseName("pkg/area_test.go", "TestArea"), File: "pkg/area_test.go",
+		Relations: []Relation{{Kind: RelCalls, Target: "pkg.Area"}}})
+	s.BuildGraph()
+	g := s.Graph()
+	if got := len(g.ArchitecturalReverseEdges("pkg.Area")); got != 1 {
+		t.Errorf("architectural fan-in = %d, want 1: a test_case is not a dependent", got)
+	}
+	if got := len(g.ReverseEdges("pkg.Area")); got != 2 {
+		t.Errorf("reverse edges = %d, want 2: traversal still sees the test", got)
+	}
+}
+
+// A test_case's name begins with its file, so a test labelled like a symbol never
+// shares that symbol's node in the name table.
+func TestTestCaseIsReferenceOnly_NameNeverMeetsASymbol(t *testing.T) {
+	s := NewStore()
+	s.Add(Fact{Kind: KindSymbol, Name: "run", File: "src/lib.rs"})
+	s.Add(Fact{Kind: KindTestCase, Name: TestCaseName("tests/cli.rs", "run"), File: "tests/cli.rs"})
+	if got := len(s.LookupByExactName("run")); got != 1 {
+		t.Errorf("facts named run = %d, want 1", got)
+	}
+	if got := TestCaseName("tests/cli.rs", "run"); got != "tests/cli.rs::run" {
+		t.Errorf("TestCaseName = %q", got)
+	}
+}
+
+// An edge whose target names no fact lands on the node its alias names, for a call
+// and for a dependency's package import alike, so a traversal crosses into the
+// repository the alias points at.
+func TestGraph_FollowsTargetAliases(t *testing.T) {
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindModule, Name: "src/catalog", File: "src/catalog", Repo: "backend"},
+		Fact{Kind: KindSymbol, Name: "src/catalog.CatalogService.items", File: "backend/src/catalog/catalog.service.ts", Repo: "backend",
+			Relations: []Relation{{Kind: RelCalls, Target: "@example/sdk.ResourceConnector.getCatalogItems"}}},
+		Fact{Kind: KindDependency, Name: "src/catalog -> @example/sdk", File: "src/catalog/catalog.service.ts", Repo: "backend",
+			Relations: []Relation{{Kind: RelImports, Target: "@example/sdk"}}},
+		Fact{Kind: KindModule, Name: "src", File: "src", Repo: "sdk"},
+		Fact{Kind: KindSymbol, Name: "src/connectors.ResourceConnector.getCatalogItems", File: "sdk/src/connectors/resource-connector.ts", Repo: "sdk"},
+	)
+	s.SetTargetAliases(map[string]FactKey{
+		"@example/sdk.ResourceConnector.getCatalogItems": {Repo: "sdk", Kind: KindSymbol, Name: "src/connectors.ResourceConnector.getCatalogItems", File: "sdk/src/connectors/resource-connector.ts"},
+		"@example/sdk": {Repo: "sdk", Kind: KindModule, Name: "src", File: "src"},
+	})
+	s.BuildGraph()
+	g := s.Graph()
+
+	path := g.FindPath("src/catalog.CatalogService.items", "src/connectors.ResourceConnector.getCatalogItems", nil, 3)
+	if !path.Found {
+		t.Fatalf("the aliased call is not an edge: %+v", path)
+	}
+	if imp := g.FindPath("src/catalog", "src", []string{RelImports}, 2); !imp.Found {
+		t.Fatalf("the aliased package import is not a module edge: %+v", imp)
+	}
+}
+
+// TestNewGraph_ScopedMethodEdges: PHP names a method `Namespace\Class::method`, so the
+// class owns it. `::` also joins the segments of a path that is not a method's, and
+// those get no owner: a constant or a property of the class, a method whose prefix
+// is a module, and a Ruby method, whose owner `#` or `.` already names.
+func TestNewGraph_ScopedMethodEdges(t *testing.T) {
+	php := func(kind string) map[string]any { return map[string]any{"symbol_kind": kind, "language": "php"} }
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindSymbol, Name: `App\Repositories\OrderRepository`, File: "app/Repositories/OrderRepository.php", Props: php(SymbolClass)},
+		Fact{Kind: KindSymbol, Name: `App\Repositories\OrderRepository::create`, File: "app/Repositories/OrderRepository.php", Props: php(SymbolMethod)},
+		Fact{Kind: KindSymbol, Name: `App\Repositories\OrderRepository::LIMIT`, File: "app/Repositories/OrderRepository.php", Props: php(SymbolConstant)},
+		Fact{Kind: KindSymbol, Name: `App\Repositories\OrderRepository::$table`, File: "app/Repositories/OrderRepository.php", Props: php(SymbolVariable)},
+		Fact{Kind: KindSymbol, Name: `App\Contracts\Orders`, File: "app/Contracts/Orders.php", Props: php(SymbolInterface)},
+		Fact{Kind: KindSymbol, Name: `App\Contracts\Orders::byId`, File: "app/Contracts/Orders.php", Props: php(SymbolMethod)},
+		Fact{Kind: KindSymbol, Name: "helpers", File: "lib/helpers.rb", Props: map[string]any{"symbol_kind": SymbolVariable}},
+		Fact{Kind: KindSymbol, Name: "helpers::format", File: "lib/helpers.rb", Props: map[string]any{"symbol_kind": SymbolFunc}},
+		Fact{Kind: KindSymbol, Name: "Billing::Invoice", File: "app/models/billing/invoice.rb", Props: map[string]any{"symbol_kind": SymbolClass}},
+		Fact{Kind: KindSymbol, Name: "Billing::Invoice#total", File: "app/models/billing/invoice.rb", Props: map[string]any{"symbol_kind": SymbolMethod}},
+		Fact{Kind: KindSymbol, Name: "Billing", File: "app/models/billing.rb", Props: map[string]any{"symbol_kind": SymbolClass}},
+	)
+	s.BuildGraph()
+	g := s.Graph()
+
+	if !hasMethodEdge(g, `App\Repositories\OrderRepository`, `App\Repositories\OrderRepository::create`) {
+		t.Errorf("a PHP class owns its method, got %+v", g.ForwardEdges(`App\Repositories\OrderRepository`))
+	}
+	if !hasMethodEdge(g, `App\Contracts\Orders`, `App\Contracts\Orders::byId`) {
+		t.Errorf("a PHP interface owns its method, got %+v", g.ForwardEdges(`App\Contracts\Orders`))
+	}
+	for _, member := range []string{`App\Repositories\OrderRepository::LIMIT`, `App\Repositories\OrderRepository::$table`} {
+		if owners := ownedBy(g, member); len(owners) != 0 {
+			t.Errorf("%s is not a method and has no owner, got %v", member, owners)
+		}
+	}
+	if owners := ownedBy(g, "helpers::format"); len(owners) != 0 {
+		t.Errorf("a function under a name that is not a type has no owner, got %v", owners)
+	}
+	if owners := ownedBy(g, "Billing::Invoice#total"); len(owners) != 1 || owners[0] != "Billing::Invoice" {
+		t.Errorf("a Ruby method is owned by the class `#` names, got %v", owners)
+	}
+	if hasMethodEdge(g, "Billing", "Billing::Invoice#total") {
+		t.Error("a class does not own the methods of a class nested under its name")
+	}
+
+	// The reason the edge matters: changing a class reaches what calls its methods.
+	seeds := g.impactSeeds(`App\Repositories\OrderRepository`)
+	found := false
+	for _, seed := range seeds {
+		found = found || seed == `App\Repositories\OrderRepository::create`
+	}
+	if !found {
+		t.Errorf("impact on the class does not start from its methods: %v", seeds)
 	}
 }

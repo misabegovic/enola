@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -270,6 +271,81 @@ func TestRunOnAPipInstallNeverReachesTheNetwork(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		t.Errorf("pip install still contacted the network: %s", r.URL)
+	}))
+	defer srv.Close()
+
+	prevAPI, prevDL := apiBase, downloadBase
+	apiBase, downloadBase = srv.URL, srv.URL
+	t.Cleanup(func() { apiBase, downloadBase = prevAPI, prevDL })
+
+	if err := Run(context.Background(), "0.4.12"); err != nil {
+		t.Fatalf("refusing to self-update is not an error condition, got %v", err)
+	}
+}
+
+// TestExternallyManagedRefusesEveryInstallerButSource pins that the guard is
+// keyed on "source" rather than on a list of installers. A build stamped with any
+// other name was put there by something that tracks the file, and the message
+// has to send the user to that installer, not back to the command refusing.
+// The pip message is pinned whole, so widening the guard cannot have reworded it.
+func TestExternallyManagedRefusesEveryInstallerButSource(t *testing.T) {
+	where := "this installation"
+	if exe, err := os.Executable(); err == nil {
+		where = exe
+	}
+	prev := version.InstallMethod
+	t.Cleanup(func() { version.InstallMethod = prev })
+
+	version.InstallMethod = "source"
+	if msg := externallyManaged(); msg != "" {
+		t.Fatalf("a source build must be free to self-update, got:\n%s", msg)
+	}
+
+	version.InstallMethod = "pip"
+	wantPip := "enola was installed with pip, which owns " + where + `.
+
+Self-updating would replace that file behind pip's back: pip's recorded hash for
+the package would no longer match, and the next pip operation would undo the
+upgrade without saying so.
+
+Upgrade with:
+  pip install -U enola-cli
+`
+	if got := externallyManaged(); got != wantPip {
+		t.Errorf("the pip message changed:\n%s", got)
+	}
+
+	for method, owner := range map[string]string{
+		"homebrew": "homebrew",
+		"":         "an installer that did not name itself",
+	} {
+		version.InstallMethod = method
+		msg := externallyManaged()
+		if msg == "" {
+			t.Errorf("install method %q must be refused", method)
+			continue
+		}
+		if !strings.Contains(msg, "installed by "+owner+", which owns "+where) {
+			t.Errorf("install method %q: message does not name its owner:\n%s", method, msg)
+		}
+		if !strings.Contains(msg, "Upgrade it through "+owner+".") {
+			t.Errorf("install method %q: message does not say where the upgrade comes from:\n%s", method, msg)
+		}
+		if strings.Contains(msg, "enola upgrade") {
+			t.Errorf("install method %q: message points back at the command being refused:\n%s", method, msg)
+		}
+	}
+}
+
+// TestRunOnAnInstallerBuildNeverReachesTheNetwork is the pip test's twin for an
+// installer the guard was not written for by name.
+func TestRunOnAnInstallerBuildNeverReachesTheNetwork(t *testing.T) {
+	prev := version.InstallMethod
+	version.InstallMethod = "homebrew"
+	t.Cleanup(func() { version.InstallMethod = prev })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		t.Errorf("an installer build still contacted the network: %s", r.URL)
 	}))
 	defer srv.Close()
 

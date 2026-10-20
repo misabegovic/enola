@@ -42,6 +42,9 @@ func cutForEdge(resolve *resolver, far string, from facts.Fact, target string) s
 func mostReachedComponent(resolve *resolver, from facts.Fact, exclude string) string {
 	counts := map[string]int{}
 	for _, rel := range from.Relations {
+		if facts.IsStorageAccess(rel.Kind) {
+			continue
+		}
 		for name, members := range resolve.members {
 			if name == exclude || !members[rel.Target] {
 				continue
@@ -98,7 +101,7 @@ func cutForStorage(r rule, resolve *resolver, model, table string) string {
 				continue
 			}
 			for _, rel := range m.Relations {
-				if ownerName(rel.Target) == model {
+				if !facts.IsStorageAccess(rel.Kind) && ownerName(rel.Target) == model {
 					return fmt.Sprintf("Reach table %s through %s, the public member of %s that already uses %s", table, m.Name, name, model)
 				}
 			}

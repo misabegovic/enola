@@ -2,6 +2,7 @@ package mdintent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/intent"
 	"github.com/enola-labs/enola/pkg/plugin"
 )
 
@@ -282,6 +284,52 @@ func TestMDIntent_AnchorsCompileToOwnedFacts(t *testing.T) {
 	}
 }
 
+// A symbol anchor compiles to the same file-level relation a file anchor does,
+// so every file-level reader keeps its meaning, and carries the symbol beside it
+// for the readers that narrow. A symbol cannot sit on a directory: a directory
+// declares no fact to name.
+func TestMDIntent_SymbolAnchorCarriesItsSymbol(t *testing.T) {
+	dir := t.TempDir()
+	good := "---\nenola_intent:\n  page:\n    type: decision\n    anchors:\n      - {repo: backend, path: app/models/profile.rb, symbol: \"Profile#record_ledger\"}\n      - {repo: backend, path: app/jobs}\n---\nbody\n"
+	if err := os.WriteFile(filepath.Join(dir, "d.md"), []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ff, err := New().Extract(context.Background(), dir, []string{"d.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]facts.Fact{}
+	for _, f := range ff {
+		if f.Props["intent_kind"] == "anchor" {
+			byName[f.Name] = f
+		}
+	}
+	sym, ok := byName["anchor: backend app/models/profile.rb Profile#record_ledger"]
+	if !ok {
+		t.Fatalf("the symbol anchor is named by its repo, file and symbol, got %v", byName)
+	}
+	if sym.Props["symbol"] != "Profile#record_ledger" || sym.Props["path"] != "app/models/profile.rb" {
+		t.Fatalf("the symbol anchor carries its symbol and its file, got %v", sym.Props)
+	}
+	if len(sym.Relations) != 1 || sym.Relations[0].Target != "backend/app/models/profile.rb" {
+		t.Fatalf("the symbol anchor joins its file like a file anchor, got %v", sym.Relations)
+	}
+	plain, ok := byName["anchor: backend app/jobs"]
+	if !ok || plain.Props["symbol"] != nil {
+		t.Fatalf("an anchor without a symbol is named and carried as before, got %v", byName)
+	}
+	for _, path := range []string{"app/models", "app/models/"} {
+		bad := "---\nenola_intent:\n  page:\n    type: decision\n    anchors:\n      - {repo: backend, path: " + path + ", symbol: Profile}\n---\nbody\n"
+		if err := os.WriteFile(filepath.Join(dir, "b.md"), []byte(bad), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err = New().Extract(context.Background(), dir, []string{"b.md"})
+		if err == nil || !strings.Contains(err.Error(), "symbol needs a file") {
+			t.Fatalf("a symbol on the directory form %q must fail the block, got %v", path, err)
+		}
+	}
+}
+
 // A snapshot must not depend on whether a previous snapshot exists. This
 // repository's own documentation names paths under its output directory, and
 // resolving links on disk made those links miss on a cold run and hit on the next
@@ -330,5 +378,259 @@ func TestMDIntent_LinksResolveAgainstTheWalkedFilesNotTheDisk(t *testing.T) {
 	// The directory of a walked file is in scope, so a link naming one still lands.
 	if strings.Join(targets, ",") != "internal/thing" {
 		t.Errorf("section links = %v, want only internal/thing", targets)
+	}
+}
+
+// TestSymbolSpanMarkdown: a document spans its text, frontmatter included, and a
+// section runs from its heading to the line before the next heading of its level
+// or higher, less trailing blank lines; a lower heading stays inside it, and a
+// heading inside a fence is not one.
+func TestSymbolSpanMarkdown(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	page := "---\ntitle: x\n---\n# Orders\n\nIntro.\n\n## Placing\n\nSteps.\n\n### Paying\n\n```\n# not a heading\n```\n\n## Cancelling\n\nLast words.\n\n\n"
+	if err := os.WriteFile(filepath.Join(dir, "docs", "orders.md"), []byte(page), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ff, err := New().Extract(context.Background(), dir, []string{"docs/orders.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][4]int{}
+	for _, f := range ff {
+		got[f.Name] = [4]int{f.Line, f.EndLine, f.Column, f.EndColumn}
+	}
+	want := map[string][4]int{
+		"docs/orders.md":            {1, 20, 1, 12},
+		"docs/orders.md#orders":     {4, 20, 1, 12},
+		"docs/orders.md#placing":    {8, 16, 1, 4},
+		"docs/orders.md#paying":     {12, 16, 1, 4},
+		"docs/orders.md#cancelling": {18, 20, 1, 12},
+	}
+	for name, span := range want {
+		if got[name] != span {
+			t.Errorf("%s span = %v, want %v", name, got[name], span)
+		}
+	}
+}
+
+// A build may read pages of more extensions than .md. The tests below list an
+// invented one through the intent package's seam, since a test cannot pass the
+// linker flag a build sets it with.
+const listedExtension = ".leaf"
+
+func writeFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for p, body := range files {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, p), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func extractJSON(t *testing.T, dir string, files ...string) string {
+	t.Helper()
+	ff, err := New().Extract(context.Background(), dir, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(ff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+const listedPage = `---
+title: Choose the queue
+kind: decision
+enola_intent:
+  page:
+    type: decision
+    status: living
+    scope: [backend]
+    relations:
+      - {rel: part-of, to: wiki/backend/epics/messaging.md}
+      - {rel: depends-on, to: wiki/backend/specs/delivery.leaf}
+    anchors:
+      - {repo: backend, path: app/jobs/deliver.rb}
+  claims:
+    - {metric: fact-count, repo: backend, kind: route, name_prefix: "/api", value: 3}
+---
+
+# Choose the queue
+
+Prose body.
+`
+
+// A listed page carrying a block compiles to exactly the facts the same bytes
+// compile to under .md, apart from the path they cite, and a relation from it
+// to a listed page binds. The .md side is read with the list empty too: what a
+// markdown page compiles to must not depend on the list.
+func TestMDIntent_AListedPageCompilesAsMarkdownDoes(t *testing.T) {
+	md, leaf := t.TempDir(), t.TempDir()
+	writeFiles(t, md, map[string]string{"wiki/backend/adrs/queue.md": listedPage})
+	writeFiles(t, leaf, map[string]string{"wiki/backend/adrs/queue" + listedExtension: listedPage})
+
+	_, err := New().Extract(context.Background(), md, []string{"wiki/backend/adrs/queue.md"})
+	if err == nil || !strings.Contains(err.Error(), "wiki/backend/specs/delivery.leaf") {
+		t.Fatalf("with the list empty a relation to %s must fail, got %v", listedExtension, err)
+	}
+
+	restore := intent.UsePageExtensions(listedExtension)
+	defer restore()
+	asMarkdown := extractJSON(t, md, "wiki/backend/adrs/queue.md")
+	asListed := extractJSON(t, leaf, "wiki/backend/adrs/queue"+listedExtension)
+	if asMarkdown == "[]" || asMarkdown == "null" {
+		t.Fatal("the markdown page compiled to nothing")
+	}
+	if got := strings.ReplaceAll(asListed, "queue"+listedExtension, "queue.md"); got != asMarkdown {
+		t.Fatalf("a listed page compiled differently from the same bytes under .md:\nlisted   %s\nmarkdown %s", got, asMarkdown)
+	}
+	if !strings.Contains(asListed, `"to":"wiki/backend/specs/delivery.leaf"`) {
+		t.Fatalf("the relation to a listed page did not compile: %s", asListed)
+	}
+}
+
+func TestMDIntent_AMalformedBlockInAListedPageIsFatal(t *testing.T) {
+	defer intent.UsePageExtensions(listedExtension)()
+	dir := t.TempDir()
+	bad := "---\nenola_intent:\n  consumes:\n    - {repo: a, target: b, via: rest}\n---\nbody\n"
+	writeFiles(t, dir, map[string]string{"page" + listedExtension: bad})
+	_, err := New().Extract(context.Background(), dir, []string{"page" + listedExtension})
+	var fatal *plugin.FatalError
+	if err == nil || !errors.As(err, &fatal) || !strings.Contains(err.Error(), "page"+listedExtension) {
+		t.Fatalf("an invalid block in a listed page must fail the snapshot naming the page, got %T: %v", err, err)
+	}
+}
+
+// A listed file without the key is a document exactly as a markdown file is:
+// named by its path, titled by its first top-level heading or else by its file
+// name less its own extension, a section per heading, a names relation per
+// link that resolves, and nothing else of its body. Its language is the syntax
+// it is written in.
+func TestMDIntent_AListedFileWithoutTheKeyIsADocument(t *testing.T) {
+	defer intent.UsePageExtensions(listedExtension)()
+	dir := t.TempDir()
+	spec := "---\ntitle: delivery\nkind: reference\n---\n\n## Objective\n\nDeliver once. See [the job](../../app/jobs/deliver.rb).\n\n" +
+		"spec: every message is delivered once\n- given a message, when it is sent twice, then one delivery\n\n```\n# not a heading\n```\n"
+	writeFiles(t, dir, map[string]string{
+		"app/jobs/deliver.rb":                     "x\n",
+		"wiki/specs/delivery" + listedExtension:   spec,
+		"wiki/specs/headed" + listedExtension:     "# b\n\nNothing else.\n",
+		"wiki/specs/notes.md":                     "# notes\n\n[the spec](delivery" + listedExtension + ")\n",
+		"wiki/_archive/old" + listedExtension:     "# old\n",
+		"wiki/_views/generated" + listedExtension: "# generated\n",
+	})
+	ff, err := New().Extract(context.Background(), dir, []string{
+		"app/jobs/deliver.rb",
+		"wiki/_archive/old" + listedExtension,
+		"wiki/_views/generated" + listedExtension,
+		"wiki/specs/delivery" + listedExtension,
+		"wiki/specs/headed" + listedExtension,
+		"wiki/specs/notes.md",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]facts.Fact{}
+	for _, f := range ff {
+		byName[f.Name] = f
+		if strings.Contains(f.File, "_archive/") || strings.Contains(f.File, "_views/") {
+			t.Errorf("a listed file under a skipped directory was read: %s", f.Name)
+		}
+	}
+	doc, ok := byName["wiki/specs/delivery"+listedExtension]
+	if !ok || doc.Props["symbol_kind"] != SymbolDocument || doc.Props["title"] != "delivery" || doc.Props["language"] != "markdown" {
+		t.Fatalf("keyless listed file: %+v", doc)
+	}
+	if doc.Props["sections"] != 1 {
+		t.Fatalf("sections = %v, want the one heading and nothing from the spec lines or the fence", doc.Props["sections"])
+	}
+	objective := byName["wiki/specs/delivery"+listedExtension+"#objective"]
+	if len(objective.Relations) != 1 || objective.Relations[0].Kind != facts.RelNames || objective.Relations[0].Target != "app/jobs/deliver.rb" {
+		t.Fatalf("section links = %+v, want the one link that resolves", objective.Relations)
+	}
+	if headed := byName["wiki/specs/headed"+listedExtension]; headed.Props["title"] != "b" {
+		t.Fatalf("a listed document is titled by its first top-level heading, got %+v", headed.Props)
+	}
+	var fromNotes []string
+	for _, r := range byName["wiki/specs/notes.md#notes"].Relations {
+		fromNotes = append(fromNotes, r.Target)
+	}
+	if strings.Join(fromNotes, ",") != "wiki/specs/delivery"+listedExtension {
+		t.Fatalf("a markdown link to a listed file = %v, want it to land on the document", fromNotes)
+	}
+	symbols := 0
+	for _, f := range ff {
+		if f.Kind == facts.KindSymbol {
+			symbols++
+		}
+	}
+	// delivery (document, objective), headed (document, b), notes (document, notes).
+	if symbols != 6 {
+		t.Fatalf("symbols = %d, want 6", symbols)
+	}
+}
+
+func TestMDIntent_DetectFiresOnATreeOfListedFilesOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"wiki/specs/delivery" + listedExtension: "# delivery\n"})
+	if ok, _ := New().Detect(dir); ok {
+		t.Fatal("with the list empty a tree of listed files must not detect")
+	}
+	defer intent.UsePageExtensions(listedExtension)()
+	if ok, _ := New().Detect(dir); !ok {
+		t.Fatal("a tree holding only listed files must detect")
+	}
+}
+
+func TestMDIntent_OwnsFactFileAnswersForListedFiles(t *testing.T) {
+	e := New()
+	if e.OwnsFactFile("wiki/a" + listedExtension) {
+		t.Fatal("with the list empty a listed file is not owned")
+	}
+	defer intent.UsePageExtensions(listedExtension)()
+	for file, want := range map[string]bool{
+		"wiki/a.md":                      true,
+		"wiki/a" + listedExtension:       true,
+		"wiki/a" + listedExtension + "x": false,
+		"wiki/a.rb":                      false,
+	} {
+		if got := e.OwnsFactFile(file); got != want {
+			t.Errorf("OwnsFactFile(%q) = %v, want %v", file, got, want)
+		}
+	}
+}
+
+// With the list empty a file of another extension is not a page at all: it
+// yields no fact and no count, as it did before the list existed.
+func TestMDIntent_WithTheListEmptyAListedFileYieldsNothing(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"wiki/a" + listedExtension: listedPage,
+		"wiki/b" + listedExtension: "# b\n\n[x](a" + listedExtension + ")\n",
+	})
+	ff, err := New().Extract(context.Background(), dir, []string{"wiki/a" + listedExtension, "wiki/b" + listedExtension})
+	if err != nil || len(ff) != 0 {
+		t.Fatalf("extract = %v, %v, want nothing", ff, err)
+	}
+}
+
+// A stamp the intent package refuses fails the snapshot by name rather than
+// reading as a build that lists nothing.
+func TestMDIntent_ARefusedListFailsTheSnapshot(t *testing.T) {
+	defer intent.UsePageExtensions("leaf")()
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"README.md": "# readme\n"})
+	_, err := New().Extract(context.Background(), dir, []string{"README.md"})
+	var fatal *plugin.FatalError
+	if err == nil || !errors.As(err, &fatal) || !strings.Contains(err.Error(), `"leaf"`) {
+		t.Fatalf("a refused list must fail the snapshot naming the entry, got %T: %v", err, err)
 	}
 }

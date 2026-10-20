@@ -264,15 +264,19 @@ func TestRuntimeProvider_GoldenThroughTheSeam(t *testing.T) {
 	}
 }
 
-func TestRuntimeProvider_NoCapturesIsAnEmptyContribution(t *testing.T) {
+// A repository with no capture has nothing observed, which is not the same as
+// observing nothing: the provider says it does not apply, and the record names
+// the capture directory rather than reading as a clean zero-fact run.
+func TestRuntimeProvider_NoCapturesIsNotApplicable(t *testing.T) {
 	requireRuby(t)
 	repo := t.TempDir()
 	ff, records := Run(context.Background(), []Provider{{
 		Name:    "runtime",
 		Command: []string{"ruby", runtimeScript(t)},
 	}}, repo, nil, nil)
-	if len(records) != 1 || records[0].Skipped || records[0].FactCount != 0 {
-		t.Fatalf("census = %+v, want a clean zero-fact run", records)
+	if len(records) != 1 || !records[0].NotApplicable() || records[0].FactCount != 0 ||
+		!strings.Contains(records[0].Reason, ".enola-runtime") {
+		t.Fatalf("census = %+v, want not applicable naming the capture directory", records)
 	}
 	if len(ff) != 0 {
 		t.Fatalf("facts = %+v, want none", ff)

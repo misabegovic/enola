@@ -9,19 +9,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/enola-labs/enola/internal/clientspec"
 	"github.com/enola-labs/enola/internal/config"
 	"github.com/enola-labs/enola/internal/explainers"
 	"github.com/enola-labs/enola/internal/extractors"
@@ -31,10 +31,9 @@ import (
 	"github.com/enola-labs/enola/internal/linkers/crossrepo"
 	"github.com/enola-labs/enola/internal/linkers/crossrepo/signals"
 	"github.com/enola-labs/enola/internal/linkers/vocab"
+	"github.com/enola-labs/enola/internal/pathglob"
 	"github.com/enola-labs/enola/internal/providers"
 	"github.com/enola-labs/enola/internal/renderers"
-	"github.com/enola-labs/enola/internal/version"
-	pkghistory "github.com/enola-labs/enola/pkg/history"
 	"github.com/enola-labs/enola/pkg/plugin"
 )
 
@@ -69,6 +68,12 @@ type Engine struct {
 	binders    *binders.Registry
 	signals    *signals.Registry
 
+	// providers is what every snapshot runs, resolved once from the config, the
+	// environment and the build: the list the config names, or in every mode
+	// the catalogue beside it. Resolved here rather than per snapshot so every
+	// repository of a cluster, and the config hash, see one answer.
+	providers providers.Plan
+
 	// store is BUILD SCRATCH: it is reassigned to a fresh store at the top of each
 	// GenerateSnapshot and read only by the pipeline helpers, all under mu. It is
 	// NOT the reader-visible store — that lives in `current` and is only swapped in
@@ -83,18 +88,28 @@ type Engine struct {
 	// disk after a snapshot. The read path is always active when caching is
 	// enabled; one-shot --explain sets this false so it never touches .enola.
 	persistCache bool
+	// drift is what the drift walk last hashed, so a long-lived engine reads a file
+	// again only after it changed; see driftHashes.
+	drift driftMemo
 	// deferLinking makes an append-mode GenerateSnapshot stop after extraction;
 	// see SetDeferLinking.
 	deferLinking bool
-	// lastFacts remembers the facts.jsonl this run last serialized, so the next
-	// output dir that receives the same bundle copies the bytes instead.
+	// writesArtifacts says the caller writes the snapshot right after generating
+	// it; see SetWritesArtifacts.
+	writesArtifacts bool
+	// staged is the facts.jsonl a generate's id pass wrote while hashing it, not
+	// yet renamed into place. Its own lock because WriteArtifacts, which takes
+	// it, does not hold mu.
+	stagedMu sync.Mutex
+	staged   stagedFacts
+	// lastFacts remembers the facts.jsonl this run last wrote, so the next
+	// output dir that receives the same bundle links to it instead.
 	lastFacts lastFactsWrite
-	// historyRecorded remembers which snapshot id this run recorded into which
-	// history root, so a cluster that writes one union to many repo dirs sharing
-	// a history store appends the revision once.
-	historyRecorded map[string]string
-	// summaries remembers this run's previous/ deltas; see summarizeOnce.
-	summaries map[string]pkghistory.Summary
+	// recordSnapshot is called at the end of WriteArtifacts; see SetSnapshotRecorder.
+	recordSnapshot func(SnapshotRecord)
+	// sessionClient is the PID of the agent process this server serves; zero for a
+	// CLI run. See SetSessionClient.
+	sessionClient atomic.Int64
 }
 
 // New creates a new Engine with the given config.
@@ -107,6 +122,15 @@ func New(cfg *config.Config) (*Engine, error) {
 	if err := cfg.Normalize(); err != nil {
 		return nil, err
 	}
+	plan, err := providers.NewPlan(providers.Settings{
+		Mode:         cfg.ProvidersMode,
+		Listed:       cfg.ProvidersListed || len(cfg.Providers) > 0,
+		Declared:     providers.FromSpecs(cfg.Providers),
+		Interpreters: cfg.Interpreters,
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	// The build-scratch store and the initial published store are the same empty
 	// store, so AutoLoadSnapshot (which mutates Store() in place before serving)
@@ -114,6 +138,7 @@ func New(cfg *config.Config) (*Engine, error) {
 	st := facts.NewStore()
 	e := &Engine{
 		cfg:          cfg,
+		providers:    plan,
 		extractors:   extractors.NewRegistry(),
 		explainers:   explainers.NewRegistry(),
 		renderers:    renderers.NewRegistry(),
@@ -134,13 +159,27 @@ func New(cfg *config.Config) (*Engine, error) {
 // generate_snapshot and a single-repo --generate never see it.
 func (e *Engine) SetDeferLinking(defer_ bool) { e.deferLinking = defer_ }
 
+// SetWritesArtifacts tells the next GenerateSnapshot calls that the caller
+// writes the snapshot to disk right after (WriteArtifacts), so the pass that
+// serializes the facts to fingerprint them also writes the facts.jsonl it
+// hashes, and the write renames that file into place rather than serializing
+// the facts a second time. A caller that might not write leaves it unset: the
+// file would wait for a write that never comes, until the next generate
+// removes it.
+func (e *Engine) SetWritesArtifacts(writes bool) { e.writesArtifacts = writes }
+
 // SetPersistCache controls whether the per-extractor cache is written to disk
 // after a snapshot. One-shot --explain disables this so it leaves .enola
 // untouched, while still reusing a cache a prior --generate may have written.
 func (e *Engine) SetPersistCache(persist bool) { e.persistCache = persist }
 
-// RegisterExtractor adds an extractor to the engine.
+// RegisterExtractor adds an extractor to the engine. An extractor that reads client
+// specs is handed the ones declared for its language here, so it never reads the
+// config itself, and an extractor a wrapper registers is treated the same way.
 func (e *Engine) RegisterExtractor(ext extractors.Extractor) {
+	if c, ok := ext.(clientspec.Consumer); ok {
+		c.SetClientSpecs(clientspec.ForLanguage(e.cfg.Clients, ext.Name()))
+	}
 	e.extractors.Register(ext)
 }
 
@@ -241,14 +280,23 @@ func (e *Engine) RestoreFromDir(dir string, repoPaths map[string]string, singleR
 		// Tags only facts whose Repo is empty, so a pre-tagged file is left intact.
 		work.SetRepoRange(0, singleRepoLabel)
 	}
+	// Indexes a binder derives beside the facts are not in facts.jsonl; rebuild them
+	// before the graph reads them, or a restored graph would lose the cross-repo
+	// edges they resolve. Only index binders run: they change no fact.
+	for _, b := range e.binders.All() {
+		if ib, ok := b.(plugin.IndexBinder); ok {
+			if err := ib.Bind(context.Background(), work); err != nil {
+				log.Printf("[engine] restore: rebuilding the %s index failed: %v", ib.Name(), err)
+			}
+		}
+	}
 	work.BuildGraph()
 
 	// Default the primary repo path from the dir; snapshot.meta.json (loaded below)
 	// overrides it when present.
 	snap := &facts.Snapshot{Meta: facts.SnapshotMeta{RepoPath: filepath.Dir(dir)}}
 	if data, err := os.ReadFile(filepath.Join(dir, "insights.json")); err == nil {
-		var ins []facts.Insight
-		if err := json.Unmarshal(data, &ins); err == nil {
+		if ins, err := facts.ReadInsights(data); err == nil {
 			snap.Insights = ins
 		}
 	}
@@ -322,433 +370,40 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	start := time.Now()
+	// A facts file staged by an earlier generate and never written was serialized
+	// from a store this generate replaces, so no write can take it any more.
+	e.discardStaged()
 
-	if repoPath == "" {
-		repoPath = e.cfg.Repo
-	}
-
-	absRepo, err := filepath.Abs(repoPath)
-	if err != nil {
-		return nil, fmt.Errorf("resolving repo path: %w", err)
-	}
-
-	// Captured ONCE, here, because two things need it and they must agree: the repo
-	// label every fact is tagged with (below) and the snapshot's own git provenance
-	// (Meta.Git, further down). Deriving the label from a second `git remote` read
-	// would let the two drift apart on a repository whose remote changed mid-run.
-	git := gitInfo(absRepo, e.cfg.Output.Dir)
-	var remote string
-	if git != nil {
-		remote = git.Remote
-	}
-	// The repository NAME, not the directory it happens to sit in — see facts.RepoLabel.
-	repoLabel := repoLabelFor(absRepo, remote)
-	// A cluster can hold two repositories whose NAMES agree and whose owners do not
-	// (acme/web and other-org/web). Labels are how facts from different repos stay
-	// apart, and graph nodes are name-keyed, so a collision would silently MERGE two
-	// repositories into one — worse than the directory-derived label this replaced,
-	// which at least differed whenever the checkouts did. Fall back to the directory
-	// for the second arrival: it keeps them separate and it is what enola labelled
-	// them before.
-	if appendMode {
-		if prev := e.current.Load(); prev != nil {
-			if taken, ok := prev.repoPaths[repoLabel]; ok && taken != absRepo {
-				repoLabel = filepath.Base(absRepo)
-				log.Printf("[engine] repo label from remote collides with %q; using directory name %q", taken, repoLabel)
-			}
-		}
-	}
-
-	// Resolve this repo's declared intent: its own enola-intent.yaml, the
-	// cluster config's entry, or the cluster entry overriding the file
-	// wholesale (reported — an override must never be only implicit). An
-	// invalid declaration fails the snapshot: a declaration that cannot be
-	// trusted is worse than none, and silent skips are how vocabulary drift
-	// would creep back in.
-	fromFile, err := intent.LoadRepoFile(absRepo)
+	r, err := e.beginRun(ctx, repoPath, appendMode)
 	if err != nil {
 		return nil, err
 	}
-	resolved := intent.Resolve(fromFile, e.cfg.Intent[repoLabel])
-	if resolved != nil && resolved.Overridden {
-		log.Printf("[engine] intent for %q: cluster config overrides %s (wholesale)", repoLabel, intent.RepoFileName)
+	e.prepareStore(r)
+
+	if err := e.walk(r); err != nil {
+		return nil, err
 	}
-
-	// Build into a BRAND-NEW store off to the side. The currently-published bundle
-	// (prev) is never mutated, so any in-flight reader keeps iterating a consistent,
-	// frozen snapshot while we regenerate. We publish the new store atomically at the
-	// end (see e.current.Store below), which is the single linearization point.
-	prev := e.current.Load()
-	work := facts.NewStore()
-	var workRepoPaths map[string]string
-	// Declarations accumulate exactly like repoPaths: carried forward from the
-	// published bundle in append mode, replaced wholesale otherwise, and handed
-	// to the swap at the end. Nothing is written into the published map.
-	workIntent := map[string]*intent.Declaration{}
-
-	// A prior state produced by a different extraction behaviour cannot be
-	// carried: its facts may be unlabeled (or labeled under different rules),
-	// and the retroactive-tagging migration below would bulk-claim a stale
-	// multi-repo union under one repo's label — manufacturing facts no repo's
-	// source states. Discarding is the missing-edge-beats-wrong-one rule
-	// applied to append mode; the discarded repos re-extract on their next
-	// generate with the current behaviour.
-	if appendMode && prev.snapshot != nil &&
-		prev.snapshot.Meta.ExtractorVersion != cacheVersion {
-		log.Printf("[engine] discarding prior state (extractor version %q != %q) — append would mislabel carried facts",
-			prev.snapshot.Meta.ExtractorVersion, cacheVersion)
-		appendMode = false
+	if err := e.extract(r); err != nil {
+		return nil, err
 	}
-
-	if appendMode {
-		// Carry prior repos forward. All() returns an independent COPY, so mutating
-		// `work` (TagUntagged/TagRange/SetRepoRange) can never touch prev.store, which
-		// stays published and readable until we swap. This is the transient ~1x
-		// fact-set memory cost of lock-free reads in append mode.
-		workRepoPaths = make(map[string]string, len(prev.repoPaths)+1)
-		for k, v := range prev.repoPaths {
-			workRepoPaths[k] = v
-		}
-		for k, v := range prev.intent {
-			workIntent[k] = v
-		}
-		if prev.store != nil {
-			work.Add(prev.store.All()...)
-		}
-
-		// A repository the union already holds is replaced, not doubled. Its
-		// prior slice goes before extraction, so what this turn adds is the only
-		// account of it; the linkers then rebuild every cross-repo edge into it
-		// from scratch, as they do on every append. This is what lets one repo
-		// be re-read into an existing union without re-reading the other twenty.
-		if _, present := prev.repoPaths[repoLabel]; present {
-			if dropped := work.RemoveWhere(func(f facts.Fact) bool { return f.Repo == repoLabel }); dropped > 0 {
-				log.Printf("[engine] replacing %q in the union: dropped its %d prior facts", repoLabel, dropped)
-			}
-		}
-
-		// Track repo label -> absolute path for multi-repo resolution.
-		workRepoPaths[repoLabel] = absRepo
-	}
-	if resolved != nil {
-		workIntent[repoLabel] = resolved
-	} else {
-		// A repo that stopped declaring must stop being declared, including when
-		// its entry was carried forward from the previous bundle.
-		delete(workIntent, repoLabel)
-	}
-	if appendMode {
-
-		// Retroactively tag facts from a prior single-repo snapshot so they
-		// are filterable by repo alongside the newly appended facts.
-		if prev.snapshot != nil && work.Count() > 0 {
-			// The label those facts actually carry, which since RepoLabel came from the
-			// remote is no longer the directory name. Older snapshots recorded none, and
-			// for them the directory IS what tagged the facts.
-			prevLabel := prev.snapshot.Meta.RepoLabel
-			if prevLabel == "" {
-				prevLabel = filepath.Base(prev.snapshot.Meta.RepoPath)
-			}
-			if _, alreadyTracked := workRepoPaths[prevLabel]; !alreadyTracked {
-				tagged := work.TagUntagged(prevLabel, prevLabel+"/")
-				if tagged > 0 {
-					workRepoPaths[prevLabel] = prev.snapshot.Meta.RepoPath
-					log.Printf("[engine] retroactively tagged %d existing facts with repo label %q", tagged, prevLabel)
-				}
-			}
-		}
-	}
-	// Non-append: `work` stays empty and workRepoPaths stays nil — the prior bundle
-	// is left intact for in-flight readers until the swap (no in-place Clear()).
-
-	// Point the build-scratch store at `work` so the pipeline helpers (which read
-	// e.store under e.mu) operate on the new store with no signature changes.
-	e.store = work
-
-	// Per-stage timing breakdown (logged at the end). Snapshotting is
-	// extraction-dominated, so this makes it obvious where time goes.
-	var tWalk, tHash, tExtract, tLink, tGraph, tExplain, tRender time.Duration
-
-	// 1. Walk repository and collect files
-	tStage := time.Now()
-	files, testFiles, allNames, skips, err := e.walkRepo(absRepo)
-	if err != nil {
-		return nil, fmt.Errorf("walking repo: %w", err)
-	}
-	tWalk = time.Since(tStage)
-	log.Printf("[engine] found %d files (%d test files, %d skipped) in %s", len(files), len(testFiles), skips.count, absRepo)
-
-	// 2. Compute file hashes (for snapshot metadata)
-	tStage = time.Now()
-	currentHashes := e.computeFileHashes(absRepo, files)
-	tHash = time.Since(tStage)
-
-	// 3. Detect and run extractors (with optional per-extractor caching).
-	tStage = time.Now()
-	var cache *extractorCache
-	cachePath := extractorCachePath(filepath.Join(absRepo, e.cfg.Output.Dir))
-	if e.cfg.IncrementalEnabled() {
-		cache = loadExtractorCache(cachePath, e.persistCache)
-		// The cache now holds an open temp file from the moment it is created, so
-		// every path out of this function has to close it. discard is a no-op after
-		// a successful save; without it, a snapshot that fails during extraction
-		// leaves the spool behind.
-		defer cache.discard()
-	}
-	preCount := e.store.Count()
-	usedExtractors, shadowedExtractors, parseErrs, err := e.runExtractors(ctx, absRepo, files, allNames, currentHashes, cache)
-	if err != nil {
-		return nil, fmt.Errorf("extraction: %w", err)
-	}
-	e.reportShadowed(absRepo, shadowedExtractors)
-	// Reference-only extraction over test/spec files. Runs every snapshot (not
-	// cached with the main extractors) and adds only KindTestRef facts, so a
-	// production symbol exercised solely by a test is not mis-reported as dead.
-	e.runTestRefExtractors(ctx, absRepo, testFiles, files, allNames)
-
-	// Compile this repo's resolved intent declaration into intent facts, inside
-	// the extraction window so SetRepoRange/TagRange treat declared facts
-	// exactly as measured ones — snapshots carry them, diffs track them, and
-	// the intent explainer reads them with no side channel.
-	if resolved != nil {
-		e.store.Add(intent.CompileFacts(resolved)...)
-	}
-
-	// Run configured external providers, still inside the extraction window so
-	// their facts are repo-labeled (and prefixed, in append mode) exactly as
-	// measured ones — and before linking, so a provider's edges participate in
-	// the graph every explainer walks. Providers merge additively: an identity
-	// an extractor already owns is never overwritten, so the census can say a
-	// provider contributed less than it emitted but the graph cannot silently
-	// change authorship.
-	provRecords := e.runProviders(ctx, absRepo, preCount, providerInput(files, testFiles, currentHashes, e.computeFileHashes(absRepo, testFiles), cache))
-	if cache != nil {
-		log.Printf("[engine] extractor cache: %d reused", cache.hits)
-		// Saved after the providers, whose entries share the spool. save is a no-op
-		// when this cache was opened non-persisting, and it creates its own
-		// directory, so neither condition is repeated here.
-		if err := cache.save(); err != nil {
-			log.Printf("[engine] could not write extractor cache: %v", err)
-		}
-	}
-
-	tExtract = time.Since(tStage)
-	newCount := e.store.Count()
-	log.Printf("[engine] extracted %d facts using %d extractors", newCount, len(usedExtractors))
-
-	// Flag facts from codegen output before the file paths are repo-prefixed below,
-	// while f.File is still resolvable against repoPath.
-	e.markGeneratedFacts(absRepo, preCount)
-
-	// Always set Repo on newly extracted facts so the repo filter works
-	// even in single-repo mode.
-	e.store.SetRepoRange(preCount, repoLabel)
-
-	// In append mode, additionally prefix file paths so facts from
-	// different repos are distinguishable by file path.
-	if appendMode {
-		e.store.TagRange(preCount, repoLabel, repoLabel+"/")
-		log.Printf("[engine] prefixed %d facts with repo label %q", newCount-preCount, repoLabel)
-	}
-
-	// A cluster's intermediate turns stop here. Linking, the graph and the
-	// explainers are recomputed from scratch on every append and only the last
-	// turn's result is kept, so running them after each of twenty-two
-	// repositories was twenty-one full passes over a growing union for nothing
-	// anyone read. The caller that walks a cluster sets deferLinking for every
-	// turn but the last; that turn runs the full pipeline once over the whole
-	// union. The bundle published here carries the store, the repo paths and
-	// the intent the next turn needs, and a meta that says what was extracted.
 	if e.deferLinking {
-		work.Freeze()
-		duration := time.Since(start)
-		deferredPrefix := ""
-		if appendMode {
-			deferredPrefix = repoLabel + "/"
-		}
-		snapshot := &facts.Snapshot{
-			Meta: facts.SnapshotMeta{
-				RepoPath:           absRepo,
-				GeneratedAt:        time.Now().UTC().Format(time.RFC3339),
-				Duration:           duration.String(),
-				Extractors:         usedExtractors,
-				Renderers:          []string{},
-				FileHashes:         fileHashesOf(absRepo, currentHashes),
-				FactCount:          e.store.Count(),
-				EnolaVersion:       version.Version,
-				ExtractorVersion:   cacheVersion,
-				Git:                git,
-				RepoLabel:          repoLabel,
-				Providers:          provRecords,
-				FilesSeen:          len(files),
-				FilesParsed:        e.store.CountFilesWithFacts(files, deferredPrefix),
-				SourceBytes:        e.store.SourceBytesWithFacts(files, deferredPrefix, absRepo),
-				FilesSkipped:       skips.count,
-				DirsSkipped:        skips.dirCount,
-				SkippedSample:      skips.sample,
-				ShadowedExtractors: shadowedExtractors,
-				ParseErrors:        len(parseErrs),
-				ParseErrorSample:   capParseErrors(parseErrs),
-				Census:             e.fileCensus(files, deferredPrefix, skips, usedExtractors, parseErrs),
-			},
-			Facts: e.store.FactsRef(),
-		}
-		e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent,
-			members: memberMetas(prev, appendMode, absRepo, snapshot.Meta)})
-		log.Printf("[engine] %s extracted into the union in %s (%d facts so far); linking and explaining deferred to the cluster's last turn",
-			repoLabel, duration.Round(time.Millisecond), e.store.Count())
-		log.Printf("[engine] timings: walk=%s hash=%s extract=%s", tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond))
-		return snapshot, nil
+		return e.publishDeferred(r), nil
 	}
 
-	// 3b. Link repos into a cross-repo "graph of graphs": derive service-level
-	// nodes and consumer→provider edges from HTTP route role matching and
-	// import/shared-lib references. Recomputed from scratch each run (prior
-	// synthetic facts are dropped first) so it stays idempotent across appends.
-	tStage = time.Now()
-	e.runBinders(ctx, plugin.StagePreLink)
-	e.linkCrossRepo(workRepoPaths)
-	e.runBinders(ctx, plugin.StagePostLink)
-	tLink = time.Since(tStage)
-
-	// 3c. Build graph index for traversal queries
-	tStage = time.Now()
-	e.store.BuildGraph()
-	tGraph = time.Since(tStage)
-	log.Printf("[engine] built graph index (%d nodes, %d edges)", e.store.Graph().NodeCount(), e.store.Graph().EdgeCount())
-
-	// 4. Run explainers
-	tStage = time.Now()
-	allInsights, usedExplainers, err := e.runExplainers(ctx, allNames)
+	e.link(r)
+	insights, usedExplainers, err := e.explain(r)
 	if err != nil {
-		return nil, fmt.Errorf("explanation: %w", err)
+		return nil, err
 	}
-	positionInsights(allInsights, e.store)
-	tExplain = time.Since(tStage)
-	log.Printf("[engine] produced %d insights using %d explainers", len(allInsights), len(usedExplainers))
-
-	// 5. Build file hashes for the snapshot meta
-	fileHashes := fileHashesOf(absRepo, currentHashes)
-
-	// 6. Build snapshot.
-	//
-	// Receipt fields: the snapshot ID is a content fingerprint over the same
-	// byte-stable serialization that becomes facts.jsonl, so it is stable across
-	// reruns on identical inputs and keys snapshot equivalence. The extraction
-	// -quality fields (files seen/parsed/skipped, parse errors, coverage) let a
-	// consumer judge how complete this extraction was before trusting it.
-	duration := time.Since(start)
-	ignoreGlobHash := computeIgnoreGlobHash(e.cfg)
-	configHash := computeConfigHash(e.cfg)
-	// In append mode this run's facts were path-prefixed with the repo label, so
-	// match the walked files against that same prefix to count parsing coverage.
-	parsedPrefix := ""
-	if appendMode {
-		parsedPrefix = repoLabel + "/"
-	}
-	// Stream the serialization straight into the hash. The ID is the only thing this
-	// pass produces, so buffering the bytes to fingerprint and then discard them cost
-	// 792 MiB on a kernel-sized graph for nothing. The digest is identical either way.
-	idHasher := newSnapshotIDHasher()
-	if err := e.store.WriteJSONL(idHasher); err != nil {
-		return nil, fmt.Errorf("serializing facts for snapshot id: %w", err)
-	}
-	snapshot := &facts.Snapshot{
-		Meta: facts.SnapshotMeta{
-			RepoPath:     absRepo,
-			GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
-			Duration:     duration.String(),
-			Extractors:   usedExtractors,
-			Explainers:   usedExplainers,
-			Renderers:    []string{},
-			FileHashes:   fileHashes,
-			FactCount:    e.store.Count(),
-			InsightCount: len(allInsights),
-
-			EnolaVersion: version.Version,
-			// What this build EXTRACTS LIKE, which for a local build the version cannot
-			// say — see facts.SnapshotMeta.ExtractorVersion.
-			ExtractorVersion: cacheVersion,
-			SnapshotID:       finishSnapshotID(idHasher, version.Version, configHash),
-			Git:              git,
-			ConfigHash:       configHash,
-			// The label the facts in this snapshot actually carry. Recorded rather than
-			// re-derived on read: a baseline outlives the build that wrote it, and a
-			// reader that recomputed the label would apply TODAY's rule to YESTERDAY's
-			// facts and conclude they match when their keys do not.
-			RepoLabel: repoLabel,
-
-			Providers: provRecords,
-
-			FilesSeen:          len(files),
-			FilesParsed:        e.store.CountFilesWithFacts(files, parsedPrefix),
-			SourceBytes:        e.store.SourceBytesWithFacts(files, parsedPrefix, absRepo),
-			FilesSkipped:       skips.count,
-			DirsSkipped:        skips.dirCount,
-			SkippedSample:      skips.sample,
-			IgnoreGlobHash:     ignoreGlobHash,
-			ShadowedExtractors: shadowedExtractors,
-			ParseErrors:        len(parseErrs),
-			ParseErrorSample:   capParseErrors(parseErrs),
-			HeuristicInsights:  countHeuristicInsights(allInsights),
-			Coverage:           coverageSummary(e.store),
-			Census:             e.fileCensus(files, parsedPrefix, skips, usedExtractors, parseErrs),
-			Unseen:             e.unseenCensus(skips, provRecords, allInsights),
-		},
-		// FactsRef aliases the store's slice rather than copying it. This is safe:
-		// `work` is published (below) and then NEVER mutated again — the next
-		// regeneration builds a different store — so a reader iterating snapshot.Facts
-		// iterates a frozen backing array. Copying every fact would just double
-		// steady-state RSS for a large repo. Baselines, which must stay immutable as
-		// the store regenerates, still use the copying All().
-		Facts:    e.store.FactsRef(),
-		Insights: allInsights,
-	}
-
-	// 7. Run renderers
-	tStage = time.Now()
-	usedRenderers, err := e.runRenderers(ctx, snapshot)
+	snapshot, err := e.buildSnapshot(r, insights, usedExplainers)
 	if err != nil {
-		return nil, fmt.Errorf("rendering: %w", err)
+		return nil, err
 	}
-	tRender = time.Since(tStage)
-	snapshot.Meta.Renderers = usedRenderers
-	log.Printf("[engine] produced %d artifacts using %d renderers", len(snapshot.Artifacts), len(usedRenderers))
-
-	// Every writer has now run: extraction, linking, binders, explainers, renderers.
-	// Collapse the structurally identical Props maps and Relations slices the
-	// extractors emitted independently onto shared instances before the store becomes
-	// visible. This must happen HERE — after the last mutation and before the
-	// publication below — because sharing is sound exactly for a store nothing writes
-	// again. Append mode carries these facts into a future mutable store via
-	// Store.All, which copies them back apart.
-	tStage = time.Now()
-	work.Freeze()
-	log.Printf("[engine] froze fact store in %s", time.Since(tStage).Round(time.Millisecond))
-
-	// Publish atomically. This single Store() is the linearization point: before it
-	// readers see the prior bundle, after it the new one — never a half-built store.
-	e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent,
-		members: memberMetas(prev, appendMode, absRepo, snapshot.Meta)})
-	log.Printf("[engine] snapshot generated in %s", duration)
-	log.Printf("[engine] timings: walk=%s hash=%s extract=%s link=%s graph=%s explain=%s render=%s",
-		tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond),
-		tLink.Round(time.Millisecond), tGraph.Round(time.Millisecond), tExplain.Round(time.Millisecond),
-		tRender.Round(time.Millisecond))
-
-	// Generation allocates large transient buffers (per-file fact slices, the
-	// pre-dedup fact list, parser scratch) that the GC frees but Go's scavenger
-	// returns to the OS only lazily. For a long-running server that loads a big
-	// repo and then idles, hand that memory back now so idle RSS settles at the
-	// live set instead of the extraction peak. Once per load, so the cost is
-	// negligible. The MemStats line reports the retained footprint for visibility.
-	debug.FreeOSMemory()
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	log.Printf("[engine] memory after snapshot: heap=%d MiB sys=%d MiB (%d facts)",
-		ms.HeapAlloc>>20, ms.Sys>>20, snapshot.Meta.FactCount)
-
+	if err := e.render(r, snapshot); err != nil {
+		e.discardStaged()
+		return nil, err
+	}
+	e.publish(r, snapshot)
 	return snapshot, nil
 }
 
@@ -759,7 +414,7 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 // compiler) added since is the identity set a provider fact may not collide
 // with — the extractor's account of a name+kind wins, always.
 func (e *Engine) runProviders(ctx context.Context, absRepo string, preCount int, in providers.Input) []facts.ProviderRecord {
-	if len(e.cfg.Providers) == 0 {
+	if len(e.providers.Providers) == 0 {
 		return nil
 	}
 	extracted := e.store.FactsRef()[preCount:]
@@ -767,10 +422,18 @@ func (e *Engine) runProviders(ctx context.Context, absRepo string, preCount int,
 	for _, f := range extracted {
 		owned[f.Kind+"\x00"+f.Name] = true
 	}
-	in.Providers = e.cfg.Providers
+	in.Providers = e.providers.Providers
 	in.RepoPath = absRepo
 	in.Taken = func(kind, name string) bool { return owned[kind+"\x00"+name] }
-	in.Ignored = func(file string) bool { return e.isIgnored(file, false) }
+	// Compiled once for the whole provider run: this closure is asked about every
+	// file a provider considers, and the bundled config ships 114 ignore patterns.
+	provIgnore := pathglob.Compile(e.cfg.Ignore)
+	provPkgs := newPyPackageExemption(absRepo, e.cfg.Ignore)
+	in.Ignored = func(file string) bool {
+		rel := filepath.ToSlash(file)
+		pattern, ok := provIgnore.Match(rel)
+		return ok && !provPkgs.exempt(rel, pattern, false)
+	}
 	provFacts, records := providers.RunWith(ctx, in)
 	// The join against the extractor's relations runs once per provider over
 	// the facts that survived the merge, and stamps which tree they describe;
@@ -880,7 +543,7 @@ func (e *Engine) linkCrossRepo(repoPaths map[string]string) {
 		if f.Props == nil {
 			return false
 		}
-		return f.Props["synthetic"] == crossrepo.SyntheticMarker
+		return f.PropAny("synthetic") == crossrepo.SyntheticMarker
 	})
 
 	// A cross-repo edge needs two repos, and ComputeLinks says so itself — but only
@@ -968,7 +631,10 @@ const skippedSampleCap = 20
 // become a C++ project by carrying node_modules. Pre-ignore: an ignored FILE may be
 // the only marker a language has, and the bundled config ignores **/*.yaml, which
 // is how a Dart repository is spelled.
-func (e *Engine) walkRepo(repoPath string) (files, testFiles, allNames []string, skips walkSkips, err error) {
+// ctx is checked at every entry: pointed at a folder of many repositories by mistake, the
+// walk alone visits hundreds of thousands of files, and a cancelled request must stop it
+// rather than hold the snapshot lock until it finishes.
+func (e *Engine) walkRepo(ctx context.Context, repoPath string) (files, testFiles, allNames []string, skips walkSkips, err error) {
 	// A symlinked repo root walks as a single non-directory entry (WalkDir
 	// Lstats the root), silently yielding zero files. Resolve the ROOT only —
 	// symlinks inside the tree keep their non-followed semantics — so a config
@@ -977,8 +643,17 @@ func (e *Engine) walkRepo(repoPath string) (files, testFiles, allNames []string,
 	if resolved, rerr := filepath.EvalSymlinks(repoPath); rerr == nil && resolved != repoPath {
 		repoPath = resolved
 	}
+	// Both lists are asked about every entry the walk visits, so their shapes are
+	// resolved once here rather than re-derived per entry. pathglob.Compile answers
+	// exactly as matchGlob does; internal/facts proves the two agree.
+	ignoreSet := pathglob.Compile(e.cfg.Ignore)
+	testGlobSet := pathglob.Compile(e.cfg.TestGlobs)
+	pkgs := newPyPackageExemption(repoPath, e.cfg.Ignore)
 	err = filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
@@ -1004,7 +679,7 @@ func (e *Engine) walkRepo(repoPath string) (files, testFiles, allNames []string,
 		}
 
 		// Skip ignored paths
-		if pattern, ok := e.ignoreMatch(relPath); ok {
+		if pattern, ok := ignoreSet.Match(relPath); ok && !pkgs.exempt(relPath, pattern, d.IsDir()) {
 			if d.IsDir() {
 				// enola's own output directory is not part of the source tree.
 				// Counting it would make dirs_skipped differ between a repo's
@@ -1018,7 +693,7 @@ func (e *Engine) walkRepo(repoPath string) (files, testFiles, allNames []string,
 			// An ignored FILE that is a test/spec is not indexed as production
 			// source, but is collected for reference-only extraction so a
 			// production symbol exercised only by a test does not look dead.
-			if e.matchesTestGlob(relPath) {
+			if testGlobSet.MatchAny(relPath) {
 				testFiles = append(testFiles, relPath)
 			}
 			skips.count++
@@ -1051,44 +726,13 @@ func (e *Engine) detect(ext extractors.Extractor, repoPath string, allNames []st
 	return ext.Detect(repoPath)
 }
 
-// matchesTestGlob reports whether a repo-relative path matches any TestGlob.
-func (e *Engine) matchesTestGlob(relPath string) bool {
-	return matchAnyGlob(filepath.ToSlash(relPath), e.cfg.TestGlobs)
-}
-
-// matchAnyGlob and matchGlob are thin aliases onto the shared matcher, which now
-// lives in internal/facts alongside the other path predicates (IsTestPath) so that
-// out-of-module consumers can reach it through pkg/facts. The enterprise performance
-// analyzer's ENOLA_PERF_EXCLUDE globs documented `**` support that path.Match cannot
-// give them; rather than grow a second glob implementation, it uses this one.
-func matchAnyGlob(relPath string, patterns []string) bool {
-	return facts.MatchAnyGlob(relPath, patterns)
-}
-
-func matchGlob(relPath string, patterns []string) (string, bool) {
-	return facts.MatchGlob(relPath, patterns)
-}
-
-// isIgnored checks whether a path matches any ignore pattern. isDir is unused: the
-// patterns discriminate on shape, not on file type, and a directory that matches is
-// pruned by the caller.
-func (e *Engine) isIgnored(relPath string, isDir bool) bool {
-	return matchAnyGlob(filepath.ToSlash(relPath), e.cfg.Ignore)
-}
-
-// ignoreMatch reports whether a path is ignored, and by which pattern. The walker
-// needs the pattern to record it in the receipt's skipped sample.
-func (e *Engine) ignoreMatch(relPath string) (string, bool) {
-	return matchGlob(filepath.ToSlash(relPath), e.cfg.Ignore)
-}
-
 // runExtractors detects applicable extractors and runs them. When cache is
 // non-nil, extractors implementing plugin.FileOwner have their facts reused
 // whenever the files they depend on are unchanged since the last snapshot.
 //
 // It also reports the SHADOWED extractors: those registered and applicable to this
 // repository, but excluded by an explicit `extractors:` list. See reportShadowed.
-func (e *Engine) runExtractors(ctx context.Context, repoPath string, files, allNames []string, hashes map[string]string, cache *extractorCache) ([]string, []string, []facts.ParseError, error) {
+func (e *Engine) runExtractors(ctx context.Context, repoPath string, files, allNames []string, hashes map[string]string, cache *extractorCache, progress *extractionProgress) ([]string, []string, []facts.ParseError, error) {
 	var usedNames []string
 	var shadowed []string
 	var parseErrs []facts.ParseError
@@ -1131,6 +775,7 @@ func (e *Engine) runExtractors(ctx context.Context, repoPath string, files, allN
 					e.store.Add(cached...)
 					usedNames = append(usedNames, ext.Name())
 					log.Printf("[engine] extractor %s: reused %d cached facts", ext.Name(), len(cached))
+					progress.finished(ext)
 					continue
 				}
 			}
@@ -1163,6 +808,7 @@ func (e *Engine) runExtractors(ctx context.Context, repoPath string, files, allN
 		e.store.Add(extracted...)
 		usedNames = append(usedNames, ext.Name())
 		log.Printf("[engine] extractor %s: emitted %d facts in %s", ext.Name(), len(extracted), time.Since(tExt).Round(time.Millisecond))
+		progress.finished(ext)
 	}
 
 	return usedNames, shadowed, parseErrs, nil
@@ -1192,7 +838,7 @@ func (e *Engine) reportShadowed(repoPath string, shadowed []string) {
 // runTestRefExtractors runs reference-only extraction over the test/spec files
 // for every enabled, detected extractor that implements plugin.TestRefExtractor.
 // It scopes each extractor to the test files it owns and adds the resulting
-// KindTestRef facts to the store. Errors are logged, not fatal.
+// KindTestRef and KindTestCase facts to the store. Errors are logged, not fatal.
 //
 // prodFiles is the same non-test file list handed to runExtractors, forwarded so an
 // extractor whose reference resolution depends on which production modules exist
@@ -1315,7 +961,14 @@ func (e *Engine) runRenderers(ctx context.Context, snapshot *facts.Snapshot) ([]
 		}
 
 		log.Printf("[engine] running renderer: %s", rnd.Name())
-		artifacts, err := rnd.Render(ctx, snapshot)
+		// A renderer that follows edges reads the store; see plugin.StoreRenderer.
+		var artifacts []facts.Artifact
+		var err error
+		if sr, ok := rnd.(plugin.StoreRenderer); ok {
+			artifacts, err = sr.RenderStore(ctx, snapshot, e.store)
+		} else {
+			artifacts, err = rnd.Render(ctx, snapshot)
+		}
 		if err != nil {
 			log.Printf("[engine] renderer %s error: %v", rnd.Name(), err)
 			continue
@@ -1355,6 +1008,13 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 		log.Printf("[engine] warning: could not rotate previous snapshot: %v", err)
 	}
 
+	// Every artifact below is written as a new file renamed over its name, never
+	// into the file already there. previous/, baseline/ and a cluster's other
+	// repositories hold links to these files, and a write into one name of a file
+	// is a write into all of them; a new file leaves every other name holding the
+	// bytes it had. It also means a reader, or a write that fails, never meets a
+	// half-written artifact.
+
 	// Hash every written artifact so the receipt records the exact output bytes
 	// (the verifiable counterpart to the per-input-file FileHashes). meta.json and
 	// receipt.json themselves are not hashed — they carry these hashes.
@@ -1363,7 +1023,7 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	// Write renderer artifacts (e.g. llm_context.md)
 	for _, a := range b.snapshot.Artifacts {
 		path := filepath.Join(outDir, a.Name)
-		if err := os.WriteFile(path, a.Content, 0o644); err != nil {
+		if err := writeFileAtomic(path, a.Content, 0o644); err != nil {
 			return fmt.Errorf("writing %s: %w", a.Name, err)
 		}
 		outputHashes[a.Name] = hashBytes(a.Content)
@@ -1374,21 +1034,28 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	// whole file in memory to write and then hash it. On a kernel-sized graph that
 	// buffer was 792 MiB, allocated at the end of a run and never released before the
 	// process went back to idle.
-	// A cluster writes the same published bundle to every repository's output
-	// dir. The first write serializes; the rest copy the bytes of that file,
-	// which is the same serialization by construction and a fraction of the
-	// time (a 1.5M-fact union serializes in seconds, copies in a fraction of
-	// one). The copy is keyed on the frozen store, which every generate replaces
-	// and the receipt republish below keeps, so a new generate never copies a
-	// stale file.
+	// When the generate's id pass already wrote the file (SetWritesArtifacts), the
+	// first write renames it into place. A cluster writes the same published bundle
+	// to every repository's output dir: the first write places the file, and the
+	// rest link to it, which is the same serialization by construction and costs
+	// no bytes at all. Both are keyed on the frozen store, which every generate
+	// replaces and the receipt republish below keeps, so a new generate never
+	// takes a stale file.
 	factsPath := filepath.Join(outDir, "facts.jsonl")
 	var factsHash string
-	if e.lastFacts.store == b.store && e.lastFacts.path != factsPath && fileExists(e.lastFacts.path) {
-		if err := copyFile(e.lastFacts.path, factsPath); err != nil {
-			return fmt.Errorf("copying facts.jsonl: %w", err)
+	if staged, ok := e.takeStaged(b.store); ok {
+		if err := moveInto(staged.path, factsPath); err != nil {
+			return fmt.Errorf("placing facts.jsonl: %w", err)
+		}
+		factsHash = staged.digest
+		e.lastFacts = lastFactsWrite{store: b.store, path: factsPath, digest: factsHash}
+		log.Printf("[engine] wrote %s (the file the snapshot id was hashed from)", factsPath)
+	} else if e.lastFacts.store == b.store && e.lastFacts.path != factsPath && fileExists(e.lastFacts.path) {
+		if err := linkInto(e.lastFacts.path, factsPath); err != nil {
+			return fmt.Errorf("linking facts.jsonl: %w", err)
 		}
 		factsHash = e.lastFacts.digest
-		log.Printf("[engine] wrote %s (copied from this run's first write)", factsPath)
+		log.Printf("[engine] wrote %s (linked to this run's first write)", factsPath)
 	} else {
 		var err error
 		factsHash, err = writeFactsJSONL(b.store, factsPath)
@@ -1408,12 +1075,14 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	if insights == nil {
 		insights = []facts.Insight{}
 	}
-	insightsJSON, err := b.store.MarshalInsights(insights)
+	// Stamped on a copy: the published snapshot is shared and immutable, and
+	// the identity is for the reader of the file.
+	insightsJSON, err := b.store.MarshalInsights(facts.WithIdentities(insights))
 	if err != nil {
 		return fmt.Errorf("marshaling insights: %w", err)
 	}
 	insightsPath := filepath.Join(outDir, "insights.json")
-	if err := os.WriteFile(insightsPath, insightsJSON, 0o644); err != nil {
+	if err := writeFileAtomic(insightsPath, insightsJSON, 0o644); err != nil {
 		return fmt.Errorf("writing insights.json: %w", err)
 	}
 	outputHashes["insights.json"] = hashBytes(insightsJSON)
@@ -1438,7 +1107,7 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 		return fmt.Errorf("marshaling meta: %w", err)
 	}
 	metaPath := filepath.Join(outDir, "snapshot.meta.json")
-	if err := os.WriteFile(metaPath, metaJSON, 0o644); err != nil {
+	if err := writeFileAtomic(metaPath, metaJSON, 0o644); err != nil {
 		return fmt.Errorf("writing snapshot.meta.json: %w", err)
 	}
 	log.Printf("[engine] wrote %s (%d bytes)", metaPath, len(metaJSON))
@@ -1449,7 +1118,7 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 		return fmt.Errorf("marshaling receipt: %w", err)
 	}
 	receiptPath := filepath.Join(outDir, "receipt.json")
-	if err := os.WriteFile(receiptPath, receiptJSON, 0o644); err != nil {
+	if err := writeFileAtomic(receiptPath, receiptJSON, 0o644); err != nil {
 		return fmt.Errorf("writing receipt.json: %w", err)
 	}
 	log.Printf("[engine] wrote %s (%d bytes)", receiptPath, len(receiptJSON))
@@ -1477,8 +1146,23 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	// same requirement, satisfied by the strongest possible evidence, since the bytes
 	// come from the artifact itself. It also costs nothing when history blobs are off,
 	// which the previous arrangement could not manage.
-	e.recordHistory(repoPath, meta, b, factsPath)
+	if e.recordSnapshot != nil && b.snapshot != nil {
+		e.recordSnapshot(SnapshotRecord{
+			RepoPath:    repoPath,
+			Meta:        meta,
+			Snapshot:    b.snapshot,
+			FactsPath:   factsPath,
+			PreviousDir: filepath.Join(outDir, PreviousSubdir),
+			Parents:     func() []string { return gitParents(repoPath) },
+			Repos:       func() []RepoState { return repoStates(e, b) },
+		})
+	}
 
+	// Say which agent session wrote this run. Rotated into previous/ with the rest by
+	// the next write, where it tells a diff whose run it is comparing against.
+	if err := e.writeSessionMark(outDir, RunMarkFile); err != nil {
+		log.Printf("[engine] warning: could not record the run's session: %v", err)
+	}
 	return nil
 }
 
@@ -1493,32 +1177,139 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// writeFactsJSONL serializes the store straight to path, returning the
-// "sha256:"-prefixed digest of exactly the bytes written.
+// serializeFacts is the serialization every facts.jsonl write streams, the
+// store's own. A variable so a test can make it fail partway through.
+var serializeFacts = (*facts.Store).WriteJSONL
+
+// stagedFacts is a facts.jsonl written under a temporary name in an output dir,
+// keyed on the frozen store it was serialized from, the way lastFacts is.
+type stagedFacts struct {
+	store  *facts.Store
+	path   string
+	digest string
+}
+
+// takeStaged hands the file staged from store to the one write that places it.
+func (e *Engine) takeStaged(store *facts.Store) (stagedFacts, bool) {
+	e.stagedMu.Lock()
+	defer e.stagedMu.Unlock()
+	s := e.staged
+	if s.path == "" || s.store != store {
+		return stagedFacts{}, false
+	}
+	e.staged = stagedFacts{}
+	return s, true
+}
+
+// discardStaged removes a staged file no write took.
+func (e *Engine) discardStaged() {
+	e.stagedMu.Lock()
+	defer e.stagedMu.Unlock()
+	if e.staged.path != "" {
+		_ = os.Remove(e.staged.path)
+		e.staged = stagedFacts{}
+	}
+}
+
+// stageFacts writes the facts serialization to a new file in dir as it streams
+// into the snapshot id's hash, and returns the file with the digest of exactly
+// its bytes. That digest is the id hash's running sum before finishSnapshotID
+// appends the version and config hash, so the id and the file's digest come
+// from one pass over one stream, and nothing holds the serialization.
+func stageFacts(store *facts.Store, dir string, idHasher hash.Hash) (stagedFacts, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return stagedFacts{}, fmt.Errorf("creating output dir: %w", err)
+	}
+	path, err := writeFactsFile(store, dir, idHasher)
+	if err != nil {
+		return stagedFacts{}, err
+	}
+	return stagedFacts{store: store, path: path, digest: hashPrefix + hex.EncodeToString(idHasher.Sum(nil))}, nil
+}
+
+// writeFactsJSONL serializes the store to a new file renamed over path, returning
+// the "sha256:"-prefixed digest of exactly the bytes written.
 //
 // The digest comes from a hash tee'd off the same stream rather than from a second
 // pass over a buffer, so it cannot describe anything other than the file on disk.
-// Durability is deliberately unchanged from the os.WriteFile this replaced: neither is
-// atomic, and making facts.jsonl atomic is a separate decision from making it cheap.
 func writeFactsJSONL(store *facts.Store, path string) (string, error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return "", fmt.Errorf("creating facts.jsonl: %w", err)
-	}
 	h := sha256.New()
-	bw := bufio.NewWriterSize(f, 1<<20)
-	if err := store.WriteJSONL(io.MultiWriter(bw, h)); err != nil {
-		_ = f.Close()
-		return "", fmt.Errorf("serializing facts.jsonl: %w", err)
+	tmp, err := writeFactsFile(store, filepath.Dir(path), h)
+	if err != nil {
+		return "", err
 	}
-	if err := bw.Flush(); err != nil {
-		_ = f.Close()
-		return "", fmt.Errorf("writing facts.jsonl: %w", err)
-	}
-	if err := f.Close(); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return "", fmt.Errorf("writing facts.jsonl: %w", err)
 	}
 	return hashPrefix + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// writeFactsFile streams the serialization into a new file in dir and into h,
+// and returns the file's path. A failure removes the file.
+func writeFactsFile(store *facts.Store, dir string, h io.Writer) (string, error) {
+	f, err := os.CreateTemp(dir, ".facts.jsonl.tmp-")
+	if err != nil {
+		return "", fmt.Errorf("creating facts.jsonl: %w", err)
+	}
+	tmp := f.Name()
+	abandon := func(err error) (string, error) {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	bw := bufio.NewWriterSize(f, 1<<20)
+	if err := serializeFacts(store, io.MultiWriter(bw, h)); err != nil {
+		return abandon(fmt.Errorf("serializing facts.jsonl: %w", err))
+	}
+	if err := bw.Flush(); err != nil {
+		return abandon(fmt.Errorf("writing facts.jsonl: %w", err))
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("writing facts.jsonl: %w", err)
+	}
+	// CreateTemp makes 0600; match the mode every other artifact is written with.
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
+}
+
+// moveInto renames src over dst, and where the rename is refused (the two on
+// different filesystems) publishes a copy of src instead. src is gone either
+// way: it is a staged file nothing else names.
+func moveInto(src, dst string) error {
+	defer func() { _ = os.Remove(src) }()
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	return replaceVia(dst, func(tmp string) error { return copyFile(src, tmp) })
+}
+
+// linkInto gives dst the file at src: a link where the filesystem allows one,
+// a copy of the same bytes where it does not.
+func linkInto(src, dst string) error {
+	return replaceVia(dst, func(tmp string) error { return linkOrCopyFile(src, tmp) })
+}
+
+// replaceVia publishes dst through a staging dir beside it: place creates the
+// new file under a name in that dir, and a rename puts it over dst, so dst is
+// never written into and never observed empty or partial.
+func replaceVia(dst string, place func(tmp string) error) error {
+	stage, err := os.MkdirTemp(filepath.Dir(dst), ".tmp-"+filepath.Base(dst)+"-")
+	if err != nil {
+		return err
+	}
+	// Also removes the staged name when it was already a link of dst's file,
+	// the one case in which a rename leaves its source behind.
+	defer func() { _ = os.RemoveAll(stage) }()
+	tmp := filepath.Join(stage, filepath.Base(dst))
+	if err := place(tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // hashBytes returns the "sha256:"-prefixed digest of b, used for output-artifact
@@ -1551,7 +1342,7 @@ func (e *Engine) GetArtifact(name string) ([]byte, error) {
 		if insights == nil {
 			insights = []facts.Insight{}
 		}
-		return b.store.MarshalInsights(insights)
+		return b.store.MarshalInsights(facts.WithIdentities(insights))
 	case "snapshot.meta.json":
 		return json.MarshalIndent(b.snapshot.Meta, "", "  ")
 	case "receipt.json":
@@ -1572,9 +1363,13 @@ func (e *Engine) GetArtifact(name string) ([]byte, error) {
 // concurrent random reads contend worse than the sequential reads the OS
 // prefetches. The extraction parsing, not hashing, is the bottleneck worth
 // parallelizing.
-func (e *Engine) computeFileHashes(repoPath string, files []string) map[string]string {
+// It stops early once ctx is done, returning what it has; the caller checks ctx.
+func (e *Engine) computeFileHashes(ctx context.Context, repoPath string, files []string) map[string]string {
 	hashes := make(map[string]string, len(files))
 	for _, relFile := range files {
+		if ctx.Err() != nil {
+			break
+		}
 		absFile := filepath.Join(repoPath, relFile)
 		data, err := os.ReadFile(absFile)
 		if err != nil {
@@ -1605,4 +1400,33 @@ func fileHashesOf(absRepo string, hashes map[string]string) []facts.FileHash {
 		})
 	}
 	return out
+}
+
+// ProvidersMode is the providers mode this engine's snapshots run in, and
+// what decided it, for the summary that ends a generate, a pin and a check.
+func (e *Engine) ProvidersMode() (mode, source string) {
+	return e.providers.Mode, e.providers.ModeSource
+}
+
+// WriteProviderSummary writes the block that ends a generate, a pin and a
+// check: under a heading naming the providers mode, one line per provider each
+// repository's snapshot records, ran, skipped or not applicable. It reads the
+// recorded snapshot, so a pin that reused one on disk reports what that run
+// did. Nothing is written when no snapshot names a provider.
+func (e *Engine) WriteProviderSummary(w io.Writer, repoPaths []string) {
+	mode, _ := e.ProvidersMode()
+	blocks := make([]providers.SummaryBlock, 0, len(repoPaths))
+	for _, repoPath := range repoPaths {
+		meta := e.MetaFor(repoPath)
+		heading := "Providers (" + mode + "):"
+		if len(repoPaths) > 1 {
+			label := meta.RepoLabel
+			if label == "" {
+				label = filepath.Base(repoPath)
+			}
+			heading = "Providers (" + mode + "), " + label + ":"
+		}
+		blocks = append(blocks, providers.SummaryBlock{Heading: heading, Records: meta.Providers})
+	}
+	providers.WriteSummary(w, blocks)
 }

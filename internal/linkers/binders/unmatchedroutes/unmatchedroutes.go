@@ -27,9 +27,9 @@ const (
 	// the linker declined to reason about it, so it has no verdict to publish.
 	PropMatchedByClients = "matched_by_clients"
 	// PropUnmatchedByServer marks a CLIENT call site that resolves to no loaded server.
-	PropUnmatchedByServer = "unmatched_by_server"
+	PropUnmatchedByServer = facts.PropUnmatchedByServer
 	// PropUnmatchedReason carries one of the crossrepo.Reason* values explaining why.
-	PropUnmatchedReason = "unmatched_reason"
+	PropUnmatchedReason = facts.PropUnmatchedReason
 )
 
 // Binder records the cross-repo linker's non-matches on the route facts themselves,
@@ -80,28 +80,39 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	// same claim whether the endpoint is a path or a root field.
 	evaluatedOps, unmatchedOps := graphqlsig.ServerOperationVerdicts(all)
 	clientKeys := httpsignal.UnmatchedClientRouteKeys(b.m, all)
+	clientMatches := httpsignal.ClientRouteMatches(b.m, all)
 
-	flaggedServer, flaggedClient := 0, 0
+	flaggedServer, flaggedClient, linkedClient := 0, 0, 0
 	store.UpdateWhere(func(f *facts.Fact) {
 		if f.Kind != facts.KindRoute {
 			return
 		}
 		if f.PropString(providers.PropResolutionLevel) == providers.LevelRuntimeObserved {
-			delete(f.Props, PropMatchedByClients)
-			delete(f.Props, PropUnmatchedByClients)
+			f.DelProp(PropMatchedByClients)
+			f.DelProp(PropUnmatchedByClients)
+			f.DelProp(facts.PropMatchedRoutes)
 			return
 		}
 		// A client-role route is a call site, never a served endpoint: it carries the
 		// reverse (unmatched_by_server) verdict, never unmatched_by_clients.
-		if f.Props != nil && f.Props[facts.PropRole] == facts.RoleClient {
-			delete(f.Props, PropUnmatchedByClients)
+		if f.Props != nil && f.PropAny(facts.PropRole) == facts.RoleClient {
+			f.DelProp(PropUnmatchedByClients)
+			// The positive verdict, and the half a consumer walks: which server
+			// routes this call reaches. Cleared when the call no longer resolves,
+			// for the same idempotency across appends as the markers.
+			if matches := clientMatches[httpsignal.ClientCallKey(*f)]; len(matches) > 0 {
+				f.SetProp(facts.PropMatchedRoutes, matchedRoutesProp(matches))
+				linkedClient++
+			} else {
+				f.DelProp(facts.PropMatchedRoutes)
+			}
 			if reason, ok := clientKeys[routeindex.RouteIdentity(*f)]; ok {
-				f.Props[PropUnmatchedByServer] = true
-				f.Props[PropUnmatchedReason] = reason
+				f.SetProp(PropUnmatchedByServer, true)
+				f.SetProp(PropUnmatchedReason, reason)
 				flaggedClient++
 			} else {
-				delete(f.Props, PropUnmatchedByServer)
-				delete(f.Props, PropUnmatchedReason)
+				f.DelProp(PropUnmatchedByServer)
+				f.DelProp(PropUnmatchedReason)
 			}
 			return
 		}
@@ -109,15 +120,15 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			key := graphqlsig.OperationIdentity(*f)
 			switch {
 			case unmatchedOps[key]:
-				f.Props[PropUnmatchedByClients] = true
-				delete(f.Props, PropMatchedByClients)
+				f.SetProp(PropUnmatchedByClients, true)
+				f.DelProp(PropMatchedByClients)
 				flaggedServer++
 			case evaluatedOps[key]:
-				f.Props[PropMatchedByClients] = true
-				delete(f.Props, PropUnmatchedByClients)
+				f.SetProp(PropMatchedByClients, true)
+				f.DelProp(PropUnmatchedByClients)
 			default:
-				delete(f.Props, PropMatchedByClients)
-				delete(f.Props, PropUnmatchedByClients)
+				f.DelProp(PropMatchedByClients)
+				f.DelProp(PropUnmatchedByClients)
 			}
 			return
 		}
@@ -126,8 +137,8 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 		// membership test alone would hand this one the other's verdict.
 		if !b.m.IsLinkable(*f) {
 			if f.Props != nil {
-				delete(f.Props, PropMatchedByClients)
-				delete(f.Props, PropUnmatchedByClients)
+				f.DelProp(PropMatchedByClients)
+				f.DelProp(PropUnmatchedByClients)
 			}
 			return
 		}
@@ -136,13 +147,13 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			if f.Props == nil {
 				f.Props = map[string]any{}
 			}
-			f.Props[PropUnmatchedByClients] = true
+			f.SetProp(PropUnmatchedByClients, true)
 			// Clearing the opposite marker is what keeps the binder idempotent
 			// across appends, and the positive marker had to join the rule the
 			// moment it existed: a route matched while one repo was loaded and
 			// unmatched once the next append changed the index carried both
 			// verdicts at once, on 3,433 routes of the estate.
-			delete(f.Props, PropMatchedByClients)
+			f.DelProp(PropMatchedByClients)
 			flaggedServer++
 			return
 		}
@@ -156,8 +167,8 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			// else-branch used to claim all of these as matched, which put 2,997
 			// routes nothing had examined into the population every "client
 			// coverage is too thin" proportion was measured against.
-			delete(f.Props, PropMatchedByClients)
-			delete(f.Props, PropUnmatchedByClients)
+			f.DelProp(PropMatchedByClients)
+			f.DelProp(PropUnmatchedByClients)
 			return
 		}
 		// A matched route says so, rather than merely stopping saying the
@@ -166,12 +177,29 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 		// `unmatched_by_clients: false` counted zero matches across 161 real
 		// ones, which is absence of a marker read as measurement of absence. The
 		// same shape as a coverage zero from an extractor that examined nothing.
-		f.Props[PropMatchedByClients] = true
-		delete(f.Props, PropUnmatchedByClients)
+		f.SetProp(PropMatchedByClients, true)
+		f.DelProp(PropUnmatchedByClients)
 	})
-	if flaggedServer > 0 || flaggedClient > 0 {
-		log.Printf("[binder:unmatched-routes] flagged %d server route(s) unused by clients, %d client call(s) unresolved to a server",
-			flaggedServer, flaggedClient)
+	if flaggedServer > 0 || flaggedClient > 0 || linkedClient > 0 {
+		log.Printf("[binder:unmatched-routes] flagged %d server route(s) unused by clients, %d client call(s) unresolved to a server; linked %d client call(s) to their server routes",
+			flaggedServer, flaggedClient, linkedClient)
 	}
 	return nil
+}
+
+// matchedRoutesProp renders a call's matches as the prop value: a []any of
+// map[string]any, the shape the value has after a round trip through facts.jsonl, so
+// a fact built here and one read back from disk are the same to every reader.
+func matchedRoutesProp(matches []httpsignal.RouteMatch) []any {
+	out := make([]any, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, map[string]any{
+			"repo":       m.Repo,
+			"method":     m.Method,
+			"name":       m.Name,
+			"file":       m.File,
+			"confidence": m.Confidence,
+		})
+	}
+	return out
 }

@@ -2,8 +2,10 @@
 // the seam through which a tool enola does not ship can contribute measured
 // facts to the graph without becoming an extractor.
 //
-// A provider is an executable named in the engine config's `providers:` block.
-// The seam runs it twice: once with --version to learn what build it is
+// A provider is an executable named in the engine config's `providers:` block,
+// or, in the every providers mode, one the catalogue offers (catalogue.go): the
+// built-in Rubydex provider and the example scripts in the providers directory,
+// each where it applies. The seam runs it twice: once with --version to learn what build it is
 // talking to, once with the repository path to collect facts, printed as JSONL
 // on stdout in the store's own fact schema. Everything about the exchange is
 // fail-closed: output is validated strictly (an unknown kind, an unknown
@@ -43,15 +45,22 @@ import (
 	"sync"
 
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/providerspec"
 )
 
-// Provider is one configured fact source: the census name its facts are
-// stamped with, the command (argv) the seam runs, and the version the
+// Provider is one fact source as the seam runs it: the census name its facts
+// are stamped with, the command (argv) the seam runs, and the version the
 // operator expects the installed build to report. An entry with no command
 // names a provider the binary carries itself (see builtin.go), run
 // in-process under the same validation and census. A reported version that
 // disagrees with the expected one is a skip, not a merge — facts from a build
 // the config did not pin would drift the graph for reasons no code change made.
+//
+// The declaration a config writes, and its validation, live in
+// internal/providerspec, which the config loads without reaching this package
+// and the engines behind it; FromSpecs turns those into Providers. The exported
+// fields below are that declaration's, and the unexported ones are what only
+// the catalogue sets, so Provider is a struct of its own rather than an alias.
 type Provider struct {
 	Name            string   `yaml:"name"`
 	Command         []string `yaml:"command"`
@@ -67,10 +76,42 @@ type Provider struct {
 	// Extensions names the file suffixes a per-file provider reads, so the
 	// seam keys and lists only those; required with FilesPerFile.
 	Extensions []string `yaml:"extensions,omitempty"`
+
+	// The fields below are set only on an entry the catalogue built, never
+	// from a config: an explicit list means exactly what it says.
+	//
+	// env is the provider process's environment, nil for the seam's own.
+	env []string
+	// interpreter is the interpreter the catalogue chose for the script, named
+	// in a skip when its version probe fails.
+	interpreter string
+	// applies decides whether anything the provider reads is in a repository,
+	// before anything is run.
+	applies func(repo string, files []string) (bool, string)
+	// unavailable is why the entry cannot run on this machine (no directory,
+	// no script, no interpreter), asked only where it applies.
+	unavailable string
+}
+
+func FromSpecs(specs []providerspec.Spec) []Provider {
+	if specs == nil {
+		return nil
+	}
+	out := make([]Provider, len(specs))
+	for i, s := range specs {
+		out[i] = Provider{
+			Name:            s.Name,
+			Command:         s.Command,
+			ExpectedVersion: s.ExpectedVersion,
+			Files:           s.Files,
+			Extensions:      s.Extensions,
+		}
+	}
+	return out
 }
 
 // FilesPerFile is the one value Provider.Files accepts.
-const FilesPerFile = "per-file"
+const FilesPerFile = providerspec.FilesPerFile
 
 // FilesFlag is the argument a per-file provider receives after the repository
 // path: the path of a file listing, one repo-relative path per line, the files
@@ -99,6 +140,17 @@ type Input struct {
 	Files     []string
 	Hashes    map[string]string
 	Cache     Cache
+
+	rubydex *rubydexEngine
+}
+
+// engine is the run's one Rubydex index, made here for a caller that runs a
+// built-in outside RunWith.
+func (in Input) engine() *rubydexEngine {
+	if in.rubydex == nil {
+		return &rubydexEngine{}
+	}
+	return in.rubydex
 }
 
 // Reserved prop keys on provider facts. The provenance pair is stamped by the
@@ -138,6 +190,13 @@ const (
 )
 
 const CensusPrefix = "enola-provider-census: "
+
+// NotApplicablePrefix starts the stderr line a provider writes when nothing it
+// reads is in the repository, followed by what was missing. It then emits no
+// facts and exits 0, and the seam records it as not applicable rather than as
+// a run that found nothing: a lint reader with no results file and one whose
+// results are clean are different answers.
+const NotApplicablePrefix = "enola-provider-not-applicable: "
 
 var allowedResolutionLevels = map[string]bool{
 	LevelConstantReceiver:  true,
@@ -183,62 +242,13 @@ var allowedRelationKinds = map[string]bool{
 	facts.RelHandledBy:    true,
 }
 
-// Validate checks the configured provider list's shape at config load, with
-// the same contract every other vocabulary gets: named errors, nothing silent.
-func Validate(providers []Provider) error {
-	seen := map[string]bool{}
-	for i, p := range providers {
-		if strings.TrimSpace(p.Name) == "" {
-			return fmt.Errorf("providers[%d]: missing name", i)
-		}
-		if seen[p.Name] {
-			return fmt.Errorf("providers[%d]: name %q is declared twice", i, p.Name)
-		}
-		seen[p.Name] = true
-		if p.Files != "" && p.Files != FilesPerFile {
-			return fmt.Errorf("providers[%d] (%s): files must be %q or absent, got %q", i, p.Name, FilesPerFile, p.Files)
-		}
-		if p.Files == FilesPerFile && len(p.Extensions) == 0 {
-			return fmt.Errorf("providers[%d] (%s): files: %s needs the extensions the provider reads", i, p.Name, FilesPerFile)
-		}
-		if p.Files == "" && len(p.Extensions) > 0 {
-			return fmt.Errorf("providers[%d] (%s): extensions only mean something with files: %s", i, p.Name, FilesPerFile)
-		}
-		if len(p.Command) == 0 {
-			if _, builtIn := builtIns[p.Name]; !builtIn {
-				return fmt.Errorf("providers[%d] (%s): missing command, and no built-in provider has that name (built-ins: %s)", i, p.Name, strings.Join(BuiltInNames(), ", "))
-			}
-			if p.Files != "" {
-				return fmt.Errorf("providers[%d] (%s): a built-in provider decides its own caching; files: is for commands", i, p.Name)
-			}
-			continue
-		}
-		if strings.TrimSpace(p.Command[0]) == "" {
-			return fmt.Errorf("providers[%d] (%s): missing command", i, p.Name)
-		}
-	}
-	return nil
-}
-
-// Run executes every configured provider against repoPath and returns the
-// merged, stamped, sorted facts plus one census record per provider — the
-// receipt's account of who contributed what, including the providers that
-// contributed nothing and why. taken reports whether an extractor already owns
-// a kind+name identity; colliding provider facts are skipped, never merged.
-// ignored reports whether a repo-relative file is excluded by the repository's
-// ignore globs, and a fact about such a file is dropped: a provider walks the
-// tree itself, so it cannot know what the configuration excludes, and a
-// vendored dependency the extractors never read must not enter the graph
-// through the seam instead. Run never fails the snapshot: every per-provider
-// failure mode is a named skip in the census.
-func Run(ctx context.Context, providers []Provider, repoPath string, taken func(kind, name string) bool, ignored func(file string) bool) ([]facts.Fact, []facts.ProviderRecord) {
-	return RunWith(ctx, Input{Providers: providers, RepoPath: repoPath, Taken: taken, Ignored: ignored})
-}
-
 // RunWith is Run with the engine's cache in hand. Without a cache every
 // provider runs whole-tree exactly as Run does.
 func RunWith(ctx context.Context, in Input) ([]facts.Fact, []facts.ProviderRecord) {
 	taken, ignored := in.Taken, in.Ignored
+	if in.rubydex == nil {
+		in.rubydex = &rubydexEngine{}
+	}
 	sorted := append([]Provider(nil), in.Providers...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 
@@ -270,6 +280,11 @@ func RunWith(ctx context.Context, in Input) ([]facts.Fact, []facts.ProviderRecor
 	for i, p := range sorted {
 		accepted, record := outcomes[i].accepted, outcomes[i].record
 		names[i] = p.Name
+		if record.NotApplicable() {
+			log.Printf("[providers] %s does not apply: %s", p.Name, record.Reason)
+			records[i] = record
+			continue
+		}
 		if record.Skipped {
 			log.Printf("[providers] %s skipped: %s", p.Name, record.Reason)
 			records[i] = record
@@ -329,22 +344,21 @@ func runOne(ctx context.Context, p Provider, in Input) ([]facts.Fact, facts.Prov
 		return nil, record
 	}
 
+	if p.applies != nil {
+		if yes, missing := p.applies(repoPath, in.Files); !yes {
+			return notApplicable(record, missing)
+		}
+	}
 	if len(p.Command) == 0 {
 		return runBuiltIn(ctx, p, in)
 	}
-
-	versionOut, err := exec.CommandContext(ctx, p.Command[0], append(p.Command[1:], "--version")...).Output()
-	if err != nil {
-		// Both spellings of a missing tool: exec.ErrNotFound for a bare name the
-		// PATH lookup missed, fs.ErrNotExist for an absolute path that is not there.
-		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
-			return skip("command not found: %s", p.Command[0])
-		}
-		return skip("version probe failed: %v", err)
+	if p.unavailable != "" {
+		return skip("%s", p.unavailable)
 	}
-	version := strings.TrimSpace(string(versionOut))
-	if version == "" {
-		return skip("provider reported no version")
+
+	version, why := probe(ctx, p)
+	if why != "" {
+		return skip("%s", why)
 	}
 	record.Version = version
 	if p.ExpectedVersion != "" && version != p.ExpectedVersion {
@@ -355,14 +369,41 @@ func runOne(ctx context.Context, p Provider, in Input) ([]facts.Fact, facts.Prov
 		return runPerFile(ctx, p, in, version, record, skip)
 	}
 
-	accepted, census, err := invoke(ctx, p, repoPath, "")
+	accepted, census, missing, err := invoke(ctx, p, repoPath, "")
 	if err != nil {
 		return skip("%v", err)
+	}
+	if missing != "" {
+		return notApplicable(record, missing)
 	}
 	record.Census = census
 	stamp(accepted, p.Name, version)
 	sortFacts(accepted)
 	return accepted, record
+}
+
+// probe asks the provider its version, the seam's test of whether it can run
+// at all, and returns the version or why it could not be had.
+func probe(ctx context.Context, p Provider) (version, why string) {
+	cmd := exec.CommandContext(ctx, p.Command[0], append(append([]string(nil), p.Command[1:]...), "--version")...)
+	cmd.Env = p.env
+	out, err := cmd.Output()
+	if err != nil {
+		// Both spellings of a missing tool: exec.ErrNotFound for a bare name the
+		// PATH lookup missed, fs.ErrNotExist for an absolute path that is not there.
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Sprintf("command not found: %s", p.Command[0])
+		}
+		if p.interpreter != "" {
+			return "", fmt.Sprintf("the interpreter %s could not run the script: %s", p.interpreter, firstErrorLine(err))
+		}
+		return "", fmt.Sprintf("version probe failed: %v", err)
+	}
+	version = strings.TrimSpace(string(out))
+	if version == "" {
+		return "", "provider reported no version"
+	}
+	return version, ""
 }
 
 // runPerFile serves a per-file provider's facts from the cache for every file
@@ -402,9 +443,16 @@ func runPerFile(ctx context.Context, p Provider, in Input, version string, recor
 		return skip("could not write the file listing: %v", err)
 	}
 	defer func() { _ = os.Remove(listing) }()
-	accepted, census, err := invoke(ctx, p, in.RepoPath, listing)
+	accepted, census, notFound, err := invoke(ctx, p, in.RepoPath, listing)
 	if err != nil {
 		return skip("%v", err)
+	}
+	if notFound != "" {
+		if len(reused) > 0 {
+			return skip("invalid output: the provider says it does not apply (%s), but %d of its facts about these files are cached", notFound, len(reused))
+		}
+		record.Reuse = nil
+		return notApplicable(record, notFound)
 	}
 	record.Census = census
 	stamp(accepted, p.Name, version)
@@ -478,34 +526,96 @@ func writeFileListing(files []string) (string, error) {
 }
 
 // invoke runs the provider over the repository, over the listed files only
-// when listing names one, and returns its validated facts and census.
-func invoke(ctx context.Context, p Provider, repoPath, listing string) ([]facts.Fact, *facts.ProviderCensus, error) {
+// when listing names one, and returns its validated facts and census, or what
+// was missing when the provider says nothing it reads is there.
+func invoke(ctx context.Context, p Provider, repoPath, listing string) ([]facts.Fact, *facts.ProviderCensus, string, error) {
 	args := append(append([]string(nil), p.Command[1:]...), repoPath)
 	if listing != "" {
 		args = append(args, FilesFlag, listing)
 	}
 	cmd := exec.CommandContext(ctx, p.Command[0], args...)
+	cmd.Env = p.env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, nil, fmt.Errorf("provider run failed: %v (%s)", err, strings.TrimSpace(stderr.String()))
+		return nil, nil, "", fmt.Errorf("provider run failed: %v (%s)", err, strings.TrimSpace(stderr.String()))
 	}
 	accepted, err := parseFacts(out)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid output: %v", err)
+		return nil, nil, "", fmt.Errorf("invalid output: %v", err)
 	}
 	census, err := parseCensus(stderr.Bytes())
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid census: %v", err)
+		return nil, nil, "", fmt.Errorf("invalid census: %v", err)
 	}
-	return accepted, census, nil
+	missing, err := parseNotApplicable(stderr.Bytes())
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if missing != "" && len(accepted) > 0 {
+		return nil, nil, "", fmt.Errorf("invalid output: the provider says it does not apply (%s) and emitted %d fact(s)", missing, len(accepted))
+	}
+	return accepted, census, missing, nil
+}
+
+// parseNotApplicable reads the provider's statement that nothing it reads is
+// in the repository. Like the census, it is made once or not at all, and a
+// statement with no reason is refused: "not applicable" with nothing named is
+// as unreadable as a skip with no reason.
+func parseNotApplicable(stderr []byte) (string, error) {
+	missing := ""
+	scanner := bufio.NewScanner(bytes.NewReader(stderr))
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, NotApplicablePrefix) {
+			continue
+		}
+		if missing != "" {
+			return "", fmt.Errorf("invalid output: more than one %q line", strings.TrimSpace(NotApplicablePrefix))
+		}
+		missing = strings.TrimSpace(strings.TrimPrefix(line, NotApplicablePrefix))
+		if missing == "" {
+			return "", fmt.Errorf("invalid output: %q names nothing that was missing", strings.TrimSpace(NotApplicablePrefix))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return missing, nil
+}
+
+// notApplicable records a provider that did not run because nothing it reads
+// was there. It is Skipped too, so every reader asking what contributed keeps
+// its answer; Applicable says why.
+func notApplicable(record facts.ProviderRecord, missing string) ([]facts.Fact, facts.ProviderRecord) {
+	no := false
+	record.Skipped = true
+	record.Applicable = &no
+	record.Reason = missing
+	return nil, record
+}
+
+// firstErrorLine is what a failed process said first on stderr, which for an
+// interpreter that cannot load a script is the load error itself; the exit
+// status alone says only that something failed.
+func firstErrorLine(err error) string {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		for _, line := range strings.Split(string(exit.Stderr), "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				return line
+			}
+		}
+	}
+	return err.Error()
 }
 
 func stamp(ff []facts.Fact, name, version string) {
 	for i := range ff {
-		ff[i].Props[PropProvider] = name
-		ff[i].Props[PropProviderVersion] = version
+		ff[i].SetProp(PropProvider, name)
+		ff[i].SetProp(PropProviderVersion, version)
 	}
 }
 
@@ -596,21 +706,21 @@ func validateFact(f facts.Fact) error {
 			return fmt.Errorf("relation %q has no target", rel.Kind)
 		}
 	}
-	level, _ := f.Props[PropResolutionLevel].(string)
+	level, _ := f.PropAny(PropResolutionLevel).(string)
 	if level == "" {
 		return fmt.Errorf("fact %q carries no %s prop — a provider must say how it resolved what it emitted", f.Name, PropResolutionLevel)
 	}
 	if !allowedResolutionLevels[level] {
 		return fmt.Errorf("fact %q carries %s %q, which is not in the vocabulary (allowed: %s)", f.Name, PropResolutionLevel, level, joinSorted(allowedResolutionLevels))
 	}
-	if via, _ := f.Props[PropObservedVia].(string); level == LevelRuntimeObserved && via == "" {
+	if via, _ := f.PropAny(PropObservedVia).(string); level == LevelRuntimeObserved && via == "" {
 		return fmt.Errorf("fact %q is %s but carries no %s prop — a runtime fact must name its observation channel", f.Name, LevelRuntimeObserved, PropObservedVia)
 	}
-	if in, _ := f.Props[PropDeclaredIn].(string); level == LevelDeclared && in == "" {
+	if in, _ := f.PropAny(PropDeclaredIn).(string); level == LevelDeclared && in == "" {
 		return fmt.Errorf("fact %q is %s but carries no %s prop — a declared fact must name the signature file that claims it", f.Name, LevelDeclared, PropDeclaredIn)
 	}
 	for _, reserved := range []string{PropProvider, PropProviderVersion} {
-		if _, claimed := f.Props[reserved]; claimed {
+		if _, claimed := f.Prop(reserved); claimed {
 			return fmt.Errorf("prop %q is stamped by the seam; a provider must not set it", reserved)
 		}
 	}

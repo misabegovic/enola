@@ -98,8 +98,8 @@ func resolveCallTargets(all []facts.Fact) []facts.Fact {
 // attributeSymbolsToModules gives every symbol a leading `declares` edge to the module
 // that declares it.
 //
-// This is the convention the Go extractor established and that the enterprise
-// package-metrics explainer depends on: it reads a symbol's FIRST `declares` target as
+// This is the convention the Go extractor established and that the package-metrics
+// explainer depends on: it reads a symbol's FIRST `declares` target as
 // the package the symbol belongs to. A Dart class already carries `declares` edges to
 // its own members, so without this the explainer read the first MEMBER name as a
 // package — minting one phantom package per class. Measured on drift: 1,746 "packages"
@@ -161,11 +161,43 @@ func resolveRoutePathRefs(all []facts.Fact, consts map[string]string) []facts.Fa
 			continue
 		}
 		f.Name = composePath(f.PropString(pathPrefixProp), literal)
-		delete(f.Props, pathRefProp)
-		delete(f.Props, pathPrefixProp)
+		f.DelProp(pathRefProp)
+		f.DelProp(pathPrefixProp)
 		out = append(out, f)
 	}
 	return out
+}
+
+func seedRetrofitIO(all []facts.Fact) {
+	type member struct{ file, name string }
+	declared := make(map[member]bool)
+	for i := range all {
+		f := &all[i]
+		if f.Kind != facts.KindRoute || f.PropString(facts.PropRole) != facts.RoleClient ||
+			f.PropString(facts.PropSource) != facts.RouteSourceDartHTTPClient {
+			continue
+		}
+		if h := f.PropString("handler"); h != "" {
+			declared[member{f.File, h}] = true
+		}
+	}
+	if len(declared) == 0 {
+		return
+	}
+	for i := range all {
+		f := &all[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		if abstract, _ := f.PropAny("abstract_member").(bool); !abstract {
+			continue
+		}
+		name := f.Name[strings.LastIndexByte(f.Name, '.')+1:]
+		if declared[member{f.File, name}] {
+			f.SetProp("io_direct", true)
+			f.SetProp("performs_io", true)
+		}
+	}
 }
 
 // computeDartPerformsIO propagates io_direct up the call graph into a transitive
@@ -181,6 +213,7 @@ func resolveRoutePathRefs(all []facts.Fact, consts map[string]string) []facts.Fa
 // The fixpoint is monotone and therefore cycle-safe: a prop is only ever turned on, so
 // a mutually recursive pair converges instead of oscillating.
 func computeDartPerformsIO(all []facts.Fact) {
+	seedRetrofitIO(all)
 	idx := make(map[string]*facts.Fact, len(all))
 	for i := range all {
 		if all[i].Kind == facts.KindSymbol {
@@ -203,10 +236,10 @@ func computeDartPerformsIO(all []facts.Fact) {
 		if f.Props == nil {
 			return false
 		}
-		if v, _ := f.Props["io_direct"].(bool); v {
+		if v, _ := f.PropAny("io_direct").(bool); v {
 			return true
 		}
-		v, _ := f.Props["performs_io"].(bool)
+		v, _ := f.PropAny("performs_io").(bool)
 		return v
 	}
 
@@ -231,7 +264,7 @@ func computeDartPerformsIO(all []facts.Fact) {
 					if f.Props == nil {
 						f.Props = map[string]any{}
 					}
-					f.Props["performs_io"] = true
+					f.SetProp("performs_io", true)
 					changed = true
 					break
 				}

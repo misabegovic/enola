@@ -19,13 +19,21 @@ type protoFile struct {
 type protoService struct {
 	name string
 	line int
+	span protoSpan
 	rpcs []protoRPC
+}
+
+// protoSpan is a declaration's extent past its first line: from its keyword to
+// its closing brace or semicolon. Zero when the file ends before it closes.
+type protoSpan struct {
+	endLine, column, endColumn int
 }
 
 // protoRPC is one `rpc M(Req) returns (Resp);` declaration.
 type protoRPC struct {
 	name         string
 	line         int
+	span         protoSpan
 	clientStream bool
 	serverStream bool
 }
@@ -34,6 +42,7 @@ type protoRPC struct {
 type protoMessage struct {
 	name string
 	line int
+	span protoSpan
 	kind string // "message" or "enum"
 }
 
@@ -84,18 +93,25 @@ func scanServices(noLine string) []protoService {
 	for _, loc := range reSvc.FindAllStringSubmatchIndex(noLine, -1) {
 		name := noLine[loc[2]:loc[3]]
 		openBrace := loc[1] - 1 // index of '{'
-		body, _ := matchBrace(noLine, openBrace)
+		body, closed := matchBrace(noLine, openBrace)
 		svc := protoService{
 			name: name,
 			line: lineAt(noLine, loc[0]),
 		}
+		if closed {
+			svc.span = spanOf(noLine, loc[0], body.start+len(body.text))
+		}
 		for _, rm := range reRPC.FindAllStringSubmatchIndex(body.text, -1) {
-			svc.rpcs = append(svc.rpcs, protoRPC{
+			rpc := protoRPC{
 				name:         body.text[rm[2]:rm[3]],
 				line:         lineAt(noLine, body.start+rm[0]),
 				clientStream: rm[4] != -1,
 				serverStream: rm[6] != -1,
-			})
+			}
+			if end, ok := rpcEnd(noLine, body.start+rm[1]); ok {
+				rpc.span = spanOf(noLine, body.start+rm[0], end)
+			}
+			svc.rpcs = append(svc.rpcs, rpc)
 		}
 		out = append(out, svc)
 	}
@@ -108,11 +124,15 @@ func scanMessages(noLine string) []protoMessage {
 	var out []protoMessage
 	reMsg := regexp.MustCompile(`\b(message|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{`)
 	for _, loc := range reMsg.FindAllStringSubmatchIndex(noLine, -1) {
-		out = append(out, protoMessage{
+		msg := protoMessage{
 			kind: noLine[loc[2]:loc[3]],
 			name: noLine[loc[4]:loc[5]],
 			line: lineAt(noLine, loc[0]),
-		})
+		}
+		if body, closed := matchBrace(noLine, loc[1]-1); closed {
+			msg.span = spanOf(noLine, loc[0], body.start+len(body.text))
+		}
+		out = append(out, msg)
 	}
 	return out
 }
@@ -179,4 +199,35 @@ func lineAt(processed string, off int) int {
 		off = 0
 	}
 	return 1 + strings.Count(processed[:off], "\n")
+}
+
+// rpcEnd is the offset of the character that ends an rpc declaration read up to
+// its returns clause: the semicolon, or the brace closing its options block.
+func rpcEnd(s string, from int) (int, bool) {
+	i := from
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	if i >= len(s) {
+		return 0, false
+	}
+	switch s[i] {
+	case ';':
+		return i, true
+	case '{':
+		body, closed := matchBrace(s, i)
+		return body.start + len(body.text), closed
+	}
+	return 0, false
+}
+
+// spanOf is the span from the declaration starting at start to the character at
+// last, inclusive. Columns count bytes on the processed view, which removes text
+// only from a // to the end of its line, so they are the source's columns.
+func spanOf(processed string, start, last int) protoSpan {
+	return protoSpan{
+		endLine:   lineAt(processed, last),
+		column:    start - strings.LastIndexByte(processed[:start], '\n'),
+		endColumn: last - strings.LastIndexByte(processed[:last], '\n') + 1,
+	}
 }

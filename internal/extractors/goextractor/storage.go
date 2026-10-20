@@ -198,7 +198,7 @@ func extractStorage(fset *token.FileSet, f *ast.File, relFile, pkgDir string) []
 					}
 					seen[key] = true
 
-					result = append(result, facts.Fact{
+					table := facts.Fact{
 						Kind: facts.KindStorage,
 						Name: tableName,
 						File: relFile,
@@ -211,7 +211,9 @@ func extractStorage(fset *token.FileSet, f *ast.File, relFile, pkgDir string) []
 						Relations: []facts.Relation{
 							{Kind: facts.RelDeclares, Target: pkgDir},
 						},
-					})
+					}
+					spanOf(fset, node).set(&table)
+					result = append(result, table)
 				}
 			}
 
@@ -227,7 +229,7 @@ func extractStorage(fset *token.FileSet, f *ast.File, relFile, pkgDir string) []
 			for _, field := range st.Fields.List {
 				typeName := typeExprToString(field.Type)
 				if strings.Contains(typeName, "s3.Client") || strings.Contains(typeName, "s3.S3") {
-					result = append(result, facts.Fact{
+					bucket := facts.Fact{
 						Kind: facts.KindStorage,
 						Name: node.Name.Name,
 						File: relFile,
@@ -239,7 +241,9 @@ func extractStorage(fset *token.FileSet, f *ast.File, relFile, pkgDir string) []
 						Relations: []facts.Relation{
 							{Kind: facts.RelDeclares, Target: pkgDir},
 						},
-					})
+					}
+					spanOf(fset, node).set(&bucket)
+					result = append(result, bucket)
 					break
 				}
 			}

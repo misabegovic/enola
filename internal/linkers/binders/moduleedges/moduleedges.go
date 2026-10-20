@@ -101,20 +101,21 @@ const (
 	reasonUniqueShort    = "unique_short_name_match"
 	reasonAmbiguousShort = "ambiguous_short_name_match"
 	reasonUnknown        = "no_symbol_match"
+	// reasonAmbiguousOwner is this channel's: two production modules of one
+	// repository declare the name, so no edge is derived rather than one being
+	// picked. It is counted here so a refusal reads differently from an absence.
+	reasonAmbiguousOwner = "ambiguous_declaring_module"
 )
 
 func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	// Recomputed from scratch each run, prior derived edges dropped first, the
-	// same idempotence the cross-repo linker keeps for its synthetics. Without
-	// the drop, a store carrying earlier derivations (an append turn, a
-	// restored baseline replay) re-derives beside them: the existing-pair
-	// check cannot see a prior derived edge, because that edge's File is the
-	// module itself and the candidate walk starts from the file's DIRNAME, so
-	// the prior registers under its parent module and the pair looks new. The
-	// measured cost was 3,266 phantom added facts on an unchanged member's
-	// replay against the estate's pin.
+	// same idempotence the cross-repo linker keeps for its synthetics. Binders run
+	// again on every append over the whole union, and a store carrying earlier
+	// derivations (an append turn, a restored baseline replay) would otherwise
+	// re-derive beside them: the measured cost was 3,266 phantom added facts on an
+	// unchanged member's replay against the estate's pin.
 	store.RemoveWhere(func(f facts.Fact) bool {
-		return f.Props != nil && f.Props[DerivedProp] == derivedFromSymbols
+		return f.Kind == facts.KindDependency && f.PropAny(DerivedProp) == derivedFromSymbols
 	})
 	production, test := moduleNames(store)
 	if len(production) == 0 {
@@ -134,10 +135,15 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	type key struct{ repo, name string }
 	type placed struct{ module string }
 	symbolModule := map[key]placed{}
+	ambiguous := map[key]bool{}
 	nameRepos := map[string]int{}
 	seenNameInRepo := map[key]bool{}
 	knownSymbols := map[string]bool{}
 	shortNameCount := map[string]int{}
+	// Repositories whose files carry their label, as an appended repository's do. A
+	// module name never carries it, so a symbol whose file sits under
+	// "<label>/<module>/" is the evidence; the root module "." shows nothing either way.
+	labelled := map[string]bool{}
 	for _, f := range store.ByKind(facts.KindSymbol) {
 		if f.File == "" {
 			continue
@@ -148,13 +154,22 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 		if module == "" || !production[module] {
 			continue
 		}
+		if f.Repo != "" && module != "." && strings.HasPrefix(f.File, f.Repo+"/"+module+"/") {
+			labelled[f.Repo] = true
+		}
 		k := key{repo: f.Repo, name: f.Name}
 		if !seenNameInRepo[k] {
 			seenNameInRepo[k] = true
 			nameRepos[f.Name]++
 		}
-		if prior, ok := symbolModule[k]; ok && prior.module <= module {
-			continue
+		if prior, ok := symbolModule[k]; ok {
+			if prior.module == module {
+				continue
+			}
+			ambiguous[k] = true
+			if prior.module < module {
+				continue
+			}
 		}
 		symbolModule[k] = placed{module: module}
 	}
@@ -166,9 +181,32 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 	unresolved, crossRepo := 0, 0
 	unresolvedReasons := map[string]int{}
 	unresolvedTargets := map[string]map[string]int{}
+	countUnresolved := func(reason string, f facts.Fact, r facts.Relation) {
+		unresolved++
+		language := f.PropString("language")
+		if language == "" {
+			language = "unknown"
+		}
+		unresolvedReasons[language+"/"+r.Kind+"/"+reason]++
+		if language == "cpp" && r.Kind == facts.RelCalls {
+			if unresolvedTargets[reason] == nil {
+				unresolvedTargets[reason] = map[string]int{}
+			}
+			unresolvedTargets[reason][r.Target]++
+		}
+	}
 	for _, f := range store.ByKind(facts.KindSymbol) {
-		source, ok := symbolModule[key{repo: f.Repo, name: f.Name}]
-		if !ok {
+		if f.File == "" {
+			continue
+		}
+		// The caller is where its own file puts it. Reading it out of the
+		// placement map answered a question about the NAME, and a name two
+		// modules declare has a winner: a call made from the losing
+		// declaration was credited to the winning module, so the binder
+		// derived an edge from a directory that never made the call and
+		// omitted the one that did.
+		sourceModule := resolve(f, production, test)
+		if sourceModule == "" || !production[sourceModule] {
 			continue
 		}
 		for _, r := range f.Relations {
@@ -182,32 +220,28 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			// genuinely crosses a repository is the cross-repo linker's,
 			// derived from a measured seam rather than from two directories
 			// sharing a name.
-			target, known := symbolModule[key{repo: f.Repo, name: r.Target}]
+			targetKey := key{repo: f.Repo, name: r.Target}
+			target, known := symbolModule[targetKey]
 			if !known {
 				if nameRepos[r.Target] > 0 {
 					crossRepo++
 					continue
 				}
-				unresolved++
-				reason := classifyUnresolvedTarget(r.Target, knownSymbols, shortNameCount)
-				language := f.PropString("language")
-				if language == "" {
-					language = "unknown"
-				}
-				category := language + "/" + r.Kind + "/" + reason
-				unresolvedReasons[category]++
-				if language == "cpp" && r.Kind == facts.RelCalls {
-					if unresolvedTargets[reason] == nil {
-						unresolvedTargets[reason] = map[string]int{}
-					}
-					unresolvedTargets[reason][r.Target]++
-				}
+				countUnresolved(classifyUnresolvedTarget(r.Target, knownSymbols, shortNameCount), f, r)
 				continue
 			}
-			if target.module == source.module {
+			// Two production modules of this repository declare the name and
+			// nothing in the graph says which one the reference means. A
+			// missing edge is honest; a picked one is a dependency nobody
+			// wrote, stated confidently enough to breach a law.
+			if ambiguous[targetKey] {
+				countUnresolved(reasonAmbiguousOwner, f, r)
 				continue
 			}
-			weights[edge{source: source.module, target: target.module, repo: f.Repo}]++
+			if target.module == sourceModule {
+				continue
+			}
+			weights[edge{source: sourceModule, target: target.module, repo: f.Repo}]++
 		}
 	}
 	if len(weights) == 0 {
@@ -222,10 +256,18 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 			skipped++
 			continue
 		}
+		// The edge sits at its source module's directory, named the way every other
+		// fact of that repository names a path. Added after the engine prefixed an
+		// appended repository's files, a bare module name here was the one path in
+		// the repository without its label.
+		file := e.source
+		if labelled[e.repo] {
+			file = e.repo + "/" + e.source
+		}
 		derived = append(derived, facts.Fact{
 			Kind: facts.KindDependency,
 			Name: fmt.Sprintf("module-edge: %s -> %s", e.source, e.target),
-			File: e.source,
+			File: file,
 			Repo: e.repo,
 			Props: map[string]any{
 				facts.PropCouplingKind: facts.CouplingSymbolRollup,
@@ -244,7 +286,7 @@ func (b *Binder) Bind(_ context.Context, store *facts.Store) error {
 		len(derived), skipped, unresolved, crossRepo)
 	if unresolved > 0 {
 		log.Printf("[module-edges] unresolved symbol edge breakdown: %s", formatBreakdown(unresolvedReasons))
-		for _, reason := range []string{reasonKnownUnplaced, reasonUniqueShort, reasonAmbiguousShort, reasonUnknown} {
+		for _, reason := range []string{reasonKnownUnplaced, reasonUniqueShort, reasonAmbiguousShort, reasonUnknown, reasonAmbiguousOwner} {
 			if targets := unresolvedTargets[reason]; len(targets) > 0 {
 				log.Printf("[module-edges] top unresolved cpp/calls/%s targets: %s", reason, formatTopTargets(targets, 5))
 			}
@@ -362,18 +404,47 @@ func resolve(f facts.Fact, production, test map[string]bool) string {
 
 // extractorEdges is the set of module pairs some extractor already connected,
 // so a derived edge never restates one that was read from source.
+//
+// An import naming an item carries the item's file, and the pair it connects
+// is that file's module: keyed on the raw target, a Rust item import
+// (`src/core.count`) never equals a module pair, and the derived edge restated
+// it.
 func extractorEdges(store *facts.Store, production, test map[string]bool) map[[2]string]bool {
 	out := map[[2]string]bool{}
+	imported := facts.NewImportTargets(func() []facts.Fact { return store.ByKind(facts.KindSymbol) })
 	for _, dep := range store.ByKind(facts.KindDependency) {
 		source := resolve(dep, production, test)
 		if source == "" {
 			continue
 		}
 		for _, r := range dep.Relations {
-			if r.Kind == facts.RelImports {
-				out[[2]string{source, r.Target}] = true
+			if r.Kind != facts.RelImports {
+				continue
 			}
+			target := r.Target
+			if dir, carried := imported.Dir(dep, target); carried {
+				if target = moduleOfDir(dir, production, test); target == "" {
+					continue
+				}
+			}
+			out[[2]string{source, target}] = true
 		}
 	}
 	return out
+}
+
+// moduleOfDir walks a directory up to the nearest module, the walk resolve
+// makes for a fact's own file.
+func moduleOfDir(dir string, production, test map[string]bool) string {
+	for cur := dir; cur != ""; {
+		if production[cur] || test[cur] {
+			return cur
+		}
+		i := strings.LastIndex(cur, "/")
+		if i < 0 {
+			return ""
+		}
+		cur = cur[:i]
+	}
+	return ""
 }

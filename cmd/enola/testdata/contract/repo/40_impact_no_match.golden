@@ -1,0 +1,6 @@
+$ enola impact no-such-thing .
+exit: 2
+--- stdout
+no facts matching "no-such-thing"
+--- stderr
+enola: no mcp-arch.yaml in <TMP>/go_sample, using built-in defaults

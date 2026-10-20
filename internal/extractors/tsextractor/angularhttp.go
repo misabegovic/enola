@@ -54,6 +54,9 @@ type angularPendingRequest struct {
 	verb  string
 	line  int
 	parts []angularPathPart
+	// caller is the symbol of the class member making the request, "" when the
+	// member has no symbol of its own.
+	caller string
 }
 
 // angularHTTPFile is what one file contributes to the repo-wide request pass.
@@ -65,8 +68,10 @@ type angularHTTPFile struct {
 }
 
 // angularHTTPRoutes collects the requests this class makes, and the constants it
-// declares for other classes to name.
-func angularHTTPRoutes(kinds *tsutil.KindTable, body *sitter.Node, ctx *extractCtx, className string, into *angularHTTPFile) {
+// declares for other classes to name. symbols is the file's symbol facts by name,
+// which names each request's caller: the requests are emitted repo-wide after the
+// per-file caller pass has run, so they are attributed here, where the class is known.
+func angularHTTPRoutes(kinds *tsutil.KindTable, body *sitter.Node, ctx *extractCtx, className string, symbols map[string]int, into *angularHTTPFile) {
 	if body == nil {
 		return
 	}
@@ -86,6 +91,11 @@ func angularHTTPRoutes(kinds *tsutil.KindTable, body *sitter.Node, ctx *extractC
 		}
 		if kindOf(kinds, n) == "call_expression" {
 			if req, ok := angularHTTPCall(kinds, n, ctx, receivers); ok {
+				if member := classMemberName(kinds, n, body, ctx.src); member != "" {
+					if name := ctx.dir + "." + className + "." + member; hasSymbol(symbols, name) {
+						req.caller = name
+					}
+				}
 				into.pending = append(into.pending, req)
 			}
 		}
@@ -96,10 +106,47 @@ func angularHTTPRoutes(kinds *tsutil.KindTable, body *sitter.Node, ctx *extractC
 	walk(body)
 }
 
+// classMemberName returns the name of the member of classBody that contains n: the
+// method or the arrow-holding field the declaration walk emits as
+// "<dir>.<Class>.<member>". "" for a call outside any member.
+func classMemberName(kinds *tsutil.KindTable, n, classBody *sitter.Node, src []byte) string {
+	for cur := n; cur != nil; cur = cur.Parent() {
+		p := cur.Parent()
+		if p == nil || p.StartByte() != classBody.StartByte() || p.EndByte() != classBody.EndByte() {
+			continue
+		}
+		if k := kindOf(kinds, cur); k != "method_definition" && k != "public_field_definition" {
+			return ""
+		}
+		name := findChildByKind(kinds, cur, "property_identifier")
+		if name == nil {
+			return ""
+		}
+		return nodeText(name, src)
+	}
+	return ""
+}
+
+func hasSymbol(symbols map[string]int, name string) bool {
+	_, ok := symbols[name]
+	return ok
+}
+
 // angularHTTPReceivers returns the member names bound to an HTTP client, by either
 // injection dialect: a constructor parameter property or an `inject()` field.
 func angularHTTPReceivers(kinds *tsutil.KindTable, body *sitter.Node, src []byte) map[string]bool {
 	out := map[string]bool{}
+	for member := range typedReceivers(kinds, body, src, angularHTTPTypes) {
+		out[member] = true
+	}
+	return out
+}
+
+// typedReceivers returns the members of a class bound to one of the given types, as
+// member name to type name, by either injection dialect: a constructor parameter
+// property or an `inject()` field.
+func typedReceivers(kinds *tsutil.KindTable, body *sitter.Node, src []byte, types map[string]bool) map[string]string {
+	out := map[string]string{}
 	for i := range body.ChildCount() {
 		member := body.Child(i)
 		switch kindOf(kinds, member) {
@@ -119,7 +166,11 @@ func angularHTTPReceivers(kinds *tsutil.KindTable, body *sitter.Node, src []byte
 					continue
 				}
 				ann := p.ChildByFieldName("type")
-				if ann == nil || !angularHTTPTypes[plainTypeName(kinds, ann, src)] {
+				if ann == nil {
+					continue
+				}
+				typ := plainTypeName(kinds, ann, src)
+				if !types[typ] {
 					continue
 				}
 				// The name is the `pattern` field, or — for a parameter property,
@@ -129,16 +180,16 @@ func angularHTTPReceivers(kinds *tsutil.KindTable, body *sitter.Node, src []byte
 					name = findChildByKind(kinds, p, "identifier")
 				}
 				if name != nil {
-					out[nodeText(name, src)] = true
+					out[nodeText(name, src)] = typ
 				}
 			}
 		case "public_field_definition":
 			for _, t := range injectCallTypes(kinds, member, src) {
-				if !angularHTTPTypes[t] {
+				if !types[t] {
 					continue
 				}
 				if name := member.ChildByFieldName("name"); name != nil {
-					out[nodeText(name, src)] = true
+					out[nodeText(name, src)] = t
 				}
 			}
 		}
@@ -271,13 +322,8 @@ func composeAngularRequests(files []*angularHTTPFile) ([]facts.Fact, angularCoun
 			// one is rooted here. The general client pass cannot do this — it has no
 			// receiver type and so no way to tell a path from a map key — which is
 			// why one client's whole Angular module contributed nothing.
-			path = strings.TrimPrefix(path, "./")
-			if !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "http") {
-				path = "/" + path
-			}
-			path = strings.ReplaceAll(path, "/./", "/")
-			clean, ok := cleanTSPath(path, nil)
-			if !ok || clean == "" {
+			clean, ok := rootRequestPath(path)
+			if !ok {
 				counts.miss("dynamic_request_path")
 				continue
 			}
@@ -287,24 +333,41 @@ func composeAngularRequests(files []*angularHTTPFile) ([]facts.Fact, angularCoun
 			}
 			seen[key] = true
 			counts.resolved++
+			props := map[string]any{
+				facts.PropRole:   facts.RoleClient,
+				"method":         req.verb,
+				"framework":      AngularFramework,
+				"language":       "typescript",
+				facts.PropSource: facts.RouteSourceTSHTTPClient,
+				"api":            "angular-httpclient",
+			}
+			if req.caller != "" {
+				props[facts.PropCaller] = req.caller
+			}
 			out = append(out, facts.Fact{
-				Kind: facts.KindRoute,
-				Name: clean,
-				File: f.relFile,
-				Line: req.line,
-				Props: map[string]any{
-					facts.PropRole:   facts.RoleClient,
-					"method":         req.verb,
-					"framework":      AngularFramework,
-					"language":       "typescript",
-					facts.PropSource: facts.RouteSourceTSHTTPClient,
-					"api":            "angular-httpclient",
-				},
+				Kind:      facts.KindRoute,
+				Name:      clean,
+				File:      f.relFile,
+				Line:      req.line,
+				Props:     props,
 				Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: f.dir}},
 			})
 		}
 	}
 	return out, counts
+}
+
+// rootRequestPath roots a path read off a typed client receiver at the application's
+// origin and cleans it for matching. The receiver's type already established that the
+// call is a request, so a relative path is a path rather than a map key.
+func rootRequestPath(path string) (string, bool) {
+	path = strings.TrimPrefix(path, "./")
+	if !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "http") {
+		path = "/" + path
+	}
+	path = strings.ReplaceAll(path, "/./", "/")
+	clean, ok := cleanTSPath(path, nil)
+	return clean, ok && clean != ""
 }
 
 // angularResolveParts joins a request's operands into path text.

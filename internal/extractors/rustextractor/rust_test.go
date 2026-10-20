@@ -156,7 +156,7 @@ func TestExtract_ImplSplitAcrossFilesStillAttaches(t *testing.T) {
 func TestExtract_UnprefixedUseOfSiblingFileSubmodule(t *testing.T) {
 	repo, files := writeRustRepo(t, map[string]string{
 		"Cargo.toml": "[package]\nname = \"demo\"\n",
-		"src/mod.rs": `
+		"src/lib.rs": `
 pub mod writer;
 pub use writer::spawn_writer;
 

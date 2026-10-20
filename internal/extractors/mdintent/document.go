@@ -8,6 +8,7 @@ import (
 
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/intent"
 )
 
 // Document mode: a markdown file that declares no intent is still a source.
@@ -129,16 +130,49 @@ func documentFacts(scope *inScope, relFile string, src []byte, count *linkCount)
 		}
 	}
 	if title == "" {
-		title = strings.TrimSuffix(filepath.Base(relFile), ".md")
+		title = intent.TrimPageExtension(filepath.Base(relFile))
 	}
-	doc.fact.Props["title"] = title
-	doc.fact.Props["sections"] = len(sections)
+	doc.fact.SetProp("title", title)
+	doc.fact.SetProp("sections", len(sections))
+	spanSections(doc, sections, lines)
 
 	out := []facts.Fact{*doc.fact}
 	for _, sec := range sections {
 		out = append(out, *sec.fact)
 	}
 	return out
+}
+
+// spanSections gives the document its whole text and each section the text it
+// heads: from its heading to the line before the next heading of the same or a
+// higher level, or to the end of the document, less trailing blank lines.
+func spanSections(doc *section, sections []*section, lines []string) {
+	setSpan(doc.fact, len(lines), lines)
+	for k, sec := range sections {
+		level, _ := sec.fact.Props["level"].(int)
+		end := len(lines)
+		for _, next := range sections[k+1:] {
+			if l, _ := next.fact.Props["level"].(int); l <= level {
+				end = next.fact.Line - 1
+				break
+			}
+		}
+		setSpan(sec.fact, end, lines)
+	}
+}
+
+// setSpan ends f at its last non-blank line at or before line last (1-based),
+// one past that line's last byte; an empty document keeps no span.
+func setSpan(f *facts.Fact, last int, lines []string) {
+	for last >= f.Line && last > 0 && strings.TrimSpace(lines[last-1]) == "" {
+		last--
+	}
+	if last < f.Line || last == 0 {
+		return
+	}
+	f.EndLine = last
+	f.Column = 1
+	f.EndColumn = len(strings.TrimRight(lines[last-1], "\r")) + 1
 }
 
 // stripFrontmatter returns the index of the first body line, skipping a

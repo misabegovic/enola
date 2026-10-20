@@ -1,0 +1,9 @@
+### pkg/a.Alpha
+File: pkg/a/a.go  Lines: 7-9
+
+```go
+   7│ func Alpha() {
+   8│ 	b.Beta()
+   9│ }
+
+```

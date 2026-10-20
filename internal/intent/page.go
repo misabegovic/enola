@@ -54,9 +54,15 @@ type PageDecl struct {
 // the reverse query ("which decisions govern this file?") becomes a
 // traversal, and an anchor whose path no measured fact touches is verdicted
 // as dangling instead of aging silently as a stale citation.
+//
+// Symbol narrows a file anchor to one fact in that file, named as the
+// extractor spells it. The file stays governed for every file-level reader,
+// so a page that narrows its anchor moves no law; only the reverse query for a
+// symbol stops answering with every page that ever cited its file.
 type PageAnchor struct {
-	Repo string `yaml:"repo"`
-	Path string `yaml:"path"`
+	Repo   string `yaml:"repo"`
+	Path   string `yaml:"path"`
+	Symbol string `yaml:"symbol"`
 }
 
 // AllowedOrigins is the closed channel vocabulary for a page's origin — WHERE
@@ -178,8 +184,8 @@ func (p *PageIntent) Validate() error {
 			if !AllowedPageRels[r.Rel] {
 				problems = append(problems, fmt.Sprintf("page.relations[%d]: rel %q is not in the vocabulary (allowed: %s)", i, r.Rel, allowedPageRels()))
 			}
-			if !strings.HasSuffix(r.To, ".md") {
-				problems = append(problems, fmt.Sprintf("page.relations[%d]: to %q must be a repo-relative markdown path", i, r.To))
+			if !IsPagePath(r.To) {
+				problems = append(problems, fmt.Sprintf("page.relations[%d]: to %q must be a repo-relative path of a page this build reads (%s)", i, r.To, strings.Join(PageExtensionsRead(), ", ")))
 			}
 		}
 		for i, a := range pg.Anchors {
@@ -189,6 +195,12 @@ func (p *PageIntent) Validate() error {
 			}
 			if strings.HasPrefix(a.Path, "/") || strings.HasPrefix(a.Path, "..") || strings.Contains(a.Path, "/../") {
 				problems = append(problems, fmt.Sprintf("page.anchors[%d]: path %q must be repo-relative", i, a.Path))
+			}
+			if a.Symbol != "" && !namesSourceFile(a.Path) {
+				problems = append(problems, fmt.Sprintf("page.anchors[%d]: symbol needs a file, and path %q reads as the directory form: a symbol anchor names a source file by its extension (symbol %q)", i, a.Path, a.Symbol))
+			}
+			if a.Symbol != "" && strings.TrimSpace(a.Symbol) != a.Symbol {
+				problems = append(problems, fmt.Sprintf("page.anchors[%d]: symbol %q carries surrounding whitespace no fact name has", i, a.Symbol))
 			}
 		}
 	}
@@ -235,6 +247,33 @@ func (p *PageIntent) Validate() error {
 		return fmt.Errorf("invalid %s block: %s", PageIntentKey, strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// namesSourceFile reports whether an anchor path can only be a file: no
+// trailing slash, and a final segment carrying an extension. A bare final
+// segment is how the standard writes a directory prefix, and a directory
+// declares no fact a symbol could name.
+func namesSourceFile(path string) bool {
+	if strings.HasSuffix(path, "/") {
+		return false
+	}
+	base := path[strings.LastIndexByte(path, '/')+1:]
+	dot := strings.LastIndexByte(base, '.')
+	return dot > 0 && dot < len(base)-1
+}
+
+// validRepoLabel accepts what facts.RepoLabel can return for a remote or a
+// directory: the case is kept, and dots are common in repository names.
+func validRepoLabel(s string) bool {
+	if s == "" || strings.Trim(s, ".") == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func validToken(s string) bool {

@@ -35,6 +35,10 @@ const (
 	PropFramework = "framework"
 	// PropRole is which side of a call a route fact represents (RoleClient/RoleServer).
 	PropRole = "role"
+	// PropUnmatchedByServer marks a CLIENT call site that resolves to no loaded server;
+	// PropUnmatchedReason says why.
+	PropUnmatchedByServer = "unmatched_by_server"
+	PropUnmatchedReason   = "unmatched_reason"
 	// PropRouteType sub-classifies a route beyond HTTP (RouteTypeGRPC,
 	// RouteTypeMiddleware). Absent means a plain HTTP route.
 	PropRouteType = "type"
@@ -58,6 +62,14 @@ const (
 	MessagingSourceAsyncAPI    = "asyncapi"
 	MessagingSourceGoKafkaCall = "go-kafka-call"
 	MessagingSourceTSKafkaCall = "typescript-kafka-call"
+	// A Ruby job's declared queue. Deliberately absent from IsMessagingCodeSource:
+	// a queue name is local to one application's broker configuration, so two
+	// repositories sharing one, "default" above all, share nothing, and no contract
+	// or cross-repository edge may form on it.
+	MessagingSourceRubyJobQueue = "ruby-job-queue"
+	// An enqueue onto a Ruby job's declared queue, added at the caller by the
+	// ruby-enqueue binder and left out of IsMessagingCodeSource for the same reason.
+	MessagingSourceRubyEnqueue = "ruby-enqueue"
 )
 
 // IsMessagingCodeSource is the central registry of extractor sources that may
@@ -206,6 +218,11 @@ const (
 	// HTTP path matching the way gRPC is; the graphql cross-repo signal owns
 	// the join.
 	RouteTypeGraphQL = "graphql"
+	// RouteTypeHook marks a WordPress hook fact: a registration on a hook
+	// (add_action, add_filter) or a hook point that fires one (do_action,
+	// apply_filters, role client). A hook is in-process dispatch, not an HTTP
+	// call, so it is kept out of HTTP matching and its coverage.
+	RouteTypeHook = "hook"
 	// RouteTypeMiddleware marks a registration that wraps other routes rather than
 	// serving one. Handler binding skips these: a middleware's "handler" is a
 	// middleware func, and binding it to a route would pollute handled_by.
@@ -231,15 +248,17 @@ const (
 // label.
 const (
 	// Hand-written HTTP call sites: code a human wrote that issues a request.
-	RouteSourceGoHTTPClient   = "go-http-client"
-	RouteSourceTSHTTPClient   = "ts-http-client"
-	RouteSourceRubyHTTPClient = "ruby-http-client"
-	RouteSourcePHPHTTPClient  = "php-http-client"
-	RouteSourceJavaHTTPClient = "java-http-client" // Spring RestTemplate / WebClient
-	RouteSourceFeign          = "feign"            // Spring Cloud @FeignClient interface
-	RouteSourceRetrofit       = "retrofit"         // Kotlin/Java Retrofit service interface
-	RouteSourceURLSession     = "urlsession"       // Swift URLSession
-	RouteSourceSwiftEndpoint  = "swift-endpoint"   // Swift endpoint enum / protocol extension
+	RouteSourceGoHTTPClient = "go-http-client"
+	// RouteSourcePythonHTTPClient is a requests/httpx/aiohttp call site.
+	RouteSourcePythonHTTPClient = "python-http-client"
+	RouteSourceTSHTTPClient     = "ts-http-client"
+	RouteSourceRubyHTTPClient   = "ruby-http-client"
+	RouteSourcePHPHTTPClient    = "php-http-client"
+	RouteSourceJavaHTTPClient   = "java-http-client" // Spring RestTemplate / WebClient
+	RouteSourceFeign            = "feign"            // Spring Cloud @FeignClient interface
+	RouteSourceRetrofit         = "retrofit"         // Kotlin/Java Retrofit service interface
+	RouteSourceURLSession       = "urlsession"       // Swift URLSession
+	RouteSourceSwiftEndpoint    = "swift-endpoint"   // Swift endpoint enum / protocol extension
 
 	// Hand-written gRPC call sites. Same "a human wrote this call" property as the
 	// HTTP sources above, over a different transport.
@@ -285,7 +304,24 @@ const (
 	// generates its implementation into a .g.dart the extractor excludes, so the
 	// annotation IS the call site as far as extraction is concerned.
 	RouteSourceDartHTTPClient = "dart-http-client"
+
+	// A call site read through an in-house client the config declares (clients:, see
+	// internal/clientspec). Hand-written like the sources above, but recognised because
+	// config named the client's type rather than because enola knows the library. Its
+	// own value, so a reader can tell a route that exists only because of that config.
+	RouteSourceConfiguredHTTPClient = "configured-http-client"
 )
+
+// PropClientSpec is the prop naming the declared client (the spec's name) a
+// RouteSourceConfiguredHTTPClient route was read through.
+const PropClientSpec = "client_spec"
+
+// PropHandlerTarget is the fact name a route's registered handler resolves to, when
+// the extractor can name it from the registration site alone: a package function
+// (`repo.Home`, the import alias resolved through the file's imports) or one of the
+// file's own package (`Home`). The http-handler binder binds the route to it when a
+// function symbol carries exactly that name.
+const PropHandlerTarget = "handler_target"
 
 // HandWrittenClientSources is the set of RouteSource values that mean "a human wrote
 // this call site", as opposed to a route derived from a generated client or a contract
@@ -302,27 +338,29 @@ const (
 // via="grpc" first (FrameworkGRPC wins), so their membership only matters if that
 // framework prop is ever absent.
 var HandWrittenClientSources = map[string]bool{
-	RouteSourceGraphQLTag:        true,
-	RouteSourceGraphQLRubyString: true,
-	RouteSourceGraphQLDecorator:  true,
-	RouteSourceGraphQLNexus:      true,
-	RouteSourceGraphQLPothos:     true,
-	RouteSourceGraphQLClientCall: true,
-	RouteSourceGoHTTPClient:      true,
-	RouteSourceTSHTTPClient:      true,
-	RouteSourceRubyHTTPClient:    true,
-	RouteSourcePHPHTTPClient:     true,
-	RouteSourceJavaHTTPClient:    true,
-	RouteSourceFeign:             true,
-	RouteSourceRetrofit:          true,
-	RouteSourceURLSession:        true,
-	RouteSourceSwiftEndpoint:     true,
-	RouteSourceGoGRPCClient:      true,
-	RouteSourceTSGRPCClient:      true,
-	RouteSourcePythonGRPCClient:  true,
-	RouteSourceScalaHTTPClient:   true,
-	RouteSourceDartHTTPClient:    true,
-	RouteSourceAngularRouter:     true,
+	RouteSourceGraphQLTag:           true,
+	RouteSourceGraphQLRubyString:    true,
+	RouteSourceGraphQLDecorator:     true,
+	RouteSourceGraphQLNexus:         true,
+	RouteSourceGraphQLPothos:        true,
+	RouteSourceGraphQLClientCall:    true,
+	RouteSourceGoHTTPClient:         true,
+	RouteSourcePythonHTTPClient:     true,
+	RouteSourceTSHTTPClient:         true,
+	RouteSourceRubyHTTPClient:       true,
+	RouteSourcePHPHTTPClient:        true,
+	RouteSourceJavaHTTPClient:       true,
+	RouteSourceFeign:                true,
+	RouteSourceRetrofit:             true,
+	RouteSourceURLSession:           true,
+	RouteSourceSwiftEndpoint:        true,
+	RouteSourceGoGRPCClient:         true,
+	RouteSourceTSGRPCClient:         true,
+	RouteSourcePythonGRPCClient:     true,
+	RouteSourceScalaHTTPClient:      true,
+	RouteSourceDartHTTPClient:       true,
+	RouteSourceAngularRouter:        true,
+	RouteSourceConfiguredHTTPClient: true,
 }
 
 // NativeAppClientSources is the set of RouteSource values only a native application
@@ -378,6 +416,8 @@ var AllRouteSources = map[string]bool{
 	RouteSourceHTTP4s:            true,
 	RouteSourceScalaHTTPClient:   true,
 	RouteSourceDartHTTPClient:    true,
+
+	RouteSourceConfiguredHTTPClient: true,
 }
 
 // DepSource values — the PropSource prop on a KindDependency fact. A SECOND, unrelated
@@ -390,9 +430,10 @@ var AllRouteSources = map[string]bool{
 // vocabulary. Registered here so the conformance test can tell the two apart rather than
 // reporting every "internal" as an unknown route source.
 const (
-	DepSourceInternal = "internal" // resolves to a module inside this repo
-	DepSourceExternal = "external" // resolves to a third-party package
-	DepSourceStdlib   = "stdlib"   // resolves to the language's standard library
+	DepSourceInternal  = "internal"  // resolves to a module inside this repo
+	DepSourceExternal  = "external"  // resolves to a third-party package
+	DepSourceStdlib    = "stdlib"    // resolves to the language's standard library
+	DepSourceFramework = "framework" // supplied virtually by a framework/compiler
 )
 
 // CompilationUnitProps name the module props that identify the unit a module is
@@ -434,7 +475,7 @@ var CompilationUnitProps = []string{
 // language does not model one. Only module facts carry these props.
 func CompilationUnit(f Fact) string {
 	for _, key := range CompilationUnitProps {
-		if v, ok := f.Props[key].(string); ok && v != "" {
+		if v, ok := f.PropAny(key).(string); ok && v != "" {
 			return v
 		}
 	}

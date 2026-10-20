@@ -1,25 +1,36 @@
 package kotlinextractor
 
 import (
+	"slices"
 	"strings"
 	"unicode"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
-// extractFileAST parses a Kotlin file using tree-sitter and emits architectural facts.
-// Output is intended to be a superset of the legacy regex extractor's output: every
-// declaration / import / Room-storage fact is preserved, and new RelInstantiates /
-// RelInjects relations are attached to symbol facts when call sites or @Inject
-// constructor parameters are observed.
-func extractFileAST(src []byte, relFile string, isAndroid bool, sourceRoot, basePackage string, packageIndex map[string]string) []facts.Fact {
+// extractFileCountingTests parses and walks one file and says how many tests the
+// file holds that could not be named, by cause.
+func extractFileCountingTests(src []byte, relFile string, isAndroid bool, sourceRoot, basePackage string, packageIndex map[string]string) ([]facts.Fact, testCaseReading) {
+	var out []facts.Fact
+	tests := withTree(src, relFile, isAndroid, sourceRoot, basePackage, packageIndex, func(_ *sitter.Node, walked []facts.Fact) {
+		out = walked
+	})
+	return out, tests
+}
+
+// withTree parses and walks one file and hands the walk's facts, its test cases
+// included, to use while the tree is still open, and says how many tests it could
+// not name. use is not called when the grammar cannot be loaded.
+func withTree(src []byte, relFile string, isAndroid bool, sourceRoot, basePackage string, packageIndex map[string]string,
+	use func(root *sitter.Node, walked []facts.Fact)) testCaseReading {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(kotlin.Language())); err != nil {
-		return nil
+		return testCaseReading{}
 	}
 
 	tree := parser.Parse(src, nil)
@@ -38,7 +49,10 @@ func extractFileAST(src []byte, relFile string, isAndroid bool, sourceRoot, base
 		packageIndex: packageIndex,
 	}
 	w.walkSourceFile(root)
-	return w.out
+	cases := kotestCases(root, src, relFile)
+	w.testCases = append(w.testCases, cases.cases...)
+	use(root, append(w.out, w.testCases...))
+	return cases
 }
 
 type astWalker struct {
@@ -55,11 +69,18 @@ type astWalker struct {
 
 	// out is the accumulating fact list.
 	out []facts.Fact
+	// testCases are appended after the walk, so reading tests leaves the order of
+	// every other fact as it was.
+	testCases []facts.Fact
+	// pkg is the file's package, which names a test the way JUnit does.
+	pkg string
 
-	// ownerStack[len-1] points at the symbol fact currently being constructed.
-	// New RelInstantiates / RelInjects edges discovered while walking that
-	// symbol's body are appended to its Relations slice.
-	ownerStack []*facts.Fact
+	// ownerStack[len-1] is the index in out of the symbol fact currently being
+	// constructed. New RelInstantiates / RelInjects edges discovered while walking
+	// that symbol's body are appended to its Relations slice. An index rather than
+	// a pointer, because walking a body appends to out, and a pointer taken before
+	// an append that grows out names a copy nobody reads.
+	ownerStack []int
 
 	// importMap maps an imported simple name to its canonical symbol fact name
 	// (e.g. "helper" → "src/util.helper"). Internal imports map to a resolvable
@@ -96,6 +117,17 @@ type astWalker struct {
 	// self-call is only genuine recursion when its argument count matches — otherwise
 	// it is delegation to a same-named overload (updateItem(x) → updateItem(i, x)).
 	selfParams int
+	// selfParamNames are that function's parameter names, for the other proof of
+	// delegation: a call that passes an argument by a name the function does not
+	// declare is a call to something else.
+	selfParamNames map[string]bool
+	// loopScopes are the enclosing loops' variables, for the rule in hierarchy.go.
+	loopScopes []kotlinLoopScope
+	// memberTypes are the declared types of the enclosing types' constructor
+	// parameters and properties, innermost last; localTypes those of the current
+	// function's parameters and locals (nil outside one). See receivers.go.
+	memberTypes []map[string]string
+	localTypes  map[string]string
 	// reactiveContext is true when the enclosing function is an RxJava / coroutine
 	// Flow chain, so the ambiguous operators (map/flatMap/filter/…) are reactive
 	// stream transforms — NOT per-element collection loops — and must not inflate
@@ -106,6 +138,8 @@ type astWalker struct {
 // kotlinBodyMetrics accumulates per-function complexity signals during the single
 // walkForCalls body traversal — mirrors the Go/Python/Ruby/Swift extractors.
 type kotlinBodyMetrics struct {
+	// typedCalls are the calls made on a receiver of declared type (receivers.go).
+	typedCalls       []typedCall
 	loopDepth        int             // max loop nesting depth
 	scalingLoopDepth int             // max nesting depth counting only input-scaling loops
 	loopCount        int             // number of loop constructs (syntactic + lambda iterators)
@@ -118,7 +152,8 @@ type kotlinBodyMetrics struct {
 	// times and is excluded.
 	callsInScalingLoop []string
 	inScalingSeen      map[string]bool
-	recursive          bool // body directly calls the enclosing function
+	scalingCallDepth   map[string]int // deepest scaling nesting each of those is called at (calldepth.go)
+	recursive          bool           // body directly calls the enclosing function
 	// sawSuperSelf is set when the body calls super.<enclosingName>(). Such a method
 	// is a framework/override that also makes a bare <enclosingName>(...) call to a
 	// DIFFERENT same-named overload (a real self-call would be infinite recursion), so
@@ -374,7 +409,7 @@ var kotlinIterators = map[string]bool{
 
 // kotlinCheapMethods are obviously-cheap methods that are not I/O. No-arg-ish
 // instance calls to these inside loops are not recorded in calls_in_loop, keeping
-// it focused (the enterprise keyword gate is the real precision filter).
+// it focused (the analyzer's keyword gate is the real precision filter).
 var kotlinCheapMethods = map[string]bool{
 	"toString": true, "let": true, "also": true, "apply": true, "run": true,
 	"with": true, "takeIf": true, "takeUnless": true, "size": true, "count": true,
@@ -484,6 +519,7 @@ func (w *astWalker) recordInLoopCall(target string) {
 	if w.metrics.inScalingSeen == nil {
 		w.metrics.inScalingSeen = make(map[string]bool)
 	}
+	w.metrics.scalingCallDepth = noteCallDepth(w.metrics.scalingCallDepth, target, w.scalingLoopDepth)
 	if !w.metrics.inScalingSeen[target] {
 		w.metrics.inScalingSeen[target] = true
 		w.metrics.callsInScalingLoop = append(w.metrics.callsInScalingLoop, target)
@@ -516,11 +552,13 @@ func (w *astWalker) popLoop(class kotlinLoopClass) {
 func (w *astWalker) pushType(name string, methods map[string]bool) {
 	w.typeStack = append(w.typeStack, name)
 	w.methodStack = append(w.methodStack, methods)
+	w.memberTypes = append(w.memberTypes, make(map[string]string))
 }
 
 func (w *astWalker) popType() {
 	w.typeStack = w.typeStack[:len(w.typeStack)-1]
 	w.methodStack = w.methodStack[:len(w.methodStack)-1]
+	w.memberTypes = w.memberTypes[:len(w.memberTypes)-1]
 }
 
 // enclosingType returns the dotted path of enclosing type names (e.g. "Outer.Inner"),
@@ -548,13 +586,26 @@ func (w *astWalker) qualify(name string) string {
 	return name
 }
 
-func (w *astWalker) pushOwner(f *facts.Fact) { w.ownerStack = append(w.ownerStack, f) }
-func (w *astWalker) popOwner()               { w.ownerStack = w.ownerStack[:len(w.ownerStack)-1] }
-func (w *astWalker) currentOwner() *facts.Fact {
+func (w *astWalker) pushOwner(idx int) { w.ownerStack = append(w.ownerStack, idx) }
+func (w *astWalker) popOwner()         { w.ownerStack = w.ownerStack[:len(w.ownerStack)-1] }
+
+// noOwner is the owner index outside any declaration.
+const noOwner = -1
+
+func (w *astWalker) currentOwner() int {
 	if len(w.ownerStack) == 0 {
-		return nil
+		return noOwner
 	}
 	return w.ownerStack[len(w.ownerStack)-1]
+}
+
+// relate adds a relation to the fact at owner, addressed at the moment of the
+// append, and nothing outside a declaration.
+func (w *astWalker) relate(owner int, kind, target string) {
+	if owner == noOwner {
+		return
+	}
+	w.out[owner].Relations = append(w.out[owner].Relations, facts.Relation{Kind: kind, Target: target})
 }
 
 func (w *astWalker) walkSourceFile(root *sitter.Node) {
@@ -563,6 +614,7 @@ func (w *astWalker) walkSourceFile(root *sitter.Node) {
 		switch kindOf(child) {
 		case "package_header":
 			// no fact emitted; package is implied by `dir`
+			w.pkg = strings.TrimSpace(strings.TrimPrefix(nodeText(child, w.src), "package"))
 		case "import":
 			w.handleImport(child)
 		case "class_declaration":
@@ -591,10 +643,11 @@ func (w *astWalker) handleImport(node *sitter.Node) {
 		importSource = "external"
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindDependency,
-		Name: w.dir + " -> " + resolved,
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindDependency,
+		Name:    w.dir + " -> " + resolved,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"language": "kotlin",
 			"source":   importSource,
@@ -669,10 +722,11 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 	exported := !privateOrInternalRe.MatchString(modifierText)
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    exported,
@@ -682,31 +736,37 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := kotlinDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 
 	if strings.Contains(modifierText, "data") {
-		f.Props["data_class"] = true
+		f.SetProp("data_class", true)
 	}
 	if strings.Contains(modifierText, "sealed") {
-		f.Props["sealed"] = true
+		f.SetProp("sealed", true)
 		// A sealed class/interface is non-instantiable — its subclasses are the
 		// concrete types — so it is an abstraction in Martin's sense. Mark it
 		// abstract so package-metrics abstractness (A) counts it, matching how
 		// interfaces and `abstract` classes are treated. (For a sealed interface
 		// this is redundant with symbol_kind=interface but harmless.)
-		f.Props["abstract"] = true
+		f.SetProp("abstract", true)
 	}
 	if strings.Contains(modifierText, "enum") {
-		f.Props["enum"] = true
+		f.SetProp("enum", true)
 	}
 	if strings.Contains(modifierText, "abstract") {
-		f.Props["abstract"] = true
+		f.SetProp("abstract", true)
 	}
 	if strings.Contains(modifierText, "annotation") {
-		f.Props["annotation_class"] = true
+		f.SetProp("annotation_class", true)
 	}
 
 	for _, st := range supertypes {
 		f.Relations = append(f.Relations, facts.Relation{Kind: facts.RelImplements, Target: st})
+	}
+	if cands := w.superCandidates(supertypes); len(cands) > 0 {
+		f.SetProp(propSuperCandidates, cands)
 	}
 
 	if w.isAndroid {
@@ -721,8 +781,7 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 	// Push this class as the current owner so any constructor calls / @Inject params
 	// found while walking its primary constructor + body attach back to it.
 	w.out = append(w.out, f)
-	owner := &w.out[len(w.out)-1]
-	w.pushOwner(owner)
+	w.pushOwner(len(w.out) - 1)
 
 	// Enter the type scope: nested methods/classes are named "<dir>.<Type>.<...>",
 	// and bare same-class calls resolve against this class's declared method names.
@@ -731,6 +790,7 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 		body = findChildByKind(node, "enum_class_body")
 	}
 	w.pushType(name, collectMethodNames(body, w.src))
+	w.bindMembers(node)
 
 	// Primary constructor parameters → RelInjects when @Inject is on the class,
 	// on the primary constructor itself (e.g., `class Foo @Inject constructor(...)`),
@@ -783,10 +843,11 @@ func (w *astWalker) handleObjectDeclaration(node *sitter.Node) {
 	exported := !privateOrInternalRe.MatchString(modifierText)
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolClass,
 			"exported":    exported,
@@ -797,18 +858,24 @@ func (w *astWalker) handleObjectDeclaration(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := kotlinDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	for _, st := range supertypes {
 		f.Relations = append(f.Relations, facts.Relation{Kind: facts.RelImplements, Target: st})
+	}
+	if cands := w.superCandidates(supertypes); len(cands) > 0 {
+		f.SetProp(propSuperCandidates, cands)
 	}
 	if w.isAndroid {
 		addAndroidProps(&f, name, annotations, strings.Join(supertypes, ", "))
 	}
 
 	w.out = append(w.out, f)
-	owner := &w.out[len(w.out)-1]
-	w.pushOwner(owner)
+	w.pushOwner(len(w.out) - 1)
 	body := findChildByKind(node, "class_body")
 	w.pushType(name, collectMethodNames(body, w.src))
+	w.bindMembers(node)
 	if body != nil {
 		w.walkForCalls(body)
 	}
@@ -850,10 +917,11 @@ func (w *astWalker) handleFunctionDeclaration(node *sitter.Node) {
 	}
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    exported,
@@ -863,29 +931,32 @@ func (w *astWalker) handleFunctionDeclaration(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := kotlinDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	// When declared inside a class/object, record the enclosing type as the
 	// receiver (parity with Go/TypeScript method facts).
 	if len(w.typeStack) > 0 {
-		f.Props["receiver"] = w.typeStack[len(w.typeStack)-1]
+		f.SetProp("receiver", w.typeStack[len(w.typeStack)-1])
 	}
 	// An `override` is dispatched polymorphically — Android/framework lifecycle
 	// callbacks (onCreate, onBind, …) and interface implementations are invoked
 	// through the supertype, never by the override's own literal name, so it must
 	// not be reported as an orphan.
 	if strings.Contains(modifierText, "override") {
-		f.Props["override"] = true
+		f.SetProp("override", true)
 	}
 	// Dagger/Hilt @Provides / @Binds methods are invoked reflectively by the DI
 	// container, never by name.
 	if containsAnnotation(annotations, "Provides") || containsAnnotation(annotations, "Binds") {
-		f.Props["di_provider"] = true
+		f.SetProp("di_provider", true)
 	}
 	if strings.Contains(modifierText, "suspend") {
-		f.Props["suspend"] = true
+		f.SetProp("suspend", true)
 	}
 	if w.isAndroid && containsAnnotation(annotations, "Composable") {
-		f.Props["android_component"] = "composable"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "composable")
+		f.SetProp("framework", "android")
 	}
 	// Direct I/O leaf: a Retrofit endpoint (@GET/@POST/…) or a Room DAO operation
 	// (@Query/@Insert/@Update/@Delete/…) is a real network/DB round-trip. Marking it
@@ -893,27 +964,44 @@ func (w *astWalker) handleFunctionDeclaration(node *sitter.Node) {
 	// N+1 (and rank it high) via the method's real I/O identity — a precise signal that
 	// does not depend on the cross-language keyword guess.
 	if kotlinIODirectFromAnnotations(annotations) {
-		f.Props["io_direct"] = true
-		f.Props["performs_io"] = true
+		f.SetProp("io_direct", true)
+		f.SetProp("performs_io", true)
+	}
+
+	if len(w.typeStack) > 0 && kotlinJUnitTest(annotations) {
+		label := strings.Trim(name, "`")
+		runner := strings.Join(append(append([]string(nil), w.typeStack...), label), ".")
+		if w.pkg != "" {
+			runner = w.pkg + "." + runner
+		}
+		endLine, col, endCol := tsutil.Span(node, w.src)
+		w.testCases = append(w.testCases, facts.NewTestCase("kotlin", w.relFile, append([]string(nil), w.typeStack...), label, runner,
+			int(node.StartPosition().Row)+1, endLine, col, endCol))
 	}
 
 	w.out = append(w.out, f)
 	ownerIdx := len(w.out) - 1
-	w.pushOwner(&w.out[ownerIdx])
+	w.pushOwner(ownerIdx)
 	// Set up per-function complexity tracking. walkForCalls is re-entrant (it
 	// dispatches nested function_declarations back here), so save and restore the
-	// outer state rather than clearing it. Props are written via the stable index
-	// (the pointer may be invalidated if the body walk grows w.out).
+	// outer state rather than clearing it.
 	savedMetrics, savedDepth := w.metrics, w.loopDepth
 	savedScaling, savedRepeat := w.scalingLoopDepth, w.repeatDepth
 	savedName, savedShort := w.selfName, w.selfShort
 	savedParams, savedReactive := w.selfParams, w.reactiveContext
+	savedParamNames, savedScopes := w.selfParamNames, w.loopScopes
+	w.loopScopes = nil
 	w.metrics = &kotlinBodyMetrics{}
+	savedLocals := w.localTypes
+	w.localTypes = make(map[string]string)
+	defer func() { w.localTypes = savedLocals }()
+	w.bindParameters(node)
 	w.loopDepth = 0
 	w.scalingLoopDepth, w.repeatDepth = 0, 0
 	w.selfName = f.Name
 	w.selfShort = name
 	w.selfParams = kotlinParamCount(node)
+	w.selfParamNames = kotlinParamNames(node, w.src)
 	body := findChildByKind(node, "function_body")
 	bodyText := ""
 	if body != nil {
@@ -933,6 +1021,9 @@ func (w *astWalker) handleFunctionDeclaration(node *sitter.Node) {
 	}
 	m := w.metrics
 	props := w.out[ownerIdx].Props
+	if len(m.typedCalls) > 0 {
+		props[propTypedCalls] = m.typedCalls
+	}
 	props["cyclomatic"] = 1 + m.decisions
 	if m.loopDepth > 0 {
 		props["loop_depth"] = m.loopDepth
@@ -955,6 +1046,7 @@ func (w *astWalker) handleFunctionDeclaration(node *sitter.Node) {
 			m.callsInScalingLoop = []string{}
 		}
 		props["calls_in_scaling_loop"] = m.callsInScalingLoop
+		props["calls_in_scaling_loop_depth"] = callDepths(m.callsInScalingLoop, m.scalingCallDepth)
 	}
 	// A body that calls super.<self>() is a framework override delegating to a
 	// same-named overload, not genuine recursion — the arity-matched bare self-call is
@@ -966,6 +1058,7 @@ func (w *astWalker) handleFunctionDeclaration(node *sitter.Node) {
 	w.scalingLoopDepth, w.repeatDepth = savedScaling, savedRepeat
 	w.selfName, w.selfShort = savedName, savedShort
 	w.selfParams, w.reactiveContext = savedParams, savedReactive
+	w.selfParamNames, w.loopScopes = savedParamNames, savedScopes
 	w.popOwner()
 }
 
@@ -982,6 +1075,78 @@ func kotlinParamCount(node *sitter.Node) int {
 		}
 	}
 	return n
+}
+
+// kotlinParamNames returns a function's declared parameter names.
+func kotlinParamNames(node *sitter.Node, src []byte) map[string]bool {
+	params := findChildByKind(node, "function_value_parameters")
+	if params == nil {
+		return nil
+	}
+	var out map[string]bool
+	for i := uint(0); i < uint(params.ChildCount()); i++ {
+		p := params.Child(i)
+		if kindOf(p) != "parameter" {
+			continue
+		}
+		// The parameter's name is its first identifier; the type follows it.
+		for j := uint(0); j < uint(p.ChildCount()); j++ {
+			if kotlinIsIdentifier(p.Child(j)) {
+				if out == nil {
+					out = make(map[string]bool)
+				}
+				out[nodeText(p.Child(j), src)] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// kotlinIsIdentifier accepts both names the grammar has used for a plain identifier.
+func kotlinIsIdentifier(n *sitter.Node) bool {
+	k := kindOf(n)
+	return k == "identifier" || k == "simple_identifier"
+}
+
+// kotlinNotSelfCall is an argument count no function has, standing in for the
+// real one when a call is proven not to be the enclosing function calling itself.
+const kotlinNotSelfCall = -1
+
+// kotlinCallNamesForeignParam reports whether a call passes an argument by a name
+// the enclosing function does not declare, which makes it a call to a different
+// function however the name and the arity line up.
+//
+// The arity check alone reads every Gradle convention plugin as recursive:
+//
+//	override fun apply(target: Project) {
+//	    with(target) { apply(plugin = "com.android.library") }
+//	}
+//
+// One argument each, same name, and the inner one is Project.apply, reached through
+// the `with` receiver. `plugin` is not a parameter of the outer function, so it
+// cannot be the callee. An unnamed call stays as it was.
+func kotlinCallNamesForeignParam(callExpr *sitter.Node, params map[string]bool, src []byte) bool {
+	args := findChildByKind(callExpr, "value_arguments")
+	if args == nil {
+		return false
+	}
+	for i := uint(0); i < uint(args.ChildCount()); i++ {
+		a := args.Child(i)
+		if kindOf(a) != "value_argument" {
+			continue
+		}
+		// A named argument is `name = expr`: an identifier directly followed by "=".
+		for j := uint(0); j+1 < uint(a.ChildCount()); j++ {
+			if kotlinIsIdentifier(a.Child(j)) && kindOf(a.Child(j+1)) == "=" {
+				if !params[nodeText(a.Child(j), src)] {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
 }
 
 // kotlinReturnType returns the source text of a function's declared return type, or ""
@@ -1038,10 +1203,11 @@ func (w *astWalker) handlePropertyDeclaration(node *sitter.Node) {
 	}
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + name,
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + name,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    exported,
@@ -1051,10 +1217,12 @@ func (w *astWalker) handlePropertyDeclaration(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := kotlinDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 
 	w.out = append(w.out, f)
-	owner := &w.out[len(w.out)-1]
-	w.pushOwner(owner)
+	w.pushOwner(len(w.out) - 1)
 	// Property initializer may contain a constructor call.
 	w.walkForCalls(node)
 	w.popOwner()
@@ -1075,10 +1243,11 @@ func (w *astWalker) handleTypeAlias(node *sitter.Node) {
 	exported := !privateOrInternalRe.MatchString(modifierText)
 
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + name,
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + name,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolType,
 			"exported":    exported,
@@ -1088,6 +1257,9 @@ func (w *astWalker) handleTypeAlias(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	})
+	if doc := kotlinDoc(node, w.src); doc != "" {
+		facts.SetDoc(&w.out[len(w.out)-1], doc)
+	}
 }
 
 // handleClassParameters walks the primary_constructor's parameters and emits
@@ -1102,7 +1274,7 @@ func (w *astWalker) handleClassParameters(pc *sitter.Node, classInjected bool) {
 		return
 	}
 	owner := w.currentOwner()
-	if owner == nil {
+	if owner == noOwner {
 		return
 	}
 	for i := uint(0); i < uint(cps.ChildCount()); i++ {
@@ -1120,10 +1292,7 @@ func (w *astWalker) handleClassParameters(pc *sitter.Node, classInjected bool) {
 		// look for one of its concrete child kinds.
 		typeName := lastTypeIdentifier(firstTypeChild(cp), w.src)
 		if paramInjected && typeName != "" {
-			owner.Relations = append(owner.Relations, facts.Relation{
-				Kind:   facts.RelInjects,
-				Target: typeName,
-			})
+			w.relate(owner, facts.RelInjects, typeName)
 		}
 		// Walk default expression (anything after `=`) for constructor calls.
 		w.walkForCalls(cp)
@@ -1138,14 +1307,31 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	}
 	kind := kindOf(node)
+	if kind == "property_declaration" && w.localTypes != nil {
+		w.bindProperty(w.localTypes, node)
+	}
 
 	// A lambda is a deferred scope: its body runs when the lambda is invoked, NOT
 	// per-iteration of the enclosing loops — so reset the loop depth for its
 	// subtree (e.g. a click handler defined inside a `forEach { … }` must not be
 	// counted as a per-iteration call). The iterator's OWN lambda is handled in the
 	// call_expression branch (its body walks at +1).
+	// A local initialised from the current element is still the current element:
+	// `val deps = config.dependencies ?: emptyList()` puts `deps` one step from it.
+	if kind == "property_declaration" && len(w.loopScopes) > 0 && node.NamedChildCount() >= 2 {
+		if kotlinReachedThroughElement(lastNamedChild(node), w.src, w.loopScopes) {
+			top := &w.loopScopes[len(w.loopScopes)-1]
+			for i := uint(0); i < node.NamedChildCount(); i++ {
+				kotlinBindDeclared(node.NamedChild(i), w.src, top)
+			}
+		}
+	}
+
 	if w.metrics != nil && kind == "lambda_literal" {
 		savedLoop, savedScaling, savedRepeat := w.loopDepth, w.scalingLoopDepth, w.repeatDepth
+		savedLambdaScopes := w.loopScopes
+		w.loopScopes = nil
+		defer func() { w.loopScopes = savedLambdaScopes }()
 		w.loopDepth, w.scalingLoopDepth, w.repeatDepth = 0, 0, 0
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
 			w.walkForCalls(node.Child(i))
@@ -1172,6 +1358,15 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 	switch kind {
 	case "for_statement", "while_statement", "do_while_statement":
 		class := kotlinSyntacticLoopClass(node, w.src)
+		scope := kotlinLoopScope{amortizes: class.repeats()}
+		if kind == "for_statement" {
+			// A loop over what belongs to an enclosing loop's element repeats
+			// without scaling (hierarchy.go).
+			if class.scales() && kotlinReachedThroughElement(kotlinForCollection(node), w.src, w.loopScopes) {
+				class = kotlinLoopInfinite
+			}
+			scope = kotlinForScope(node, w.src, class.repeats())
+		}
 		if w.metrics != nil {
 			w.metrics.loopCount++
 			w.metrics.decisions++
@@ -1182,10 +1377,23 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 				w.metrics.scalingLoopDepth = w.scalingLoopDepth + 1
 			}
 		}
-		w.pushLoop(class)
-		for i := uint(0); i < uint(node.ChildCount()); i++ {
-			w.walkChild(node.Child(i))
+		// A for statement evaluates its collection once, before the first
+		// iteration; walking it with the body read `for (x in load())` as a load
+		// per element.
+		var once *sitter.Node
+		if kind == "for_statement" {
+			if once = kotlinForCollection(node); once != nil {
+				w.walkChild(once)
+			}
 		}
+		w.pushLoop(class)
+		w.loopScopes = append(w.loopScopes, scope)
+		for i := uint(0); i < uint(node.ChildCount()); i++ {
+			if c := node.Child(i); once == nil || c.StartByte() != once.StartByte() || c.EndByte() != once.EndByte() {
+				w.walkChild(c)
+			}
+		}
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		w.popLoop(class)
 		return
 	}
@@ -1194,25 +1402,36 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		var iterLambda *sitter.Node
 		iterClass := kotlinLoopScaling
 		argCount := kotlinCallArgCount(node)
+		if kotlinCallNamesForeignParam(node, w.selfParamNames, w.src) {
+			argCount = kotlinNotSelfCall
+		}
 		// First named child is the callee expression.
 		if callee := firstNamedChild(node); callee != nil {
 			if name, isNav := calleeName(callee, w.src); name != "" {
-				if owner := w.currentOwner(); owner != nil {
+				// A receiver whose type is declared: receivers.go.
+				if isNav && !isCapitalized(name) {
+					if r := firstNamedChild(callee); r != nil {
+						w.noteTypedCall(nodeText(r, w.src)+"."+name, w.receiverType(r), name)
+					}
+				}
+				if owner := w.currentOwner(); owner != noOwner {
 					switch {
 					case isCapitalized(name):
 						// Kotlin convention: a capitalized callee is a constructor.
-						owner.Relations = append(owner.Relations, facts.Relation{
-							Kind:   facts.RelInstantiates,
-							Target: name,
-						})
+						w.relate(owner, facts.RelInstantiates, name)
+						// In Compose it is as often a function; resolveCapitalCalls
+						// keeps the candidate where a function is declared under it.
+						if c := w.typeCandidate(name); c != "" && !isNav {
+							notes, _ := w.out[owner].PropAny(propCapitalCalls).([]string)
+							if !slices.Contains(notes, c) {
+								w.out[owner].SetProp(propCapitalCalls, append(notes, c))
+							}
+						}
 					case !isNav:
 						// Bare lowercase call: a same-class method, a same-package
 						// function, or an imported top-level function.
 						if target := w.resolveCall(name); target != "" {
-							owner.Relations = append(owner.Relations, facts.Relation{
-								Kind:   facts.RelCalls,
-								Target: target,
-							})
+							w.relate(owner, facts.RelCalls, target)
 							w.recordCallMetrics(target, argCount)
 						}
 					case navReceiverIsThis(callee, w.src):
@@ -1221,10 +1440,7 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 						// receiver of unknown type) are left unresolved.
 						if methods := w.currentMethods(); methods[name] {
 							t := w.dir + "." + w.enclosingType() + "." + name
-							owner.Relations = append(owner.Relations, facts.Relation{
-								Kind:   facts.RelCalls,
-								Target: t,
-							})
+							w.relate(owner, facts.RelCalls, t)
 							w.recordCallMetrics(t, argCount)
 						}
 					case navReceiverIsSuper(callee, w.src):
@@ -1239,7 +1455,7 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 					case w.loopDepth > 0 && isNav && !kotlinCheapMethods[name]:
 						// Method call on a non-this receiver inside a loop (dao.insert,
 						// repo.getAll). No graph edge today, but its name feeds the perf
-						// metric so the enterprise analyzer can flag per-iteration I/O.
+						// metric so the performance analyzer can flag per-iteration I/O.
 						tgt := name
 						if r := firstNamedChild(callee); r != nil {
 							if recv := nodeText(r, w.src); recv != "" {
@@ -1262,6 +1478,10 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 					// candidates. An iterator is never infinite.
 					if isNav && kotlinConstantBoundReceiver(firstNamedChild(callee), w.src) {
 						iterClass = kotlinLoopConstant
+					} else if isNav && kotlinReachedThroughElement(firstNamedChild(callee), w.src, w.loopScopes) {
+						// `config.dependencies.forEach { … }` under a loop over
+						// configurations repeats without scaling (hierarchy.go).
+						iterClass = kotlinLoopInfinite
 					}
 				}
 			}
@@ -1295,13 +1515,8 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 	// repo.getUser()) and property access (slot.uniqueId), none of which produced a
 	// usage edge before, which is why live members were reported as orphans.
 	if kind == "navigation_expression" {
-		if owner := w.currentOwner(); owner != nil {
-			if member, _ := calleeName(node, w.src); member != "" {
-				owner.Relations = append(owner.Relations, facts.Relation{
-					Kind:   facts.RelCalls,
-					Target: member,
-				})
-			}
+		if member, _ := calleeName(node, w.src); member != "" {
+			w.relate(w.currentOwner(), facts.RelCalls, member)
 		}
 	}
 
@@ -1310,20 +1525,15 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 	// only as a method reference (e.g. `onClick = ::doNothing`, `.map(::helper)`) is
 	// not mis-reported as an orphan. The trailing identifier is the callable name.
 	if kind == "callable_reference" {
-		if owner := w.currentOwner(); owner != nil {
-			var last *sitter.Node
-			for i := uint(0); i < uint(node.ChildCount()); i++ {
-				if c := node.Child(i); c.IsNamed() {
-					last = c
-				}
+		var last *sitter.Node
+		for i := uint(0); i < uint(node.ChildCount()); i++ {
+			if c := node.Child(i); c.IsNamed() {
+				last = c
 			}
-			if last != nil {
-				if name := nodeText(last, w.src); name != "" {
-					owner.Relations = append(owner.Relations, facts.Relation{
-						Kind:   facts.RelCalls,
-						Target: name,
-					})
-				}
+		}
+		if last != nil {
+			if name := nodeText(last, w.src); name != "" {
+				w.relate(w.currentOwner(), facts.RelCalls, name)
 			}
 		}
 	}
@@ -1382,9 +1592,11 @@ func (w *astWalker) walkLambdaSubtree(node, lambda *sitter.Node, class kotlinLoo
 			body = lit
 		}
 		w.pushLoop(class)
+		w.loopScopes = append(w.loopScopes, kotlinLambdaScope(body, w.src, class.repeats()))
 		for i := uint(0); i < uint(body.ChildCount()); i++ {
 			w.walkChild(body.Child(i))
 		}
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		w.popLoop(class)
 		return
 	}
@@ -1754,9 +1966,4 @@ func findFirstIdentifier(node *sitter.Node, src []byte) *sitter.Node {
 	return nil
 }
 
-func nodeText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }

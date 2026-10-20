@@ -33,8 +33,13 @@ func (e *Engine) unseenCensus(skips walkSkips, records []facts.ProviderRecord, i
 		FilesExcludedByIgnore: skips.count,
 		DirsExcludedByIgnore:  skips.dirCount,
 		OutsideGraph:          map[string]int{},
+		OutsideGraphPrefixes:  map[string]int{},
 	}
 	for _, r := range records {
+		// A provider with nothing to read here left nothing unseen.
+		if r.NotApplicable() {
+			continue
+		}
 		skip := facts.ProviderSkip{Name: r.Name}
 		if r.Skipped {
 			skip.Reason = r.Reason
@@ -56,7 +61,7 @@ func (e *Engine) unseenCensus(skips walkSkips, records []facts.ProviderRecord, i
 	dynamicFiles := map[string]bool{}
 	for _, f := range all {
 		names[f.Name] = true
-		if f.Kind == facts.KindFileRef && f.Props["dynamic_send_prefixes"] != nil {
+		if f.Kind == facts.KindFileRef && f.PropAny("dynamic_send_prefixes") != nil {
 			dynamicFiles[f.File] = true
 		}
 	}
@@ -65,9 +70,25 @@ func (e *Engine) unseenCensus(skips walkSkips, records []facts.ProviderRecord, i
 			if !isOutsideGraphKind(rel.Kind) || names[rel.Target] {
 				continue
 			}
+			// TypeScript's internal dependency target is often an implicit,
+			// extensionless graph node rather than a standalone fact. The extractor
+			// has already proven it local; counting it as outside would turn healthy
+			// aliased imports into the very coverage warning meant to diagnose broken
+			// aliases.
+			if f.Kind == facts.KindDependency {
+				source, _ := f.PropAny("source").(string)
+				if source == facts.DepSourceInternal || source == facts.DepSourceFramework {
+					continue
+				}
+			}
 			u.OutsideGraph[rel.Kind]++
+			if rel.Kind == facts.RelImports {
+				if prefix := unresolvedImportPrefix(rel.Target); prefix != "" {
+					u.OutsideGraphPrefixes[prefix]++
+				}
+			}
 		}
-		if f.Kind == facts.KindSymbol && f.Props["symbol_kind"] == facts.SymbolClass && dynamicFiles[f.File] {
+		if f.Kind == facts.KindSymbol && f.PropAny("symbol_kind") == facts.SymbolClass && dynamicFiles[f.File] {
 			u.DynamicFeatureClasses++
 		}
 	}
@@ -77,6 +98,24 @@ func (e *Engine) unseenCensus(skips walkSkips, records []facts.ProviderRecord, i
 		}
 	}
 	return u
+}
+
+func unresolvedImportPrefix(target string) string {
+	target = strings.Trim(strings.TrimSpace(target), "/")
+	if target == "" || strings.HasPrefix(target, ".") {
+		return ""
+	}
+	parts := strings.Split(target, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	if strings.HasPrefix(parts[0], "@") {
+		if len(parts) < 3 {
+			return ""
+		}
+		return parts[0] + "/" + parts[1]
+	}
+	return parts[0]
 }
 
 func isOutsideGraphKind(kind string) bool {

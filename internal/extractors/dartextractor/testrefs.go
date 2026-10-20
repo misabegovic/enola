@@ -9,6 +9,7 @@ import (
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 
+	"github.com/enola-labs/enola/internal/extractors/extcoverage"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
 )
@@ -37,17 +38,31 @@ func (e *DartExtractor) ExtractTestRefs(ctx context.Context, repoPath string, te
 		return nil, nil
 	}
 
-	out := parallel.MapFiles(ctx, dartTests, func(relFile string) facts.Fact {
+	type testFile struct {
+		ref   facts.Fact
+		cases testCaseReading
+	}
+	out := parallel.MapFiles(ctx, dartTests, func(relFile string) testFile {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
-			return facts.Fact{}
+			return testFile{}
 		}
-		return extractTestRefs(src, relFile)
+		ref, cases := extractTestRefsAndCases(src, relFile)
+		return testFile{ref: ref, cases: cases}
 	})
 
 	var result []facts.Fact
-	for _, f := range out {
-		if f.Kind != "" {
+	named, unlabelled := 0, 0
+	for _, tf := range out {
+		if tf.ref.Kind != "" {
+			result = append(result, tf.ref)
+		}
+		result = append(result, tf.cases.cases...)
+		named += len(tf.cases.cases)
+		unlabelled += tf.cases.unlabelled
+	}
+	if unlabelled > 0 {
+		if f, ok := extcoverage.Fact(repoPath, "dart:test_cases", "test_case", named, map[string]int{"label_not_literal": unlabelled}); ok {
 			result = append(result, f)
 		}
 	}
@@ -56,20 +71,32 @@ func (e *DartExtractor) ExtractTestRefs(ctx context.Context, repoPath string, te
 
 // extractTestRefs collects the production names one test file references.
 func extractTestRefs(src []byte, relFile string) facts.Fact {
+	ref, _ := extractTestRefsAndCases(src, relFile)
+	return ref
+}
+
+// extractTestRefsAndCases reads one test file's references and its tests from one
+// parse.
+func extractTestRefsAndCases(src []byte, relFile string) (facts.Fact, testCaseReading) {
 	pp, _ := parserPool.Get().(*sitter.Parser)
 	if pp == nil {
-		return facts.Fact{}
+		return facts.Fact{}, testCaseReading{}
 	}
 	defer parserPool.Put(pp)
 	tree := pp.Parse(src, nil)
 	if tree == nil {
-		return facts.Fact{}
+		return facts.Fact{}, testCaseReading{}
 	}
 	defer tree.Close()
 	root := tree.RootNode()
 	if root == nil {
-		return facts.Fact{}
+		return facts.Fact{}, testCaseReading{}
 	}
+	cases := dartTestCases(root, src, relFile)
+	return dartTestRef(root, src, relFile), cases
+}
+
+func dartTestRef(root *sitter.Node, src []byte, relFile string) facts.Fact {
 
 	targets := map[string]bool{}
 	var visit func(*sitter.Node)

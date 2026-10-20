@@ -8,10 +8,6 @@
 // concurrency-safe accessors (the engine's published snapshot, the status usage
 // files) and never mutates server state. All logging goes to stderr; stdout is
 // reserved for the MCP stdio protocol.
-//
-// It is a public package so a wrapper binary can add panels of its own without
-// forking the page: see Options for the template-overlay and insight-label
-// extension points.
 package dashboard
 
 import (
@@ -31,9 +27,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/enola-labs/enola/pkg/bootstrap"
-	"github.com/enola-labs/enola/pkg/diff"
-	"github.com/enola-labs/enola/pkg/facts"
+	"github.com/enola-labs/enola/internal/diff"
+	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/metrics"
 	"github.com/enola-labs/enola/pkg/history"
 	"github.com/enola-labs/enola/pkg/status"
 )
@@ -43,44 +39,8 @@ var pageTemplate string
 
 var baseTmpl = template.Must(template.New("dashboard").Parse(pageTemplate))
 
-// OverlayBlocks names the template blocks an Options.Overlay may redefine, in
-// page order. They are the stable half of the overlay contract — renaming one
-// silently drops a wrapper's panel — so a wrapper can assert its fragment
-// defines only these, and TestOverlayBlocksExistInPage keeps the page honest.
-func OverlayBlocks() []string {
-	return []string{"extra-styles", "extra-cards", "extra-modals", "extra-scripts"}
-}
-
-// Options configures a dashboard, and is the whole extension surface a wrapper
-// binary has. A zero Options is the plain engine dashboard.
+// Options configures a dashboard. A zero Options is the plain engine dashboard.
 type Options struct {
-	// Overlay is a template fragment that redefines any of the page's extension
-	// blocks: "extra-styles" (inside <style>), "extra-cards" (end of the summary
-	// card grid), "extra-modals" (after the last modal) and "extra-scripts"
-	// (inside the trailing <script>). Each is empty by default.
-	//
-	// A fragment renders against the same page model as the rest of the template,
-	// so it reaches its own data through {{.Extra}} and may reuse the page's CSS
-	// classes — .card, .modal, .modal-panel, .count-link and .insight-summary are
-	// the stable ones.
-	Overlay string
-
-	// Extra computes the data the overlay blocks render, once per request from
-	// the live fact store, and is exposed to the template as {{.Extra}}. Leaving
-	// it nil — or returning nil, e.g. for an unlicensed feature — renders the
-	// blocks with no data, which a fragment guarded by {{if .Extra}} skips.
-	Extra func(*facts.Store) any
-
-	// InsightLabels adds explainer-id → display-label entries to the page's own
-	// map. That map is also the admission list (see insightDetails), so a wrapper
-	// that registers extra explainers MUST list them here or their insights are
-	// filtered out of its own dashboard.
-	InsightLabels map[string]string
-
-	// Title names the product in the page title, heading and footer. Defaults to
-	// defaultTitle.
-	Title string
-
 	// Tracker is this process's usage tracker, and the ONLY source the page uses
 	// to describe the server it is served by — PID, uptime, dashboard port, the
 	// graph loaded, and this process's own tool counts. Without it the page can
@@ -115,16 +75,17 @@ type Options struct {
 // defaultTitle is the product name shown when Options.Title is empty.
 const defaultTitle = "enola"
 
-// engineView is the slice of the engine the dashboard depends on. Narrowing to
-// an interface keeps the handler testable without constructing a full engine.
-// *bootstrap.Engine satisfies it.
+// Engine is the slice of the engine the dashboard depends on. Narrowing to an
+// interface keeps the handler testable without constructing a full engine, and
+// keeps this package from importing the composition root and, through it, every
+// extractor the binary carries. *bootstrap.Engine satisfies it.
 //
 //   - GetArtifact fetches the live in-memory receipt ("receipt.json").
 //   - ActiveRepo + OutputDir locate the last-written receipt on disk, used as a
 //     fallback: AutoLoadSnapshot restores a snapshot's facts with an near-empty
 //     Meta, so after a server restart the in-memory receipt is blank while a full
 //     one persists at <repo>/.enola/receipt.json.
-type engineView interface {
+type Engine interface {
 	GetArtifact(name string) ([]byte, error)
 	ActiveRepo() string
 	OutputDir(repoPath string) string
@@ -136,13 +97,11 @@ type engineView interface {
 
 // Server is a running dashboard HTTP server bound to a loopback port.
 type Server struct {
-	port   int
-	eng    engineView
-	opts   Options
-	tmpl   *template.Template
-	labels map[string]string // insight-source allowlist + display labels
-	title  string            // product name in the page title/heading/footer
-	mux    *http.ServeMux
+	port int
+	eng  Engine
+	opts Options
+	tmpl *template.Template
+	mux  *http.ServeMux
 
 	changeMu      sync.Mutex
 	changeCacheID string
@@ -160,12 +119,8 @@ type Server struct {
 // Start binds a free ephemeral port on 127.0.0.1, serves the dashboard from a
 // background goroutine, and returns immediately. A serve error after startup is
 // logged to stderr and never propagated — the MCP server must keep running.
-//
-// An invalid Options.Overlay is reported here rather than at render time, so a
-// wrapper's template mistake fails loudly at startup instead of silently
-// dropping its panels from every page.
-func Start(eng *bootstrap.Engine, opts Options) (*Server, error) {
-	tmpl, err := buildTemplate(opts.Overlay)
+func Start(eng Engine, opts Options) (*Server, error) {
+	tmpl, err := buildTemplate()
 	if err != nil {
 		return nil, err
 	}
@@ -175,12 +130,10 @@ func Start(eng *bootstrap.Engine, opts Options) (*Server, error) {
 		return nil, fmt.Errorf("binding dashboard port: %w", err)
 	}
 	s := &Server{
-		port:   ln.Addr().(*net.TCPAddr).Port,
-		eng:    eng,
-		opts:   opts,
-		tmpl:   tmpl,
-		labels: mergedLabels(opts.InsightLabels),
-		title:  titleOr(opts.Title),
+		port: ln.Addr().(*net.TCPAddr).Port,
+		eng:  eng,
+		opts: opts,
+		tmpl: tmpl,
 	}
 
 	s.mux = http.NewServeMux()
@@ -306,14 +259,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// titleOr returns the configured product name, or the default when unset.
-func titleOr(title string) string {
-	if title == "" {
-		return defaultTitle
-	}
-	return title
-}
-
 // buildTemplate returns the page template for one server, with an optional
 // overlay fragment applied over it. Parsing a fragment onto a clone redefines
 // whichever extension blocks it declares and leaves the rest of the page
@@ -324,16 +269,10 @@ func titleOr(title string) string {
 // straight from baseTmpl would make the NEXT server's Clone fail. Keeping
 // baseTmpl un-executed is what lets a wrapper start a dashboard after a plain
 // one in the same process.
-func buildTemplate(overlay string) (*template.Template, error) {
+func buildTemplate() (*template.Template, error) {
 	t, err := baseTmpl.Clone()
 	if err != nil {
 		return nil, fmt.Errorf("cloning dashboard template: %w", err)
-	}
-	if overlay == "" {
-		return t, nil
-	}
-	if t, err = t.Parse(overlay); err != nil {
-		return nil, fmt.Errorf("parsing dashboard overlay: %w", err)
 	}
 	return t, nil
 }
@@ -499,11 +438,10 @@ type pageData struct {
 	Quality          qualityAssessment
 	Changes          changeSummary
 
-	// Extra is whatever Options.Extra returned for this request — the data the
-	// overlay blocks render. Nil in a plain engine dashboard, and nil whenever a
-	// wrapper declines to supply it (e.g. an unlicensed feature), which is what a
-	// fragment guarded by {{if .Extra}} keys off.
-	Extra any
+	// PackageMetrics backs the Package Metrics card and its main-sequence modal.
+	// Nil when the store holds no typed package, which both guard on, so they
+	// disappear rather than render empty.
+	PackageMetrics *metricsView
 }
 
 // buildPageForModule collects the status, current-snapshot receipt and
@@ -511,7 +449,7 @@ type pageData struct {
 // module if non-empty. Every source degrades gracefully to a note on error.
 func (s *Server) buildPageForModule(module string) pageData {
 	data := pageData{
-		Title:           s.title,
+		Title:           defaultTitle,
 		Port:            s.port,
 		SnapshotPath:    s.opts.SnapshotPath,
 		GenerateCommand: s.opts.GenerateCommand,
@@ -610,7 +548,7 @@ func (s *Server) buildPageForModule(module string) pageData {
 
 	// Insight list (grouped by explainer) backing the clickable Insights counter.
 	// Empty → the counter renders as a plain number.
-	data.Insights, data.InsightStructural, data.InsightCandidate = insightDetails(s.currentInsights(publishedSnapshot), s.labels)
+	data.Insights, data.InsightStructural, data.InsightCandidate = insightDetails(s.currentInsights(publishedSnapshot), insightLabels)
 	for _, group := range data.Insights {
 		data.InsightTotal += group.Count
 		for _, item := range group.Items {
@@ -624,11 +562,12 @@ func (s *Server) buildPageForModule(module string) pageData {
 	// clickable Extraction-quality coverage cards.
 	data.Coverage, data.UnresolvedRoutes = coverageDetails(store)
 
-	// Whatever a wrapper's overlay blocks render, recomputed per request from the
-	// same live store as everything above.
-	if s.opts.Extra != nil {
-		data.Extra = s.opts.Extra(store)
-	}
+	// Package metrics, recomputed per request from the same live store as
+	// everything above. Zone classification comes from metrics.Classify, the same
+	// source the explainer and the package_metrics tool use, so the page cannot
+	// disagree with the tool. Nil when nothing has a type, which is what the card
+	// and the modal guard on.
+	data.PackageMetrics = packageMetricsView(metrics.Compute(store))
 
 	return data
 }
@@ -651,7 +590,7 @@ func (s *Server) readChangeSummary(repoPath, snapshotID string) changeSummary {
 	if snapshotID != "" && snapshotID == s.changeCacheID {
 		return s.changeCache
 	}
-	result := readChangeSummary(repoPath, snapshotID, s.opts.HistoryDir, s.labels)
+	result := readChangeSummary(repoPath, snapshotID, s.opts.HistoryDir, insightLabels)
 	s.changeCacheID, s.changeCache = snapshotID, result
 	return result
 }

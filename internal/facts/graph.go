@@ -1,7 +1,9 @@
 package facts
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -40,8 +42,8 @@ type Graph struct {
 
 	// CSR adjacency over node IDs. fwdOff has len(names)+1 entries; the edges of node
 	// n are the half-open range [fwdOff[n], fwdOff[n+1]) in fwdTgt/fwdRel. Within a
-	// node's range, edges keep the order they were added — traversal output, and so
-	// every golden file, depends on it.
+	// node's range, edges are ordered by the neighbour's name, then the relation's —
+	// traversal output, and so every golden file, depends on it. See sortAdjacency.
 	fwdOff []uint32
 	fwdTgt []uint32
 	fwdRel []uint16
@@ -129,6 +131,11 @@ type TraversalNode struct {
 	// node also stands for others, so a walk through it is not read as more precise
 	// than it is.
 	Conflated []string `json:"conflated,omitempty"`
+	// Files lists, sorted, every file a fact sharing this node's name lives in,
+	// when there is more than one. File above names one of them; a dependency
+	// fact named for its module is declared once per importing file, and
+	// reading the node's File alone named one importer of several.
+	Files []string `json:"files,omitempty"`
 }
 
 // TraversalEdge is an edge traversed during traversal.
@@ -165,9 +172,12 @@ type ImpactResult struct {
 // compiled page set, so the trail continues past the first hop: the page
 // that governs a file names what it is part of, depends on, or supersedes.
 type GoverningPage struct {
-	Page      string              `json:"page"`
-	Type      string              `json:"type,omitempty"`
-	Status    string              `json:"status,omitempty"`
+	Page   string `json:"page"`
+	Type   string `json:"type,omitempty"`
+	Status string `json:"status,omitempty"`
+	// Symbols names the facts the page anchors in this file, when it narrows an
+	// anchor to one; empty when a file or directory anchor governs.
+	Symbols   []string            `json:"symbols,omitempty"`
 	Relations []GoverningRelation `json:"relations,omitempty"`
 }
 
@@ -203,7 +213,15 @@ type PathResult struct {
 // emitted by an external consumer), the graph normalises the target by stripping known
 // Go module path prefixes (stored in KindModule facts as props["modulePath"]). This
 // allows edges to land on the correct fact in the loaded external repo.
-func NewGraph(ff []Fact) *Graph {
+func NewGraph(ff []Fact) *Graph { return NewGraphWithAliases(ff, nil) }
+
+// NewGraphWithAliases is NewGraph over a store's target aliases (see
+// Store.SetTargetAliases): an edge whose target names no fact but has an alias lands
+// on the node of the fact the alias names, for every relation kind, including a
+// dependency's import of another repository's package. Without an alias a call
+// target still gets the Go module-path normalization below, which is what a graph
+// built from bare facts (a conformance baseline) has to go on.
+func NewGraphWithAliases(ff []Fact, aliases map[string]FactKey) *Graph {
 	g := &Graph{
 		facts:  ff,
 		ids:    make(map[string]uint32, len(ff)),
@@ -216,8 +234,8 @@ func NewGraph(ff []Fact) *Graph {
 	// declaredNodes a usable boundary: after this loop, an ID below it is a name some
 	// fact declares and an ID at or above it is a dangling edge target.
 	moduleNames := make(map[string]bool)
-	modulePaths := make(map[string]struct{}) // Go module paths for cross-repo normalisation
-	nameID := make([]uint32, len(ff))        // per-fact node ID, so the next pass needn't re-hash
+	var modulePaths []string          // Go module paths for cross-repo normalisation, longest first
+	nameID := make([]uint32, len(ff)) // per-fact node ID, so the next pass needn't re-hash
 	for i, f := range ff {
 		nameID[i] = noNode
 		if f.Name != "" {
@@ -225,18 +243,25 @@ func NewGraph(ff []Fact) *Graph {
 		}
 		if f.Kind == KindModule {
 			moduleNames[f.Name] = true
-			if mp, ok := f.Props["modulePath"].(string); ok && mp != "" {
-				modulePaths[mp] = struct{}{}
+			if mp, ok := f.PropAny("modulePath").(string); ok && mp != "" {
+				modulePaths = append(modulePaths, mp)
 			}
 		}
 	}
 	g.declaredNodes = uint32(len(g.names))
+	// Longest first, so a module nested under another's path claims its own targets;
+	// ranging over a map picked between them by iteration order.
+	sort.Slice(modulePaths, func(i, j int) bool {
+		if len(modulePaths[i]) != len(modulePaths[j]) {
+			return len(modulePaths[i]) > len(modulePaths[j])
+		}
+		return modulePaths[i] < modulePaths[j]
+	})
 
 	// Index which facts declare each node, as CSR. Every fact declaring the name is
 	// recorded, not just the first: which one a node means depends on the edge that
-	// reaches it, and that is not known until traversal time. Counting first and
-	// filling in fact order keeps each node's list in ascending fact index, as
-	// appending to a per-name slice did.
+	// reaches it, and that is not known until traversal time. Each node's list is then
+	// put in the order sortDeclaringFacts defines.
 	g.factOff = make([]uint32, g.declaredNodes+1)
 	for _, id := range nameID {
 		if id != noNode {
@@ -255,15 +280,26 @@ func NewGraph(ff []Fact) *Graph {
 			fillPos[id]++
 		}
 	}
+	sortDeclaringFacts(g.factOff, g.factIdxs, ff)
 
 	// Second pass: build adjacency lists
+	imported := NewImportTargets(func() []Fact { return ff })
 	for fi, f := range ff {
 		for _, rel := range f.Relations {
+			// A method's table access lands on a storage fact that shares its name
+			// with the model's class symbol, so as an edge it would read as the
+			// method depending on the class: fan-in, impact and paths would all
+			// grow by an edge no code makes.
+			if IsStorageAccess(rel.Kind) {
+				continue
+			}
 			target := rel.Target
-			// For unresolved call targets, attempt cross-repo normalisation by
-			// stripping known Go module path prefixes.
-			if rel.Kind == RelCalls {
-				if !g.declares(target) {
+			if !g.declares(target) {
+				if k, ok := aliases[target]; ok && g.declares(k.Name) {
+					target = k.Name
+				} else if rel.Kind == RelCalls {
+					// For unresolved call targets, attempt cross-repo normalisation
+					// by stripping known Go module path prefixes.
 					if normalized := normalizeExternalTarget(target, modulePaths); normalized != "" {
 						if g.declares(normalized) {
 							target = normalized
@@ -283,11 +319,22 @@ func NewGraph(ff []Fact) *Graph {
 			modName := fileDirectory(f.File)
 			if moduleNames[modName] {
 				for _, rel := range f.Relations {
-					if rel.Kind == RelImports {
-						target := resolveToModule(rel.Target, moduleNames)
-						if target != "" && target != modName {
-							b.addEdge(b.idFor(modName), RelImports, target)
+					if rel.Kind != RelImports {
+						continue
+					}
+					raw := rel.Target
+					if dir, carried := imported.Dir(f, raw); carried {
+						if dir == "" {
+							continue
 						}
+						raw = dir
+					}
+					target := resolveToModule(raw, moduleNames)
+					if k, ok := aliases[rel.Target]; ok && target == "" && k.Kind == KindModule {
+						target = k.Name
+					}
+					if target != "" && target != modName {
+						b.addEdge(b.idFor(modName), RelImports, target)
 					}
 				}
 			}
@@ -306,7 +353,7 @@ func NewGraph(ff []Fact) *Graph {
 		if f.Kind != KindSymbol {
 			continue
 		}
-		sk, _ := f.Props["symbol_kind"].(string)
+		sk, _ := f.PropAny("symbol_kind").(string)
 		if sk != SymbolMethod && sk != SymbolFunc && sk != SymbolGetter {
 			continue
 		}
@@ -368,6 +415,8 @@ func (b *graphBuilder) finish() {
 
 	g.fwdOff, g.fwdTgt, g.fwdRel = buildCSR(b.src, b.tgt, b.rel, n)
 	g.revOff, g.revTgt, g.revRel = buildCSR(b.tgt, b.src, b.rel, n)
+	sortAdjacency(g.fwdOff, g.fwdTgt, g.fwdRel, g.names, g.relKinds)
+	sortAdjacency(g.revOff, g.revTgt, g.revRel, g.names, g.relKinds)
 }
 
 // dedup marks duplicate (source, relation, target) triples by setting their source to
@@ -468,6 +517,74 @@ func buildCSR(from, to []uint32, rel []uint16, n uint32) (off, tgt []uint32, kin
 	return off, tgt, kinds
 }
 
+// sortDeclaringFacts orders the facts declaring each node by repo, file, line and
+// kind. Where several facts of one kind share a name (a Ruby module reopened in
+// forty files) the first of them is the one a traversal reports the node as, and in
+// fact-index order that was whichever the store held first, so a node's file and
+// line changed with how the graph was loaded.
+func sortDeclaringFacts(off []uint32, idxs []int32, ff []Fact) {
+	for n := 0; n+1 < len(off); n++ {
+		own := idxs[off[n]:off[n+1]]
+		if len(own) < 2 {
+			continue
+		}
+		slices.SortFunc(own, func(a, b int32) int {
+			fa, fb := &ff[a], &ff[b]
+			return cmp.Or(
+				cmp.Compare(fa.Repo, fb.Repo),
+				cmp.Compare(fa.File, fb.File),
+				cmp.Compare(fa.Line, fb.Line),
+				cmp.Compare(fa.Kind, fb.Kind),
+				cmp.Compare(a, b),
+			)
+		})
+	}
+}
+
+// sortAdjacency orders every node's edges by neighbour name, then relation name.
+//
+// Left as built, a node's edges sit in the order its facts sit in the store, and
+// that is not one order: extractors emit in map-iteration order, and a store read
+// back from facts.jsonl is in file order. A walk visits neighbours in this order
+// and stops at a node cap, so the same question listed different dependents after
+// a generate, after a restore, and from one generate to the next. IDs and relation
+// IDs are handed out in store order too, which is why the names are compared.
+//
+// A (neighbour, relation) pair is unique within a node once dedup has run, so the
+// order is total.
+func sortAdjacency(off, tgt []uint32, kinds []uint16, names, relKinds []string) {
+	s := adjacencySorter{names: names, relKinds: relKinds}
+	for n := 0; n+1 < len(off); n++ {
+		lo, hi := off[n], off[n+1]
+		if hi-lo < 2 {
+			continue
+		}
+		s.tgt, s.kinds = tgt[lo:hi], kinds[lo:hi]
+		sort.Sort(&s)
+	}
+}
+
+// adjacencySorter sorts one node's slice of the two parallel CSR arrays in place.
+type adjacencySorter struct {
+	tgt             []uint32
+	kinds           []uint16
+	names, relKinds []string
+}
+
+func (s *adjacencySorter) Len() int { return len(s.tgt) }
+
+func (s *adjacencySorter) Swap(i, j int) {
+	s.tgt[i], s.tgt[j] = s.tgt[j], s.tgt[i]
+	s.kinds[i], s.kinds[j] = s.kinds[j], s.kinds[i]
+}
+
+func (s *adjacencySorter) Less(i, j int) bool {
+	if s.tgt[i] != s.tgt[j] {
+		return s.names[s.tgt[i]] < s.names[s.tgt[j]]
+	}
+	return s.relKinds[s.kinds[i]] < s.relKinds[s.kinds[j]]
+}
+
 // lookup resolves a node name to its ID. A name with no node is not in the graph at
 // all — neither declared by a fact nor targeted by an edge.
 func (g *Graph) lookup(name string) (uint32, bool) {
@@ -519,7 +636,7 @@ func (g *Graph) factIdxsOf(id uint32) []int32 {
 }
 
 // methodOwner returns the owner type name for a method fact name of the form
-// "<owner>.<method>" or "<owner>#<method>", but only when <owner> is itself a
+// "<owner>.<method>", "<owner>#<method>" or "<owner>::<method>", but only when <owner> is itself a
 // known symbol fact whose symbol_kind is a type (struct/interface/class/type).
 // Returns "" otherwise.
 //
@@ -544,11 +661,19 @@ func (g *Graph) methodOwner(name string) string {
 			return owner
 		}
 	}
-	dot := strings.LastIndex(name, ".")
-	if dot <= 0 {
-		return ""
+	if dot := strings.LastIndex(name, "."); dot > 0 {
+		if owner := g.declaredTypeNamed(name[:dot]); owner != "" {
+			return owner
+		}
 	}
-	return g.declaredTypeNamed(name[:dot])
+	// PHP and C++ name a method "Namespace\\Class::method". "::" also separates
+	// the segments of a Ruby or Rust path, where what precedes the last one is a
+	// module, so it is tried last and under the same guard: an owner no fact
+	// declares as a type yields no edge.
+	if scope := strings.LastIndex(name, "::"); scope > 0 {
+		return g.declaredTypeNamed(name[:scope])
+	}
+	return ""
 }
 
 // declaredTypeNamed returns name when a symbol fact declares it with a type
@@ -564,7 +689,7 @@ func (g *Graph) declaredTypeNamed(name string) string {
 	if of.Kind != KindSymbol {
 		return ""
 	}
-	switch sk, _ := of.Props["symbol_kind"].(string); sk {
+	switch sk, _ := of.PropAny("symbol_kind").(string); sk {
 	case SymbolStruct, SymbolInterface, SymbolClass, SymbolType:
 		return name
 	}
@@ -872,10 +997,211 @@ func (g *Graph) FindPath(from, to string, relKinds []string, maxDepth int) PathR
 	return result
 }
 
+// SetPathResult is the shortest path between two sets of nodes. From and To
+// name the nodes the path actually joins; a name asked for that the graph
+// does not hold is listed rather than dropped, since a set that silently lost
+// a member answers a smaller question than the one asked.
+type SetPathResult struct {
+	PathResult
+	UnresolvedFrom []string `json:"unresolved_from,omitempty"`
+	UnresolvedTo   []string `json:"unresolved_to,omitempty"`
+}
+
+// FindPathBetween finds the shortest path from any node in froms to any node in
+// tos with one breadth-first search seeded at every source, over the same
+// relation filter and depth clamp as FindPath. Each target is expanded by
+// RollupSeeds, as find_path expands a single target, so a path ending at one of
+// a type's methods reaches the type. Sources are seeded in name order and each
+// node's neighbours are visited in name order, so among equally short paths the
+// first one in that order is returned and a rerun returns the same one. Names
+// are exact node names; nothing is resolved by substring.
+func (g *Graph) FindPathBetween(froms, tos []string, relKinds []string, maxDepth int) SetPathResult {
+	// RollupSeeds takes the read lock itself, so the targets are expanded before
+	// this walk takes it.
+	var held, unresolvedTo []string
+	g.mu.RLock()
+	for _, to := range sortedUnique(tos) {
+		if _, ok := g.lookup(to); ok {
+			held = append(held, to)
+		} else {
+			unresolvedTo = append(unresolvedTo, to)
+		}
+	}
+	g.mu.RUnlock()
+	targets := map[string]bool{}
+	for _, to := range held {
+		for _, seed := range g.RollupSeeds(to) {
+			targets[seed] = true
+		}
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if maxDepth <= 0 {
+		maxDepth = 10
+	}
+	if maxDepth > 20 {
+		maxDepth = 20
+	}
+
+	result := SetPathResult{UnresolvedTo: unresolvedTo}
+	var sources []uint32
+	seeded := map[uint32]bool{}
+	var unresolvedFrom []string
+	for _, from := range sortedUnique(froms) {
+		id, ok := g.lookup(from)
+		if !ok {
+			unresolvedFrom = append(unresolvedFrom, from)
+			continue
+		}
+		if !seeded[id] {
+			seeded[id] = true
+			sources = append(sources, id)
+		}
+	}
+	result.UnresolvedFrom = unresolvedFrom
+	targetIDs := map[uint32]bool{}
+	for name := range targets {
+		if id, ok := g.lookup(name); ok {
+			targetIDs[id] = true
+		}
+	}
+	if len(sources) == 0 || len(targetIDs) == 0 {
+		return result
+	}
+
+	for _, id := range sources {
+		if targetIDs[id] {
+			result.From, result.To, result.Found = g.names[id], g.names[id], true
+			result.Path = []TraversalNode{g.nodeForID(id, 0, "")}
+			return result
+		}
+	}
+
+	type queueItem struct {
+		id    uint32
+		depth int
+	}
+	visited := make(map[uint32]struct{}, len(sources))
+	parent := make(map[uint32]uint32)
+	parentRel := make(map[uint32]uint16)
+	queue := make([]queueItem, 0, len(sources))
+	for _, id := range sources {
+		visited[id] = struct{}{}
+		queue = append(queue, queueItem{id: id})
+	}
+	relSet := g.relIDSet(relKinds)
+	reached, found := uint32(0), false
+	for qi := 0; qi < len(queue) && !found; qi++ {
+		item := queue[qi]
+		if item.depth >= maxDepth {
+			continue
+		}
+		tgts, rels := g.adjOf(item.id, false)
+		order := make([]int, 0, len(tgts))
+		for i := range tgts {
+			if relSet != nil {
+				if _, ok := relSet[rels[i]]; !ok {
+					continue
+				}
+			}
+			order = append(order, i)
+		}
+		sort.SliceStable(order, func(a, b int) bool { return g.names[tgts[order[a]]] < g.names[tgts[order[b]]] })
+		for _, i := range order {
+			tid := tgts[i]
+			if _, seen := visited[tid]; seen {
+				continue
+			}
+			visited[tid] = struct{}{}
+			parent[tid] = item.id
+			parentRel[tid] = rels[i]
+			if targetIDs[tid] {
+				reached, found = tid, true
+				break
+			}
+			queue = append(queue, queueItem{id: tid, depth: item.depth + 1})
+		}
+	}
+	if !found {
+		return result
+	}
+
+	path := []uint32{reached}
+	for cur := reached; !seeded[cur]; cur = parent[cur] {
+		path = append(path, parent[cur])
+	}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	result.From, result.To, result.Found = g.names[path[0]], g.names[reached], true
+	for i, id := range path {
+		via := ""
+		if i > 0 {
+			via = g.relName(parentRel[id])
+		}
+		result.Path = append(result.Path, g.nodeForID(id, i, via))
+	}
+	for i := 1; i < len(path); i++ {
+		result.Edges = append(result.Edges, TraversalEdge{
+			Source: g.names[path[i-1]],
+			Target: g.names[path[i]],
+			Kind:   g.relName(parentRel[path[i]]),
+		})
+	}
+	return result
+}
+
+// sortedUnique returns names sorted with repeats removed, a fresh slice.
+func sortedUnique(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := append([]string(nil), names...)
+	sort.Strings(out)
+	kept := out[:1]
+	for _, n := range out[1:] {
+		if n != kept[len(kept)-1] {
+			kept = append(kept, n)
+		}
+	}
+	return kept
+}
+
 // ImpactSet computes the transitive set of nodes affected by changing the target.
 // It performs a reverse BFS and groups results by depth.
 // If includeForward is true, it also includes what the target depends on.
 func (g *Graph) ImpactSet(target string, maxDepth, maxNodes int, includeForward bool) ImpactResult {
+	// Reverse traversal: who depends on target? When the target is a type, seed
+	// from its methods (via has_method) and constructor too, so callers that
+	// reference the type through those — not the bare type node — are included.
+	return g.impactFrom(target, g.impactSeeds(target), []string{target}, maxDepth, maxNodes, includeForward)
+}
+
+// ImpactSetOf is ImpactSet for a target that is several nodes at once and no node
+// itself: a source file, given as the names it declares. Each is expanded as a
+// target of its own would be, so a type declared there brings its methods along.
+// Dependents among the names themselves are not dependents of the file.
+func (g *Graph) ImpactSetOf(target string, names []string, maxDepth, maxNodes int, includeForward bool) ImpactResult {
+	seen := make(map[string]struct{}, len(names))
+	var seeds []string
+	for _, name := range names {
+		for _, seed := range g.impactSeeds(name) {
+			if _, dup := seen[seed]; !dup {
+				seen[seed] = struct{}{}
+				seeds = append(seeds, seed)
+			}
+		}
+	}
+	if len(seeds) == 0 {
+		seeds = []string{target}
+	}
+	return g.impactFrom(target, seeds, seeds, maxDepth, maxNodes, includeForward)
+}
+
+// impactFrom walks back from seeds, and forward from forwardFrom when asked to.
+func (g *Graph) impactFrom(target string, seeds, forwardFrom []string, maxDepth, maxNodes int, includeForward bool) ImpactResult {
 	if maxDepth <= 0 {
 		maxDepth = 3
 	}
@@ -889,10 +1215,6 @@ func (g *Graph) ImpactSet(target string, maxDepth, maxNodes int, includeForward 
 		maxNodes = 500
 	}
 
-	// Reverse traversal: who depends on target? When the target is a type, seed
-	// from its methods (via has_method) and constructor too, so callers that
-	// reference the type through those — not the bare type node — are included.
-	seeds := g.impactSeeds(target)
 	rev := g.traverseFrom(seeds, "reverse", nil, nil, maxDepth, maxNodes)
 
 	// max_nodes caps rev.Nodes, so len(rev.Nodes) is not the dependent count.
@@ -912,7 +1234,13 @@ func (g *Graph) ImpactSet(target string, maxDepth, maxNodes int, includeForward 
 
 	// Bucket nodes by depth (skip depth 0, which holds the target entity's own
 	// seed nodes) and roll up which other repos contain a dependent.
-	targetRepo := g.repoOf(target)
+	// A file target is no node; its repository is the one its facts carry.
+	targetRepo := ""
+	for _, seed := range seeds {
+		if targetRepo = g.repoOf(seed); targetRepo != "" {
+			break
+		}
+	}
 	repoSet := map[string]bool{}
 	for _, n := range rev.Nodes {
 		if n.Depth > 0 {
@@ -944,7 +1272,7 @@ func (g *Graph) ImpactSet(target string, maxDepth, maxNodes int, includeForward 
 
 	// Optionally include forward dependencies
 	if includeForward {
-		fwd := g.Traverse(target, "forward", nil, nil, maxDepth, maxNodes)
+		fwd := g.TraverseFrom(forwardFrom, "forward", nil, nil, maxDepth, maxNodes)
 		result.Forward = &fwd
 	}
 
@@ -957,6 +1285,11 @@ func (g *Graph) ImpactSet(target string, maxDepth, maxNodes int, includeForward 
 // pins itself to code, and the traversal answers "which decisions govern
 // this code?" for any node under analysis. Page type and status join from
 // the page's own declaration when it carries one.
+//
+// A page that narrows its anchor to a symbol governs that symbol, and the
+// methods of a class it names through has_method, and nothing else in the
+// file: asked about a sibling method it is left out, which is the whole point
+// of narrowing. Every other anchor answers as it always has.
 func (g *Graph) GoverningIntent(target string) []GoverningPage {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -968,7 +1301,31 @@ func (g *Graph) GoverningIntent(target string) []GoverningPage {
 	if f.File == "" || f.Repo == "" {
 		return nil
 	}
-	return g.governingForFile(f.Repo, f.File)
+	return g.governingForFile(f.Repo, f.File, &governedSymbol{name: f.Name, owner: g.methodOwner(f.Name)})
+}
+
+// GoverningIntentForFact answers GoverningIntent for a fact already resolved to
+// its repository, file and name, so a caller holding several facts of one name
+// asks about each where it lives.
+func (g *Graph) GoverningIntentForFact(repo, file, name string) []GoverningPage {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if repo == "" || file == "" || name == "" {
+		return nil
+	}
+	return g.governingForFile(repo, file, &governedSymbol{name: name, owner: g.methodOwner(name)})
+}
+
+// governedSymbol is the fact a reverse query asks about, with the class that
+// declares it when it is a method, since a page about the class governs its
+// methods.
+type governedSymbol struct {
+	name  string
+	owner string
+}
+
+func (s *governedSymbol) names(symbol string) bool {
+	return symbol == s.name || (s.owner != "" && symbol == s.owner)
 }
 
 // GoverningIntentForFile answers the same reverse query for a file named
@@ -980,13 +1337,15 @@ func (g *Graph) GoverningIntentForFile(repo, file string) []GoverningPage {
 	if repo == "" || file == "" {
 		return nil
 	}
-	return g.governingForFile(repo, file)
+	return g.governingForFile(repo, file, nil)
 }
 
 // governingForFile joins the file against every declared anchor of its repo
 // and resolves the matching pages with their declarations and outgoing
-// relations. Caller holds g.mu.
-func (g *Graph) governingForFile(repo, file string) []GoverningPage {
+// relations. With a symbol, a symbol anchor joins only when it names that
+// symbol or its class; without one, every anchor on the file joins, symbol
+// anchors included, and the symbols ride along. Caller holds g.mu.
+func (g *Graph) governingForFile(repo, file string, asked *governedSymbol) []GoverningPage {
 	// Join in both the label-prefixed and repo-relative file forms, same as
 	// every intent join — a single trimmed form mis-fires when a real path
 	// starts with the repo's own name.
@@ -995,6 +1354,7 @@ func (g *Graph) governingForFile(repo, file string) []GoverningPage {
 		forms = append(forms, trimmed)
 	}
 	pages := map[string]bool{}
+	symbols := map[string]map[string]bool{}
 	pageInfo := map[string]*Fact{}
 	pageByForm := map[string]*Fact{}
 	relations := map[string][]*Fact{}
@@ -1014,7 +1374,17 @@ func (g *Graph) governingForFile(repo, file string) []GoverningPage {
 			}
 			for _, form := range forms {
 				if path == form || strings.HasPrefix(form, path+"/") {
+					symbol := af.PropString("symbol")
+					if symbol != "" && asked != nil && !asked.names(symbol) {
+						break
+					}
 					pages[af.File] = true
+					if symbol != "" {
+						if symbols[af.File] == nil {
+							symbols[af.File] = map[string]bool{}
+						}
+						symbols[af.File][symbol] = true
+					}
 					break
 				}
 			}
@@ -1032,6 +1402,10 @@ func (g *Graph) governingForFile(repo, file string) []GoverningPage {
 	out := make([]GoverningPage, 0, len(pages))
 	for page := range pages {
 		gp := GoverningPage{Page: page}
+		for symbol := range symbols[page] {
+			gp.Symbols = append(gp.Symbols, symbol)
+		}
+		sort.Strings(gp.Symbols)
 		var pageRepo string
 		if pf, ok := pageInfo[page]; ok {
 			gp.Type = pf.PropString("page_type")
@@ -1062,8 +1436,12 @@ func (g *Graph) governingForFile(repo, file string) []GoverningPage {
 // measured graph — the forward half of the reverse query: what code does
 // this page govern, and does the graph actually measure it.
 type AnchorCoverage struct {
-	Repo          string `json:"repo"`
-	Path          string `json:"path"`
+	Repo string `json:"repo"`
+	Path string `json:"path"`
+	// Symbol is the fact a narrowed anchor names; the coverage beside it is
+	// still its file's, because the file is what the anchor governs for every
+	// file-level reader.
+	Symbol        string `json:"symbol,omitempty"`
 	MeasuredFiles int    `json:"measured_files"`
 	MeasuredFacts int    `json:"measured_facts"`
 }
@@ -1100,7 +1478,7 @@ func (g *Graph) GovernedByPage(page string) ([]AnchorCoverage, bool) {
 	out := make([]AnchorCoverage, len(anchors))
 	files := make([]map[string]bool, len(anchors))
 	for i, af := range anchors {
-		out[i] = AnchorCoverage{Repo: af.PropString("intent_owner"), Path: af.PropString("path")}
+		out[i] = AnchorCoverage{Repo: af.PropString("intent_owner"), Path: af.PropString("path"), Symbol: af.PropString("symbol")}
 		files[i] = map[string]bool{}
 	}
 	for i := range g.facts {
@@ -1173,6 +1551,12 @@ func (g *Graph) impactSeeds(target string) []string {
 	defer g.mu.RUnlock()
 
 	seeds := []string{target}
+	// A target naming a file seeds from every fact the file declares: what
+	// imports or calls into the file names those facts, never the file, so a
+	// walk from the path alone reached nothing.
+	if declared := g.declaredInFile(target); len(declared) > 0 {
+		return append(seeds, declared...)
+	}
 	// Seed expansion only applies to type symbols, so resolve with symbol context:
 	// a type sharing a name with a module or service must still expand its methods.
 	// When no symbol declares the name the kind check below returns the bare target.
@@ -1183,7 +1567,7 @@ func (g *Graph) impactSeeds(target string) []string {
 	if g.facts[idx].Kind != KindSymbol {
 		return seeds
 	}
-	switch sk, _ := g.facts[idx].Props["symbol_kind"].(string); sk {
+	switch sk, _ := g.facts[idx].PropAny("symbol_kind").(string); sk {
 	case SymbolStruct, SymbolClass, SymbolInterface, SymbolType:
 	default:
 		return seeds
@@ -1208,6 +1592,40 @@ func (g *Graph) impactSeeds(target string) []string {
 	return seeds
 }
 
+// declaredInFile lists, sorted, the names of the symbols, routes and storage
+// facts declared in the file path names, when path is a file and not the name
+// of such a fact itself: a name some code fact declares keeps its own reading,
+// and a path only reference facts carry (a file_ref, a test_ref) is the file.
+// The caller holds g.mu.
+func (g *Graph) declaredInFile(path string) []string {
+	if id, ok := g.lookup(path); ok {
+		for _, i := range g.factIdxsOf(id) {
+			if int(i) < len(g.facts) && fileDeclarable(g.facts[i].Kind) {
+				return nil
+			}
+		}
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range g.facts {
+		if f.File != path || f.Name == path || !fileDeclarable(f.Kind) || seen[f.Name] {
+			continue
+		}
+		seen[f.Name] = true
+		out = append(out, f.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func fileDeclarable(kind string) bool {
+	switch kind {
+	case KindSymbol, KindRoute, KindStorage:
+		return true
+	}
+	return false
+}
+
 // normalizeExternalTarget strips a known Go module path prefix from a call
 // target that doesn't match any fact. This bridges cross-repo call edges where
 // the consumer emits the full import path (e.g. "github.com/x/go-auth/adapters.Handler.Login")
@@ -1215,8 +1633,8 @@ func (g *Graph) impactSeeds(target string) []string {
 //
 //	subpackage: "github.com/x/go-auth/adapters.Handler.Login" → "adapters.Handler.Login"
 //	root pkg:   "github.com/x/go-auth.SecurityHeaders"        → "..SecurityHeaders"
-func normalizeExternalTarget(target string, modulePaths map[string]struct{}) string {
-	for modulePath := range modulePaths {
+func normalizeExternalTarget(target string, modulePaths []string) string {
+	for _, modulePath := range modulePaths {
 		if !strings.HasPrefix(target, modulePath) {
 			continue
 		}
@@ -1358,8 +1776,13 @@ func (g *Graph) edgesOf(id uint32, reverse bool) []Edge {
 //
 // A route is an entry-point declaration, not a symbol, so it is not architectural
 // coupling — the same reasoning that excludes test_ref and file_ref.
+//
+// A test_case carries no relations, so it is never the source this is asked about
+// today. It is named here because this is the one place that says which kinds are
+// not architecture, and a test that later gained an edge must not start counting as
+// a dependent by default.
 func isReferenceOnlyKind(kind string) bool {
-	return kind == KindTestRef || kind == KindFileRef || kind == KindRoute
+	return kind == KindTestRef || kind == KindFileRef || kind == KindRoute || kind == KindTestCase || kind == KindRuntimeUnit
 }
 
 // ArchitecturalReverse returns a reverse adjacency map restricted to edges that
@@ -1425,7 +1848,8 @@ func (g *Graph) ArchitecturalFanIn(name string) int {
 // Rails monolith it puts an importer base class (449 lines, 102 one-line delegations,
 // exactly ONE call out) at out-degree 104.
 //
-// Nothing else is filtered. The reverse filter's other two arms cannot fire here:
+// Named references are also excluded: reading a symbol as data is not a call.
+// The reverse filter's other two arms cannot fire here:
 // a symbol never points at a reference-only fact (test_ref/file_ref/route), and
 // RelInstantiates in this direction is the symbol really constructing another type.
 func (g *Graph) ArchitecturalForwardEdges(name string) []Edge {
@@ -1468,19 +1892,22 @@ func (g *Graph) ArchitecturalFanOut(name string) int {
 // isArchitecturalForwardEdge applies the coupling filter to one outgoing edge, given
 // its relation kind. Callers hold the lock.
 func (g *Graph) isArchitecturalForwardEdge(relID uint16) bool {
-	return g.relName(relID) != RelHasMethod
+	rk := g.relName(relID)
+	return rk != RelHasMethod && rk != RelNames
 }
 
 // isArchitecturalEdge applies the coupling filter to one incoming edge, given its
 // SOURCE node and relation kind. Callers hold the lock.
 func (g *Graph) isArchitecturalEdge(srcID uint32, relID uint16) bool {
 	rk := g.relName(relID)
+	// RelNames describes a read, not an invocation; it belongs in traversal and
+	// dead-code evidence, not call coupling.
 	// RelInstantiates keeps ubiquitous DATA structs out of the dead-code report, but
 	// it is not change-risk coupling: a data struct built at many sites is not a god
 	// class or a call-graph hotspot. Exclude it from fan-in / centrality (and the
 	// outlier distribution). Traversal, impact_analysis, find_path and orphans read
 	// the unfiltered index and still see it.
-	if rk == RelInstantiates || rk == RelImplementedBy {
+	if rk == RelInstantiates || rk == RelImplementedBy || rk == RelNames {
 		return false
 	}
 	if idx, ok := g.factIndexForID(srcID, rk); ok && isReferenceOnlyKind(g.facts[idx].Kind) {
@@ -1614,6 +2041,30 @@ func (g *Graph) conflatedKindsOf(id uint32) []string {
 	return kinds
 }
 
+// filesOf lists the files of the facts declaring node id, sorted, when they
+// are more than one.
+func (g *Graph) filesOf(id uint32) []string {
+	idxs := g.factIdxsOf(id)
+	if len(idxs) < 2 {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, i := range idxs {
+		if int(i) < len(g.facts) && g.facts[i].File != "" {
+			seen[g.facts[i].File] = true
+		}
+	}
+	if len(seen) < 2 {
+		return nil
+	}
+	files := make([]string, 0, len(seen))
+	for f := range seen {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+	return files
+}
+
 // nodeFor builds the traversal node for name. viaRel is the relation kind that reached
 // it, or "" for a traversal/path origin; it disambiguates which fact the node means
 // when a name is shared.
@@ -1634,6 +2085,7 @@ func (g *Graph) nodeForID(id uint32, depth int, viaRel string) TraversalNode {
 		node.Line = f.Line
 		node.Repo = f.Repo
 		node.Conflated = g.conflatedKindsOf(id)
+		node.Files = g.filesOf(id)
 	} else {
 		// No backing fact: this is a dangling edge target (e.g. an inferred call
 		// into an unanalyzed package or an interface method). Mark it honestly
@@ -1676,15 +2128,29 @@ func (g *Graph) buildImpactSummary(byDepth map[int][]TraversalNode, total int) s
 			summary += "; "
 		}
 		summary += "depth " + itoa(d) + ": "
+		// Ranging over kindCount lists the kinds in Go's random map order, so
+		// two identical questions over one snapshot could differ by this line
+		// alone. The larger count leads and a tie goes to the smaller name.
+		kinds := make([]string, 0, len(kindCount))
+		for kind := range kindCount {
+			kinds = append(kinds, kind)
+		}
+		sort.Slice(kinds, func(i, j int) bool {
+			if kindCount[kinds[i]] != kindCount[kinds[j]] {
+				return kindCount[kinds[i]] > kindCount[kinds[j]]
+			}
+			return kinds[i] < kinds[j]
+		})
 		first := true
-		for kind, count := range kindCount {
+		for _, kind := range kinds {
+			count := kindCount[kind]
 			if !first {
 				summary += ", "
 			}
-			summary += itoa(count) + " " + kind
 			if count > 1 {
-				summary += "s"
+				kind = PluralKind(kind)
 			}
+			summary += itoa(count) + " " + kind
 			first = false
 		}
 	}
@@ -1692,6 +2158,10 @@ func (g *Graph) buildImpactSummary(byDepth map[int][]TraversalNode, total int) s
 	prefix := itoa(total) + " total dependents"
 	if shown < total {
 		prefix += " (showing " + itoa(shown) + ")"
+	}
+	// The node cap can leave nothing to break down.
+	if summary == "" {
+		return prefix
 	}
 	return prefix + " — " + summary
 }

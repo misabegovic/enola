@@ -39,7 +39,7 @@ type Binary struct {
 	VersionVar string // ldflags -X target for the version string
 
 	// BuildOutput is the artifact name a source build produces, when it differs
-	// from Name (e.g. "enola-ent" for enola-enterprise). Defaults to Name.
+	// from Name (a wrapper commonly ships under a shorter one). Defaults to Name.
 	BuildOutput string
 
 	// Version is the build version of THIS binary, as its own main package knows
@@ -47,8 +47,8 @@ type Binary struct {
 	//
 	// It is carried here rather than read from internal/version because that
 	// variable is enola's, stamped by enola's release workflow. A wrapper is
-	// stamped through a different -X target (enola-enterprise uses
-	// `main.version`), so anything reading internal/version inside a wrapper
+	// stamped through a different -X target (typically its own `main.version`),
+	// so anything reading internal/version inside a wrapper
 	// reports "dev" forever: `doctor` said "enola dev", the SARIF driver claimed
 	// to be enola dev, and the dashboard registered its instance as dev. Empty
 	// falls back to internal/version, which is correct for the OSS binary and is
@@ -64,9 +64,8 @@ func (b Binary) output() string {
 	return b.Name
 }
 
-// HelpSpec is the rendered form of `--help`. A wrapper binary starts from
-// DefaultHelp and appends to Commands/Flags/Sections rather than restating the
-// shared text.
+// HelpSpec is the rendered form of `--help`. Every field is plain data, so a caller
+// composing its own help starts from DefaultHelp rather than restating the shared text.
 type HelpSpec struct {
 	Bin       Binary
 	Tagline   string    // one-line description, printed beside the binary name
@@ -79,9 +78,8 @@ type HelpSpec struct {
 	Sections  []Section // trailing blocks, in order
 }
 
-// DefaultHelp returns the help shared by every enola binary. It documents only
-// what the engine itself provides — it never mentions licensing, activation or
-// anything a wrapper adds.
+// DefaultHelp returns the help shared by every enola binary. It documents what the
+// engine itself provides, with the binary's own name and version substituted in.
 func DefaultHelp(bin Binary) HelpSpec {
 	return HelpSpec{
 		Bin:     bin,
@@ -89,12 +87,19 @@ func DefaultHelp(bin Binary) HelpSpec {
 		Intro:   "Give your AI agent a map of the codebase before it starts exploring.",
 		Usage: []string{
 			bin.Name + " [flags] [repo_path|config_path]",
+			bin.Name + " help [command [subcommand]]",
 			bin.Name + " dashboard [--open] [repo_path|config_path]",
+			bin.Name + " cluster init [--dry-run] [dir]",
 			bin.Name + " baseline <pin|show|clear> [repo_path|config_path]",
 			bin.Name + " check [flags] [repo_path|config_path]",
 			bin.Name + " constraints <lint|mine|ledger> [repo_path|config_path]",
+			bin.Name + " contract [--json]",
 			bin.Name + " plan [flags] [path...] [repo_path|config_path]",
+			bin.Name + " pack --budget N [flags] [path...] [repo_path|config_path]",
 			bin.Name + " coverage [flags] [repo_path|config_path]",
+			bin.Name + " path [flags] <from> <to> [repo_path|config_path]",
+			bin.Name + " impact [flags] <target> [repo_path|config_path]",
+			bin.Name + " flows [flags] [repo_path|config_path]",
 			bin.Name + " doctor [repo_path]",
 			bin.Name + " log [flags] [repo_path|config_path]",
 			bin.Name + " show [<revision>] [repo_path|config_path]",
@@ -105,15 +110,22 @@ func DefaultHelp(bin Binary) HelpSpec {
 			bin.Name + " install [--hooks] [--global] [--targets=…] [repo_path]",
 		},
 		Commands: []FlagDoc{
+			{Flag: "help", Desc: "Show this page, or with a command, that command's own page: its\nflags, subcommands, exit codes and examples. \"" + bin.Name + " help flows\",\n\"" + bin.Name + " --help flows\" and \"" + bin.Name + " flows --help\" are the same\npage. Subcommands work too: \"" + bin.Name + " help baseline pin\"."},
 			{Flag: "dashboard", Desc: "Explore the latest snapshot in a read-only local web dashboard,\nwithout starting an MCP server. Add --open to launch the browser.\nStays attached to the terminal; stop with Ctrl-C."},
-			{Flag: "install", Desc: "Write " + bin.Name + "'s instructions into the files your coding\nagents read (Claude Code, Cursor, Copilot, Codex, Pi, opencode,\nAGENTS.md). Previews every change and asks before writing.\n  --hooks   also run the loop automatically, instead of leaving\n            the agent to remember. In Claude Code and Codex: pin\n            a baseline at session start and report the\n            architectural delta at the end, but only if the\n            change introduced a regression. In opencode, which\n            has no hooks of that shape: a plugin that points the\n            session's first searches at the index instead.\n            Opt-in, because both run code.\n  --targets a comma-separated subset, for narrowing a run. The\n            default is every target, and a target whose agent is\n            not installed skips itself and says so.\n  --global  configure this user rather than this repository.\n  --dry-run show what would change and write nothing."},
+			{Flag: "cluster", Desc: "Write a cluster config for a folder that holds several git\nrepositories. \"init\" lists every immediate subfolder that is a\nrepository in cluster.yaml, refusing to overwrite; pass that file\nto --generate to index them as one linked graph."},
+			{Flag: "install", Desc: "Write " + bin.Name + "'s instructions into the files your coding\nagents read (Claude Code, Cursor, Copilot, Codex, Pi, opencode,\nAGENTS.md). Previews every change and asks before writing.\n  --hooks   also run the loop automatically, instead of leaving\n            the agent to remember. In Claude Code, Codex and Pi:\n            pin a baseline at session start and report the\n            architectural delta at the end, but only if the\n            change introduced a regression. The preview names\n            the hooks each target receives, and \"no hook\"\n            where it receives none. In opencode, which\n            has no hooks of that shape: a plugin that points the\n            session's first searches at the index instead.\n            Opt-in, because both run code. Pi always gets its\n            extension, which serves the tools; --hooks only adds\n            the session hooks to it.\n  --targets a comma-separated subset, for narrowing a run. The\n            default is every target, and a target whose agent is\n            not installed skips itself and says so.\n  --global  configure this user rather than this repository.\n  --dry-run show what would change and write nothing."},
 			{Flag: "uninstall", Desc: "Remove everything \"install\" wrote, leaving the rest of each\nfile byte-for-byte as it was."},
 			{Flag: "baseline", Desc: "Manage the diff baseline — the \"before\" your changes are graded\nagainst. \"pin\" snapshots the repository and freezes it (no separate\n--generate needed), \"show\" reports what the current baseline\ndescribes, \"clear\" removes it. The baseline is stored per-repository,\nin that repo's output dir, so several repos each keep their own."},
 			{Flag: "check", Desc: "Grade what a change did to the architecture against the pinned\nbaseline, and exit with a code CI can act on:\n  0 clean · 1 regression · 2 error · 3 declined (not comparable)\nRead-only by default — nothing is written, and the baseline stays\nput, so it can be run as often as you like. Run\n\"" + bin.Name + " check --help\" for the flags."},
 			{Flag: "constraints", Desc: "Author the declared constraint vocabulary. \"lint\" parses each repo's\nenola-intent.yaml (and any cluster-config intent override), reports\nevery validation problem with its file context, and resolves each\ndeclared component against the current snapshot if one exists —\nso a selector that matches nothing is caught while authoring, not\nby a vacuously-passing rule. Exits 1 on validation problems.\n\"mine\" searches the snapshot's fact store for near-invariants and\nreports candidate rules with their evidence and named exceptions —\nproposals for review, never self-adopting law.\n\"ledger\" reports how much of the law you already declared is being\nEXCUSED rather than obeyed — each rule's breaches beside the\nsuppressions and exemptions that signed them away, with every\nexcuse's owner and age. Evidence for judging a rule, never a gate."},
+			{Flag: "contract", Desc: "What a program reading this binary may rely on, printed rather than\ncopied: the closed sets the engine validates with (rule forms and the\nkeys each requires, vias, the token and pattern grammars, page\nrelations, origin channels, fact and relation kinds, check statuses\nand exit codes, the page extensions this build reads), and with\n--json a JSON Schema for each artefact and answer, generated from the\ntypes it is written from. Reads nothing; writes nothing."},
 			{Flag: "plan", Desc: "The pre-edit contract: which declared constraints govern an\nintended change (--paths, --symbols), its blast radius over the\ncurrent snapshot, and — for a --patch — the constraint verdicts\nthat WOULD appear, evaluated over a scratch copy BEFORE any edit\nlands in the tree. Nothing is written; a report, never a gate.\nRun \"" + bin.Name + " plan --help\" for the flags."},
+			{Flag: "pack", Desc: "What to open within a budget: the line ranges of the tests and\nsymbols named (--names) inside the paths named, then each named file\nwhole, sized to --budget estimated tokens (four characters each; no\ndefault). A file that moved since the snapshot is named with no\nrange. Reads the snapshot and the tree; never writes."},
 			{Flag: "coverage", Desc: "Report which cross-repo edges were resolved and which were not,\nper service — telling a genuinely isolated service apart from one\nwhose outbound edges could not be followed. Needs two or more\nrepositories in one graph. A report, not a gate: always exits 0."},
-			{Flag: "endpoint", Desc: "Report what changing an HTTP endpoint reaches: the controller\nserving it, the models that controller touches, the models\nassociated with those, the tables behind them, and the callers,\nincluding the frontend screen a calling route module implements.\nUse impact_analysis when you have a symbol; use this when what\nyou have is a URL."},
+			{Flag: "endpoint", Desc: "Report what changing an HTTP endpoint reaches: the controller\nserving it, the models that controller touches, the models\nassociated with those, the tables behind them, and the callers,\nincluding the frontend screen a calling route module implements.\nUse impact when you have a symbol; use this when what you have\nis a URL."},
+			{Flag: "path", Desc: "Find the shortest path between two nodes in the snapshot on disk,\nas the find_path MCP tool finds it: how does A reach B? With\n--from-node and --to-node, how does any of one set of exact names\nreach any of another, in one search. Reads the snapshot; never\ngenerates one."},
+			{Flag: "impact", Desc: "Compute what transitively depends on a node in the snapshot on\ndisk, as the impact_analysis MCP tool computes it, in its summary,\ncompact or full mode and under its token cap: --list names the\ndependents by depth, --json emits the raw graph with each one's\nfile and line. Exits 2 when nothing was traversed because the\ntarget matched nothing or too many nodes, so an empty answer is\nnever an unasked question. Reads the snapshot; never generates one.\nRun \"" + bin.Name + " impact --help\" for the flags."},
+			{Flag: "flows", Desc: "Rank the ways into a program by what each reaches. An entry is a\nserved route's handler, a program's main, or a symbol a framework\ninvokes; its flow is every symbol the calls from it reach. --show\ndescribes one flow with its stages, --through lists the flows that\nreach a symbol, --json emits the report. A flow is a floor: each one\ncounts the calls whose target is no symbol in the graph.\nRun \"" + bin.Name + " flows --help\" for the flags."},
 			{Flag: "log", Desc: "EXPERIMENTAL. Show what this repository's architecture has done over\ntime — one line per recorded snapshot, with what changed since the\none before it. Read-only: it reports what was observed and never\nsnapshots to fill a gap. Every snapshot is recorded as a revision\n(~450 bytes, outside the repo); set `history.enabled: false` to stop."},
 			{Flag: "show", Desc: "EXPERIMENTAL. Show what ONE recorded revision did to the architecture\n— \"log\" says a revision added twelve facts, this says which twelve.\nReconstructs the revision and its predecessor out of\nthe stored history and compares them, so a past change is described in the same words it\nwas described in at the time. A revision is a snapshot id or prefix, a\ngit commit, HEAD~N, @<seq>, a ref name, or `latest` (the default)."},
 			{Flag: "diff", Desc: "EXPERIMENTAL. Show the architecture delta between any two recorded\nrevisions — the question a week of work produces, where \"show\" answers\nfor a single one. Either side of the range may be empty, meaning the\noldest or newest recorded revision."},
@@ -121,7 +133,7 @@ func DefaultHelp(bin Binary) HelpSpec {
 			{Flag: "gc", Desc: "EXPERIMENTAL. Report what the architecture history holds — how many\nrevisions, how many can still be replayed, how much disk — and remove\nwhat it no longer needs. With no flags it removes only garbage;\n--thin-older-than and --prune-working discard things a reader could\nstill reach, so each has to be asked for."},
 			{Flag: "history", Desc: "EXPERIMENTAL. Share the architecture history between machines through\na directory store — a git repository, a shared mount, an S3-synced\nfolder. Plain files, content-addressed, tamper-evident. \"push\" copies\nlocal revisions in, \"pull\" imports what other machines pushed,\n\"verify\" walks every chain and names gaps and tampering, \"gc\" applies\nretention — printed first, deleted only with --apply, recorded in the\nchain. Point it with history.shared_dir or the first argument."},
 			{Flag: "doctor", Desc: "Report whether the session hooks are actually FIRING in this\nrepository, not merely configured. `install --hooks` can write a\nconfiguration your agent silently ignores — it reports success\neither way — so this asks the only question that settles it: when\ndid each hook last run, and what did it conclude? A report, not a\ngate: always exits 0."},
-			{Flag: "providers", Desc: "The fact providers this binary carries itself. `providers list`\nnames each and whether it is ready; `providers fetch rubydex`\ndownloads the pinned Rubydex engine library, verifies its published\ndigest, and caches it, after which a `providers:` entry named\nrubydex with no command runs in-process. The only network access a\nprovider ever makes, and never at snapshot time."},
+			{Flag: "providers", Desc: "The fact providers this binary can offer. `providers list [--json]`\nnames the catalogue (the built-in rubydex and the example scripts\nin the providers directory), what each applies to, and whether it\ncan run on this machine and why not; `providers fetch rubydex`\ndownloads the pinned Rubydex engine library, verifies its published\ndigest, and caches it, after which a `providers:` entry named\nrubydex with no command runs in-process. The only network access a\nprovider ever makes, and never at snapshot time."},
 		},
 		Flags: []FlagDoc{
 			{Flag: "--generate", Desc: "Generate a snapshot and exit (do not start MCP server)"},
@@ -131,9 +143,12 @@ func DefaultHelp(bin Binary) HelpSpec {
 			{Flag: "--status", Desc: "Show MCP server status: uptime, tool usage and estimated value,\naggregated across every repo the server has served. While the server\nis running this also prints the dashboard URL."},
 			{Flag: "--status --all", Desc: "Show the per-repo breakdown instead (from ~/.enola/usage/)"},
 			{Flag: "--no-dashboard", Desc: "Do not start the localhost dashboard alongside the MCP server"},
+			{Flag: "--listen <path>", Desc: "Also accept MCP sessions on a unix socket at <path> (or set\nENOLA_LISTEN), each a session over the same loaded graph, so\nevery process that connects shares one engine. Owner-only; a\nsocket a stopped server left is replaced, a live one refused.\nThe server lives as long as the session on stdio, or until\nsignalled when stdio carries none"},
+			{Flag: "--small", Desc: "Serve the MCP tools for a small context window: explore,\nimpact_analysis, governing_intent, constraints_for, query_insights\nand context_pack, each described in one line, with compact JSON\nresults capped at 2000 tokens unless max_tokens says otherwise"},
+			{Flag: "--no-cluster", Desc: "With --generate on a folder that holds several git repositories:\nindex it as one repository instead of as a cluster"},
 			{Flag: "--version", Desc: "Print version information"},
 			{Flag: "--version --json", Desc: "Print the version and the extractor version as JSON, on stdout.\nThis is the release manifest: what a build is called, and what it\nEXTRACTS LIKE. See UPDATES."},
-			{Flag: "--help, -h", Desc: "Show this help message"},
+			{Flag: "--help, -h", Desc: "Show this help message. Followed by a command, show that\ncommand's help instead: " + bin.Name + " --help <command>"},
 		},
 		ConfigDoc: "Path to the config file (default: mcp-arch.yaml). Set `repos:` in it to\n  name a multi-repo cluster; entries resolve relative to the config file, so\n  a checked-in cluster config means the same thing wherever it is run from.",
 		Examples: []Example{
@@ -296,32 +311,6 @@ func buildSection(bin Binary) Section {
     go build -ldflags "-X %s=0.1.0" -o %s %s
 `, bin.VersionVar, bin.output(), bin.CmdPackage),
 	}
-}
-
-// AppendFlagNote appends note as extra lines to an existing flag's description,
-// so a wrapper can qualify a shared flag without restating the Flags slice. It
-// is a no-op when the flag is absent.
-func (s *HelpSpec) AppendFlagNote(flag, note string) {
-	for i := range s.Flags {
-		if s.Flags[i].Flag == flag {
-			s.Flags[i].Desc += "\n" + note
-			return
-		}
-	}
-}
-
-// InsertSectionsBefore inserts sections immediately before the section with the
-// given title, so a wrapper can place its own blocks precisely rather than only
-// at the end. Sections are appended when the title is not found.
-func (s *HelpSpec) InsertSectionsBefore(title string, secs ...Section) {
-	for i, sec := range s.Sections {
-		if sec.Title == title {
-			rest := append([]Section{}, s.Sections[i:]...)
-			s.Sections = append(append(s.Sections[:i:i], secs...), rest...)
-			return
-		}
-	}
-	s.Sections = append(s.Sections, secs...)
 }
 
 // RenderHelp writes the help text for spec to w.

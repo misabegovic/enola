@@ -16,7 +16,6 @@ package diff
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -145,7 +144,24 @@ const (
 	// facts.SameRepo compares the snapshot's own identity, and a union's members
 	// are not that, so a union that lost a member compared clean.
 	WarnUnionMembership WarningKind = "union_membership"
+	// WarnOtherSession — the baseline was pinned, or the previous run taken, by another
+	// agent session that is still running on the same repository. Advisory: the delta is
+	// real, but its "before" is that session's, so it can include that session's edits.
+	WarnOtherSession WarningKind = "other_session"
 )
+
+// WarningKinds returns every kind this package can raise. It exists for the
+// consumers that keep their own classification of the kinds (the gate's blocking
+// and advisory maps): a test over this list is what stops a kind added here from
+// landing in none of them.
+func WarningKinds() []WarningKind {
+	return []WarningKind{
+		WarnDifferentRepo, WarnRepoLabel, WarnVersionMismatch, WarnExtractorSet,
+		WarnProviderSet, WarnExplainerSet, WarnIgnoreGlobs, WarnInvertedPair,
+		WarnStaleBaseline, WarnPreReceipt, WarnUnclassified, WarnUnionMembership,
+		WarnOtherSession,
+	}
+}
 
 // InvalidatesDelta reports whether a warning means the numbers describe something OTHER
 // than the change being examined — a different repository, a different enola, a different
@@ -275,6 +291,22 @@ type SnapshotDiff struct {
 	FindingsChanged []InsightChange `json:"findings_changed,omitempty"`
 }
 
+// compareSnapshots is compareMeta plus the one question the meta cannot answer.
+// Every surface that holds both snapshots goes through it, so the diff and the
+// receipt comparison cannot give different answers about one pair.
+func compareSnapshots(baseline, current *facts.Snapshot) Comparability {
+	c := compareMeta(baseline.Meta, current.Meta)
+	// The union arm: a multi-repo snapshot's members are labels on its facts,
+	// not fields of its identity.
+	if gone := droppedRepos(baseline, current); len(gone) > 0 {
+		c.add(WarnUnionMembership,
+			"the baseline measured %s and this snapshot does not — every verdict about that code went quiet at once, so a breach that stopped being reported is not a breach that was fixed",
+			strings.Join(gone, ", "))
+		c.Comparable = false
+	}
+	return c
+}
+
 // Compute returns the delta from baseline to current. A nil snapshot is treated
 // as empty (so the first diff against no baseline reports everything as added).
 func Compute(baseline, current *facts.Snapshot) *SnapshotDiff {
@@ -306,15 +338,7 @@ func ComputeChanged(baseline, current *facts.Snapshot, changedFiles []string) *S
 		d.CurrentGeneratedAt = current.Meta.GeneratedAt
 	}
 	if baseline != nil && current != nil {
-		d.Comparability = compareMeta(baseline.Meta, current.Meta)
-		// The union arm, which the meta cannot answer: a multi-repo snapshot's
-		// members are labels on its facts, not fields of its identity.
-		if gone := droppedRepos(baseline, current); len(gone) > 0 {
-			d.Comparability.add(WarnUnionMembership,
-				"the baseline measured %s and this snapshot does not — every verdict about that code went quiet at once, so a breach that stopped being reported is not a breach that was fixed",
-				strings.Join(gone, ", "))
-			d.Comparability.Comparable = false
-		}
+		d.Comparability = compareSnapshots(baseline, current)
 	} else {
 		// No baseline (or no current) to check against — the delta stands alone, so
 		// there is nothing it could be incomparable with.
@@ -724,6 +748,11 @@ func (d *SnapshotDiff) touchedNames() map[string]struct{} {
 	return m
 }
 
+// intentExplainerName is the Source the intent explainer's findings carry. It is
+// spelled here rather than imported: this package needs the name and nothing else
+// from that one.
+const intentExplainerName = "intent"
+
 // findingHasStructuralCause reports whether any entity the finding cites was
 // structurally touched by this change. Evidence-less findings can't be attributed,
 // so they default to real (never silently hidden).
@@ -741,6 +770,14 @@ func findingHasStructuralCause(in facts.Insight, touched map[string]struct{}) bo
 	// the 1.0 "selector cannot be evaluated" finding was filed as incidental and
 	// exited 0 — a vacuous pass wearing the shape of the guarantee against it.
 	if in.Source == constraints.ExplainerName {
+		return true
+	}
+	// An intent finding is the same case. It is declared against measured, and it
+	// cites the DECLARATION: a failed seam claim names the claim, a missing seam
+	// names the consumes entry. Neither moves when the code moves out from under
+	// it, so a route rename that deleted a claimed cross-repo seam filed the 1.0
+	// "Claim failed" as incidental and `--fail-on=intent` exited 0.
+	if in.Source == intentExplainerName {
 		return true
 	}
 	for _, ev := range in.Evidence {
@@ -968,17 +1005,6 @@ func edgeKey(e Edge) string {
 	return e.Repo + "\x00" + e.Source + "\x00" + e.Kind + "\x00" + e.Target
 }
 
-// titleNumber matches the volatile metrics embedded in finding titles (counts,
-// ratios, percentages) so they can be stripped for a stable identity.
-var titleNumber = regexp.MustCompile(`[0-9]+(\.[0-9]+)?`)
-
-// normalizeTitle removes the volatile numbers from a finding title, leaving the
-// stable subject. "Large public surface: x/y exports 67 of 67 symbols (100%)"
-// and the same line with different counts collapse to one identity.
-func normalizeTitle(s string) string {
-	return titleNumber.ReplaceAllString(s, "#")
-}
-
 // groupInsightsByKey buckets findings that share a findingKey, so a group of
 // identically-identified findings is compared member-for-member instead of collapsing
 // to one. Each bucket is sorted by intraInsightOrder so the two sides pair positionally
@@ -986,7 +1012,7 @@ func normalizeTitle(s string) string {
 func groupInsightsByKey(ins []facts.Insight) map[string][]facts.Insight {
 	groups := make(map[string][]facts.Insight, len(ins))
 	for _, in := range ins {
-		k := findingKey(in)
+		k := facts.FindingKey(in)
 		groups[k] = append(groups[k], in)
 	}
 	for _, g := range groups {
@@ -1005,7 +1031,7 @@ func groupInsightsByKey(ins []facts.Insight) map[string][]facts.Insight {
 // already shares an identity. It never enters findingKey, so evidence churn on a lone
 // finding is still not an identity change — see TestCompute_SummaryFindingDoesNotChurn.
 func intraInsightOrder(in facts.Insight) string {
-	return sortedEvidenceEntities(in) + "\x00" + in.Title
+	return facts.EvidenceEntities(in) + "\x00" + in.Title
 }
 
 // insightChanged reports whether two findings under the same identity differ in
@@ -1029,37 +1055,6 @@ func evidenceJSON(ev []facts.Evidence) string {
 		return ""
 	}
 	return string(b)
-}
-
-// findingKey identifies an insight so a finding stays the SAME finding across
-// snapshots even as its metrics drift or a ranked list re-orders.
-//
-// Most explainers name their subject (module/symbol/repo/pattern) in the title
-// and vary only by counts, so the number-normalized title is the stable identity.
-// This is what stops whole-codebase "summary" findings (e.g. the layers pattern,
-// whose evidence enumerates every module) from churning resolve+introduce on any
-// edit. Cycles are the exception: their title carries only a member count, so two
-// distinct cycles would collide — they are keyed on their sorted member modules
-// (the evidence), which is also what makes a cycle stay identified as long as its
-// membership holds.
-func findingKey(in facts.Insight) string {
-	if in.Source == "cycles" {
-		return in.Source + "\x00" + sortedEvidenceEntities(in)
-	}
-	return in.Source + "\x00" + normalizeTitle(in.Title)
-}
-
-// sortedEvidenceEntities joins a finding's cited entities (Fact/Symbol/File) in
-// sorted order — a stable identity for set-defined findings like cycles.
-func sortedEvidenceEntities(in facts.Insight) string {
-	var ents []string
-	for _, ev := range in.Evidence {
-		if e := firstNonEmpty(ev.Fact, ev.Symbol, ev.File); e != "" {
-			ents = append(ents, e)
-		}
-	}
-	sort.Strings(ents)
-	return strings.Join(ents, "\x1f")
 }
 
 // --- helpers ---
@@ -1092,11 +1087,28 @@ func edgeSet(ff []facts.Fact) map[string]Edge {
 
 // propsChanged reports whether two facts sharing an identity differ in their
 // props. encoding/json sorts map keys, so the marshaled form is order-stable.
+//
+// The doc prop is left out of the comparison. It is the comment on a symbol, and
+// a reworded comment is not something a change did to the architecture.
 func propsChanged(a, b facts.Fact) bool {
-	if len(a.Props) == 0 && len(b.Props) == 0 {
+	if a.PropCount() == 0 && b.PropCount() == 0 {
 		return false
 	}
-	return propsJSON(a.Props) != propsJSON(b.Props)
+	if propsJSON(a.Props) == propsJSON(b.Props) {
+		return false
+	}
+	_, aDoc := a.Prop(facts.PropDoc)
+	_, bDoc := b.Prop(facts.PropDoc)
+	if !aDoc && !bDoc {
+		return true
+	}
+	return propsJSON(withoutDoc(a)) != propsJSON(withoutDoc(b))
+}
+
+func withoutDoc(f facts.Fact) map[string]any {
+	props := f.CloneProps()
+	delete(props, facts.PropDoc)
+	return props
 }
 
 func propsJSON(p map[string]any) string {
@@ -1108,15 +1120,6 @@ func propsJSON(p map[string]any) string {
 		return ""
 	}
 	return string(b)
-}
-
-func firstNonEmpty(ss ...string) string {
-	for _, s := range ss {
-		if s != "" {
-			return s
-		}
-	}
-	return ""
 }
 
 func factMatches(f facts.Fact, focusLC string) bool {
@@ -1182,7 +1185,7 @@ func (d *SnapshotDiff) sortAll() {
 // findingSortKey totally orders findings for deterministic rendering: identity first,
 // then whatever separates findings that share it.
 func findingSortKey(in facts.Insight) string {
-	return findingKey(in) + "\x00" + intraInsightOrder(in)
+	return facts.FindingKey(in) + "\x00" + intraInsightOrder(in)
 }
 
 // KindCounts returns counts of facts by kind for the given slice, used by the

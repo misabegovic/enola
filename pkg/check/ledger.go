@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enola-labs/enola/internal/diff"
 	"github.com/enola-labs/enola/internal/explainers/constraints"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/intent"
@@ -61,6 +62,18 @@ type LedgerRule struct {
 	Source  string `json:"source,omitempty"`
 	Repo    string `json:"repo,omitempty"`
 	Because string `json:"because,omitempty"`
+	// Said is the sentence the rule was written from, as the declaration
+	// carries it.
+	Said string `json:"said,omitempty"`
+	// Verdicted reports whether the snapshot reached a verdict on the rule at
+	// all. A rule it did not verdict has no breaches because it was not asked,
+	// which is not the same as a rule that was asked and kept, and
+	// UnverdictedReason, one of constraints.UnverdictedReasons, says which
+	// question the snapshot could not answer, with UnverdictedDetail naming
+	// the component, service or measurement.
+	Verdicted         bool   `json:"verdicted"`
+	UnverdictedReason string `json:"unverdicted_reason,omitempty"`
+	UnverdictedDetail string `json:"unverdicted_detail,omitempty"`
 	// Breaches counts the violations this rule reported in the current
 	// snapshot, suppressed ones included: a suppressed breach is still a breach,
 	// which is the whole point of counting them here.
@@ -71,6 +84,28 @@ type LedgerRule struct {
 	// that never reached the Breaches count because the law was narrowed.
 	Exempted int            `json:"exempted"`
 	Excuses  []LedgerExcuse `json:"excuses,omitempty"`
+	// BreachList is every finding Breaches counted, present only when the list
+	// was asked for. A pointer so an asked-for rule with no breaches still reads
+	// as an empty list, while an unasked ledger is exactly what it was before
+	// the list existed.
+	BreachList *[]LedgerBreach `json:"breach_list,omitempty"`
+}
+
+// LedgerBreach is one counted breach, carrying the identity check pairs
+// findings on, so a reader holding a standing breach takes that identity from
+// the one place that derives it instead of deriving it a second time.
+type LedgerBreach struct {
+	// Identity is diff.FindingIdentity of the finding: the key check pairs a
+	// baseline's findings with the current ones on, and the enola/v1
+	// fingerprint its SARIF prints. Titles that differ only in a number share
+	// one, as they do in check, and each keeps its own entry here.
+	Identity string `json:"identity"`
+	Title    string `json:"title"`
+	File     string `json:"file,omitempty"`
+	Symbol   string `json:"symbol,omitempty"`
+	// Suppressed reports that a ledger entry excused this breach. It is still
+	// listed, as it is still counted: a suppressed breach is still a breach.
+	Suppressed bool `json:"suppressed"`
 }
 
 // LedgerSummary is the counts alone — what the verdict carries, so a gate's
@@ -125,9 +160,30 @@ type Ledger struct {
 // now is a parameter rather than a call to time.Now so an age is testable and
 // a report renders identically for identical inputs.
 func ComputeLedger(store *facts.Store, suppressions []Suppression, findings []facts.Insight, now time.Time) Ledger {
+	return computeLedger(store, suppressions, findings, now, ledgerRows{verdicts: true})
+}
+
+// ComputeLedgerWithBreaches is ComputeLedger with each rule's counted breaches
+// listed. The list is built in the loop that counts, so its length is the
+// count by construction, and it is sorted by identity then title so a rerun is
+// byte-identical. Exempted findings are not breaches and are not listed.
+func ComputeLedgerWithBreaches(store *facts.Store, suppressions []Suppression, findings []facts.Insight, now time.Time) Ledger {
+	return computeLedger(store, suppressions, findings, now, ledgerRows{list: true, verdicts: true})
+}
+
+// ledgerRows says what the rows carry beyond the counts. The verdict flag
+// resolves every declared component again, which a summary alone never reads,
+// so the gate's summary does not pay for it.
+type ledgerRows struct {
+	list     bool
+	verdicts bool
+}
+
+func computeLedger(store *facts.Store, suppressions []Suppression, findings []facts.Insight, now time.Time, rows ledgerRows) Ledger {
 	if store == nil {
 		return Ledger{}
 	}
+	list := rows.list
 	byID := map[string]*LedgerRule{}
 	var order []string
 	for _, f := range store.ByKind(facts.KindIntent) {
@@ -144,6 +200,7 @@ func ComputeLedger(store *facts.Store, suppressions []Suppression, findings []fa
 			Source:  f.PropString("source"),
 			Repo:    f.Repo,
 			Because: f.PropString("because"),
+			Said:    f.PropString("said"),
 		}
 		for _, ex := range intent.DecodeExemptions(f.PropString("exempt")) {
 			rule.Excuses = append(rule.Excuses, LedgerExcuse{
@@ -187,6 +244,7 @@ func ComputeLedger(store *facts.Store, suppressions []Suppression, findings []fa
 	// "signed and still doing work" is told apart from "signed and forgotten".
 	applied := map[string]map[string]bool{}
 	matchedSuppression := map[string]bool{}
+	listed := map[string][]LedgerBreach{}
 	for _, in := range findings {
 		if in.Source != constraintsSource {
 			continue
@@ -214,21 +272,43 @@ func ComputeLedger(store *facts.Store, suppressions []Suppression, findings []fa
 			continue
 		}
 		rule.Breaches++
+		suppressed := false
 		for _, s := range suppressions {
 			if s.suppresses(in) {
 				rule.Suppressed++
+				suppressed = true
 				if s.Rule != "" {
 					matchedSuppression[s.Rule] = true
 				}
 				break
 			}
 		}
+		if list {
+			ev := witnessEvidence(in)
+			listed[id] = append(listed[id], LedgerBreach{
+				Identity:   diff.FindingIdentity(in),
+				Title:      in.Title,
+				File:       ev.File,
+				Symbol:     ev.Symbol,
+				Suppressed: suppressed,
+			})
+		}
+	}
+
+	var unverdicted map[string]constraints.Unverdict
+	if rows.verdicts {
+		unverdicted = constraints.UnverdictedRules(store, findings)
 	}
 
 	led := Ledger{Summary: LedgerSummary{Rules: len(order), ByMode: map[string]int{}}}
 	oldest := -1
 	for _, id := range order {
 		rule := *byID[id]
+		if rows.verdicts {
+			u, not := unverdicted[id]
+			rule.Verdicted = !not
+			rule.UnverdictedReason, rule.UnverdictedDetail = u.Reason, u.Detail
+		}
 		sort.SliceStable(rule.Excuses, func(i, j int) bool {
 			if rule.Excuses[i].Kind != rule.Excuses[j].Kind {
 				return rule.Excuses[i].Kind < rule.Excuses[j].Kind
@@ -251,6 +331,16 @@ func ComputeLedger(store *facts.Store, suppressions []Suppression, findings []fa
 			mode = "ratchet"
 		}
 		led.Summary.ByMode[mode]++
+		if list {
+			breaches := append([]LedgerBreach{}, listed[id]...)
+			sort.SliceStable(breaches, func(i, j int) bool {
+				if breaches[i].Identity != breaches[j].Identity {
+					return breaches[i].Identity < breaches[j].Identity
+				}
+				return breaches[i].Title < breaches[j].Title
+			})
+			rule.BreachList = &breaches
+		}
 		led.Summary.Breaches += rule.Breaches
 		led.Summary.Suppressed += rule.Suppressed
 		led.Summary.Exempted += rule.Exempted
@@ -273,6 +363,21 @@ func ComputeLedger(store *facts.Store, suppressions []Suppression, findings []fa
 		led.Summary.OldestExcuseDays = oldest
 	}
 	return led
+}
+
+// witnessEvidence is the evidence a breach is listed at: the first entry that
+// names a file, which is where every rule form puts its witness, or the first
+// entry when none does.
+func witnessEvidence(in facts.Insight) facts.Evidence {
+	for _, ev := range in.Evidence {
+		if ev.File != "" {
+			return ev
+		}
+	}
+	if len(in.Evidence) > 0 {
+		return in.Evidence[0]
+	}
+	return facts.Evidence{}
 }
 
 // datable reports whether a date string parses as the YYYY-MM-DD both carriers
@@ -308,7 +413,7 @@ func ageDays(date string, now time.Time) int {
 // unasked — the same counterparty rule every other declared-intent surface
 // keeps — and a zeroed ledger would read as a law with nothing wrong with it.
 func AttachLedger(v Verdict, store *facts.Store, p Policy, currentFindings []facts.Insight, now time.Time) Verdict {
-	led := ComputeLedger(store, p.Suppressions, currentFindings, now)
+	led := computeLedger(store, p.Suppressions, currentFindings, now, ledgerRows{})
 	if led.Summary.Rules == 0 {
 		return v
 	}

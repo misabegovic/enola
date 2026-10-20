@@ -68,6 +68,9 @@ func (e *Explainer) verdictIndependent(r rule, store *facts.Store, memberFacts m
 				continue
 			}
 			for _, rel := range f.Relations {
+				if facts.IsStorageAccess(rel.Kind) {
+					continue
+				}
 				target := ownerOf(rel.Target)
 				if !includers[target] {
 					continue

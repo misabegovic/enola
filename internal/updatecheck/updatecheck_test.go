@@ -503,3 +503,56 @@ func TestHumanLineNamesPipForAPipInstall(t *testing.T) {
 		t.Errorf("agent notice gained a command an agent will run:\n%s", agent)
 	}
 }
+
+// TestSuppressedWhenTheBuildNamesNoManifest pins the fourth reason. A build whose
+// linker flags emptied manifestURL must not create ~/.enola or take the lock on
+// the way to a fetch that cannot succeed, and the default URL must not suppress.
+func TestSuppressedWhenTheBuildNamesNoManifest(t *testing.T) {
+	path := isolate(t, "0.3.2")
+	if Suppressed() {
+		t.Fatal("the default manifest URL must not suppress the check")
+	}
+
+	prev := manifestURL
+	manifestURL = ""
+	t.Cleanup(func() { manifestURL = prev })
+
+	if !Suppressed() {
+		t.Fatal("a build with no manifest URL must suppress the check")
+	}
+	if Due() {
+		t.Error("a refresh is reported due for a build with no manifest")
+	}
+	Refresh(context.Background())
+	if _, err := os.Stat(filepath.Dir(path)); err == nil {
+		t.Errorf("Refresh created %s for a build with no manifest", filepath.Dir(path))
+	}
+}
+
+// TestHumanLineSendsAnInstallerBuildToItsInstaller is the imperative's half of the
+// widened guard: `enola upgrade` refuses every install method but "source", so a
+// build stamped by any installer is told to upgrade through it.
+func TestHumanLineSendsAnInstallerBuildToItsInstaller(t *testing.T) {
+	path := isolate(t, "0.3.2")
+	seed(t, path, state{
+		CheckedAt: time.Now().UTC(),
+		Manifest:  Manifest{Version: "0.3.12", ExtractorVersion: "v193"},
+	})
+
+	prev := version.InstallMethod
+	t.Cleanup(func() { version.InstallMethod = prev })
+
+	for method, want := range map[string]string{
+		"homebrew": "Upgrade through homebrew.",
+		"":         "Upgrade through the tool that installed it.",
+	} {
+		version.InstallMethod = method
+		human := HumanLine("v193")
+		if !strings.Contains(human, want) {
+			t.Errorf("install method %q: want %q in:\n%s", method, want, human)
+		}
+		if strings.Contains(human, "enola upgrade") {
+			t.Errorf("install method %q: pointed at the command that refuses it:\n%s", method, human)
+		}
+	}
+}

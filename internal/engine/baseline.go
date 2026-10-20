@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,7 +26,45 @@ const (
 // snapshotArtifactFiles are the on-disk files that constitute a persisted
 // snapshot. receipt.json rides along so a pinned/previous baseline carries its
 // provenance + quality receipt, which compare_receipts diffs against the current.
-var snapshotArtifactFiles = []string{"facts.jsonl", "insights.json", "snapshot.meta.json", "receipt.json"}
+var snapshotArtifactFiles = []string{"facts.jsonl", "insights.json", "snapshot.meta.json", "receipt.json", RunMarkFile}
+
+// Session marks record which agent session produced a run (run.json, beside the
+// artifacts and rotated into previous/ with them) or pinned a baseline (pin.json,
+// inside baseline/). A repository's .enola is shared by every session working on it,
+// so a diff needs them to say when its "before" came from another session.
+const (
+	RunMarkFile = "run.json"
+	PinMarkFile = "pin.json"
+)
+
+// SessionMark is the content of run.json and pin.json.
+type SessionMark struct {
+	// AgentPID is the agent process that ran or pinned; zero when it was not known
+	// (a CLI run from a terminal, or a record written before marks existed).
+	AgentPID int    `json:"agent_pid,omitempty"`
+	At       string `json:"at"` // RFC3339 UTC
+}
+
+// ReadSessionMark reads a session mark from dir, or returns nil when there is none.
+func ReadSessionMark(dir, name string) *SessionMark {
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return nil
+	}
+	var m SessionMark
+	if json.Unmarshal(data, &m) != nil {
+		return nil
+	}
+	return &m
+}
+
+func (e *Engine) writeSessionMark(dir, name string) error {
+	data, err := json.Marshal(SessionMark{AgentPID: e.SessionClient(), At: time.Now().UTC().Format(time.RFC3339)})
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dir, name), data, 0o644)
+}
 
 // OutputDir returns the absolute .enola output directory for repoPath.
 func (e *Engine) OutputDir(repoPath string) string {
@@ -51,18 +90,23 @@ func ResolveBaselineDir(outDir, selector string) string {
 	}
 }
 
-// SetBaseline pins the current on-disk snapshot as the diff baseline by copying
-// the snapshot artifacts from the output dir into <output>/baseline/. Returns an
-// error if no snapshot has been written yet.
+// SetBaseline pins the current on-disk snapshot as the diff baseline by
+// publishing the snapshot artifacts from the output dir into <output>/baseline/
+// (see copyArtifacts). Returns an error if no snapshot has been written yet.
 func (e *Engine) SetBaseline(repoPath string) error {
 	outDir := e.OutputDir(repoPath)
 	if _, err := os.Stat(filepath.Join(outDir, "facts.jsonl")); err != nil {
 		return fmt.Errorf("no snapshot to pin as baseline (run generate_snapshot first): %w", err)
 	}
-	if err := copyArtifacts(outDir, filepath.Join(outDir, BaselineSubdir)); err != nil {
+	dir := filepath.Join(outDir, BaselineSubdir)
+	if err := copyArtifacts(outDir, dir); err != nil {
 		return err
 	}
-	return e.writeBaselineMembers(filepath.Join(outDir, BaselineSubdir))
+	if err := e.writeBaselineMembers(dir); err != nil {
+		return err
+	}
+	// Written after the copy, which republishes the directory.
+	return e.writeSessionMark(dir, PinMarkFile)
 }
 
 // BaselineMembersFile is the per-member provenance manifest a multi-repo pin
@@ -102,10 +146,10 @@ func LoadBaselineMembers(baseDir string) (map[string]facts.SnapshotMeta, error) 
 	return members, nil
 }
 
-// rotatePrevious copies the existing snapshot artifacts (if any) from outDir into
-// outDir/previous/ before they are overwritten, giving a one-step-back baseline
+// rotatePrevious publishes the existing snapshot artifacts (if any) from outDir
+// into outDir/previous/ before they are replaced, giving a one-step-back baseline
 // for diffing without any explicit pin. It is a no-op when no prior snapshot
-// exists. Only the root artifact files are copied, so the previous/ and
+// exists. Only the root artifact files are taken, so the previous/ and
 // baseline/ subdirs are never nested into themselves.
 func rotatePrevious(outDir string) error {
 	if _, err := os.Stat(filepath.Join(outDir, "facts.jsonl")); err != nil {
@@ -139,6 +183,12 @@ func rotatePrevious(outDir string) error {
 // Replacing rather than overlaying also means dstDir ends up holding exactly the
 // current artifact set: a stray file written by an older enola no longer survives
 // indefinitely because nothing overwrites it.
+//
+// Each file is staged as a link to its source where the filesystem allows, and as a
+// copy where it does not. No writer here writes into an artifact that exists: every
+// one is a new file renamed over its name (WriteArtifacts), so a link keeps the bytes
+// it was taken with exactly as a copy would, and costs nothing to take. Copying was
+// half the 50 GB a warm regenerate of a 24-repository cluster wrote.
 func copyArtifacts(srcDir, dstDir string) error {
 	parent := filepath.Dir(dstDir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -154,7 +204,7 @@ func copyArtifacts(srcDir, dstDir string) error {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	for _, name := range snapshotArtifactFiles {
-		if err := copyFile(filepath.Join(srcDir, name), filepath.Join(tmpDir, name)); err != nil {
+		if err := linkOrCopyFile(filepath.Join(srcDir, name), filepath.Join(tmpDir, name)); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
@@ -169,6 +219,20 @@ func copyArtifacts(srcDir, dstDir string) error {
 		return fmt.Errorf("publishing %s: %w", dstDir, err)
 	}
 	return nil
+}
+
+// linkFile is os.Link, a variable so a test can refuse links the way a second
+// filesystem does.
+var linkFile = os.Link
+
+// linkOrCopyFile gives dst, a name that does not exist yet, the file at src: a
+// link, or a copy of its bytes where the link is refused (another filesystem, one
+// without links).
+func linkOrCopyFile(src, dst string) error {
+	if err := linkFile(src, dst); err == nil {
+		return nil
+	}
+	return copyFile(src, dst)
 }
 
 func copyFile(src, dst string) error {
@@ -204,7 +268,7 @@ func LoadSnapshotDir(dir string) (*facts.Snapshot, error) {
 	// scope at the return — the returned slice is the only thing that keeps it alive —
 	// so there is nothing for a copy to protect against.
 	//
-	// It mattered because this runs at the END of every snapshot: recordHistory loads
+	// It mattered because this runs at the END of every snapshot: the history recorder loads
 	// the previous snapshot to summarize the delta, and on a 1.9M-fact graph All's deep
 	// copy of every fact, Props map and Relations slice cost as much again as the load
 	// itself. Measured on the kernel, the history step took footprint from 8.5 GB to
@@ -212,8 +276,7 @@ func LoadSnapshotDir(dir string) (*facts.Snapshot, error) {
 	snap := &facts.Snapshot{Facts: store.FactsRef()}
 
 	if data, err := os.ReadFile(filepath.Join(dir, "insights.json")); err == nil {
-		var ins []facts.Insight
-		if err := json.Unmarshal(data, &ins); err == nil {
+		if ins, err := facts.ReadInsights(data); err == nil {
 			snap.Insights = ins
 		}
 	}
@@ -259,7 +322,7 @@ func (e *Engine) CurrentMeta(repoPath string) *facts.SnapshotMeta {
 	if err != nil {
 		return nil
 	}
-	_, _, allNames, _, walkErr := e.walkRepo(absRepo)
+	_, _, allNames, _, walkErr := e.walkRepo(context.Background(), absRepo)
 	if walkErr != nil {
 		allNames = nil
 	}
@@ -285,7 +348,7 @@ func (e *Engine) CurrentMeta(repoPath string) *facts.SnapshotMeta {
 		EnolaVersion:     version.Version,
 		ExtractorVersion: cacheVersion,
 		Git:              git,
-		ConfigHash:       computeConfigHash(e.cfg),
+		ConfigHash:       configHashWith(e.cfg, e.providers.Providers),
 		IgnoreGlobHash:   computeIgnoreGlobHash(e.cfg),
 	}
 }

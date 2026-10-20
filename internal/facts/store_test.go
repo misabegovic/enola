@@ -1046,3 +1046,44 @@ func TestTagRange_IndexesEachFactOnceUnderItsRepo(t *testing.T) {
 		t.Fatalf("ByFile(svc/m.go) = %d, want 2", got)
 	}
 }
+
+// ExcludeKinds is applied before the limit, so a capped query over a store that
+// holds test cases returns exactly what it returned before they existed.
+func TestQueryAdvanced_ExcludeKindsBeforeTheLimit(t *testing.T) {
+	s := NewStore()
+	for i := 0; i < 3; i++ {
+		s.Add(Fact{Kind: KindTestCase, Name: TestCaseName("area_test.go", fmt.Sprintf("TestArea%d", i)), File: "area_test.go"})
+	}
+	s.Add(Fact{Kind: KindSymbol, Name: "pkg.Area", File: "area.go"})
+	s.Add(Fact{Kind: KindSymbol, Name: "pkg.AreaOf", File: "area.go"})
+
+	got, total := s.QueryAdvanced(QueryOpts{Name: "area", ExcludeKinds: []string{KindTestCase}, Limit: 2})
+	if total != 2 || len(got) != 2 || got[0].Name != "pkg.Area" || got[1].Name != "pkg.AreaOf" {
+		t.Errorf("got %d of %d: %+v, want the two symbols", len(got), total, got)
+	}
+	if _, total := s.QueryAdvanced(QueryOpts{Name: "area", Limit: 2}); total != 5 {
+		t.Errorf("without ExcludeKinds total = %d, want 5", total)
+	}
+}
+
+func TestStore_HasFileOutside(t *testing.T) {
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindSymbol, Name: "a.A", Repo: "api", File: "api/a.go"},
+		Fact{Kind: KindModule, Name: "a", Repo: "api"}, // no file: says nothing either way
+		Fact{Kind: KindDependency, Name: "module-edge: a -> b", Repo: "api", File: "a"},
+		Fact{Kind: KindSymbol, Name: "b.B", Repo: "web", File: "src/b.ts"},
+	)
+	if s.HasFileOutside("api", KindSymbol, "api/") {
+		t.Error("every api symbol is under api/; the dependency outside it is another kind")
+	}
+	if !s.HasFileOutside("api", KindDependency, "api/") {
+		t.Error("the api dependency names a file outside api/")
+	}
+	if !s.HasFileOutside("web", KindSymbol, "web/") {
+		t.Error("src/b.ts is outside web/")
+	}
+	if s.HasFileOutside("absent", KindSymbol, "absent/") {
+		t.Error("a repo the store does not hold has no file anywhere")
+	}
+}

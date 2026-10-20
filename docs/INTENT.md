@@ -18,7 +18,7 @@ enola-defined schema:
 |---|---|---|
 | `enola-intent.yaml` | a repo's root | that repo's own declaration |
 | `intent:` block | a cluster config (`mcp-arch.yaml`) | per-repo declarations for an estate, overriding repo files wholesale |
-| `enola_intent:` key | a markdown page's YAML frontmatter | intent declared where the *decision* lives — a wiki, a docs tree |
+| `enola_intent:` key | a page's YAML frontmatter: a `.md` file, or a file of another page extension the build reads | intent declared where the *decision* lives — a wiki, a docs tree |
 
 For markdown, the key is deliberately namespaced: a wiki's own
 toolchain, linters and renderers ignore `enola_intent:`, and enola
@@ -28,6 +28,14 @@ stays prose. If your wiki has its own conventions (statuses, source
 citations, ownership fields), your tooling can *derive* the
 `enola_intent:` block from them — but that derivation is your side of
 the boundary; enola's contract is the block itself.
+
+A build reads pages ending in `.md`, and may be linked to read more page
+extensions beside it
+(`-X github.com/enola-labs/enola/internal/intent.PageExtensions=.ext`, a
+comma-separated list; `.md` is never an entry). A page of a listed
+extension is read exactly as a markdown page is: a file carrying the key
+compiles as intent, and a file without it is a document of headings and
+links. A build that lists nothing reads markdown alone.
 
 ## The repo and cluster schema
 
@@ -183,7 +191,10 @@ decision lives, not inside the repo it governs.
   its supply chain, reviewed beside the manifest it describes.
 - **`rel`** — how pages relate: `depends-on`, `supersedes`,
   `superseded-by`, `part-of`, `relates-to`. Targets are
-  repo-relative markdown paths.
+  repo-relative paths of pages the build reads: `.md` files, and files
+  of any further page extension the build lists. A target of another
+  extension fails the block, so a relation the build could never
+  resolve is refused rather than reported dangling.
 - **`anchors`** — where a relation joins page to page, an anchor
   joins page to code: a repo label plus a repo-relative path,
   either a file or a directory prefix. A validated shape rather
@@ -195,7 +206,13 @@ decision lives, not inside the repo it governs.
   is a claim with nothing to check it against, so the anchor
   rather than the prose is what makes a decision enforceable —
   and an anchor that stops resolving is a citation announcing it
-  went stale, instead of waiting for a reader to notice.
+  went stale, instead of waiting for a reader to notice. A file anchor
+  may add `symbol:`, a fact name as the extractor spells it
+  (`{repo: backend, path: app/models/profile.rb, symbol:
+  "Profile#record_ledger"}`): the reverse query for a symbol then
+  returns that page only for the symbol and the methods of a class it
+  names, a measured file holding no fact of that name is dangling, and
+  every file-level reader still counts the file as governed.
 - **`origin`** — where knowledge came from: `slack`, `langfuse`,
   `notion`, `github`, `web`, `repo`, `other`. Channels, not source
   files: the entry names the class of system the page's evidence was

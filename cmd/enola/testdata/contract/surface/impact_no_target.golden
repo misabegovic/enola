@@ -1,0 +1,39 @@
+$ enola impact
+exit: 2
+--- stdout
+--- stderr
+Usage: enola impact [flags] <target> [repo_path|config_path]
+
+Compute the blast radius of changing a node in the snapshot on disk: everything
+that transitively depends on it, grouped by hop depth, and the knowledge pages
+anchored to its file. <target> is matched as the impact_analysis MCP tool
+matches it, and the output is the tool's own, in the mode asked for. Narrow a
+target with a scope prefix, quoted as one argument: 'kind:symbol Alpha',
+'file:pkg/a Alpha', 'repo:backend Alpha'. A path to a source file reaches what
+depends on anything the file declares.
+
+Use endpoint when what you have is a URL; use this when you have a symbol.
+
+The snapshot is read, never generated: with none on disk this exits 2 and says
+how to generate one.
+
+Exit codes:
+  0  the report was produced
+  2  the command could not run, the tool reported an error, or nothing was
+     traversed because the target matched too many nodes to pick from
+
+Flags:
+  -include-forward
+    	also include what the target depends on
+  -json
+    	the tool's full mode, its raw JSON; the same as --output-mode full
+  -list
+    	the dependents by depth, with their files; the same as --output-mode compact
+  -max-depth int
+    	how many hops of impact to compute, 1-10 (default the tool's, 3)
+  -max-nodes int
+    	maximum impacted nodes to return, 1-500 (default the tool's, 200); the total reported stays exact
+  -max-tokens int
+    	a hard cap on output size in approximate tokens, cut on a line boundary with the tool's notice
+  -output-mode string
+    	summary (the tool's default), compact, or full

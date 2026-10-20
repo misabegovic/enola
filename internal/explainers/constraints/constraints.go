@@ -158,7 +158,12 @@ var memberKinds = []string{facts.KindModule, facts.KindSymbol, facts.KindRoute, 
 // `where: {type: package, pinned: false}` selects exactly the declared packages
 // that name no single version. Naming the kind is the whole opt-in: a
 // declaration that omits `kind:` ranges over memberKinds exactly as before.
-var referenceMemberKinds = []string{facts.KindTestRef, facts.KindFileRef, facts.KindLint, facts.KindDependency}
+//
+// test_case joins them for test_ref's reason: a component written over a
+// directory must not start holding every test in it because tests became facts.
+// runtime_unit joins for the same reason: a deploy file's units are selected by
+// naming the kind, never swept into a component over config/.
+var referenceMemberKinds = []string{facts.KindTestRef, facts.KindFileRef, facts.KindLint, facts.KindDependency, facts.KindTestCase, facts.KindRuntimeUnit}
 
 // reachVias are the edge kinds the private form walks — the same closed
 // vocabulary a rule's via may name, kept as a sorted slice here because the
@@ -247,6 +252,55 @@ type rule struct {
 	growth                    int
 	owns                      map[string]string
 	exempt                    []intent.ConstraintExemption
+	// repo is the label of the repository whose declaration compiled the
+	// rule, the first place a component name it uses is read.
+	repo string
+	// ambiguous lists the component names this rule uses that two or more
+	// other repositories of a union declare and its own does not. A rule
+	// holding one is refused rather than verdicted.
+	ambiguous []ambiguousName
+
+	// said is the sentence the rule was written from, carried to its findings
+	// and never read.
+	said string
+}
+
+// ambiguousName is one component name with no single reading for a rule: the
+// repositories that declare it, none of them the rule's own.
+type ambiguousName struct {
+	name  string
+	repos []string
+}
+
+// renameComponents rewrites every component name the rule uses, in every role
+// that can hold one: the subject of each form, the counterpart roles, the
+// forbid_cycles list, and the keys of the rule's own ownership overrides. It is
+// the one place that knows which fields those are, so a reading keyed by
+// anything but the bare name cannot miss a role.
+func (r *rule) renameComponents(rename func(string) string) {
+	for _, field := range []*string{
+		&r.forbid, &r.forbidReach, &r.allow, &r.protect, &r.private, &r.forbidFact,
+		&r.cap, &r.require, &r.requireEdge, &r.requireDefines, &r.forbidCycles,
+		&r.independent, &r.requireName, &r.forbidName, &r.protocol, &r.guide,
+		&r.storageStaysHome, &r.capRuntime, &r.requireConsumer, &r.uniqueAcross,
+		&r.requireGoverned, &r.to,
+	} {
+		if *field != "" {
+			*field = rename(*field)
+		}
+	}
+	for _, list := range [][]string{r.only, r.owners, r.except, r.steps, r.among} {
+		for i, name := range list {
+			list[i] = rename(name)
+		}
+	}
+	if len(r.owns) > 0 {
+		owns := make(map[string]string, len(r.owns))
+		for name, value := range r.owns {
+			owns[rename(name)] = value
+		}
+		r.owns = owns
+	}
 }
 
 func (r rule) advisory() bool { return r.mode == "advisory" }
@@ -279,28 +333,129 @@ func (r rule) titled(rest string) string {
 // declarations reads the compiled component and rule intent facts back into
 // their evaluable shapes — shared between the explainer's verdict pass and the
 // contract query, so the two can never read a declaration differently.
+//
+// Components are keyed by the repository whose declaration compiled them and
+// the name. The screen that refuses a duplicate name runs per repository, so in
+// a union two repositories may each declare core with a different selector,
+// and keying the union by bare name would verdict one repository's rules
+// against the other's core. A name one repository declares keeps the bare name
+// as its key, which is every single-repository snapshot; a name two or more
+// declare is keyed name@repository for each, and every rule's references are
+// rewritten to the key it reads.
 func declarations(store *facts.Store) (map[string]component, []rule) {
-	components := map[string]component{}
+	type declared struct {
+		repo string
+		c    component
+	}
+	var order []declared
+	seen := map[[2]string]bool{}
+	declarers := map[string][]string{}
 	var rules []rule
 	for _, f := range store.ByKind(facts.KindIntent) {
 		switch f.PropString("intent_kind") {
 		case "component":
 			c := decodeComponent(f)
-			// First declaration wins, which is what the declaration screen's own
-			// index does. A duplicate component name is refused there, so a
-			// second fact for one name reaches this loop only from a store the
-			// screen never passed — and the answer it gets must still be the
-			// screen's, or a declaration compiles under one reading and verdicts
-			// under the other.
-			if _, seen := components[c.name]; !seen {
-				components[c.name] = c
+			// First declaration wins within a repository, which is what the
+			// declaration screen's own index does. A duplicate component name is
+			// refused there, so a second fact for one name reaches this loop only
+			// from a store the screen never passed — and the answer it gets must
+			// still be the screen's, or a declaration compiles under one reading
+			// and verdicts under the other.
+			at := [2]string{f.Repo, c.name}
+			if seen[at] {
+				continue
 			}
+			seen[at] = true
+			declarers[c.name] = append(declarers[c.name], f.Repo)
+			order = append(order, declared{repo: f.Repo, c: c})
 		case "rule":
-			rules = append(rules, decodeRule(f))
+			r := decodeRule(f)
+			r.repo = f.Repo
+			rules = append(rules, r)
 		}
+	}
+	for _, repos := range declarers {
+		sort.Strings(repos)
+	}
+	components := make(map[string]component, len(order))
+	for _, d := range order {
+		components[componentKey(d.c.name, d.repo, declarers)] = d.c
+	}
+	for i := range rules {
+		rules[i].readNamesInOwnRepository(declarers)
 	}
 	sort.Slice(rules, func(i, j int) bool { return rules[i].id < rules[j].id })
 	return components, rules
+}
+
+// componentKey is the key one repository's declaration of a name is held
+// under: the bare name while no other repository declares it.
+func componentKey(name, repo string, declarers map[string][]string) string {
+	if len(declarers[name]) < 2 {
+		return name
+	}
+	return name + "@" + repo
+}
+
+// readNamesInOwnRepository rewrites each component name the rule uses to the
+// declaration it reads: its own repository's, or else the one other
+// repository's that declares it. A name two or more other repositories declare
+// is left as written and recorded as ambiguous, because taking whichever came
+// first is the misreading this exists to stop.
+func (r *rule) readNamesInOwnRepository(declarers map[string][]string) {
+	recorded := map[string]bool{}
+	r.renameComponents(func(name string) string {
+		repos := declarers[name]
+		if len(repos) < 2 {
+			return name
+		}
+		for _, repo := range repos {
+			if repo == r.repo {
+				return name + "@" + repo
+			}
+		}
+		if !recorded[name] {
+			recorded[name] = true
+			r.ambiguous = append(r.ambiguous, ambiguousName{name: name, repos: repos})
+		}
+		return name
+	})
+	sort.Slice(r.ambiguous, func(i, j int) bool { return r.ambiguous[i].name < r.ambiguous[j].name })
+}
+
+// CauseAmbiguousComponent refuses a rule in a union whose component name two
+// or more other repositories declare and its own does not.
+const CauseAmbiguousComponent = "ambiguous_component"
+
+// ambiguousNameInsights refuses a rule by each name it cannot read, the
+// counterparty rule's shape at the level of a name: no reading of the
+// component is the rule's own, so any verdict would be about someone else's
+// part of the code.
+func ambiguousNameInsights(r rule) []facts.Insight {
+	own := r.repo
+	if own == "" {
+		own = "the rule's own repository"
+	}
+	out := make([]facts.Insight, 0, len(r.ambiguous))
+	for _, a := range r.ambiguous {
+		declaredBy := wordList(a.repos)
+		out = append(out, unevaluableRule(r, CauseAmbiguousComponent,
+			fmt.Sprintf("component %s is declared by %s, not by %s", a.name, declaredBy, own),
+			fmt.Sprintf("The rule names %s, and in this union %s each declare a component of that name while %s, which declared the rule, does not. A rule reads a name in its own repository first and otherwise in the one other repository declaring it; with two or more there is no single reading, so the rule emitted no verdict rather than judging against whichever declaration came first.", a.name, declaredBy, own),
+			fmt.Sprintf("Declare %s in %s, or rename the declarations so the name the rule means has one reading in the union", a.name, own)))
+	}
+	return out
+}
+
+// wordList joins names the way a sentence lists them.
+func wordList(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 }
 
 // decodeComponent reads one compiled component fact back into the selector
@@ -335,6 +490,7 @@ func decodeRule(f facts.Fact) rule {
 		recipe:           f.PropString("recipe"),
 		instance:         f.PropString("instance"),
 		because:          f.PropString("because"),
+		said:             f.PropString("said"),
 		source:           f.PropString("source"),
 		forbid:           f.PropString("forbid"),
 		forbidReach:      f.PropString("forbid_reach"),
@@ -524,7 +680,7 @@ func (e *Explainer) evaluate(store *facts.Store, opts evaluation) evaluated {
 			continue
 		}
 		for _, f := range store.FactsRef() {
-			if visible, ok := f.Props["exported"].(bool); ok && visible && f.File != "" {
+			if visible, ok := f.PropAny("exported").(bool); ok && visible && f.File != "" {
 				exportedFiles[f.File] = true
 			}
 		}
@@ -536,15 +692,18 @@ func (e *Explainer) evaluate(store *facts.Store, opts evaluation) evaluated {
 	// breach. The resolvable set is every canonical member-kind fact name,
 	// plus the service nodes: a service-to-service edge targets a repo label,
 	// and skipping it as unresolvable would blind allow-only to every
-	// cross-repo landing.
-	resolvable := map[string]bool{}
+	// cross-repo landing. A name alone is not a landing, though: in a union a
+	// call's bare name meets same-named facts of other repositories, and its
+	// own repository's service node, so each is kept with where it was
+	// measured and asked whether the edge can land on it.
+	resolvable := landings{}
 	for _, r := range rules {
 		if r.allow == "" {
 			continue
 		}
 		for _, kind := range append(append([]string{}, memberKinds...), facts.KindService) {
 			for _, f := range store.ByKind(kind) {
-				resolvable[f.Name] = true
+				resolvable.add(f)
 			}
 		}
 		break
@@ -631,6 +790,10 @@ func (e *Explainer) evaluate(store *facts.Store, opts evaluation) evaluated {
 
 	var insights []facts.Insight
 	for _, r := range rules {
+		if len(r.ambiguous) > 0 {
+			insights = append(insights, ambiguousNameInsights(r)...)
+			continue
+		}
 		if namesUnasked(r, unasked) || namesUnasked(r, unevaluable) {
 			continue
 		}
@@ -651,6 +814,14 @@ func (e *Explainer) evaluate(store *facts.Store, opts evaluation) evaluated {
 			verdicts = stampSince(r, verdicts)
 		}
 		decided := exemptVerdicts(r, verdicts)
+		if r.said != "" {
+			// Ahead of the description rather than after it: readers take the
+			// rationale from the description's closing "Because:", so the
+			// sentence goes where it cannot become part of that.
+			for i := range decided {
+				decided[i].Description = fmt.Sprintf("Said: %q. %s", r.said, decided[i].Description)
+			}
+		}
 		if r.recipe != "" {
 			for i := range decided {
 				decided[i].Description += fmt.Sprintf(" This verdict traces to rule %s (recipe %s, instantiated in %s).", r.id, r.recipe, r.source)
@@ -724,9 +895,12 @@ func (e *Explainer) verdictsFor(r rule, guard bool, run func() []facts.Insight) 
 // make one rule fail and prove the radius names it instead of staying silent.
 var verdictSeam func(r rule)
 
-func (e *Explainer) verdictsOf(r rule, store *facts.Store, graphWalk []facts.Fact, resolve *resolver, ground *grounding, resolvable map[string]bool, members map[string]map[string]bool, memberFacts, carriers, carried map[string][]facts.Fact, exportedFiles, definedNames, composed map[string]bool, census map[string]map[string]bool) []facts.Insight {
+func (e *Explainer) verdictsOf(r rule, store *facts.Store, graphWalk []facts.Fact, resolve *resolver, ground *grounding, resolvable landings, members map[string]map[string]bool, memberFacts, carriers, carried map[string][]facts.Fact, exportedFiles, definedNames, composed map[string]bool, census map[string]map[string]bool) []facts.Insight {
 	if verdictSeam != nil {
 		verdictSeam(r)
+	}
+	if refusal, refused := accessUnmeasured(r, store, memberFacts); refused {
+		return []facts.Insight{refusal}
 	}
 	var verdicts []facts.Insight
 	switch {
@@ -911,7 +1085,7 @@ func deadExemptionInsight(r rule, ex intent.ConstraintExemption) facts.Insight {
 // component into the to component.
 func (e *Explainer) verdictForbid(r rule, resolve *resolver, ground *grounding) []facts.Insight {
 	var out []facts.Insight
-	skipped := map[string]bool{}
+	skipped, outside := map[string]bool{}, map[string]bool{}
 	for _, f := range resolve.sources(r, r.forbid) {
 		from, sourced := resolve.source(r, r.forbid, f)
 		if !sourced {
@@ -940,7 +1114,11 @@ func (e *Explainer) verdictForbid(r rule, resolve *resolver, ground *grounding) 
 				onto, landed = resolve.target(r, r.to, rel, f)
 				if !landed {
 					if ground.ungroundable(rel, f) {
-						skipped[rel.Target] = true
+						if ground.outside(rel, f) {
+							outside[rel.Target] = true
+						} else {
+							skipped[rel.Target] = true
+						}
 					}
 					continue
 				}
@@ -966,6 +1144,9 @@ func (e *Explainer) verdictForbid(r rule, resolve *resolver, ground *grounding) 
 	out = dedupVerdicts(out)
 	if len(skipped) > 0 {
 		out = append(out, groundSkipInsight(r, skipped))
+	}
+	if len(outside) > 0 {
+		out = append(out, outsideInsight(r, outside))
 	}
 	return out
 }
@@ -1192,7 +1373,7 @@ func reachWitnesses(adjacency map[string][]string, source string, toSet map[stri
 // only: would make each rule assert something nobody decided. An edge whose
 // target resolves to nothing measured is skipped — fail closed, never guessed
 // into a breach.
-func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable map[string]bool, ground *grounding) []facts.Insight {
+func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable landings, ground *grounding) []facts.Insight {
 	// One target question, asked of the allow component and of every allowed
 	// landing in turn — exact name, then a member's method, then the measured
 	// file a path target grounds onto.
@@ -1208,7 +1389,7 @@ func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable map[s
 		return false
 	}
 	var out []facts.Insight
-	skipped := map[string]bool{}
+	skipped, outside := map[string]bool{}, map[string]bool{}
 	for _, f := range resolve.sources(r, r.allow) {
 		from, sourced := resolve.source(r, r.allow, f)
 		if !sourced {
@@ -1218,9 +1399,14 @@ func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable map[s
 			if rel.Kind != r.via {
 				continue
 			}
-			if !resolvable[rel.Target] && !ground.resolves(rel, f) {
+			measured := resolvable.measured(rel, f)
+			if !measured && !ground.resolves(rel, f) {
 				if ground.ungroundable(rel, f) {
-					skipped[rel.Target] = true
+					if ground.outside(rel, f) {
+						outside[rel.Target] = true
+					} else {
+						skipped[rel.Target] = true
+					}
 				}
 				continue
 			}
@@ -1228,7 +1414,7 @@ func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable map[s
 				continue
 			}
 			onto := groundedBasis
-			if resolvable[rel.Target] {
+			if measured {
 				onto = exactBasis
 			}
 			out = append(out, facts.Insight{
@@ -1252,7 +1438,50 @@ func (e *Explainer) verdictAllowOnly(r rule, resolve *resolver, resolvable map[s
 	if len(skipped) > 0 {
 		out = append(out, groundSkipInsight(r, skipped))
 	}
+	if len(outside) > 0 {
+		out = append(out, outsideInsight(r, outside))
+	}
 	return out
+}
+
+// landings holds, by name, the repository and kind of every fact an edge's bare
+// target may name, each pair once: a union's 500 queues named default in one
+// repository are one place a call could land, not 500.
+type landings map[string][]landing
+
+type landing struct{ kind, repo string }
+
+func (l landings) add(f facts.Fact) {
+	at := landing{kind: f.Kind, repo: f.Repo}
+	for _, seen := range l[f.Name] {
+		if seen == at {
+			return
+		}
+	}
+	l[f.Name] = append(l[f.Name], at)
+}
+
+// measured reports whether an edge's target names a fact the edge can land
+// on, asked the way the written target_id asks it: the caller's own repository
+// first, the rest of the union only when it holds nothing of the name.
+func (l landings) measured(rel facts.Relation, from facts.Fact) bool {
+	named := l[rel.Target]
+	home := false
+	for _, at := range named {
+		if at.repo == from.Repo {
+			home = true
+			break
+		}
+	}
+	for _, at := range named {
+		if home && at.repo != from.Repo {
+			continue
+		}
+		if facts.LandsByName(from, rel, facts.Fact{Kind: at.kind, Repo: at.repo}) {
+			return true
+		}
+	}
+	return false
 }
 
 // verdictProtect emits one violation per measured via-edge landing on a member
@@ -1327,7 +1556,7 @@ func (e *Explainer) verdictPrivate(r rule, graphWalk []facts.Fact, resolve *reso
 	// surface at all.
 	public := resolve.components[r.private].public
 	for _, f := range memberFacts[r.private] {
-		visible, ok := f.Props["exported"].(bool)
+		visible, ok := f.PropAny("exported").(bool)
 		if len(public) > 0 && f.File != "" {
 			visible, ok = matchConstraintPath(f.File, public), true
 		}
@@ -1645,7 +1874,7 @@ func (e *Explainer) verdictRequireDefines(r rule, memberFacts map[string][]facts
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		if sk, _ := f.Props["symbol_kind"].(string); definesMethods(sk) {
+		if sk, _ := f.PropAny("symbol_kind").(string); definesMethods(sk) {
 			if _, seen := classKind[f.Name]; !seen {
 				classKind[f.Name] = true
 			}
@@ -2519,7 +2748,7 @@ func firstFactByName(sorted []facts.Fact) map[string]facts.Fact {
 // goes through, where an int survives as a float64. Copied from intentcheck
 // rather than shared, for the same reason the path matcher is.
 func intPropOf(f facts.Fact, key string) (int, bool) {
-	switch v := f.Props[key].(type) {
+	switch v := f.PropAny(key).(type) {
 	case int:
 		return v, true
 	case float64:

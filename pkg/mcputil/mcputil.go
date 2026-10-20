@@ -1,5 +1,5 @@
-// Package mcputil holds the shared MCP tool-output helpers used by enola's OSS
-// server and by out-of-module tools (enola-enterprise): result builders, the
+// Package mcputil holds the shared MCP tool-output helpers used by enola's own
+// server and by tools outside this module: result builders, the
 // summary→compact→full output-mode ladder, and a token cap. Centralizing them
 // keeps every tool on one verbosity model and output shape.
 package mcputil
@@ -75,12 +75,16 @@ const approxTokensPerChar = 4
 // boundary and appending a notice that tells the caller how to narrow. maxTokens
 // <= 0 disables the cap. isJSON marks output whose structure truncation breaks
 // (full mode), so the notice makes that explicit.
+//
+// Text CapTokens already cut to this budget is returned as it is. A server that caps
+// every result by default meets output a tool has already cut to the caller's
+// max_tokens, and cutting it again would drop the notice the first cut wrote.
 func CapTokens(s string, maxTokens int, isJSON bool) string {
 	if maxTokens <= 0 {
 		return s
 	}
 	limit := maxTokens * approxTokensPerChar
-	if len(s) <= limit {
+	if len(s) <= limit || alreadyCapped(s, maxTokens, limit) {
 		return s
 	}
 	cut := s[:limit]
@@ -88,13 +92,33 @@ func CapTokens(s string, maxTokens int, isJSON bool) string {
 	if nl := strings.LastIndexByte(cut, '\n'); nl > 0 {
 		cut = cut[:nl]
 	}
-	notice := fmt.Sprintf("\n\n[truncated: output exceeded max_tokens=%d. "+
-		"Re-run with output_mode=summary, tighter filters, or a lower max_depth/max_nodes/limit.]", maxTokens)
 	if isJSON {
-		notice = fmt.Sprintf("\n\n[truncated: JSON output exceeded max_tokens=%d and is no longer valid JSON. "+
-			"Re-run with output_mode=summary/compact, or raise max_tokens / narrow the query.]", maxTokens)
+		return cut + jsonCapNotice(maxTokens)
 	}
-	return cut + notice
+	return cut + textCapNotice(maxTokens)
+}
+
+// Worded to be true of every tool, because this is shared and knows none of them: it
+// used to recommend output_mode=summary, which some tools do not have and others
+// were already answering in.
+const capRemedy = "Narrow the query (tighter filters, a lower limit or depth, or a smaller output_mode " +
+	"where the tool has one), raise max_tokens for more, or pass a negative max_tokens for all of it."
+
+func textCapNotice(maxTokens int) string {
+	return fmt.Sprintf("\n\n[truncated: output exceeded max_tokens=%d. %s]", maxTokens, capRemedy)
+}
+
+func jsonCapNotice(maxTokens int) string {
+	return fmt.Sprintf("\n\n[truncated: JSON output exceeded max_tokens=%d and is no longer valid JSON. %s]", maxTokens, capRemedy)
+}
+
+func alreadyCapped(s string, maxTokens, limit int) bool {
+	for _, notice := range []string{textCapNotice(maxTokens), jsonCapNotice(maxTokens)} {
+		if strings.HasSuffix(s, notice) && len(s)-len(notice) <= limit {
+			return true
+		}
+	}
+	return false
 }
 
 // IsGeneratedPath reports whether a repo-relative path is build/generated/vendored
@@ -128,5 +152,7 @@ func IsGeneratedPath(p string) bool {
 			return true
 		}
 	}
-	return false
+	// `zz_generated.deepcopy.go`, `zz_generated.openapi.go`: the name the
+	// Kubernetes code generators give every file they write.
+	return strings.HasPrefix(base, "zz_generated.")
 }

@@ -134,3 +134,44 @@ func TestExplain_ForbidFactOverLintFactsWrapsALinterRule(t *testing.T) {
 		t.Fatalf("evidence = %+v", violations[0].Evidence)
 	}
 }
+
+// TestTestCaseIsReferenceOnly_SelectedOnlyByNamingTheKind: a component over a
+// directory holds the production facts in it and none of its tests, and a
+// component that names kind test_case holds the tests and nothing else.
+func TestTestCaseIsReferenceOnly_SelectedOnlyByNamingTheKind(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindIntent, Name: "component: pkg-code", File: "enola/constraints/c.yaml",
+			Props: map[string]any{"intent_kind": "component", "component": "pkg-code", "match": "pkg/**", "source": "enola/constraints/c.yaml"}},
+		facts.Fact{Kind: facts.KindIntent, Name: "component: pkg-tests", File: "enola/constraints/c.yaml",
+			Props: map[string]any{"intent_kind": "component", "component": "pkg-tests", "match": "pkg/**", "kind": "test_case", "source": "enola/constraints/c.yaml"}},
+		facts.Fact{Kind: facts.KindIntent, Name: "rule: no-code", File: "enola/constraints/c.yaml",
+			Props: map[string]any{"intent_kind": "rule", "rule": "no-code", "forbid_fact": "pkg-code", "because": "probe", "source": "enola/constraints/c.yaml"}},
+		facts.Fact{Kind: facts.KindIntent, Name: "rule: no-tests", File: "enola/constraints/c.yaml",
+			Props: map[string]any{"intent_kind": "rule", "rule": "no-tests", "forbid_fact": "pkg-tests", "because": "probe", "source": "enola/constraints/c.yaml"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "pkg.Area", File: "pkg/area.go", Line: 3},
+		facts.Fact{Kind: facts.KindTestCase, Name: facts.TestCaseName("pkg/area_test.go", "TestArea"), File: "pkg/area_test.go", Line: 5, EndLine: 7},
+	)
+	insights, err := New().Explain(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidenceFiles := func(rule string) []string {
+		var files []string
+		for _, in := range insights {
+			if !strings.Contains(in.Title, rule+" violated") {
+				continue
+			}
+			for _, ev := range in.Evidence {
+				files = append(files, ev.File)
+			}
+		}
+		return files
+	}
+	if got := evidenceFiles("no-code"); len(got) != 1 || got[0] != "pkg/area.go" {
+		t.Errorf("no-code evidence = %v, want only pkg/area.go: a test_case must not join a component that did not name its kind", got)
+	}
+	if got := evidenceFiles("no-tests"); len(got) != 1 || got[0] != "pkg/area_test.go" {
+		t.Errorf("no-tests evidence = %v, want only pkg/area_test.go", got)
+	}
+}

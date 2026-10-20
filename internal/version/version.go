@@ -20,7 +20,8 @@ var Version = "dev"
 // the PyPI wheel built in packaging/pypi, where pip records the file's hash and
 // path and will overwrite or remove it on the next operation.
 //
-// Only "pip" currently changes any behaviour. The value is deliberately a plain
-// string rather than a bool so that a future installer (a distro package, a
-// Homebrew formula) can name itself without another linker flag.
+// Any value other than "source" makes `enola upgrade` refuse and name that value
+// as the owner; "pip" also gets the pip command spelled out. The value is
+// deliberately a plain string rather than a bool so that a future installer (a
+// distro package, a Homebrew formula) can name itself without another linker flag.
 var InstallMethod = "source"

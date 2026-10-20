@@ -10,15 +10,22 @@ import (
 )
 
 // targetsOf returns the RelCalls targets of a single test-ref fact, failing the
-// test unless exactly one fact was produced and it has the shape the contract
+// test unless exactly one test_ref was produced and it has the shape the contract
 // demands: kind test_ref, name == file == relFile, language "go", and no
-// relation other than "calls".
+// relation other than "calls". The test_case facts the pass emits beside it are
+// set aside here and asserted by their own tests.
 func targetsOf(t *testing.T, ff []facts.Fact, relFile string) map[string]bool {
 	t.Helper()
-	if len(ff) != 1 {
-		t.Fatalf("want exactly 1 test_ref fact, got %d: %+v", len(ff), ff)
+	var refs []facts.Fact
+	for _, f := range ff {
+		if f.Kind != facts.KindTestCase {
+			refs = append(refs, f)
+		}
 	}
-	f := ff[0]
+	if len(refs) != 1 {
+		t.Fatalf("want exactly 1 test_ref fact, got %d: %+v", len(refs), refs)
+	}
+	f := refs[0]
 	if f.Kind != facts.KindTestRef {
 		t.Fatalf("kind = %q, want %q", f.Kind, facts.KindTestRef)
 	}
@@ -156,8 +163,11 @@ func TestHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range ff {
-		if f.Kind != facts.KindTestRef {
-			t.Fatalf("emitted a non-test_ref fact: %+v", f)
+		if f.Kind != facts.KindTestRef && f.Kind != facts.KindTestCase {
+			t.Fatalf("emitted a fact that is neither a test_ref nor a test_case: %+v", f)
+		}
+		if f.Kind == facts.KindTestCase && len(f.Relations) > 0 {
+			t.Fatalf("a test_case carries relations: %+v", f)
 		}
 	}
 	got := targetsOf(t, ff, "pkg/svc/svc_test.go")

@@ -1,7 +1,6 @@
 package kotlinextractor
 
 import (
-	"bufio"
 	"context"
 	"log"
 	"os"
@@ -10,9 +9,12 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/extcoverage"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/extractors/jvmsrc"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/linescan"
 	"github.com/enola-labs/enola/internal/parallel"
 )
 
@@ -123,22 +125,51 @@ func (e *KotlinExtractor) Extract(ctx context.Context, repoPath string, files []
 
 	// The detected flags above are read-only, and the per-file extractors are
 	// pure, so parse in parallel and merge in file order for deterministic output.
-	perFileFacts := parallel.MapFiles(ctx, kotlinFiles, func(relFile string) []facts.Fact {
+	perFileFacts := parallel.MapFiles(ctx, kotlinFiles, func(relFile string) kotlinFileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[kotlin-extractor] error reading %s: %v", relFile, err)
-			return nil
+			return kotlinFileResult{}
 		}
-		ff := extractFileAST(src, relFile, isAndroid, sourceRoot, basePackage, packageIndex)
-		ff = append(ff, extractRetrofitFacts(src, relFile)...)
-		return append(ff, extractServletRouteFacts(src, relFile)...)
+		clients := append(extractRetrofitFacts(src, relFile), extractServletRouteFacts(src, relFile)...)
+		ff, tests := extractFileWithClients(src, relFile, isAndroid, sourceRoot, basePackage, packageIndex, clients)
+		return kotlinFileResult{facts: ff, unlabelled: tests.unlabelled, nested: tests.nested}
 	})
 
 	modules := make(map[string]bool)
-	for i, ff := range perFileFacts {
-		allFacts = append(allFacts, ff...)
+	named, unlabelled, nested := 0, 0, 0
+	for i, r := range perFileFacts {
+		allFacts = append(allFacts, r.facts...)
 		modules[factpath.Dir(kotlinFiles[i])] = true
+		for _, f := range r.facts {
+			if f.Kind == facts.KindTestCase {
+				named++
+			}
+		}
+		unlabelled += r.unlabelled
+		nested += r.nested
 	}
+	if unlabelled+nested > 0 {
+		unnamed := map[string]int{}
+		if unlabelled > 0 {
+			unnamed["label_not_literal"] = unlabelled
+		}
+		if nested > 0 {
+			unnamed["nested_name_not_composed"] = nested
+		}
+		if f, ok := extcoverage.Fact(repoPath, "kotlin:test_cases", "test_case", named, unnamed); ok {
+			allFacts = append(allFacts, f)
+		}
+	}
+
+	// Calls on a receiver of declared type become edges, and supertypes written by
+	// simple name become implements edges, now that every file has been read.
+	resolveTypedCalls(allFacts)
+	resolveCapitalCalls(allFacts)
+
+	// The walker marks only the round-trip itself (a Retrofit endpoint, a Room DAO
+	// operation). A method with a calls edge to one is I/O through it.
+	ioclosure.Propagate(allFacts)
 
 	for dir := range modules {
 		allFacts = append(allFacts, facts.Fact{
@@ -202,89 +233,89 @@ func detectAndroidProject(repoPath string) bool {
 // addAndroidProps classifies a class/interface declaration as an Android component.
 func addAndroidProps(f *facts.Fact, name string, annotations []string, supertypes string) {
 	if containsAnnotation(annotations, "HiltAndroidApp") {
-		f.Props["android_component"] = "application"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "application")
+		f.SetProp("framework", "android")
 		return
 	}
 	if containsAnnotation(annotations, "HiltViewModel") {
-		f.Props["android_component"] = "viewmodel"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "viewmodel")
+		f.SetProp("framework", "android")
 		return
 	}
 	if containsAnnotation(annotations, "AndroidEntryPoint") {
-		f.Props["framework"] = "android"
+		f.SetProp("framework", "android")
 		if supertypeMatches(supertypes, "Activity", "ComponentActivity", "AppCompatActivity", "FragmentActivity") {
-			f.Props["android_component"] = "activity"
+			f.SetProp("android_component", "activity")
 		} else if supertypeMatches(supertypes, "Fragment") {
-			f.Props["android_component"] = "fragment"
+			f.SetProp("android_component", "fragment")
 		} else if supertypeMatches(supertypes, "Service") {
-			f.Props["android_component"] = "service"
+			f.SetProp("android_component", "service")
 		} else if supertypeMatches(supertypes, "BroadcastReceiver") {
-			f.Props["android_component"] = "broadcast_receiver"
+			f.SetProp("android_component", "broadcast_receiver")
 		}
 		return
 	}
 	if containsAnnotation(annotations, "Component") || containsAnnotation(annotations, "Subcomponent") {
 		// Dagger/Hilt DI component interface — infrastructure, not domain code.
-		f.Props["di_component"] = true
-		f.Props["framework"] = "android"
+		f.SetProp("di_component", true)
+		f.SetProp("framework", "android")
 		return
 	}
 	if containsAnnotation(annotations, "Module") {
-		f.Props["android_component"] = "di_module"
-		f.Props["di_module"] = true
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "di_module")
+		f.SetProp("di_module", true)
+		f.SetProp("framework", "android")
 		return
 	}
 
 	if strings.HasSuffix(name, "ViewModel") || supertypeMatches(supertypes, "ViewModel") {
-		f.Props["android_component"] = "viewmodel"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "viewmodel")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "Application") {
-		f.Props["android_component"] = "application"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "application")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "Activity", "ComponentActivity", "AppCompatActivity") {
-		f.Props["android_component"] = "activity"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "activity")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "Fragment") {
-		f.Props["android_component"] = "fragment"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "fragment")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "Service", "FirebaseMessagingService", "IntentService", "JobIntentService") {
-		f.Props["android_component"] = "service"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "service")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "BroadcastReceiver") {
-		f.Props["android_component"] = "broadcast_receiver"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "broadcast_receiver")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "ContentProvider") {
-		f.Props["android_component"] = "content_provider"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "content_provider")
+		f.SetProp("framework", "android")
 		return
 	}
 	if supertypeMatches(supertypes, "Worker", "CoroutineWorker", "ListenableWorker") {
-		f.Props["android_component"] = "worker"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "worker")
+		f.SetProp("framework", "android")
 		return
 	}
 	if strings.HasSuffix(name, "Repository") || strings.HasSuffix(name, "RepositoryImpl") {
-		f.Props["android_component"] = "repository"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "repository")
+		f.SetProp("framework", "android")
 		return
 	}
 	if strings.HasSuffix(name, "UseCase") {
-		f.Props["android_component"] = "usecase"
-		f.Props["framework"] = "android"
+		f.SetProp("android_component", "usecase")
+		f.SetProp("framework", "android")
 		return
 	}
 }
@@ -445,7 +476,7 @@ func kotlinFileSourceRoot(repoPath, relFile string) (string, bool) {
 		return "", false
 	}
 	defer func() { _ = f.Close() }()
-	scanner := bufio.NewScanner(f)
+	scanner := linescan.New(f)
 	for scanner.Scan() {
 		m := packageRe.FindStringSubmatch(scanner.Text())
 		if m == nil {
@@ -457,6 +488,9 @@ func kotlinFileSourceRoot(repoPath, relFile string) (string, bool) {
 			return strings.TrimSuffix(dir, pkgPath), true
 		}
 		return "", true // package found but dir doesn't mirror it — root is ""
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[kotlin-extractor] error reading %s: %v", relFile, err)
 	}
 	return "", false
 }
@@ -517,4 +551,10 @@ func resolveKotlinImport(importPath string, packageIndex map[string]string, sour
 		return factpath.Clean(sourceRoot + asPath), false
 	}
 	return importPath, true
+}
+
+type kotlinFileResult struct {
+	facts      []facts.Fact
+	unlabelled int
+	nested     int
 }

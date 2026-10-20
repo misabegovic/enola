@@ -1,22 +1,21 @@
 package command
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
-	"time"
 
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// ConstraintsLedger is `enola constraints ledger [--json] [repo_path]`: how
-// much of the declared law is being excused rather than obeyed.
+// ConstraintsLedger is `enola constraints ledger [--json [--breaches]] [--repo label]
+// [repo_path|config]`: how much of the declared law is being excused rather than
+// obeyed.
 //
 // The gate has always collected the inputs — a suppression entry and an
 // `exempt:` carve-out each name an owner, a reason and a date — and never
@@ -38,17 +37,30 @@ func (r *Runner) ConstraintsLedger(args []string) {
 	fs := flag.NewFlagSet("constraints ledger", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	asJSON := fs.Bool("json", false, "print the ledger as JSON")
+	breaches := fs.Bool("breaches", false, "with --json, list under each rule every breach it counted, with the finding identity check pairs on")
+	member := fs.String("repo", "", "the repository whose law to report, by its label, when the snapshot holds several")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, "Usage: "+r.name()+" constraints ledger [--json] [repo_path]\n\n"+
+		fmt.Fprint(os.Stderr, "Usage: "+r.name()+" constraints ledger [--json [--breaches]] [--repo label] [repo_path|config]\n\n"+
 			"Every declared rule, its enforcement mode, the breaches it raised in the\n"+
 			"current snapshot, and how many of those a suppression or an exemption\n"+
 			"excused — with each excuse's owner, reason and age.\n\n"+
 			"The rate is evidence for a human: a rule whose breaches are mostly signed\n"+
 			"away is a rule to reconsider, and that is invisible one verdict at a time.\n"+
-			"A report, never a gate — nothing here fails a build.\n")
+			"A report, never a gate — nothing here fails a build.\n\n"+
+			"--breaches adds each rule's breach_list: identity, title, evidence file and\n"+
+			"symbol, and whether a suppression matched, one entry per counted breach.\n\n"+
+			"Named a config listing several repositories, the ledger reads their union,\n"+
+			"and --repo names the member whose suppressions and drift it reports.\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "constraints ledger")
 	}
 	if err := fs.Parse(args); err != nil {
+		os.Exit(check.StatusUsageError.ExitCode())
+	}
+	// The list is for a reader that parses; printed as text it would bury the
+	// excuse rate the report exists to show under every breach it counted.
+	if *breaches && !*asJSON {
+		fmt.Fprintln(os.Stderr, "constraints ledger: --breaches lists breaches in the JSON form; pass --json with it")
 		os.Exit(check.StatusUsageError.ExitCode())
 	}
 	repoPath := "."
@@ -59,153 +71,50 @@ func (r *Runner) ConstraintsLedger(args []string) {
 
 	tgt := r.resolveTarget(repoPath)
 	tgt.engine.SetPersistCache(false)
-	snap, err := bootstrap.LoadSnapshotDir(tgt.engine.OutputDir(repoPath))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "constraints ledger: no snapshot for %s; generate one first\n", repoPath)
-		os.Exit(check.StatusUsageError.ExitCode())
-	}
-	// A malformed ledger is an operational failure here exactly as it is in
-	// `check`: reporting an excuse rate from half an excuse list would understate
-	// the number this command exists to state.
-	suppressions, err := check.LoadSuppressions(repoPath)
+	res, err := r.ledgerAnswer(context.Background(), tgt, repoPath, *member, *breaches, *asJSON)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "constraints ledger: %v\n", err)
 		os.Exit(check.StatusUsageError.ExitCode())
 	}
-	store := facts.NewStore()
-	store.Add(snap.Facts...)
-	led := check.ComputeLedger(store, suppressions, snap.Insights, time.Now())
-
-	// Staleness, computed the way `plan` computes it. Without it this report
-	// and `enola check` can print different numbers from the same tree and
-	// neither says why: check re-extracts on every run, while this reads the
-	// snapshot on disk, so an edit since the last snapshot moves one and not the
-	// other. A report that silently disagrees with the gate is worse than no
-	// report.
-	staleness := ""
-	if err := tgt.engine.RestoreFromDir(tgt.engine.OutputDir(repoPath),
-		map[string]string{filepath.Base(repoPath): repoPath}, filepath.Base(repoPath)); err == nil {
-		if d, dErr := tgt.engine.DriftFromMeta(repoPath, snap.Meta); dErr == nil && (d.Unknown || d.Any()) {
-			staleness = d.Summary(5)
-		}
+	if res.IsError {
+		fmt.Fprintf(os.Stderr, "constraints ledger: %s\n", resultText(res))
+		os.Exit(check.StatusUsageError.ExitCode())
 	}
-
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(struct {
-			check.Ledger
-			GeneratedAt string `json:"generated_at,omitempty"`
-			Staleness   string `json:"staleness,omitempty"`
-		}{led, snap.Meta.GeneratedAt, staleness})
-		os.Exit(0)
-	}
-	fmt.Print(renderLedger(led, snap.Meta, staleness))
+	fmt.Print(resultText(res))
 	os.Exit(0)
 }
 
-// renderLedger prints the summary line, then a row per rule that has something
-// to say. Rules with no breaches and no excuses are counted rather than listed:
-// they are the denominator, and printing thirty quiet rows is how a reader
-// stops reaching the four that matter.
-func renderLedger(led check.Ledger, meta facts.SnapshotMeta, staleness string) string {
-	var sb strings.Builder
-	if led.Summary.Rules == 0 {
-		sb.WriteString("No rules declared — nothing to excuse.\n\n" +
-			"This repository has not stated a law, so it is unasked rather than clean.\n" +
-			"See docs/CONSTRAINTS.md to declare one.\n")
-		return sb.String()
-	}
-	fmt.Fprintf(&sb, "%s\n", led.Summary.Line())
-	switch {
-	case staleness != "":
-		fmt.Fprintf(&sb, "read from the snapshot generated %s, which is STALE relative to the working tree: %s\n"+
-			"Re-snapshot before trusting these counts — `enola check` re-extracts and will not agree with them.\n",
-			meta.GeneratedAt, staleness)
-	case meta.GeneratedAt != "":
-		fmt.Fprintf(&sb, "read from the snapshot generated %s — a rule declared since then is not counted here\n",
-			meta.GeneratedAt)
-	}
+// LedgerDocument is `constraints ledger --json`; the constraints_ledger tool
+// answers it.
+type LedgerDocument = check.LedgerDocument
 
-	rules := append([]check.LedgerRule(nil), led.Rules...)
-	sort.SliceStable(rules, func(i, j int) bool {
-		a, b := rules[i], rules[j]
-		if ea, eb := a.Suppressed+a.Exempted, b.Suppressed+b.Exempted; ea != eb {
-			return ea > eb
-		}
-		if a.Breaches != b.Breaches {
-			return a.Breaches > b.Breaches
-		}
-		return a.ID < b.ID
-	})
-
-	quiet := 0
-	shown := 0
-	for _, rule := range rules {
-		if rule.Breaches == 0 && rule.Exempted == 0 && len(rule.Excuses) == 0 {
-			quiet++
-			continue
-		}
-		if shown == 0 {
-			sb.WriteString("\n")
-		}
-		shown++
-		mode := rule.Mode
-		if mode == "" {
-			mode = "ratchet"
-		}
-		fmt.Fprintf(&sb, "%s [%s] — %s reported, %d excused",
-			rule.ID, mode, countOf(rule.Breaches, "breach", "breaches"), rule.Suppressed+rule.Exempted)
-		if rule.Source != "" {
-			fmt.Fprintf(&sb, " · declared in %s", rule.Source)
-		}
-		sb.WriteString("\n")
-		if rule.Because != "" {
-			fmt.Fprintf(&sb, "    because: %s\n", rule.Because)
-		}
-		for _, ex := range rule.Excuses {
-			age := "undated"
-			if ex.Date != "" {
-				age = ex.Date
-				if ex.AgeDays > 0 {
-					age = fmt.Sprintf("%s, %s ago", ex.Date, countOf(ex.AgeDays, "day", "days"))
-				}
-			}
-			owner := ex.Owner
-			if owner == "" {
-				owner = "unnamed"
-			}
-			fmt.Fprintf(&sb, "    %s by %s (%s)", ex.Kind, owner, age)
-			if ex.Witness != "" {
-				fmt.Fprintf(&sb, " — %s", ex.Witness)
-			}
-			// An idle excuse is named on its own line rather than dropped: a
-			// signature that stopped excusing anything is the one row in this
-			// report someone can act on today.
-			if !ex.Matched {
-				sb.WriteString(" [matched nothing in this snapshot]")
-			}
-			sb.WriteString("\n")
-			if ex.Reason != "" {
-				fmt.Fprintf(&sb, "        %q\n", ex.Reason)
-			}
-		}
+// ledgerAnswer restores the target's snapshot and asks the constraints_ledger
+// tool over it, for the text or, with asJSON, the document. The snapshot is
+// read once, by the restore; the tool computes how far the tree has moved from
+// the meta that read carried.
+func (r *Runner) ledgerAnswer(ctx context.Context, tgt target, repoPath, member string, breaches, asJSON bool) (*mcp.CallToolResult, error) {
+	eng := tgt.engine
+	cfg := eng.Config()
+	// A config names no output directory of its own: the snapshot is the first
+	// member's, as a cluster writes its union to every member and lint reads it.
+	if _, err := os.Stat(filepath.Join(eng.OutputDir(tgt.repoPaths[0]), "facts.jsonl")); err != nil || !restoreSnapshot(eng, cfg) {
+		return nil, fmt.Errorf("no snapshot for %s; generate one first", repoPath)
 	}
-	if quiet > 0 {
-		fmt.Fprintf(&sb, "\n%s with no breaches and no excuses.\n", countOf(quiet, "rule", "rules"))
+	format := "text"
+	if asJSON {
+		format = "json"
 	}
-	if led.Summary.Excused > 0 {
-		sb.WriteString("\nA rule whose breaches are mostly excused is a rule to reconsider, not a\n" +
-			"team to chase: the excuse rate is what makes that judgement available.\n")
-	}
-	return sb.String()
+	return r.callToolResult(ctx, eng, cfg, "constraints_ledger", map[string]any{"repo": member, "breaches": breaches, "format": format, "max_tokens": -1})
 }
 
-// countOf renders a count with an explicit plural form. The package's plural()
-// appends an "s", which is right for "rule" and wrong for "breach".
-func countOf(n int, singular, plural string) string {
-	if n == 1 {
-		return fmt.Sprintf("%d %s", n, singular)
+// snapshotStaleness is how far repoPath has moved since the snapshot whose meta
+// this is, in one line, or empty when nothing has. The meta the snapshot was
+// read with carries every file hash the comparison needs, so asking needs no
+// second read of the snapshot. An unanswerable comparison is said, never passed
+// off as clean.
+func snapshotStaleness(eng *bootstrap.Engine, repoPath string, meta facts.SnapshotMeta) string {
+	if d, err := eng.DriftFromMeta(repoPath, meta); err == nil && (d.Unknown || d.Any()) {
+		return d.Summary(5)
 	}
-	return fmt.Sprintf("%d %s", n, plural)
+	return ""
 }

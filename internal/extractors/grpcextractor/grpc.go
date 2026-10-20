@@ -126,7 +126,7 @@ func factsForProtoFile(pf protoFile, relFile, dir string) []facts.Fact {
 			Kind: facts.KindSymbol,
 			Name: dir + "." + msg.name,
 			File: relFile,
-			Line: msg.line,
+			Line: msg.line, EndLine: msg.span.endLine, Column: msg.span.column, EndColumn: msg.span.endColumn,
 			Props: map[string]any{
 				"symbol_kind": symbolKindForMessage(msg.kind),
 				"language":    "grpc",
@@ -144,7 +144,7 @@ func factsForProtoFile(pf protoFile, relFile, dir string) []facts.Fact {
 			Kind: facts.KindSymbol,
 			Name: serviceSym,
 			File: relFile,
-			Line: svc.line,
+			Line: svc.line, EndLine: svc.span.endLine, Column: svc.span.column, EndColumn: svc.span.endColumn,
 			Props: map[string]any{
 				"symbol_kind":       facts.SymbolInterface,
 				"language":          "grpc",
@@ -163,7 +163,7 @@ func factsForProtoFile(pf protoFile, relFile, dir string) []facts.Fact {
 				Kind: facts.KindSymbol,
 				Name: serviceSym + "." + rpc.name,
 				File: relFile,
-				Line: rpc.line,
+				Line: rpc.line, EndLine: rpc.span.endLine, Column: rpc.span.column, EndColumn: rpc.span.endColumn,
 				Props: map[string]any{
 					"symbol_kind":       facts.SymbolMethod,
 					"language":          "grpc",
@@ -182,7 +182,7 @@ func factsForProtoFile(pf protoFile, relFile, dir string) []facts.Fact {
 				Kind: facts.KindRoute,
 				Name: path,
 				File: relFile,
-				Line: rpc.line,
+				Line: rpc.line, EndLine: rpc.span.endLine, Column: rpc.span.column, EndColumn: rpc.span.endColumn,
 				Props: map[string]any{
 					"method":            "POST",
 					facts.PropRole:      facts.RoleServer,

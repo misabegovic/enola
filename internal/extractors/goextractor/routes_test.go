@@ -390,3 +390,122 @@ func Dyn(w http.ResponseWriter, r *http.Request) {}
 		}
 	}
 }
+
+// A router with chi's verb names that takes middleware before the handler puts
+// the handler last. Read from the second argument, POST /login was served by
+// the form binder.
+func TestExtractRoutes_ChiVerbWithMiddlewareTakesTheLastArgument(t *testing.T) {
+	ff := extractAll(t, map[string]string{
+		"internal/server/routes.go": `package server
+
+import (
+	"net/http"
+	"github.com/go-chi/chi/v5"
+)
+
+type router struct{ chi.Router }
+
+func (r *router) Post(pattern string, h ...any) {}
+func (r *router) Get(pattern string, h ...any)  {}
+
+func SetupRoutes(m *router) {
+	m.Post("/login", Bind(Form{}), SignInPost)
+	m.Get("/repo", RequireSignIn, RepoAssignment, Home)
+	m.Get("/plain", Plain)
+}
+
+type Form struct{}
+
+func Bind(v any) func(http.Handler) http.Handler                  { return nil }
+func RequireSignIn(next http.Handler) http.Handler                { return next }
+func RepoAssignment(next http.Handler) http.Handler               { return next }
+func SignInPost(w http.ResponseWriter, r *http.Request)           {}
+func Home(w http.ResponseWriter, r *http.Request)                 {}
+func Plain(w http.ResponseWriter, r *http.Request)                {}
+`,
+	})
+	want := map[string]string{"/login": "SignInPost", "/repo": "Home", "/plain": "Plain"}
+	seen := 0
+	for _, r := range findFactsByKind(ff, facts.KindRoute) {
+		handler, ok := want[r.Name]
+		if !ok {
+			continue
+		}
+		seen++
+		if got := r.PropString("handler"); got != handler {
+			t.Errorf("%s: handler = %q, want %q", r.Name, got, handler)
+		}
+		// The post-link binder turns this into the route's handled_by edge.
+		if got := r.PropString(facts.PropHandlerTarget); got != "internal/server."+handler {
+			t.Errorf("%s: handler target = %q, want internal/server.%s", r.Name, got, handler)
+		}
+	}
+	if seen != len(want) {
+		t.Errorf("saw %d of %d routes", seen, len(want))
+	}
+}
+
+// A method value on a local whose type its struct literal states, `r := routes{...}`
+// then `m.Put(path, r.upload)`, names that type's method. A local of no stated type,
+// or one bound to two types, names nothing.
+func TestExtractRoutes_MethodValueOnALocalStruct(t *testing.T) {
+	got := goRouteTargets(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.22\n",
+		"routers/actions/artifacts.go": `package actions
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+)
+
+type artifactRoutes struct{ prefix string }
+
+func (r *artifactRoutes) upload(w http.ResponseWriter, req *http.Request)   {}
+func (r *artifactRoutes) download(w http.ResponseWriter, req *http.Request) {}
+
+type v4Routes struct{}
+
+func (r v4Routes) create(w http.ResponseWriter, req *http.Request) {}
+
+func Routes(prefix string) chi.Router {
+	m := chi.NewRouter()
+	r := artifactRoutes{prefix: prefix}
+	m.Put("/upload", r.upload)
+	m.Get("/download", r.download)
+	var v4 = &v4Routes{}
+	m.Post("/v4/create", v4.create)
+	h := newHandler()
+	m.Get("/other", h.serve)
+	return m
+}
+
+func Twice(flag bool) chi.Router {
+	m := chi.NewRouter()
+	x := artifactRoutes{}
+	if flag {
+		x := v4Routes{}
+		_ = x
+	}
+	m.Get("/twice", x.upload)
+	return m
+}
+
+type handler struct{}
+
+func newHandler() *handler                                         { return &handler{} }
+func (h *handler) serve(w http.ResponseWriter, req *http.Request) {}
+`,
+	})
+	want := map[string]string{
+		"PUT /upload":     "routers/actions.artifactRoutes.upload",
+		"GET /download":   "routers/actions.artifactRoutes.download",
+		"POST /v4/create": "routers/actions.v4Routes.create",
+		"GET /other":      "",
+	}
+	for key, target := range want {
+		if have, ok := got[key]; !ok || have != target {
+			t.Errorf("%s handler target = %q, want %q (have %v)", key, have, target, got)
+		}
+	}
+}

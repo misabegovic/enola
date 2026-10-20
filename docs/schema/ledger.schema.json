@@ -1,0 +1,185 @@
+{
+  "$defs": {
+    "check.LedgerBreach": {
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "identity": {
+          "type": "string"
+        },
+        "suppressed": {
+          "type": "boolean"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity",
+        "suppressed",
+        "title"
+      ],
+      "type": "object"
+    },
+    "check.LedgerExcuse": {
+      "properties": {
+        "age_days": {
+          "type": "integer"
+        },
+        "date": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "matched": {
+          "type": "boolean"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "witness": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "matched"
+      ],
+      "type": "object"
+    },
+    "check.LedgerRule": {
+      "properties": {
+        "because": {
+          "type": "string"
+        },
+        "breach_list": {
+          "items": {
+            "$ref": "#/$defs/check.LedgerBreach"
+          },
+          "type": "array"
+        },
+        "breaches": {
+          "type": "integer"
+        },
+        "excuses": {
+          "items": {
+            "$ref": "#/$defs/check.LedgerExcuse"
+          },
+          "type": "array"
+        },
+        "exempted": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "said": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "suppressed": {
+          "type": "integer"
+        },
+        "unverdicted_detail": {
+          "type": "string"
+        },
+        "unverdicted_reason": {
+          "type": "string"
+        },
+        "verdicted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "breaches",
+        "exempted",
+        "id",
+        "mode",
+        "suppressed",
+        "verdicted"
+      ],
+      "type": "object"
+    },
+    "check.LedgerSummary": {
+      "properties": {
+        "breaches": {
+          "type": "integer"
+        },
+        "by_mode": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "excused": {
+          "type": "integer"
+        },
+        "exempted": {
+          "type": "integer"
+        },
+        "idle_excuses": {
+          "type": "integer"
+        },
+        "oldest_excuse_days": {
+          "type": "integer"
+        },
+        "rules": {
+          "type": "integer"
+        },
+        "suppressed": {
+          "type": "integer"
+        },
+        "undatable_excuses": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "breaches",
+        "excused",
+        "exempted",
+        "rules",
+        "suppressed"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "generated_at": {
+      "type": "string"
+    },
+    "rules": {
+      "items": {
+        "$ref": "#/$defs/check.LedgerRule"
+      },
+      "type": "array"
+    },
+    "staleness": {
+      "type": "string"
+    },
+    "summary": {
+      "$ref": "#/$defs/check.LedgerSummary"
+    }
+  },
+  "required": [
+    "summary"
+  ],
+  "title": "constraints ledger --json",
+  "type": "object"
+}

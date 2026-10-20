@@ -314,18 +314,6 @@ func TestRender_ContainsHeadlineNumbers(t *testing.T) {
 	}
 }
 
-func TestRender_ExtraSections(t *testing.T) {
-	r := computeFixture(t)
-	r.AddSection("Dead code (enterprise)", "  potential dead code        3\n")
-	out := r.Render()
-	if !strings.Contains(out, "Dead code (enterprise)") {
-		t.Errorf("extra section title missing\n%s", out)
-	}
-	if !strings.Contains(out, "potential dead code") {
-		t.Errorf("extra section body missing\n%s", out)
-	}
-}
-
 // unresolvedFixtureFacts mimics a Python snapshot before import resolution:
 // module names are slash paths but dependency import targets are raw dotted
 // paths that match no module.
@@ -618,5 +606,31 @@ func TestCompute_CodeHealth_OmittedWhenEmpty(t *testing.T) {
 	}
 	if strings.Contains(r.Render(), "Code health") {
 		t.Error("Code health section should be omitted when empty")
+	}
+}
+
+// A Rust item import names `<dir>.<item>`; walked up by "/" it reached the
+// parent directory's module, and hotspot coupling credited the wrong module.
+func TestComputeHotspots_ItemImportCouplesToItsFilesModule(t *testing.T) {
+	ff := []facts.Fact{
+		{Kind: facts.KindModule, Name: "src", File: "src"},
+		{Kind: facts.KindModule, Name: "src/core", File: "src/core"},
+		{Kind: facts.KindModule, Name: "src/hooks", File: "src/hooks"},
+		{Kind: facts.KindSymbol, Name: "src/core.count", File: "src/core/count.rs"},
+		{Kind: facts.KindDependency, Name: "src/hooks -> crate::core::count", File: "src/hooks/run.rs",
+			Props:     map[string]any{facts.PropTargetFile: "src/core/count.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/core.count"}}},
+	}
+	eng := newTestEngine(t)
+	eng.Store().Add(ff...)
+	eng.Store().BuildGraph()
+	var r Report
+	computeHotspots(eng.Store(), &r)
+	got := map[string]int{}
+	for _, h := range r.Hotspots {
+		got[h.Module] = h.FanIn
+	}
+	if got["src/core"] != 1 || got["src"] != 0 {
+		t.Errorf("want fan-in on src/core and none on src, got %+v", r.Hotspots)
 	}
 }

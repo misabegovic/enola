@@ -3,12 +3,15 @@ package goextractor
 import (
 	"context"
 	"go/ast"
+	"go/doc"
 	"go/parser"
 	"go/token"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
@@ -26,6 +29,8 @@ func isGoTestFile(relFile string) bool { return strings.HasSuffix(relFile, "_tes
 // no symbols. Test functions therefore never become dead-code candidates, and no
 // symbol/module/route explainer is affected, while the dead-code detector can see
 // that a production function is exercised by a test and not mis-report it as dead.
+// Each test the go command would run is a facts.KindTestCase beside it, which
+// carries a span and no edges, so the same holds for it.
 //
 // The engine hands every TestGlob match to every TestRefExtractor whose repo it
 // detected, scoped by plugin.FileOwner when the extractor implements it.
@@ -66,7 +71,8 @@ func (e *GoExtractor) ExtractTestRefs(ctx context.Context, repoPath string, test
 }
 
 // refsFromGoTest parses one Go test file and returns a single reference-only fact
-// carrying the production symbols it calls, or nil when it references nothing.
+// carrying the production symbols it calls, when it calls any, and a test_case per
+// test go test would run from it.
 //
 // Call targets are resolved with the PRODUCTION resolvers (flattenSelector,
 // collectLocalTypes, resolveChain), so a reference from a test is spelled exactly
@@ -80,7 +86,9 @@ func (e *GoExtractor) ExtractTestRefs(ctx context.Context, repoPath string, test
 // production code: that blind spot is pre-existing and not specific to tests.
 func refsFromGoTest(src []byte, relFile, modulePath string) []facts.Fact {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, relFile, src, parser.SkipObjectResolution)
+	// Comments are parsed for go/doc, which reads an example's output comment to decide
+	// whether go test runs it.
+	f, err := parser.ParseFile(fset, relFile, src, parser.SkipObjectResolution|parser.ParseComments)
 	if err != nil {
 		log.Printf("[go-extractor] error parsing test file %s: %v", relFile, err)
 		return nil
@@ -151,14 +159,123 @@ func refsFromGoTest(src []byte, relFile, modulePath string) []facts.Fact {
 		}
 	}
 
-	if len(rels) == 0 {
-		return nil
+	var out []facts.Fact
+	if len(rels) > 0 {
+		out = append(out, facts.Fact{
+			Kind:      facts.KindTestRef,
+			Name:      relFile,
+			File:      relFile,
+			Props:     map[string]any{"language": "go"},
+			Relations: rels,
+		})
 	}
-	return []facts.Fact{{
-		Kind:      facts.KindTestRef,
-		Name:      relFile,
-		File:      relFile,
-		Props:     map[string]any{"language": "go"},
-		Relations: rels,
-	}}
+	return append(out, goTestCases(fset, f, relFile)...)
+}
+
+// goTestCases emits one test_case per function go test runs from this file, chosen
+// by the rules the go command applies when it builds the test main
+// (cmd/go/internal/load/test.go): a Test, Benchmark or Fuzz function whose suffix
+// does not start with a lower-case letter and whose one parameter is *T, *B or *F,
+// and an example go/doc finds with an output comment, since go test compiles the
+// others and never runs them. TestMain taking *testing.M is the package's main, not
+// a test. A function the go command would reject (type parameters, results, a
+// second parameter) fails the build rather than running, so it gets no fact.
+func goTestCases(fset *token.FileSet, f *ast.File, relFile string) []facts.Fact {
+	runnableExamples := map[string]bool{}
+	for _, ex := range doc.Examples(f) {
+		if ex.Output == "" && !ex.EmptyOutput {
+			continue
+		}
+		runnableExamples["Example"+ex.Name] = true
+	}
+
+	var out []facts.Fact
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || fn.Body == nil {
+			continue
+		}
+		style := goTestStyle(fn, runnableExamples)
+		if style == "" {
+			continue
+		}
+		name := fn.Name.Name
+		tc := facts.Fact{
+			Kind: facts.KindTestCase,
+			Name: facts.TestCaseName(relFile, name),
+			File: relFile,
+			Line: fset.Position(fn.Pos()).Line,
+			Props: map[string]any{
+				"language":    "go",
+				"label":       name,
+				"groups":      []string{},
+				"runner_name": name,
+				"style":       style,
+			},
+		}
+		spanOf(fset, fn).set(&tc)
+		out = append(out, tc)
+	}
+	return out
+}
+
+func goTestStyle(fn *ast.FuncDecl, runnableExamples map[string]bool) string {
+	name := fn.Name.Name
+	if fn.Type.TypeParams.NumFields() > 0 {
+		return ""
+	}
+	switch {
+	case runnableExamples[name]:
+		return "example"
+	case name == "TestMain":
+		if goTestSignature(fn, "T") {
+			return "test"
+		}
+		return ""
+	case goTestPrefix(name, "Test") && goTestSignature(fn, "T"):
+		return "test"
+	case goTestPrefix(name, "Benchmark") && goTestSignature(fn, "B"):
+		return "benchmark"
+	case goTestPrefix(name, "Fuzz") && goTestSignature(fn, "F"):
+		return "fuzz"
+	}
+	return ""
+}
+
+// goTestPrefix is the go command's isTest: "Test" alone is a test, and so is any
+// name whose suffix does not start with a lower-case letter, so TestX and Test_x
+// run while Testify does not.
+func goTestPrefix(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	if len(name) == len(prefix) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(name[len(prefix):])
+	return !unicode.IsLower(r)
+}
+
+// goTestSignature is the go command's isTestFunc: no results and exactly one
+// parameter of type *T or *pkg.T. It cannot check the package is testing, since the
+// import may be renamed, and neither can the go command.
+func goTestSignature(fn *ast.FuncDecl, arg string) bool {
+	if fn.Type.Results != nil && len(fn.Type.Results.List) > 0 {
+		return false
+	}
+	params := fn.Type.Params
+	if params == nil || len(params.List) != 1 || len(params.List[0].Names) > 1 {
+		return false
+	}
+	ptr, ok := params.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	switch x := ptr.X.(type) {
+	case *ast.Ident:
+		return x.Name == arg
+	case *ast.SelectorExpr:
+		return x.Sel.Name == arg
+	}
+	return false
 }

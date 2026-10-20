@@ -57,12 +57,12 @@ func canonicalizeTargets(allFacts []facts.Fact, crossLangIndex, filePkg map[stri
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		switch f.Props["symbol_kind"] {
+		switch f.PropAny("symbol_kind") {
 		case facts.SymbolClass, facts.SymbolInterface, facts.SymbolEnum, facts.SymbolType:
 		default:
 			continue
 		}
-		fqn, _ := f.Props["fqn"].(string)
+		fqn, _ := f.PropAny("fqn").(string)
 		if fqn == "" {
 			continue
 		}
@@ -143,70 +143,6 @@ func resolveCallTarget(target, filePackage string, typeIndex map[string]string) 
 	return target
 }
 
-// computeScalaPerformsIO propagates the direct-I/O signal transitively over the
-// intra-repo call graph: a function is marked performs_io when it, or anything it
-// reaches through RelCalls edges to known symbols, does I/O.
-//
-// This is what lets the performance analyzer recognise an N+1 whose database call
-// sits behind two layers of service wrapper — the in-loop callee itself looks
-// innocent, and only the closure says otherwise. Mirrors the Rust and Python
-// extractors' fixpoint, and is cycle-safe because it iterates to stability rather
-// than recursing.
-func computeScalaPerformsIO(allFacts []facts.Fact) {
-	exists := make(map[string]bool)
-	for i := range allFacts {
-		if allFacts[i].Kind == facts.KindSymbol {
-			exists[allFacts[i].Name] = true
-		}
-	}
-
-	io := make(map[string]bool)
-	adj := make(map[string][]string)
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		if b, _ := f.Props["io_direct"].(bool); b {
-			io[f.Name] = true
-		}
-		seen := make(map[string]bool)
-		for _, r := range f.Relations {
-			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
-				continue
-			}
-			seen[r.Target] = true
-			adj[f.Name] = append(adj[f.Name], r.Target)
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for name, callees := range adj {
-			if io[name] {
-				continue
-			}
-			for _, c := range callees {
-				if io[c] {
-					io[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind == facts.KindSymbol && io[f.Name] {
-			if f.Props == nil {
-				f.Props = map[string]any{}
-			}
-			f.Props["performs_io"] = true
-		}
-	}
-}
-
 // resolveTypeTarget maps one edge target onto a canonical fact name, or leaves it
 // honestly unresolved.
 //
@@ -272,14 +208,14 @@ func isTypeName(s string) bool {
 // this repository declares, and repoints the edge at the declaring directory so
 // module-level coupling is visible.
 func resolveImport(f *facts.Fact, typeDir, packageDir map[string]string) {
-	imp, _ := f.Props["import"].(string)
+	imp, _ := f.PropAny("import").(string)
 	if imp == "" {
 		return
 	}
 	// A stdlib classification is already correct and must not be overwritten: a
 	// repository that declares its own `scala.meta` package would otherwise
 	// reclassify the language's own library as its internal code.
-	if f.Props[facts.PropSource] == "stdlib" {
+	if f.PropAny(facts.PropSource) == "stdlib" {
 		return
 	}
 
@@ -292,7 +228,7 @@ func resolveImport(f *facts.Fact, typeDir, packageDir map[string]string) {
 		// declaring type rather than a package; try the parent. Skipped for a
 		// wildcard, whose import string is already the package — walking to its
 		// parent would resolve the wrong thing.
-		if wc, _ := f.Props["wildcard"].(bool); !wc {
+		if wc, _ := f.PropAny("wildcard").(bool); !wc {
 			if parent := parentName(imp); parent != "" {
 				if dir, ok = typeDir[parent]; !ok {
 					dir, ok = packageDir[parent]
@@ -304,7 +240,7 @@ func resolveImport(f *facts.Fact, typeDir, packageDir map[string]string) {
 		return // genuinely external
 	}
 
-	f.Props[facts.PropSource] = "internal"
+	f.SetProp(facts.PropSource, "internal")
 	for j := range f.Relations {
 		if f.Relations[j].Kind == facts.RelImports {
 			f.Relations[j].Target = dir

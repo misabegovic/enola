@@ -39,6 +39,27 @@ Current writers resolve `target_id` using the source fact's repository:
 2. Emit an ID if all local matches have the same identity.
 3. If there is no local match, emit an ID only if all matches across the
    snapshot have the same identity.
+4. If no fact carries the name, and the target is another loaded repository's
+   symbol or package as the consumer's source spells it (a Go import path under
+   that repository's module path, an npm package name a repository's
+   `package.json` declares, or a Java/Scala/.NET fully qualified type name a
+   type's `fqn` prop carries), emit the ID of the one fact that repository
+   declares under its own name for it. The target keeps the consumer's spelling:
+   `github.com/acme/auth.AuthService.Login` resolves to the `auth` repository's
+   `..AuthService.Login`.
+5. For a `calls` or `instantiates` relation written by a Ruby fact (a
+   `language` of `ruby`, or, for a provider fact with no language, a `.rb`,
+   `.rake` or `.ru` file or a `Rakefile`), keep an ID from the steps above
+   only when the fact it names is a `symbol` or an `association`. A bare Ruby
+   call such as `config` otherwise matches the `config` module by name. This
+   step only removes an ID; it never adds or changes one.
+6. For a `calls` or `instantiates` relation in any language, drop an ID from
+   steps 1 to 3 when the fact it names is a `service` node, or is neither a
+   `symbol` nor an `association` and belongs to another repository than the
+   source fact. In a union a bare call such as `default` otherwise matches
+   another repository's job queue, and one named like a repository matches its
+   service node. An ID from step 4 is not subject to this step. It only removes
+   an ID; it never adds or changes one.
 
 Do not choose an arbitrary fact when `target_id` is absent.
 
@@ -87,10 +108,12 @@ fact's name exactly as that fact carries it.
 | `service` | repository label | yes (`depends_on`) | A whole repo — multi-repo (append) mode only |
 | `intent` | the declared entry's name | yes | Architecture declared in `enola-intent.yaml`, not measured from source |
 | `extraction` | `<extractor>:<account>` (e.g. `ruby:calls`) | no | An extractor's own coverage account for one repo |
-| `association` | `Model#macro` (e.g. `Order#items`) or `Child<Parent` for an STI chain | no | A framework model relationship (Rails belongs_to/has_many, ...) |
+| `association` | `Model#macro` (e.g. `Order#items`), `Model::method` in PHP, or `Child<Parent` for an STI chain | no | A framework model relationship (Rails belongs_to/has_many, Eloquent belongsTo/hasMany, ...) |
 | `test_ref` | test file path | yes (`calls`, `instantiates`) | Reference-only: which production symbols a test exercises. Test files are otherwise excluded from indexing |
 | `file_ref` | source file path | yes (`calls`, `instantiates`) | Reference-only: call edges made in file-scope (top-level) code with no enclosing symbol |
 | `lint` | the linter finding's id | no | A finding an external linter reported through the provider seam |
+| `test_case` | `<test file path>::<runner_name>` | no | Reference-only: one test a language's usual runner can select, with its span |
+| `runtime_unit` | `<declaring file path>::<unit name>` | yes (`runs`) | Reference-only: one thing a deploy file says runs in production (a process, a worker, a schedule, a container, a role), with what it runs |
 
 ### symbol
 
@@ -116,17 +139,37 @@ Contract props:
   consumer must treat it as optional rather than as the route's classifier.
 - `role`: `client` | `server`. Absent means server: a route declaration found
   without a call site is a served endpoint.
-- `type`: sub-classifies beyond HTTP — `grpc` | `graphql` | `middleware`.
+- `type`: sub-classifies beyond HTTP — `grpc` | `graphql` | `middleware` | `hook`.
+  `hook` is a WordPress hook: a registration on it (`add_action`, `add_filter`) or,
+  with `role` `client`, a hook point that fires it (`do_action`, `apply_filters`). A
+  hook is in-process dispatch and is kept out of HTTP matching.
   Absent means a plain HTTP route. A gRPC route's path is the wire path
   `/pkg.Service/Method`.
 - `framework`: mostly descriptive; the value `grpc` is branched on (it labels
   cross-repo edges via=grpc).
 - `method`: the HTTP verb; `*` means the route handles every verb (a raw
   servlet, or a mapping declared without one).
+- `matched_routes` (client routes, multi-repo mode): the server routes the
+  cross-repo HTTP linker resolved this call site to, as an array of
+  `{repo, name, file, method, confidence, id}`. `id` is the target route's fact
+  id, computed by the writer like `target_id`; `confidence` is `verified` or
+  `probable` under the rule the service edge uses. Only the chosen provider's
+  routes are listed, so a call several repositories serve with nothing to choose
+  between them has none. A call its own repository serves keeps its match,
+  although it draws no service edge. This is a prop rather than a relation
+  because a call and the route it reaches usually share a name, and a relation
+  names its target by name.
+- `caller`, `caller_id` (client routes): the symbol whose body makes the call,
+  the innermost function containing the call site that has a symbol of its own.
+  `caller_id` is that symbol's fact id; the symbol is always declared in the call
+  site's own file. Absent for a call at module scope or inside a function with no
+  symbol of its own. Written by the TypeScript, Kotlin, Swift,
+  Java, Dart and Python extractors; a Retrofit or Feign route's caller is the interface
+  method it annotates.
 
 ### dependency
 
-- `source`: where the import resolves — `internal` | `external` | `stdlib`.
+- `source`: where the import resolves — `internal` | `external` | `stdlib` | `framework` (a compiler/framework-provided virtual module).
   This is a second, unrelated vocabulary on the same prop key as route's
   `source`, discriminated by the fact's kind. Reading `source` without first
   checking kind gets a value from the wrong vocabulary.
@@ -145,6 +188,11 @@ Contract props:
   resolves by name alone.
 - `via`: how a cross-repo edge was established — [Via kinds](#via-kinds)
   (multi-repo mode).
+- `param_segment_endpoints`, `param_segment_endpoint_count`: on an HTTP cross-repo
+  edge, the endpoints that matched only because a server path parameter stood in for
+  a literal client segment (`linking.match_literal_against_params`). Each is also in
+  `endpoints`. The edge's `confidence` is the strongest among its endpoints, so this
+  list is how to weigh the looser ones.
 - `coupling_kind`: on a synthetic module-coupling edge derived from
   references rather than read from an import statement), which reference
   produced it — `reference` (constant-receiver call), `inheritance`, `mixin`,
@@ -164,10 +212,17 @@ Contract props:
 - `messaging_operation`: `publish` | `subscribe`.
 - `source` on a topic fact: a third vocabulary on the `source` key, again
   discriminated by kind — `asyncapi` (read from an AsyncAPI spec),
-  `go-kafka-call` or `typescript-kafka-call` (a call site).
+  `go-kafka-call` or `typescript-kafka-call` (a call site), `ruby-job-queue`
+  (a Ruby job class's own `queue_as` or `sidekiq_options queue:` literal, the
+  class as `code_symbol`, role `consumer`), `ruby-enqueue` (a `perform_later`,
+  `perform_async`, `perform_in` or `perform_at` on a constant that resolves to
+  one class carrying one such queue, at the caller, role `producer`, the class
+  as `job`).
 - `messaging`: the protocol carried by the topic operation (e.g. `kafka`).
   Security suffixes describe the transport, not a different broker, so
-  `kafka-secure` is read as the same family as `kafka`.
+  `kafka-secure` is read as the same family as `kafka`. A Ruby job queue carries
+  `activejob` or `sidekiq`, which is never Kafka, so a queue name forms no
+  cross-repository edge and binds no contract.
 
 Contract-bound topic operations additionally carry `messaging_*` binding props
 written by the contract binder. Two of them have a fixed vocabulary:
@@ -199,10 +254,17 @@ The remaining `messaging_*` props (`messaging_contract_bound`,
   of detected vs resolved edges.
 - `unresolved_*`: per-cause counts the extractor could not resolve (e.g.
   `unresolved_macros`).
+- A declared in-house client's account, one per repository and named
+  `<extractor>:client:<name>`, carries `client_spec`, `receivers` (class members declared
+  with one of its receiver types), `edge_coverage` with edge type `configured_http_call`
+  (detected: calls through the client, resolved: routes they became, unresolved:
+  skipped) and `skipped`, per-cause counts written `cause=n,...` (`dynamic_path`,
+  `missing_path_argument`, `non_route_path`). It is emitted even when the client found
+  nothing, so a declaration that matches nothing is visible.
 
 ### association
 
-- `model`, `macro` (e.g. `has_many`), `target`; `through` when set.
+- `model`, `macro` (e.g. `has_many`, or Eloquent's `hasMany`), `target`; `through` when set.
 - STI chains are emitted as associations with `macro: inherits`.
 
 ### lint
@@ -217,6 +279,25 @@ production symbols they exercise; nothing counts them as coupling. A consumer
 that builds a call graph should treat their targets as "referenced" without
 adding them to coupling metrics.
 
+### test_case
+
+Reference-only, with no relations: one test the language's usual runner can
+select, carrying `line`, `end_line`, `column` and `end_column` for the test's
+own node. The name starts with the file path, so it never shares a name with a
+symbol. A test whose label is not a literal (interpolated, generated, a
+parametrised row) and a subtest get no fact. Where a language has tests that
+can be seen and not named (C and C++, Dart, Kotlin, PHP, Ruby, Rust, Scala,
+TypeScript), one `<language>:test_cases` extraction fact counts the tests named
+as resolved and the rest as unresolved, by cause.
+
+- `language`
+- `label`: the test's own name as written
+- `groups`: the enclosing module, class, `describe` or `group` labels,
+  outermost first (empty where the language has none)
+- `runner_name`: the name the runner prints and filters on
+- `style`: where the language has more than one kind of test (Go: `test`,
+  `benchmark`, `fuzz`, `example`; Swift: `xctest`, `swift-testing`)
+
 ## Relation kinds
 
 | Kind | Meaning |
@@ -229,9 +310,12 @@ adding them to coupling metrics.
 | `instantiates` | Source constructs an instance of target via a constructor call |
 | `injects` | Source declares target as a DI-injected constructor parameter |
 | `has_method` | Owner type (struct/interface/class) declares target as a method. Synthesized, not read from source |
-| `handled_by` | A route/endpoint is served by target (e.g. a gRPC RPC route to its handler method). Added post-extraction |
+| `handled_by` | A route/endpoint is served by target, its handler symbol. Written at extraction where the route sits on its handler (decorator and annotation frameworks, .NET, Rails routes, Laravel routes) and by post-link binders elsewhere: a Go handler that is a package function or has the `func(http.ResponseWriter, *http.Request)` signature, a routes-file handler named `<type fqn>.<method>` (Play), and gRPC implementations. For a Rails route the handler is the method that serves it: looked for inside the namespace the route's engine isolates, and on the controller's ancestors when the action is inherited. Emitted only when the target is a symbol the snapshot declares under that exact name |
 | `implemented_by` | A declared contract operation is implemented by a code symbol. Added post-extraction |
-| `names` | Source names target by symbol literal without calling it — a method name passed as data for something else to dispatch. A reference, not a call |
+| `names` | Source names target by symbol literal without calling it — a method name passed as data for something else to dispatch, or a PHP class written as `Foo::class`, an enum case, a class constant or a static property. A reference, not a call |
+| `reads` | Source method runs a query that reads the table of target, a storage fact. Ruby: only where the call's receiver names the model exactly. About storage, not a call: left out of the graph's edges |
+| `writes` | Source method runs a statement that writes the table of target, a storage fact. Read like `reads` |
+| `runs` | A runtime unit runs target, the symbol its entrypoint reaches: a schedule's job class, the job classes of the queues a worker drains. An entry point, not a call |
 
 ## Route sources
 
@@ -243,6 +327,7 @@ HTTP client call sites:
 | Value | Meaning |
 |---|---|
 | `go-http-client` | Go net/http call site |
+| `python-http-client` | Python requests / httpx / aiohttp call site |
 | `ts-http-client` | TypeScript fetch/axios call site |
 | `ruby-http-client` | Ruby HTTP call site |
 | `php-http-client` | PHP HTTP call site |
@@ -253,6 +338,7 @@ HTTP client call sites:
 | `swift-endpoint` | Swift endpoint enum / protocol extension |
 | `scala-http-client` | sttp / Play WS / http4s client |
 | `dart-http-client` | Dart package:http / dio / chopper call site or annotated interface |
+| `configured-http-client` | call site through an in-house client declared under `clients:` in the config; carries `client_spec` (the declaring spec's name) and, when the call names a service, `target_hint` |
 
 gRPC client call sites: `go-grpc-client`, `ts-grpc-client`,
 `python-grpc-client`.
@@ -294,3 +380,53 @@ Props outside the contract — `language`, `exported`, `handler`, `superclass`,
 line counts, complexity metrics — are metadata. Extractors can add or remove
 them without changing `format_version`; consumers must not require them. The
 contract props are the ones documented above.
+
+One descriptive prop is prose rather than a measurement:
+
+- `doc` (symbols, and Go, Python, Java, TypeScript and Rust modules): the first
+  paragraph of the comment its author wrote on the symbol, on one line: a Python
+  docstring, the comment block above a Go declaration, a JSDoc block or run of `//`
+  lines above a TypeScript one, or a run of `#` lines above a Ruby `def`, `class` or
+  `module`, a Javadoc, KDoc, Scaladoc or PHP docblock, the `<summary>` of a C# `///`
+  XML comment, or the `///` lines or `/** */` block above a Rust item or a Swift or
+  Dart declaration, read above its attributes or annotations, or the Doxygen block
+  or run of `//` lines above a C or C++ declaration or the template holding it,
+  where `@brief` opens the description and a definition's own doc wins over its
+  prototype's. Of a block with tags, the text before its first tag; tool directives
+  such as `// eslint-disable` and `# rubocop:disable` are left out. On a Go module,
+  the package comment: from `doc.go` when it has one, else the first file by name
+  that does, never a test file or a licence. On a Python module, the docstring of
+  its `__init__.py`. On a Java module, the Javadoc of its `package-info.java`. On a
+  TypeScript module, the JSDoc block opening its `index` file, when it is marked
+  `@packageDocumentation`, `@module` or `@fileoverview`. On a Rust module, the `//!`
+  lines or `/*! */` block opening its `lib.rs`, `main.rs` or `mod.rs`, else the
+  `foo.rs` beside its `foo/`. Cut at a word and ended with `...` when it runs past
+  300 bytes; the whole comment is in [docs.jsonl](docs.md). Absent when the symbol
+  has no comment, and on languages whose extractor does not read one.
+  `diff_snapshot` and `enola check` do not report a change to it.
+
+`doc` adds no node and no edge. The same function, from a build before `doc` and
+from one after:
+
+```json
+{"kind":"symbol","name":"internal/flows.Analyze","file":"internal/flows/flows.go","line":186,
+ "props":{"symbol_kind":"function","exported":true,"cyclomatic":17}}
+
+{"kind":"symbol","name":"internal/flows.Analyze","file":"internal/flows/flows.go","line":186,
+ "props":{"symbol_kind":"function","exported":true,"cyclomatic":17,
+          "doc":"Analyze finds the entries of a graph, walks each, and ranks what it found."}}
+```
+
+It is read as written. A comment that names an old name of the function, or
+describes what it used to do, is passed on unchanged.
+
+Where it is read:
+
+| Reader | Uses `doc` |
+|---|---|
+| `facts.jsonl` | As a prop of the symbol fact |
+| `enola flows --show` and `--json`, and `flows.json` | In a flow's summary, and on its entry and each stage. See [flows.md](flows.md#example) |
+| `diff_snapshot`, `enola check` | Ignore it, so editing a comment is not an architecture change |
+| MCP tools | Never print it, by design: `doc` on every result would spend an agent's context on prose it rarely needs. `show_symbol` prints the source, comment included, when an agent asks for it |
+
+Go, Python, TypeScript, Ruby, Java, C# and PHP extractors fill it.

@@ -46,6 +46,12 @@ Loop props work as they do in [Go](go.md#loops-for-n1-hunting) — `app/db.get_p
 `loop_count=1, loop_depth=1, calls_in_scaling_loop=[app/db.get_user]`, which is the N+1
 candidate set.
 
+Python also recognises a loop fixed by name (`for p in RESERVED_PREFIXES`, `for s in
+DagRunState`, `range(MAX_RETRIES)`), an inner loop reached through the outer element
+(`for dag in dags: for task in dag.tasks`), and a batch loop (`for chunk in chunked(ids,
+500)`, a three-argument `range`, a `while` that fetches a page and drains it). The rules
+are in [the index](README.md#loops-what-counts-as-nesting).
+
 ### Module-level code is not lost
 
 Python does real work at import time, and those calls belong to no function. They are
@@ -60,7 +66,7 @@ file_ref  app/mcp_server.py   --calls--> app/mcp_server.health_check
 Without this, an MCP tool registered by a decorator at module scope has no caller and
 reads as dead code.
 
-### Test references, and the one gap
+### Test references
 
 `tests/**`, `test_*.py` and `conftest.py` are ignored for indexing and recovered as
 `test_ref`:
@@ -70,12 +76,31 @@ test_ref  tests/test_app.py   --calls--> app/api.handler
                               --calls--> app/tested_only.verify_checksum
 ```
 
-> **Stated limit.** Python has no `TestRefExtractor` implementation yet — the globs are
-> configured and the recovery path exists, but until it is implemented a Python symbol
-> called *only* from a test reads as unreferenced. Expect dead-code false positives on
-> Python repositories to be higher than on Go, Ruby or TypeScript. This is written down
-> in [`internal/config/config.go`](../../internal/config/config.go) next to the globs
-> themselves rather than discovered later.
+Test recovery emits references only; test-defined symbols and routes stay out of
+the production graph. Imports of functions defined or re-exported by `__init__.py`
+resolve to their production definitions. Receiver-typed methods that need a global
+production index can still go unresolved in this pass.
+
+### Callable values and configured entry points
+
+Callback defaults, fallback expressions such as `processor or default_processor`,
+and callable metadata such as `hostname.__module__` contribute references. Literal
+`getattr(imported_module, "function_name")` does too; computed names remain unresolved.
+Fallback, metadata and literal reflection uses carry `names` edges: traversal and
+dead-code detection see them, while call counts and coupling do not treat these
+reads as invocations. Uppercase fallback constants are not constructor calls.
+
+Plain Python strings support both dotted paths and `module:factory` notation.
+Factory strings must resolve to a declared symbol; colon-delimited data such as
+`en:Japan` does not become a call to an unresolved symbol.
+YAML string values, INI/CFG values and single-handler Docker `CMD`/`ENTRYPOINT`
+arrays can also name entry points. Configuration references must resolve to a
+symbol present in the snapshot. Prose, YAML keys, interpolated paths, missing
+symbols and external modules do not become configuration reference edges.
+
+Markdown document and heading symbols remain in the architectural graph but are
+excluded from dead-code candidates and their population. Public APIs still need
+external-consumer and compatibility checks before removal.
 
 ## Routes — FastAPI router factories and `include_router`
 

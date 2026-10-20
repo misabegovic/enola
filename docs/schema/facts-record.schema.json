@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "facts.wireRelation": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "target_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "column": {
+      "type": "integer"
+    },
+    "end_column": {
+      "type": "integer"
+    },
+    "end_line": {
+      "type": "integer"
+    },
+    "file": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "line": {
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "props": {
+      "additionalProperties": {},
+      "type": "object"
+    },
+    "relations": {
+      "items": {
+        "$ref": "#/$defs/facts.wireRelation"
+      },
+      "type": "array"
+    },
+    "repo": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "name"
+  ],
+  "title": "One line of facts.jsonl",
+  "type": "object"
+}

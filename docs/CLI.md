@@ -31,7 +31,7 @@ pip install enola-cli
 gem "enola"   # then: bundle exec enola
 ```
 
-`enola-cli` is the PyPI project name because `enola` was taken; the installed command is unaffected. The gems live at [enola-labs/enola-rb](https://github.com/enola-labs/enola-rb).
+`enola-cli` is the PyPI project name because `enola` was taken; the installed command is unaffected. The gems are maintained upstream at [misabegovic/enola-rb](https://github.com/misabegovic/enola-rb); enola-labs/enola-rb is a mirror.
 
 Binaries are published for Linux, macOS (amd64/arm64), and Windows (amd64). You can also download a specific build from the [Releases page](https://github.com/enola-labs/enola/releases), or [build from source](#build-from-source).
 
@@ -51,6 +51,7 @@ Because your agent launches enola as a long-lived MCP server process, an upgrade
 - **Cursor** - toggle the enola server off and back on in **Settings → MCP** (or reload the window).
 - **GitHub Copilot (VS Code)** - restart the server from the `.vscode/mcp.json` editor (the **Restart** CodeLens above the server entry), or reload the window.
 - **opencode** - quit and restart it; it loads its configuration once at startup and never reloads it.
+- **Pi** - start a new session or run `/reload`; the extension starts its enola server once per session.
 
 ### Configuration (optional)
 
@@ -66,6 +67,8 @@ enola: no mcp-arch.yaml in /Users/you/src/api, using built-in defaults
 It is worth reading. A config decides which extractors run and which paths are ignored, so the wrong one does not fail - it analyses something other than what you asked for. enola looks in the working directory, then (only for a binary that is *not* on your `PATH`, i.e. an unpacked bundle rather than an installed one) beside the executable; the second case says so explicitly.
 
 Note that a list-valued setting **replaces** its default rather than extending it. That is why the bundled `mcp-arch.yaml` declares no `extractors:`, `explainers:` or `renderers:` - a copied list silently falls behind as new ones ship. Set `extractors:` only to deliberately narrow a run; enola warns when an extractor you excluded would have detected the repository.
+
+Two sets of paths are ignored whatever your `ignore:` list says: the output directory, and the files `enola install` owns inside a repository (`.claude/rules/enola.md`, `.pi/extensions/enola.js` and the rest). Neither is your architecture, and indexing them would change it.
 
 The install script installs **only the binary**, by design - it does not place a config file. Grab the bundled one from the repo whenever you want to customize (tune the `ignore` globs, pick a subset of extractors, change the output dir, …):
 
@@ -110,6 +113,10 @@ When you do pass a config, its `repo:` is only the *default* repository - you ca
 
 With `--hooks` the same target installs `.opencode/plugin/enola.js`. opencode has no hook configuration in the shape Claude Code and Codex accept, so the plugin does a narrower job: it names the enola tool that answers a structural question in the descriptions of `grep`, `glob` and `list`, repeats that in the system prompt where it also reaches subagents, and refuses the first searches of a session outright with the tool to call instead. That last part blocks, so it is bounded twice: it gives up after two refusals, and it gives up the moment any enola tool is called, including one that failed. `ENOLA_OPENCODE_GATE=off` disables the refusals and leaves the rest.
 
+**Pi** - nothing to register. Pi has no MCP client, so `enola install --targets pi` writes an extension, `.pi/extensions/enola.js` (or `~/.pi/agent/extensions/enola.js` with `--global`), that is the client: at session start it launches enola's MCP server and registers every tool with Pi as `enola_<tool>` (`enola_explore`, `enola_impact_analysis`, ...), and tells the model those names in the system prompt. It is written on every install, not only with `--hooks`, since without it Pi has no enola tools at all. The extension runs the enola binary that installed it, by absolute path, so re-run `enola install` if you move the binary.
+
+Pi loads a project's extensions only once the project is trusted: accept Pi's trust prompt, run `/trust`, or start it with `pi --approve`. Until then it still reads `AGENTS.md` but has none of the tools. A global install needs no trust.
+
 **GitHub Copilot (VS Code)** - add enola to `.vscode/mcp.json` in your workspace (or your user-level MCP config via **MCP: Open User Configuration**). Note the top-level key is `servers` (not `mcpServers`), and the config path in `args` is optional - drop it to use defaults:
 
 ```json
@@ -125,6 +132,12 @@ With `--hooks` the same target installs `.opencode/plugin/enola.js`. opencode ha
 
 Or add it from the command line: `code --add-mcp "{\"name\":\"enola\",\"command\":\"enola\"}"`. Then open a project and ask Copilot to generate a snapshot.
 
+**Codex** - register it from the command line:
+
+```bash
+codex mcp add enola -- enola
+```
+
 ### Use it
 
 Everything below is a prompt you type at your agent in plain English. enola picks the tool.
@@ -133,7 +146,7 @@ Everything below is a prompt you type at your agent in plain English. enola pick
 
 > "Generate an architectural snapshot of /path/to/my/project"
 
-The snapshot gives your agent all 19 tools (`enola --list`) plus a summary at
+The snapshot gives your agent all 26 tools (`enola --list`) plus a summary at
 `.enola/llm_context.md`. Measured cold and warm times across the public corpus are in
 [BENCHMARKS.md](BENCHMARKS.md#4-scale).
 
@@ -234,7 +247,7 @@ to interpret the result:
 
 ---
 
-## The nineteen tools
+## The twenty-six tools
 
 `enola --list` prints this catalogue from the running binary; it is reproduced here so
 you can read it without one installed. You never call these by name — you ask in plain
@@ -248,14 +261,21 @@ thing.
 | `query_facts` | Precision filter over the extracted facts. |
 | `show_symbol` | Show me the actual source of this named symbol. |
 | `traverse` | Walk the dependency or call graph outward from here. |
-| `find_path` | How does A reach B? |
+| `find_path` | How does A reach B? With `from_nodes` and `to_nodes`, how does any of one set of nodes reach any of another, in one search? |
 | `impact_analysis` | If I change this, what breaks? |
 | `endpoint_impact` | Who calls this HTTP endpoint, and which screens sit behind them? |
 | `governing_intent` | Which knowledge pages govern this code — and which code does a page govern? |
 | `constraints_for` | What am I about to break by editing this file? |
 | `plan_check` | What would this change do, before it exists? |
+| `context_pack` | Which lines do I open, within the window I have? |
+| `constraints_ledger` | How much of the declared law is excused rather than obeyed? The same answer as `constraints ledger`. |
+| `constraints_lint` | Is the declaration valid, and what does each declared component select? The same answer as `constraints lint`. |
+| `grade` | What did the change do against the pinned baseline? The same verdict as `check`, graded without writing anything. |
 | `coverage_report` | Which cross-repo edges were resolved, and which were missed? |
 | `query_insights` | What did the explainers find? |
+| `package_metrics` | How stable and how abstract is this package, and how far is that from the main sequence? |
+| `find_orphans` | What does nothing reference any more? |
+| `analyze_performance` | Where does the cost grow with the input? |
 | `set_baseline` | Remember the architecture as it is now. |
 | `diff_snapshot` | What did my change actually do? |
 | `snapshot_receipt` | What was this graph generated over, what was excluded, and where are its known limits? |
@@ -267,6 +287,48 @@ The last two are the only ones that answer about the **past**. Everything above 
 describes the tree as it is now — `diff_snapshot` included, which compares two nows.
 
 Full parameter reference for each: **[ARCHITECTURE.md → The tools](../ARCHITECTURE.md#the-tools)**.
+
+### Answers a program reads
+
+`plan_check`, `diff_snapshot`, `snapshot_receipt`, `query_facts`, `impact_analysis`, `find_path`, `traverse`, `constraints_for`, `context_pack`, `explore`, `governing_intent`, `query_insights`, `constraints_ledger`, `constraints_lint` and `grade` list an output schema in `tools/list` and return their answer as structured content beside their text, in every `output_mode`. The text is what it always was. The structured content is the whole answer, never cut by the cap below, and every finding in it carries its identity. When the snapshot looks stale the text keeps its banner and the structured content gains a `freshness` field saying the same. When the binary the server started from has been replaced on disk since, the banner says so and `freshness` carries `binary_replaced: true`; `constraints_ledger`, `constraints_lint` and `grade`, whose text is a document and carries no banner, say it in `freshness` alone. The schemas are the ones `enola contract` prints for the documents the commands write, so `constraints ledger --json`, `constraints lint --json` and `check --json` are the structured content of `constraints_ledger`, `constraints_lint` and `grade`: those commands call the tools.
+
+### One repository per answer
+
+`plan_check`, `diff_snapshot`, `set_baseline`, `snapshot_receipt`, `constraints_ledger` and `grade` answer for one repository, and take it as `repo`. With one repository loaded nothing changes. When the snapshot holds several, `repo` names one; `plan_check` also reads it from paths that start with a repository's name (`web/src/main.rs`); anything else is refused with the repositories listed, rather than answered for whichever was loaded last. `constraints_lint` without `repo` lints every repository, each under its own name.
+
+### Every result is capped
+
+Every tool takes `max_tokens`, and a result over it arrives cut on a line boundary with a notice saying how to narrow the question or ask for more. Left out, it defaults to **8000** estimated tokens on the default server and **2000** under `--small`; a positive value replaces the default, and a **negative value means no cap**, returning the whole result exactly as the tool produced it. A token here is an estimate of four characters, not a tokenizer's count, so a model's own count of a capped result can run somewhat over the number asked for. A cut JSON result is no longer valid JSON, and the notice says so.
+
+### A small window: `--small`
+
+A client with a small context window can start the server with `--small`. It serves these read tools and no others:
+
+| Tool | The question it answers |
+|---|---|
+| `explore` | What is in here, and what touches it? |
+| `impact_analysis` | If I change this, what breaks? |
+| `governing_intent` | Which knowledge pages govern this code? |
+| `constraints_for` | What am I about to break by editing this file? |
+| `query_insights` | What did the explainers find? |
+| `context_pack` | Which lines do I open, within the window I have? |
+
+Each is described in one line, the server's instructions are a few sentences naming only these, results are compact JSON rather than indented, and the default cap is 2000 estimated tokens. Snapshots, baselines and grading are left to the command line and the session hooks (`enola --generate`, `enola baseline pin`, `enola check`, `enola install --hooks`), so a tool call never waits on indexing a large repository; a call made before any snapshot exists says so and names the command that makes one. The default server is unchanged by the flag's existence: register both under different names if different agents want different profiles.
+
+```bash
+claude mcp add enola-small -- enola --small
+```
+
+```json
+{
+  "mcpServers": {
+    "enola-small": {
+      "command": "enola",
+      "args": ["--small"]
+    }
+  }
+}
+```
 
 ## Explain a repository at a glance
 
@@ -293,7 +355,7 @@ enola --explain ci/cluster.yaml
 
 The argument is a **repository** when it is a directory and a **config file** when it is a file, so both forms work without a flag to tell them apart.
 
-**The report covers nine sections:**
+**The report covers thirteen sections:**
 - **Overview** - path, analysis time, active languages, total fact count
 - **Architectural kinds** - counts of modules, symbols, routes, storage, dependencies, services
 - **Relations** - the edge census: declares, imports, calls, implements, instantiates, injects, has_method
@@ -302,7 +364,10 @@ The argument is a **repository** when it is a directory and a **config file** wh
 - **Dependencies** - external, internal, and stdlib import counts
 - **Architecture** - detected pattern with confidence, cyclic dependencies, layer violations, cross-repo edges
 - **Impact analysis (hotspots)** - top modules ranked by fan-in + fan-out coupling, with criticality tier and blast radius
+- **Package metrics** - Ca, Ce, instability, abstractness and average distance from the main sequence, with the most depended-upon package. Directly after Impact analysis because both read the same import edges: Ca IS the fan-in
 - **Code health** - per-explainer findings with their top offenders: god classes (high fan-in symbols), call-graph hotspots, deep dependency chains, large public surfaces, and complexity outliers
+- **Dead code** - how many symbols nothing references, split by confidence tier and, separately, by class and visibility, over the population the analyzer actually examines rather than every symbol in the snapshot
+- **Performance** - functions analyzed, findings by severity and kind, the Big-O of those that state one, the nesting depth of the rest, and the worst few with their locations. The full set is `analyze_performance`
 - **Vendored candidates** - directories that look like in-tree copies of another project, so you can decide whether to exclude them. Nothing is excluded on your behalf; the section is absent when there is nothing to report
 
 Every finding carries a confidence score. Proof-class findings reach `1.0`: dependency
@@ -440,7 +505,7 @@ Code health
 
 No artifacts are written; `.enola/` is not touched. For a persistent snapshot with agent-readable output, use `--generate` or the MCP server.
 
-For interactive per-module blast-radius queries with configurable depth, see the `impact_analysis` tool reference in **[ARCHITECTURE.md → The tools](../ARCHITECTURE.md#the-tools)**.
+For per-module blast-radius queries with configurable depth, run `enola impact <target>` (see the [command table](#command-line-reference)), or see the `impact_analysis` tool reference in **[ARCHITECTURE.md → The tools](../ARCHITECTURE.md#the-tools)**.
 
 ---
 
@@ -448,23 +513,30 @@ For interactive per-module blast-radius queries with configurable depth, see the
 
 ## Command-line reference
 
-Run `enola --help` for the full text. With no flags, enola starts the MCP server on stdio.
+Run `enola --help` for the full text, and `enola help <command>` for one command's page: its flags, exit codes and examples. With no flags, enola starts the MCP server on stdio.
 
 Every path argument follows the same rule: **a directory is a repository, a file is a config.** Anything that is neither is rejected rather than silently ignored.
 
 | Command | What it does |
 |------|--------------|
+| `help [command [subcommand]]` | **The help for one command.** `enola help flows`, `enola --help flows` and `enola flows --help` print the same page: what the command does, its flags, its exit codes, examples, and the commands next to it. Subcommands have pages too (`enola help baseline pin`). With no command it prints `enola --help`. `--help` never runs the command it describes, wherever it appears in the arguments. |
 | `install [--hooks] [--global]` | **Tell your coding agents enola is here.** Writes its instructions into the files they actually read - `.claude/rules/enola.md`, `.cursor/rules/enola.mdc`, and a marked block in `AGENTS.md` if you have one. Previews every change and asks before writing. See [Wiring it into your agents](#wiring-it-into-your-agents---enola-install). |
-| `coverage [--repo=<svc>] [--unresolved] [--json]` | **Which cross-repo edges enola resolved, and which it did not** — per service, so you can tell a genuinely isolated service from one whose outbound edges enola could not follow. The unresolved list is always shown: it is what makes the resolved count worth believing, and each entry is either a repository you have not loaded, a third-party endpoint, or a blind spot in enola. Needs two or more repositories in one graph. A report, not a gate — it always exits `0`. |
+| `coverage [--repo=<svc>] [--unresolved] [--json]` | **Which cross-repo edges enola resolved, and which it did not** — per service, so you can tell a genuinely isolated service from one whose outbound edges enola could not follow. The unresolved list is always shown: it is what makes the resolved count worth believing, and each entry is either a repository you have not loaded, a third-party endpoint, or a blind spot in enola. `--unresolved` narrows the report to the services that have unresolved call sites and lists each one, grouped by the path it calls, with its file and line. Needs two or more repositories in one graph. A report, not a gate — it always exits `0`. In-house clients declared under `clients:` get their own table in the text output: receivers, call sites, routes, and calls skipped by cause. |
 | `doctor [repo]` | **Are the session hooks actually firing?** `install --hooks` writes a hook configuration and reports success — but whether your agent honours that configuration is a contract owned by the agent, not by enola, and a config it ignores looks identical to one it runs. So the hooks record every time they fire, *including* the runs where they deliberately say nothing, and this reports when each last ran, what it concluded, and whether the pinned baseline can still be graded against at all. `NEVER FIRED` after a real session means the wiring is not working. A report, not a gate — it always exits `0`. |
 | `dashboard [--open] [repo\|config]` | **Explore the latest snapshot visually without starting MCP.** Starts the read-only localhost dashboard attached to the terminal until Ctrl-C; `--open` also launches the browser. |
-| `providers list \| fetch <name>` | **The fact providers this binary carries itself.** `list` names each built-in and whether it is ready; `fetch rubydex` downloads the pinned Rubydex engine library from rubygems.org, verifies its published sha256, and caches it under the user cache directory, after which a `providers:` entry named `rubydex` with no command runs in-process. The only network access a provider ever makes, and never at snapshot time. |
+| `cluster init [--dry-run] [dir]` | **Write the cluster config for a folder of repositories.** Lists every immediate subfolder of `dir` that is a git repository into `dir/cluster.yaml`, with paths relative to the file, so `enola --generate dir/cluster.yaml` indexes them as one linked graph. Refuses to overwrite, and refuses a folder with fewer than two repositories; `--dry-run` prints the file instead. See [CLUSTERS.md](CLUSTERS.md). |
+| `providers list [--json] [config] \| fetch <name>` | **The fact providers this binary can offer.** `list` names the catalogue (the built-in `rubydex` and the example scripts in the providers directory), the mode a snapshot would run in and what decided it, what each entry applies to, and whether it can run on this machine and why not; `--json` gives the same. `fetch rubydex` downloads the pinned Rubydex engine library from rubygems.org, verifies its published sha256, and caches it under the user cache directory, after which a `providers:` entry named `rubydex` with no command runs in-process. The only network access a provider ever makes, and never at snapshot time. |
 | `uninstall [--global]` | Remove everything `install` wrote, leaving the rest of each file byte-for-byte as it was. |
 | `baseline pin\|show\|clear [repo\|config]` | Manage the diff baseline - the "before" a change is graded against. `pin` freezes the snapshot on disk when every repository's own receipt shows it matches the working tree under this build and config (members of a cluster must also agree on one union), and otherwise snapshots first, linking once on the cluster's last turn, and says which repository made it regenerate; `show` reports what the current baseline describes; `clear` removes it. Stored per repository, in that repo's `.enola/baseline`, so several repos each keep their own. |
 | `check [flags] [repo\|config]` | **Grade what a change did to the architecture**, and exit with a code CI can act on. Read-only: writes nothing and leaves the baseline in place, so it can be run repeatedly. See [The gate](#the-gate---enola-check). |
-| `constraints <lint\|mine\|init\|explain\|ledger> [repo\|config]` | **The authoring loop.** `lint` validates the declared vocabulary and resolves each component against the current snapshot; `mine` proposes candidate rules out of the snapshot's own regularities; `init` writes a first declaration binding every shipped recipe whose required roles resolve to directories the repository has, refusing to overwrite and guessing nothing; `explain <path>` names the components a file's facts belong to, the selector that admitted each, and the edges the file makes; `ledger` reports how much of the declared law is being EXCUSED rather than obeyed — each rule's breaches beside the suppressions and exemptions that signed them away, with every excuse's owner, reason and age, and the ones that now match nothing. `lint` exits `0` when every declaration is valid, `1` when it reported validation problems; `mine`, `init`, `explain` and `ledger` exit `0` whenever they produced a report, and `2` when they could not run — no snapshot to read, or a declaration `init` would have had to overwrite. See [CONSTRAINTS.md](CONSTRAINTS.md). |
-| `endpoint [flags] <endpoint> [repo\|config]` | **What changing an HTTP endpoint reaches.** The controller serving it, the models that controller touches, the models associated with those, the tables behind them, and the callers - including the frontend screen a calling route module implements. The endpoint is matched as a substring of the path, optionally prefixed with a verb (`GET /v1/candidates`, or just `/v1/candidates`). Client call sites and mock-server routes are excluded: this answers about what the application serves. `--json` emits the report; `--max-routes` bounds how many matched endpoints are followed. The `endpoint_impact` MCP tool answers the same question in a session. |
+| `constraints <lint\|mine\|init\|explain\|ledger> [repo\|config]` | **The authoring loop.** `lint` validates the declared vocabulary and resolves each component against the current snapshot; `mine` proposes candidate rules out of the snapshot's own regularities; `init` writes a first declaration binding every shipped recipe whose required roles resolve to directories the repository has, refusing to overwrite and guessing nothing; `explain <path>` names the components a file's facts belong to, the selector that admitted each, and the edges the file makes; `ledger` reports how much of the declared law is being EXCUSED rather than obeyed — each rule's breaches beside the suppressions and exemptions that signed them away, with every excuse's owner, reason and age, and the ones that now match nothing (`ledger --json --breaches` also lists each rule's counted breaches with the finding identity `check` pairs on). In `ledger --json` every rule row carries `verdicted`, false for a rule the snapshot reached no verdict on, with `unverdicted_reason` (one of the closed set `contract` prints: the part matches nothing, names a service the snapshot does not hold, has a selector or a role it cannot evaluate, or the form needs a measurement it lacks) and `unverdicted_detail` naming the part or measurement; and `said`, when the rule carries one, the sentence the rule was written from, returned as written and never read for meaning. `lint --json` prints one document instead of the text: `valid`, each problem with its file and, where it names an entry, the entry's line, each rule or component key nothing reads (`unknown_keys`, with file, line and the rule or component it sits in), and every component with its selector, member count and state (`resolved`, `matches_nothing`, `unevaluable`, or `unasked` with the service it names); the text form prints the same unknown keys as warnings, and neither form counts them as problems. `lint` exits `0` when every declaration is valid, `1` when it reported validation problems; `mine`, `init`, `explain` and `ledger` exit `0` whenever they produced a report, and `2` when they could not run — no snapshot to read, or a declaration `init` would have had to overwrite. See [CONSTRAINTS.md](CONSTRAINTS.md). |
+| `contract [--json]` | **What a program reading this binary may rely on, printed rather than copied.** The closed sets the engine validates and evaluates with, read from its own tables: the rule forms and the keys each requires, every rule and component key, counterpart roles, modes, directions, rule and seam vias, component kinds, the token pattern and the two bounded pattern dialects, page relations and origin channels, fact and relation kinds, check statuses with their exit codes, lint's states, the ledger's unverdicted reasons and the page extensions this build reads. With `--json`, one document that also carries a JSON Schema for each artefact and answer (`facts_record`, `receipt`, `insights`, `ledger`, `check`, `lint`, `contract`), generated from the types it is written from and checked in under `docs/schema/` as `<name>.schema.json`. Reads nothing on disk and writes nothing; exits `0`. |
+| `endpoint [flags] <endpoint> [repo\|config]` | **What changing an HTTP endpoint reaches.** The controller serving it, the models that controller touches, the models associated with those, the tables behind them, and the callers - including the frontend screen a calling route module implements. The endpoint is matched as a substring of the path, optionally prefixed with a verb (`GET /v1/candidates`, or just `/v1/candidates`). Client call sites and mock-server routes are excluded: this answers about what the application serves. `--json` emits the report; `--max-routes` bounds how many matched endpoints are followed. The `endpoint_impact` MCP tool answers the same question in a session. The callers are the client call sites the cross-repo linker matches to the route, under the same config, parameter matching and service aliases included. |
+| `path [flags] <from> <to> [repo\|config]` | **How does A reach B?** The shortest path between two nodes in the snapshot on disk, found the way the `find_path` MCP tool finds it: `<from>` and `<to>` are matched with the tool's disambiguation, and an ambiguous name keeps its resolution and the candidates tried in the answer. `--from-node` and `--to-node`, each repeatable, take exact node names instead, and one search returns the shortest path from any of the first to any of the second, listing names the graph does not hold. `--relation-kinds` and `--max-depth` are the tool's own. The output is the tool's JSON, byte for byte, because the command calls the registered tool; the `find_path` MCP tool answers the same question in a session. The snapshot is read and never generated: with none on disk it exits `2` naming `--generate`, and a tool error exits `2`. |
+| `impact [flags] <target> [repo\|config]` | **If I change this, what breaks?** Everything that transitively depends on a node in the snapshot on disk, grouped by hop (depth 1 is its direct callers, depth 2 theirs), with the pages anchored to its file, computed the way the `impact_analysis` MCP tool computes it and printed as the tool prints it, because the command calls the registered tool. The target is matched as the tool matches it and narrowed with a scope prefix, quoted as one argument (`'kind:symbol Alpha'`, `'file:pkg/a Alpha'`, `'repo:backend Alpha'`). `--output-mode` picks `summary` (the default: the exact dependent count, the breakdown by kind and depth, and the modules holding the most dependents), `compact` or `full`; `--list` is `compact`, the dependents by depth, and `--json` is `full`, every dependent with its file, line and depth and the edges between them. `--max-tokens` caps the output on a line boundary with the tool's notice, and `--max-depth` (1-10, default 3), `--max-nodes` (1-500, default 200) and `--include-forward` are the tool's own; a value outside those ranges is refused rather than clamped, and the total stays exact when the list is cut. The `impact_analysis` MCP tool answers the same question in a session. A `<target>` that is a file's path, where no code fact carries that name, is the file: its dependents are what depends on anything the file declares. A dependent standing for facts in several files (a dependency fact named for its module is declared once per importing file) names them all under `files`. A target matching a few nodes is resolved to the best of them, as the tool resolves it: the report names the node it is about (`resolution.matched` in the JSON) and stderr says a pick was made. The snapshot is read and never generated: with none on disk it exits `2` naming `--generate`. Exits `0` on a report, and `2` on a tool error or when nothing was traversed: the target matched nothing, or too many nodes to pick from, in which case the candidates are printed. An empty list that exited `0` would read as "nothing depends on this". |
+| `flows [flags] [repo\|config]` | **The ways into a program, ranked by what each reaches.** An entry is a served route's handler, a program's `main`, or a symbol a framework invokes; its flow is every symbol the calls from it reach. With no flags it lists the largest flows, one line each, with the symbols and modules each reaches. `--show <flow>` describes one: its stages (the steps that account for most of it, each with its share), the modules it passes through and a summary sentence. `--through <symbol>` lists only the flows that reach a symbol. `--top` (1-500, default 10) bounds a listing and `--json` emits the report. A flow is a floor, not a measurement: the walk ends at any call whose target is no symbol in the graph, and each flow counts those. See [The ways in](#the-ways-in---enola-flows) for how to read the listing. Entries that reach the same symbols are folded into one flow, and a flow that sits almost wholly inside a larger one names it. The program's flows are listed first; a flow whose entry is an example, a script, a migration or build tooling is marked `side` and listed after them. Test code is never an entry. `enola --generate` writes the same ranking to `.enola/flows.json` ([schema](schema/flows.md)). Read-only. Exits `0` on any produced report, `2` when it could not run or `--show` or `--through` named nothing it could pick. |
 | `plan [flags] [path...] [repo\|config]` | **The pre-edit contract.** Which declared constraints govern an intended change (`--paths`, `--symbols`), its blast radius over the current snapshot, and — for a `--patch` — the constraint verdicts that WOULD appear, evaluated over a scratch copy before any edit lands in the tree. Nothing is written; a report, never a gate. Exits `0` on any produced report, `2` when it could not run. See [CONSTRAINTS.md](CONSTRAINTS.md). |
+| `pack --budget N [flags] [path...] [repo\|config]` | **What to open within a budget.** The line ranges of the tests and symbols named with `--names` inside the paths named, in the order asked, then each named file whole, sized to `--budget` estimated tokens (four characters a token, an estimate; there is no default). Tests and symbols are taken while they fit and the rest are counted as left out; a whole file bigger than what remains is marked to search; a symbol whose end was never measured is listed at its start line. A file whose content moved since the snapshot is named with no range; with no snapshot, another config or another build it answers nothing. Reads only. Exits `0` on an answer, `2` when it could not answer. The MCP twin is `context_pack`. |
 | `log [flags] [repo\|config]` | **What has this architecture done over time?** One line per snapshot enola recorded, oldest first, with what changed since the one before it - `--graph` draws the branch topology, `--stat` breaks each delta down by fact kind, `-n` and `--since` bound the window. Read-only: it reports what was observed and never snapshots to fill a gap. `--backfill` instead BUILDS the timeline from the repository's own commit history, so a repository enola has never seen still has a past to read. **Experimental.** See [HISTORY.md](HISTORY.md). |
 | `show [rev] [repo\|config]` | **What did THIS revision do?** `log` says a revision added twelve facts; this says which twelve. Reconstructs the revision and its predecessor out of the stored history and compares them, so a past change is described in the words it was described in at the time. A revision is a snapshot id or prefix, a git commit, `HEAD~3`, `@7`, a ref name, or `latest` (the default). **Experimental.** |
 | `diff <a>..<b> [repo\|config]` | **What happened between these two points?** The architecture delta across a range - the question a week of work produces, where `show` answers for a single revision. Either side of the range may be empty, meaning the oldest or the newest recorded revision. **Experimental.** |
@@ -475,15 +547,18 @@ Every path argument follows the same rule: **a directory is a repository, a file
 
 | Flag | What it does |
 |------|--------------|
-| `--generate [repo_path\|config_path]` | Generate a snapshot and exit - no MCP server. Artifacts go to `output.dir` (default `.enola/`). With `repos:` in the config, indexes the whole cluster in one run. |
+| `--generate [repo_path\|config_path]` | Generate a snapshot and exit - no MCP server. Artifacts go to `output.dir` (default `.enola/`). With `repos:` in the config, indexes the whole cluster in one run. A directory whose immediate subfolders include two or more git repositories is indexed as a cluster: enola says it detected them, writes `cluster.yaml` there (see `cluster init`) or uses the one already there, and keeps the other settings of the config in force. A directory that is itself a git repository is indexed as one repository, with a warning. |
+| `--no-cluster` | With `--generate` on a directory holding several git repositories, index it as one repository instead of as a cluster. |
 | `--explain [repo_path\|config_path]` | Print the statistics report above and exit. Read-only: nothing is written to `.enola/`. A directory is a repository; a file is a config, so a `repos:` config reports over the whole cluster. |
 | `--list` | List the MCP tools this build serves, with one-line summaries. |
 | `--status` | List every enola server running right now - PID, repos, uptime, calls, dashboard URL - plus per-tool call counts and an estimate of the reconstruction those calls saved, in time and tokens. |
 | `--status --all` | The same usage, broken down per repository. |
 | `--no-dashboard` | Start the MCP server without the localhost dashboard. |
+| `--listen <path>` | Also accept MCP sessions on a unix socket at `<path>`, each one a session over the same loaded graph. `ENOLA_LISTEN=<path>` does the same for a caller that passes no arguments. See [One server, many callers](#one-server-many-callers-----listen). |
+| `--small` | Start the MCP server with the small-window profile: the read tools listed under it, described in one line each, short instructions, compact JSON results, and a default cap of 2000 estimated tokens per result. See [A small window](#a-small-window---small). |
 | `--version` | Print the build version. |
 | `--version --json` | Print the build version and the extractor version as JSON, on stdout. This is the release manifest — see [Staying current](#staying-current). |
-| `--help`, `-h` | Show usage. |
+| `--help`, `-h` | Show usage. Followed by a command (`enola --help flows`), show that command's page instead. |
 
 ### Staying current
 
@@ -532,12 +607,14 @@ enola uninstall               # remove it all again
 | GitHub Copilot | `.github/instructions/enola.instructions.md` *(owned)* | — lives in IDE/account settings |
 | Codex · Copilot · Pi | `AGENTS.md` *(marked block, only if it already exists)* | — |
 | Codex | `.codex/hooks.json` *(managed entries, `--hooks` only)*, covered by `AGENTS.md` otherwise | `~/.codex/AGENTS.md` *(marked block)*, `~/.codex/hooks.json` *(managed entries, `--hooks` only)* |
-| Pi | *covered by `AGENTS.md`* | `~/.pi/agent/AGENTS.md` *(marked block)* |
+| Pi | `.pi/extensions/enola.js` *(owned)*, instructions covered by `AGENTS.md` | `~/.pi/agent/AGENTS.md` *(marked block)*, `~/.pi/agent/extensions/enola.js` *(owned)* |
 | opencode | `.opencode/enola.md` *(owned)* + its entry in `opencode.json`, or covered by `AGENTS.md` | `~/.config/opencode/enola.md` *(owned)* + its entry in `~/.config/opencode/opencode.json` |
 | opencode | `mcp.enola` in the same config *(the one target that registers the server itself)* | same |
 | opencode | `.opencode/plugin/enola.js` *(owned, `--hooks` only)* | `~/.config/opencode/plugin/enola.js` *(owned, `--hooks` only)* |
 
-**Codex, Copilot, Pi and opencode all read the repository's `AGENTS.md`**, so locally one block serves all four - enola won't write a second repo-local file for them, which would only put the same instruction into the same context window twice. Their `--global` entries add what `AGENTS.md` can't: guidance in projects where nobody has run `enola install`. Those are written only when the tool's config directory already exists, so enola never creates `~/.codex` for someone who doesn't use Codex.
+**Codex, Copilot, Pi and opencode all read the repository's `AGENTS.md`**, so locally one block serves all four - enola won't write a second repo-local instruction file for them, which would only put the same instruction into the same context window twice. Their `--global` entries add what `AGENTS.md` can't: guidance in projects where nobody has run `enola install`. Those are written only when the tool's config directory already exists, so enola never creates `~/.codex` for someone who doesn't use Codex.
+
+**Pi also gets an extension on every install**, not only with `--hooks`: it is not a second copy of the instructions but the MCP client Pi lacks, without which the instructions would name tools Pi cannot call. See [Pi](#connect-it-to-your-agent) above for what it does and the project trust step a local install needs.
 
 **`--targets` is for narrowing, not for choosing.** The default is every target, and that
 is almost always what you want: each one writes only into files its own agent reads, and
@@ -571,10 +648,25 @@ exists, which it is free to read and then ignore. That is the honest description
 default, and on a small local model it is often what happens. `--hooks` is what makes the
 loop run whether or not the agent remembers to.
 
-In Claude Code and Codex that means two session hooks:
+In Claude Code, Codex and Pi that means two session hooks (in Pi they run from the extension, on its session start and agent end events, and `enola doctor` reports on them the same way):
 
 - **`SessionStart`** freezes the architecture as a baseline when a session begins - the "before".
 - **`Stop`** grades what the session changed when your agent finishes a turn, and hands the verdict back **only if** there is something to say: a structural regression under the policy you set, or - since the default policy is empty - a finding enola measured exactly and did not enforce.
+
+**pi has no hook configuration either, so there the two hooks are an extension**:
+`.pi/extensions/enola.ts` in the repository, or `~/.pi/agent/extensions/enola.ts` with
+`--global` (written only when `~/.pi` exists). It runs the same `hook session-start` on
+pi's `session_start` and `hook stop` on `agent_end`, with the payload the other agents
+send, pinned to the binary you installed with. When the stop hook has something to say,
+the extension hands it to the model once as a follow-up message and marks the stop that
+follows as the replay, so a report is delivered once rather than at every stop. It
+imports nothing beyond Node's standard library, registers no tool or command, and a
+failed run says nothing. pi loads a project's extensions only after you trust the project.
+
+The preview names, per target, the hooks it will receive, and says `no hook` for a target
+that receives none, whether because its agent has no mechanism enola can write or because
+the agent is not installed. "Restart your agent session" is printed only when a hook was
+actually written.
 
 **In opencode it means something different**, because opencode has no hook configuration
 of that shape. There `--hooks` installs `.opencode/plugin/enola.js`, which works on the
@@ -622,6 +714,14 @@ enola baseline: regenerating, shopfront moved since its snapshot: 1 modified (e.
 
 That is what makes step 1 safe to run without thinking about it: the "before" is always the tree you were looking at when you typed it, not whenever enola last happened to index. For a cluster, every member must agree on one union before the pin stands, so a config with `repos:` snapshots what it must and links once on the cluster's last turn.
 
+**`check` grades the snapshot on disk when nothing has moved.** A read-only check asks each member what `pin` asks: the same config, a build that could have written the snapshot, no file added, removed or edited since, and one union across a cluster. It asks two more things, because a grade reads them and a pin does not: that git still stands where the snapshot recorded it (the files a change touched are asked of git), and that the baseline compares the same against the snapshot's time as against now (a stale or inverted pair is judged by time). When every answer is yes, the snapshot is graded as it stands and one line on stderr says so:
+
+```
+enola check: the snapshot written 2026-09-26T17:13:28Z in /path/to/repo/.enola matches every working tree under this build and config; graded without regenerating
+```
+
+The verdict is the one a regenerate would give, except that `current_generated_at` names when that snapshot was written. Anything else regenerates, and so does every `--write`, which exists to persist a new snapshot.
+
 A baseline is stored **per repository**, in that repo's own `.enola/baseline`, so several repositories each keep their own and pinning one never disturbs another. `baseline show` reports what the current one describes - when it was generated, over which repo, how many facts, and its snapshot id - and `baseline clear` removes it.
 
 **Pinned, or one step back?** `check` grades against the pinned baseline. `--baseline=previous` grades against the preceding snapshot instead - the `previous/` set that rotates every time a snapshot is written. The two answer different questions, and diverge as soon as more than one change has landed:
@@ -658,7 +758,7 @@ Pin when you start a piece of work and the answer stays "what has this branch do
 
 **A stale baseline warns; it never blocks.** Past three days it tells you exactly how stale and what that means (the delta now also contains whatever the repo itself changed in between) - then grades anyway, because a long-lived baseline is a legitimate way to measure a multi-day refactor and only you know which you meant.
 
-**Nothing fails by default.** A bare `enola check` runs all nineteen explainers, reports every finding the change introduced, and exits `0` - saying in its own output that no policy was in effect, because a gate that enforces nothing must never be mistaken for a gate that found nothing. What breaks the build is what you name:
+**Nothing fails by default.** A bare `enola check` runs all twenty-two explainers, reports every finding the change introduced, and exits `0` - saying in its own output that no policy was in effect, because a gate that enforces nothing must never be mistaken for a gate that found nothing. What breaks the build is what you name:
 
 ```bash
 enola check --fail-on=layers                               # fail on a declared layer order
@@ -719,7 +819,7 @@ single library maintained by one core team, most people are minor to most module
 Text and JSON only. SARIF and the annotation hosts place entries on diff lines as problems,
 and this is neither.
 
-**The verdict has four writers, and all four read the same verdict.** `--format` picks `text` (the default), `json` (what `--json` means), `sarif` or `annotations`; nothing is recomputed for a writer, so a fifth is a table row. SARIF carries one rule per declared rule id with the team's `because` as its description, one result per finding in every bucket (failures as errors, advisories and declared findings as warnings, resolved findings at no level and with no region, suppressed and exempted findings with the ledger entry or exemption that excused them), the evidence span as the region, and the finding's stable identity under `partialFingerprints.enola/v1`. Annotations place every finding that has a measured position on its file and line, as Buildkite markdown grouped by file (`--link` takes the pull request's files view so each line links into the diff) or as GitHub workflow commands; findings without a position are counted at the end and never placed. The host is a flag and never read from the environment, so a run on a laptop renders exactly what the run in CI rendered.
+**The verdict has four writers, and all four read the same verdict.** `--format` picks `text` (the default), `json` (what `--json` means), `sarif` or `annotations`; nothing is recomputed for a writer, so a fifth is a table row. SARIF carries one rule per declared rule id with the team's `because` as its description, one result per finding in every bucket (failures as errors, advisories and declared findings as warnings, resolved findings at no level and with no region, suppressed and exempted findings with the ledger entry or exemption that excused them), the evidence span as the region, and the finding's stable identity under `partialFingerprints.enola/v1`. The JSON writer carries the same identity as `identity` on every finding in every list, the value `insights.json` carries for the same finding, so a reader pairs findings between runs by it rather than by title. Annotations place every finding that has a measured position on its file and line, as Buildkite markdown grouped by file (`--link` takes the pull request's files view so each line links into the diff) or as GitHub workflow commands; findings without a position are counted at the end and never placed. The host is a flag and never read from the environment, so a run on a laptop renders exactly what the run in CI rendered.
 
 The nineteen names `--fail-on` accepts are `cycles`, `layers`, `intent`, `constraints`,
 `crossrepo`, `coverage`, `unused-routes`, `messaging-coverage`, `god-class`, `hotspots`,
@@ -801,6 +901,60 @@ Lists cap at 12 entries with a `--detail` pointer, and `declares` edges - the me
 **Baselines are portable.** A baseline is identified by the repository's normalized git remote (falling back to the checkout directory name), not by the absolute path it was pinned at - so one pinned on a CI runner grades against a checkout anywhere else. That's what makes the CI shape cheap: the default branch publishes `.enola/baseline/` once, every PR restores it and diffs against it, and no job ever indexes the base a second time.
 
 Ready-made wiring: [`examples/hooks/pre-commit`](../examples/hooks/pre-commit) (blocks only on exit `1`; a missing or incomparable baseline skips the gate rather than blocking someone over setup they haven't done) and [`examples/ci/architecture-gate.yml`](../examples/ci/architecture-gate.yml) (publish-on-main, restore-on-PR).
+
+### The ways in - `enola flows`
+
+`enola flows` lists the ways into a program, largest first. This is enola's own
+repository:
+
+```
+4 flows from 8 entries (5 route, 3 main); 4 reach nothing the graph follows
+
+   #  flow                              reach  modules  unresolved  note
+   1  cmd/enola.main                     2134      110        3900
+   2  ALL /                               162        9         236
+   3  packaging/pypi/build_wheel.main       6        1           0  side
+   4  examples/cross-repo/api.main          4        1           4  side
+```
+
+**Why so few.** A flow needs an entry: the handler of a served route, a
+program's `main`, or a symbol a framework invokes. enola is one binary, so it is
+one flow. Its subcommands are reached through a dispatcher that `main` calls,
+which makes them steps of that flow:
+
+```bash
+enola flows --show cmd/enola.main   # the stages under main, each with its share
+```
+
+The MCP tools do not appear for a different reason. Each is registered as a
+function literal, and a literal has no symbol to enter at, so its calls are
+counted under the function that registers it. The same holds in any repository:
+a web application lists a flow per bound route, a command-line tool lists one,
+and a library lists none.
+
+**The first line** says how many entries were found and how many of them reach
+nothing. Here four of the eight are example route handlers that call nothing
+the graph follows. They are entries and not flows.
+
+**`unresolved`** counts the calls inside the flow whose target is no symbol in
+the graph. Most of them are not a gap. Of the 3,900 above, about 3,400 are calls
+into the standard library and imported packages, where the walk ends by design.
+About 400 are calls on a value whose type the extractor could not name, and only
+those hide code the flow may reach. Read the number against `reach`: a flow
+reaching a handful of symbols with many unresolved calls is one the graph could
+barely follow.
+
+**`side`** marks a flow whose entry is not the program: an example, a script, a
+migration, build or docs tooling. Side flows are listed after the rest however
+much they reach.
+
+**In the note column,** `also X` names entries folded into this flow because
+they reach the same symbols, and `inside X` names a larger flow that contains
+at least 90% of this one.
+
+`enola --generate` writes the 50 largest flows, with their stages and a summary
+sentence each, to `.enola/flows.json`. [schema/flows.md](schema/flows.md) is its
+contract.
 
 ### What it saved you - `--status`
 
@@ -885,7 +1039,24 @@ Agent tooling starts one enola server per session, so opening four terminals mea
 
 **Every page describes its own server.** The PID, uptime, repos and per-server call counts on a page belong to the process serving it - never to whichever server happened to start last. If a page shows a graph you did not expect, the switcher tells you which server holds the one you want.
 
-Running servers register themselves under `~/.enola/instances/`; a record is removed on exit, and one left behind by a hard-killed process is cleaned up by the next reader. Each workspace also keeps its own graph receipt under `~/.enola/graphs/`, so restarting a server in one repo restores *that* repo's graph rather than whatever another terminal snapshotted last.
+Running servers register themselves under `~/.enola/instances/`; a record is removed on exit, and one left behind by a hard-killed process is cleaned up by the next reader. Each workspace also keeps its own graph receipt under `~/.enola/graphs/`, and each agent session its own under `~/.enola/graphs/sessions/`, so restarting a server restores *that* session's graph rather than whatever another terminal or another session in the same directory snapshotted last.
+
+A record also names the file the server was started from, with its size and modification time, and whether that file has been replaced since (`binary_path`, `binary_size`, `binary_mod_time`, `binary_replaced`). An install replaces the binary under a running server, which goes on answering from the build it loaded while its `version` still names that build; `--status` marks such a server `(binary replaced since it started)`. Restarting it is yours: a server never restarts itself.
+
+#### One server, many callers - `--listen`
+
+Over stdio a server has one session, so every process that wants the graph starts a server of its own and loads it again. `--listen <path>` (or `ENOLA_LISTEN=<path>`) makes the server also accept connections on a unix socket at `<path>`, each one an MCP session on the same server over the graph it has loaded. It speaks exactly what stdio speaks, one JSON-RPC message per line, and reads run side by side while snapshots queue one behind another, as they do for one session.
+
+- **Found without being told.** The instance record carries the path as `socket`, so a caller reads `~/.enola/instances/` for a live server holding its repository and connects.
+- **Owner-only.** The socket is created readable and writable by its owner alone. A socket file nothing answers on, which a killed server leaves behind, is replaced; one a live server answers on is refused, naming that server's pid; a path that is not a socket is never touched. A lock file, `<path>.lock`, sits beside it and holds the claim for the server's life.
+- **Lifetime.** When stdio carries a session, the server lives as long as that session, as it always has, and closes the socket sessions when it ends. When stdio carries none (the server was started with its input closed), it serves the socket until it is signalled. The socket file is removed on exit.
+- **Unix only in practice.** Windows has unix sockets with different permission rules; they are not handled here.
+
+Whatever the transport, every session gets three more things:
+
+- **A handshake that says what the engine holds.** The `initialize` result (and `server/discover`'s, on the stateless protocol) carries under `_meta.engine`: `extractor_version`, `snapshot_id`, `repos` (each with its `label`, `path` and the URI of its `receipt` resource), `binary` (`path`, and `replaced`, true once the file has been replaced on disk since the server started) and `socket` when it listens on one. A caller can tell "reload" from "restart" without a second call.
+- **Receipt resources.** Each loaded repository's receipt is a resource, `enola://receipt/<label>`, read as `snapshot_receipt`'s full answer. A session subscribed to one is sent `notifications/resources/updated` when the snapshot the server holds reloads, whether a sibling `--generate` rewrote it or a call through any session did; while any session is subscribed the server checks the workspace receipt every two seconds rather than on the next call. The list follows what is loaded and its changes are not announced, so a session that subscribes to nothing is sent nothing.
+- **Progress.** `generate_snapshot`, and a `grade` whose tree has moved and must be re-read, send `notifications/progress` when the request carries a progress token: the files extracted of the files found, once the walk has counted them and at the end of each extractor.
 
 ---
 
@@ -893,7 +1064,7 @@ Running servers register themselves under `~/.enola/instances/`; a record is rem
 
 ## Build from source
 
-Prerequisites: **Go 1.25+** and a **C compiler** (for the tree-sitter bindings).
+Prerequisites: **Go 1.26+** and a **C compiler** (for the tree-sitter bindings).
 
 ```bash
 go build -o enola ./cmd/enola   # or: go install ./cmd/enola

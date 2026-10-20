@@ -441,3 +441,88 @@ class TodoItems extends Table { IntColumn get id => integer()(); }`
 		t.Errorf("part_of should resolve to the host file, got %q", withHost.partOf)
 	}
 }
+
+func TestRetrofitMethodIsIO(t *testing.T) {
+	src := `
+import 'package:dio/dio.dart';
+import 'package:retrofit/retrofit.dart';
+
+@RestApi()
+abstract class MeClient {
+  factory MeClient(Dio dio) = _MeClient;
+
+  @GET('/v1/me')
+  Future<String> me();
+
+  String describe();
+}
+
+class MeSource {
+  Future<String> load() => client.me();
+  String label() => client.describe();
+}
+`
+	all := resolveCallTargets(walkSource(t, "lib/api/me_client.dart", src))
+	computeDartPerformsIO(all)
+	for name, want := range map[string]bool{
+		"lib/api.MeClient.me":       true,
+		"lib/api.MeSource.load":     true,
+		"lib/api.MeClient.describe": false,
+		"lib/api.MeSource.label":    false,
+	} {
+		f := findFact(all, facts.KindSymbol, name)
+		if f == nil {
+			t.Fatalf("missing %s", name)
+		}
+		if got, _ := f.Props["performs_io"].(bool); got != want {
+			t.Errorf("%s performs_io = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// A route's handler is the screen its builder builds, through any wrapper that hands
+// it on as `child:` (a Page, a provider), and through a block body whose one return
+// builds it. A child the builder chooses at run time names nothing.
+func TestNavigationRouteHandlerIsTheScreen(t *testing.T) {
+	src := `
+import 'package:go_router/go_router.dart';
+
+final router = GoRouter(routes: [
+  GoRoute(path: '/home', pageBuilder: (c, s) => MaterialExtendedPage(child: const HomeScreen())),
+  GoRoute(path: '/members', pageBuilder: (c, s) {
+    final id = s.uri.queryParameters['id'];
+    return const MaterialExtendedPage(child: AddMembersScreen());
+  }),
+  GoRoute(path: '/users', builder: (c, s) => const UsersScreen()),
+  GoRoute(path: '/profile', builder: (c, s) => BlocProvider(create: (_) => ProfileBloc(), child: const ProfileScreen())),
+  GoRoute(path: '/picker', pageBuilder: (c, s) => MaterialExtendedPage(child: wide ? const WidePicker() : const NarrowPicker())),
+  GoRoute(path: '/inline', builder: (c, s) => Scaffold(body: const Text('hi'))),
+  GoRoute(path: '/either', builder: (c, s) {
+    if (wide) {
+      return const WidePicker();
+    }
+    return const NarrowPicker();
+  }),
+]);
+`
+	all := walkSource(t, "lib/routing/router.dart", src)
+	want := map[string]string{
+		"/home":    "HomeScreen",
+		"/members": "AddMembersScreen",
+		"/users":   "UsersScreen",
+		"/profile": "ProfileScreen",
+		"/picker":  "",
+		"/inline":  "",
+		"/either":  "",
+	}
+	for path, handler := range want {
+		r := findFact(all, facts.KindRoute, path)
+		if r == nil {
+			t.Errorf("missing route %s", path)
+			continue
+		}
+		if got := r.PropString("handler"); got != handler {
+			t.Errorf("route %s handler = %q, want %q", path, got, handler)
+		}
+	}
+}

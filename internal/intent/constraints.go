@@ -297,6 +297,13 @@ type ConstraintRule struct {
 	Mode    string `yaml:"mode"`
 	Because string `yaml:"because"`
 
+	// Said is the sentence a person said that this rule was written from,
+	// carried unchanged to the compiled fact, the ledger row and every finding
+	// the rule raises. It is never read for meaning: the law is the form the
+	// rule declares, and this only keeps the words it was written from beside
+	// the verdict, so a reader meets their own sentence rather than an id.
+	Said string `yaml:"said"`
+
 	Exempt []ConstraintExemption `yaml:"exempt"`
 
 	// SourceFile mirrors ConstraintComponent.SourceFile: the repo-relative
@@ -382,6 +389,10 @@ func allowedComponentKinds() string {
 // what a concern may reach — compose from the existing edge forms.
 var AllowedRuleVias = viaSet(AllRuleVias)
 
+// allowedCodeVias is the vocabulary of the forms that walk or demand edges,
+// where an access via would end the walk at a table.
+var allowedCodeVias = viaSet(CodeRuleVias)
+
 func viaSet(vias []string) map[string]bool {
 	out := make(map[string]bool, len(vias))
 	for _, via := range vias {
@@ -392,6 +403,19 @@ func viaSet(vias []string) map[string]bool {
 
 func allowedRuleVias() string {
 	return strings.Join(AllRuleVias, ", ")
+}
+
+func allowedCodeViaList() string {
+	return strings.Join(CodeRuleVias, ", ")
+}
+
+// walkingViaProblem names a via a walking or demanding form cannot take: one
+// outside the vocabulary, or an access kind only the one-edge forms judge.
+func walkingViaProblem(loc, id, via string) string {
+	if IsAccessVia(via) {
+		return fmt.Sprintf("%s (%s): via %q names a table a method reads or writes, which only forbid, allow and protect judge (allowed here: %s)", loc, id, via, allowedCodeViaList())
+	}
+	return fmt.Sprintf("%s (%s): via %q is not a rule edge kind (allowed: %s)", loc, id, via, allowedCodeViaList())
 }
 
 // AllowedRuleModes is the closed enforcement-mode vocabulary. Ratchet (the
@@ -480,8 +504,8 @@ func constraintProblems(components []ConstraintComponent, rules []ConstraintRule
 		if c.Recipe == "" && !validToken(c.Name) {
 			problems = append(problems, fmt.Sprintf("%s: name %q must be a lowercase token", loc, c.Name))
 		}
-		if c.Service != "" && !validToken(c.Service) {
-			problems = append(problems, fmt.Sprintf("%s (%s): service %q must be a lowercase token", loc, c.Name, c.Service))
+		if c.Service != "" && !validRepoLabel(c.Service) {
+			problems = append(problems, fmt.Sprintf("%s (%s): service %q must be a repository label: letters, digits, '.', '_' and '-', the last segment of its remote or its directory name", loc, c.Name, c.Service))
 		}
 		if !c.Selects() {
 			problems = append(problems, fmt.Sprintf("%s (%s): needs at least one match pattern, a service, or a where predicate", loc, c.Name))
@@ -616,8 +640,8 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 			problems = append(problems, fmt.Sprintf("%s (%s): cap needs max_members of at least 1 — an empty surface is forbid_fact's form", loc, r.ID))
 		}
 	case r.RequireEdge != "":
-		if !AllowedRuleVias[r.Via] {
-			problems = append(problems, fmt.Sprintf("%s (%s): via %q is not a rule edge kind (allowed: %s)", loc, r.ID, r.Via, allowedRuleVias()))
+		if !allowedCodeVias[r.Via] {
+			problems = append(problems, walkingViaProblem(loc, r.ID, r.Via))
 		}
 		if !AllowedEdgeDirections[r.Direction] {
 			problems = append(problems, fmt.Sprintf("%s (%s): require_edge needs a direction (allowed: %s) — inbound demands a measured edge land on each member, outbound demands each member make one", loc, r.ID, allowedEdgeDirections()))
@@ -665,8 +689,8 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 			problems = append(problems, fmt.Sprintf("%s (%s): surface must be exported or absent (absent means every member)", loc, r.ID))
 		}
 	case r.Protocol != "":
-		if !AllowedRuleVias[r.Via] {
-			problems = append(problems, fmt.Sprintf("%s (%s): via %q is not a rule edge kind (allowed: %s)", loc, r.ID, r.Via, allowedRuleVias()))
+		if !allowedCodeVias[r.Via] {
+			problems = append(problems, walkingViaProblem(loc, r.ID, r.Via))
 		}
 		if len(r.Steps) < 2 {
 			problems = append(problems, fmt.Sprintf("%s (%s): protocol needs at least 2 steps — a single step declares no order to conform to", loc, r.ID))
@@ -686,8 +710,8 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 		if r.WhenPropContains != nil && (r.WhenPropContains.Prop == "" || r.WhenPropContains.Value == "") {
 			problems = append(problems, fmt.Sprintf("%s (%s): when_prop_contains needs both prop and value; omit it to require of every member", loc, r.ID))
 		}
-		if len(r.WhenEdgeTo) > 0 && !AllowedRuleVias[r.Via] {
-			problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to needs a via (allowed: %s) — the antecedent reads one kind of the member's own outgoing edges, and which kind is never defaulted", loc, r.ID, allowedRuleVias()))
+		if len(r.WhenEdgeTo) > 0 && !allowedCodeVias[r.Via] {
+			problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to needs a via (allowed: %s): the antecedent reads one kind of the member's own outgoing edges, and which kind is never defaulted", loc, r.ID, allowedCodeViaList()))
 		}
 		for j, target := range r.WhenEdgeTo {
 			switch {
@@ -727,8 +751,8 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 	}
 	// Forbid_reach walks every rule-via edge kind by default, so its via is
 	// optional — but a declared one must still come from the vocabulary.
-	if r.ForbidReach != "" && r.Via != "" && !AllowedRuleVias[r.Via] {
-		problems = append(problems, fmt.Sprintf("%s (%s): via %q is not a rule edge kind (allowed: %s)", loc, r.ID, r.Via, allowedRuleVias()))
+	if r.ForbidReach != "" && r.Via != "" && !allowedCodeVias[r.Via] {
+		problems = append(problems, walkingViaProblem(loc, r.ID, r.Via))
 	}
 	if !edgeForm && r.ForbidReach == "" && r.RequireEdge == "" && r.Protocol == "" && len(r.WhenEdgeTo) == 0 && r.Via != "" {
 		problems = append(problems, fmt.Sprintf("%s (%s): via belongs to the edge forms (forbid, forbid_reach, allow, require_edge, protocol) and to require's when_edge_to antecedent, not this one", loc, r.ID))
@@ -782,12 +806,12 @@ func ruleFormProblems(loc string, r ConstraintRule, names map[string]bool, noun 
 			problems = append(problems, fmt.Sprintf("%s (%s): when_via belongs to the require_edge form, whose via names the edge the rule demands — every other form reads its antecedent on via itself", loc, r.ID))
 		case len(r.WhenEdgeTo) == 0:
 			problems = append(problems, fmt.Sprintf("%s (%s): when_via names the edge kind the when_edge_to antecedent reads, and no antecedent is declared", loc, r.ID))
-		case !AllowedRuleVias[r.WhenVia]:
-			problems = append(problems, fmt.Sprintf("%s (%s): when_via %q is not a measured edge kind (allowed: %s)", loc, r.ID, r.WhenVia, allowedRuleVias()))
+		case !allowedCodeVias[r.WhenVia]:
+			problems = append(problems, fmt.Sprintf("%s (%s): when_via %q is not a measured edge kind (allowed: %s)", loc, r.ID, r.WhenVia, allowedCodeViaList()))
 		}
 	}
 	if r.RequireEdge != "" && len(r.WhenEdgeTo) > 0 && r.WhenVia == "" {
-		problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to on the require_edge form needs a when_via (allowed: %s) — via already names the edge this rule demands, so the kind the antecedent reads is never defaulted from it", loc, r.ID, allowedRuleVias()))
+		problems = append(problems, fmt.Sprintf("%s (%s): when_edge_to on the require_edge form needs a when_via (allowed: %s): via already names the edge this rule demands, so the kind the antecedent reads is never defaulted from it", loc, r.ID, allowedCodeViaList()))
 	}
 	if r.RequireDefines == "" && (r.Method != "" || len(r.AnyOf) > 0) {
 		problems = append(problems, fmt.Sprintf("%s (%s): method belongs to the require_defines form, as does any_of", loc, r.ID))

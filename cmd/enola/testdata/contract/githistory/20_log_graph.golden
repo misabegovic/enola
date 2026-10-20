@@ -1,0 +1,6 @@
+$ enola log --graph .
+exit: 0
+--- stdout
+* 966c7cd  <TIME>  (01b246396b27, backfill)  initial: 20 facts, 3 findings
+* 50df2b1  <TIME>  (9522ef6c8541, backfill)  1 new finding · +4 facts · +4 edges
+--- stderr

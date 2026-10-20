@@ -1,0 +1,279 @@
+{
+  "$defs": {
+    "constraints.ExemplarNote": {
+      "properties": {
+        "exemplar": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exemplar",
+        "rule"
+      ],
+      "type": "object"
+    },
+    "constraints.UnevaluableSelector": {
+      "properties": {
+        "cause": {
+          "type": "string"
+        },
+        "component": {
+          "type": "string"
+        },
+        "near_miss": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "prop": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cause",
+        "component",
+        "prop"
+      ],
+      "type": "object"
+    },
+    "constraints.UnreachableRole": {
+      "properties": {
+        "component": {
+          "type": "string"
+        },
+        "members": {
+          "type": "integer"
+        },
+        "owns": {
+          "type": "string"
+        },
+        "partial": {
+          "type": "boolean"
+        },
+        "role": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "side": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "via": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "members",
+        "owns",
+        "role",
+        "rule",
+        "side",
+        "via"
+      ],
+      "type": "object"
+    },
+    "layers.LayerCount": {
+      "properties": {
+        "layer": {
+          "type": "string"
+        },
+        "members": {
+          "type": "integer"
+        },
+        "order": {
+          "type": "integer"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "layer",
+        "members",
+        "order",
+        "paths",
+        "repo"
+      ],
+      "type": "object"
+    },
+    "lint.Component": {
+      "properties": {
+        "members": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "selector": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "members",
+        "name",
+        "state"
+      ],
+      "type": "object"
+    },
+    "lint.Problem": {
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    },
+    "lint.UnknownKey": {
+      "properties": {
+        "component": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "key",
+        "line"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "absent_exemplars": {
+      "items": {
+        "$ref": "#/$defs/constraints.ExemplarNote"
+      },
+      "type": "array"
+    },
+    "components": {
+      "items": {
+        "$ref": "#/$defs/lint.Component"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "layers": {
+      "items": {
+        "$ref": "#/$defs/layers.LayerCount"
+      },
+      "type": "array"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "problems": {
+      "items": {
+        "$ref": "#/$defs/lint.Problem"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "resolution": {
+      "type": "string"
+    },
+    "snapshot": {
+      "type": "string"
+    },
+    "unevaluable_selectors": {
+      "items": {
+        "$ref": "#/$defs/constraints.UnevaluableSelector"
+      },
+      "type": "array"
+    },
+    "unknown_keys": {
+      "items": {
+        "$ref": "#/$defs/lint.UnknownKey"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "unreachable_roles": {
+      "items": {
+        "$ref": "#/$defs/constraints.UnreachableRole"
+      },
+      "type": "array"
+    },
+    "valid": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "components",
+    "notes",
+    "problems",
+    "resolution",
+    "unknown_keys",
+    "valid"
+  ],
+  "title": "constraints lint --json",
+  "type": "object"
+}

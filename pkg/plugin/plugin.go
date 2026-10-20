@@ -101,12 +101,27 @@ type KeyDependent interface {
 	AffectsKey(relFile string) bool
 }
 
+// ConfigKeyed is an optional interface a FileOwner Extractor may implement when
+// configuration, not only file contents, decides its output. A non-empty ConfigKey is
+// folded into the extractor's incremental-cache key, so editing that configuration
+// re-runs the extractor instead of serving facts extracted under the old one. An empty
+// key leaves the cache key exactly as it would be without the interface, so an
+// extractor with nothing configured keeps the caches it already has.
+type ConfigKeyed interface {
+	// ConfigKey returns a stable rendering of the configuration the extractor reads,
+	// or "" when it reads none.
+	ConfigKey() string
+}
+
 // TestRefExtractor is an optional interface an Extractor may implement to parse
 // test/spec files for their outbound references into production code only. The
 // engine calls it with the test files (matched by config.TestGlobs) that the
 // extractor owns. Implementations must emit ONLY reference facts (facts.KindTestRef
 // carrying RelCalls relations) and no symbol/module/route facts, so test code
 // never becomes a dead-code candidate and no other explainer is affected.
+// facts.KindTestCase is the one other kind allowed here: one per test the
+// language's runner can select, with a span and no relations, so it names a
+// test's lines without adding an edge anything could count.
 // Extractors that do not implement it are simply skipped for test-ref extraction.
 type TestRefExtractor interface {
 	// ExtractTestRefs parses the repo-relative test files in testFiles and returns
@@ -198,4 +213,16 @@ type Renderer interface {
 	Name() string
 	// Render produces artifacts from the given snapshot.
 	Render(ctx context.Context, snapshot *facts.Snapshot) ([]facts.Artifact, error)
+}
+
+// StoreRenderer is an optional capability of a Renderer: producing its artifacts
+// from the fact store as well as the snapshot.
+//
+// A snapshot carries its facts as a flat list. A renderer that follows edges
+// needs to find a fact by name, and building its own index over the list would
+// duplicate the one the store already holds, on every snapshot. A Renderer
+// implementing it has RenderStore called INSTEAD of Render. The store is
+// read-only here.
+type StoreRenderer interface {
+	RenderStore(ctx context.Context, snapshot *facts.Snapshot, store *facts.Store) ([]facts.Artifact, error)
 }

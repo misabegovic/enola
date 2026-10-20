@@ -33,7 +33,7 @@ const maxUnresolvedCallers = 8
 func unresolvedCallers(store *facts.Store, repo string) []facts.Evidence {
 	served := map[string]bool{}
 	for _, fact := range store.ByKind(facts.KindRoute) {
-		if role, _ := fact.Props["role"].(string); role == "client" {
+		if role, _ := fact.PropAny("role").(string); role == "client" {
 			continue
 		}
 		served[routeKey(fact)] = true
@@ -44,10 +44,10 @@ func unresolvedCallers(store *facts.Store, repo string) []facts.Evidence {
 		if fact.Repo != repo {
 			continue
 		}
-		if role, _ := fact.Props["role"].(string); role != "client" {
+		if role, _ := fact.PropAny("role").(string); role != "client" {
 			continue
 		}
-		if isDouble, _ := fact.Props["test_double"].(bool); isDouble {
+		if isDouble, _ := fact.PropAny("test_double").(bool); isDouble {
 			continue
 		}
 		if served[routeKey(fact)] {
@@ -89,7 +89,7 @@ func unresolvedCallers(store *facts.Store, repo string) []facts.Evidence {
 
 // routeKey compares a client's path dialect against a server's.
 func routeKey(fact facts.Fact) string {
-	method, _ := fact.Props["method"].(string)
+	method, _ := fact.PropAny("method").(string)
 	segments := strings.Split(fact.Name, "/")
 	for i, segment := range segments {
 		if segment == "{}" || strings.HasPrefix(segment, ":") || strings.HasPrefix(segment, "*") {
@@ -111,9 +111,10 @@ func (e *CoverageExplainer) Explain(ctx context.Context, store *facts.Store) ([]
 	var insights []facts.Insight
 	for _, svc := range store.ByKind(facts.KindService) {
 		cov := readCoverage(svc)
-		var unresolved, detected int
+		var unresolved, detected, resolved int
 		for _, c := range cov {
 			detected += c.detected
+			resolved += c.resolved
 			unresolved += c.unresolved
 		}
 		if unresolved == 0 {
@@ -130,7 +131,7 @@ func (e *CoverageExplainer) Explain(ctx context.Context, store *facts.Store) ([]
 		evidence = append(evidence, unresolvedCallers(store, svc.Repo)...)
 
 		var insight facts.Insight
-		if facts.ClassifyService(outbound, detected, unresolved) == facts.ServiceCoverageGap {
+		if facts.ClassifyService(outbound, detected, resolved, unresolved) == facts.ServiceCoverageGap {
 			insight = facts.Insight{
 				Title: fmt.Sprintf("Coverage gap: service %s appears isolated but has %d unresolved outbound call site(s)",
 					svc.Name, unresolved),
@@ -158,7 +159,76 @@ func (e *CoverageExplainer) Explain(ctx context.Context, store *facts.Store) ([]
 		}
 		insights = append(insights, insight)
 	}
-	return insights, nil
+	return append(insights, silentClients(store)...), nil
+}
+
+// silentClients reports each in-house client the config declares (clients:) that matched
+// no call site in any loaded repository.
+//
+// In one repository, finding nothing is ordinary: a server calls no client. Across every
+// loaded repository it is almost always the config, and one of the cheapest mistakes to
+// make in it: a receiver type written the way the interface is named rather than the way
+// classes inject it. The receiver count says which half of the declaration is wrong.
+func silentClients(store *facts.Store) []facts.Insight {
+	type tally struct {
+		receivers, calls int
+		evidence         []facts.Evidence
+	}
+	bySpec := map[string]*tally{}
+	for _, f := range store.ByKind(facts.KindExtraction) {
+		spec := f.PropString(facts.PropClientSpec)
+		if spec == "" {
+			continue
+		}
+		t := bySpec[spec]
+		if t == nil {
+			t = &tally{}
+			bySpec[spec] = t
+		}
+		receivers := asInt(f.PropAny("receivers"))
+		calls := 0
+		for _, c := range readCoverage(f) {
+			calls += c.detected
+		}
+		t.receivers += receivers
+		t.calls += calls
+		where := f.Repo
+		if where == "" {
+			where = f.File
+		}
+		t.evidence = append(t.evidence, facts.Evidence{Fact: f.Name,
+			Detail: fmt.Sprintf("%s: %d receiver(s), %d call site(s)", where, receivers, calls)})
+	}
+
+	specs := make([]string, 0, len(bySpec))
+	for spec := range bySpec {
+		specs = append(specs, spec)
+	}
+	sort.Strings(specs)
+
+	var out []facts.Insight
+	for _, spec := range specs {
+		t := bySpec[spec]
+		if t.calls > 0 {
+			continue
+		}
+		sort.Slice(t.evidence, func(i, j int) bool { return t.evidence[i].Detail < t.evidence[j].Detail })
+		why := "no class in any loaded repository declares a member of its receiver types"
+		action := "Check receiver_types against the type a class injects (constructor parameter or inject() field)"
+		if t.receivers > 0 {
+			why = fmt.Sprintf("%d member(s) of its receiver types exist, but none of its declared methods is called on them", t.receivers)
+			action = "Check the method names under methods against the calls made on those members"
+		}
+		out = append(out, facts.Insight{
+			Title: fmt.Sprintf("Declared client %s matched no call site", spec),
+			Description: fmt.Sprintf("The config declares the in-house client %s, but %s, so it contributed no client route. "+
+				"The dependencies it would carry are missing from the graph, not absent from the code.", spec, why),
+			Confidence: 0.9,
+			Evidence:   t.evidence,
+			Actions:    []string{action},
+		})
+	}
+	return out
 }
 
 // coverageEntry is one edge_type's tally, read back tolerantly from a service node.
@@ -197,7 +267,7 @@ func readCoverage(svc facts.Fact) []coverageEntry {
 		return nil
 	}
 	var raw []map[string]any
-	switch v := svc.Props["edge_coverage"].(type) {
+	switch v := svc.PropAny("edge_coverage").(type) {
 	case []map[string]any:
 		raw = v
 	case []any:

@@ -3,6 +3,7 @@ package rustextractor
 import (
 	"strings"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
@@ -40,7 +41,7 @@ func extractUtoipaRoutes(root *sitter.Node, src []byte, relFile, dir string) []f
 		for i := uint(0); i < uint(parent.ChildCount()); i++ {
 			c := parent.Child(i)
 			if kindOf(c) == "attribute_item" {
-				if isCfgTestAttribute(nodeText(c, src)) {
+				if attr, ok := parseRustAttribute(c, src); ok && attr.isCfgTest(src) {
 					sawCfgTest = true
 				}
 				if isUtoipaPathAttribute(c, src) {
@@ -98,6 +99,7 @@ func utoipaRouteFacts(attr, item *sitter.Node, src []byte, relFile, dir string) 
 		}
 	}
 	line := int(attr.StartPosition().Row) + 1
+	endLine, col, endCol := tsutil.Span(attr, src)
 
 	out := make([]facts.Fact, 0, len(verbs))
 	for _, v := range verbs {
@@ -114,6 +116,9 @@ func utoipaRouteFacts(attr, item *sitter.Node, src []byte, relFile, dir string) 
 			Name:      path,
 			File:      relFile,
 			Line:      line,
+			EndLine:   endLine,
+			Column:    col,
+			EndColumn: endCol,
 			Props:     props,
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: dir}},
 		})

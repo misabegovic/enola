@@ -1,0 +1,90 @@
+{
+  "$defs": {
+    "facts.wireEvidence": {
+      "properties": {
+        "column": {
+          "type": "integer"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "end_column": {
+          "type": "integer"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "fact": {
+          "type": "string"
+        },
+        "fact_id": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "facts.wireInsight": {
+      "properties": {
+        "confidence": {
+          "type": "number"
+        },
+        "description": {
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/facts.wireEvidence"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "identity": {
+          "type": "string"
+        },
+        "informational": {
+          "type": "boolean"
+        },
+        "metrics": {
+          "additionalProperties": {},
+          "type": "object"
+        },
+        "source": {
+          "type": "string"
+        },
+        "suggested_actions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "confidence",
+        "description",
+        "evidence",
+        "title"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "items": {
+    "$ref": "#/$defs/facts.wireInsight"
+  },
+  "title": "insights.json",
+  "type": "array"
+}

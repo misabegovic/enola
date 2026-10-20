@@ -52,9 +52,10 @@ var supportedPlatforms = map[string]bool{
 // Run performs a self-update to the latest release. current is the installed
 // version (version.Version); a value of "dev" is always treated as out of date.
 func Run(ctx context.Context, current string) error {
-	// Checked before anything else, including the release lookup. A pip install
-	// is not a slow path to the same outcome, it is the wrong outcome, and there
-	// is no reason to spend a network round trip discovering that.
+	// Checked before anything else, including the release lookup. An install
+	// another tool owns (pip, or any installer that stamped its name) is not a
+	// slow path to the same outcome, it is the wrong outcome, and there is no
+	// reason to spend a network round trip discovering that.
 	if msg := externallyManaged(); msg != "" {
 		fmt.Fprint(os.Stderr, msg)
 		return nil
@@ -124,15 +125,23 @@ func Run(ctx context.Context, current string) error {
 // else. The command it installs is still `enola`, which is exactly the sort of
 // asymmetry nobody remembers under pressure, so the message spells the whole
 // command out rather than saying "upgrade with pip".
+//
+// Every value other than "source" is refused, not only the ones named here. An
+// installer that stamped its own name did so because it tracks the file, and a
+// self-update would also fetch upstream's release over a build that may not be
+// upstream's. The refusal names the installer, since that is where the upgrade
+// has to come from; an empty value refuses too, because it names no owner.
 func externallyManaged() string {
-	if version.InstallMethod != "pip" {
+	method := version.InstallMethod
+	if method == "source" {
 		return ""
 	}
 	where := "this installation"
 	if exe, err := os.Executable(); err == nil {
 		where = exe
 	}
-	return fmt.Sprintf(`enola was installed with pip, which owns %s.
+	if method == "pip" {
+		return fmt.Sprintf(`enola was installed with pip, which owns %s.
 
 Self-updating would replace that file behind pip's back: pip's recorded hash for
 the package would no longer match, and the next pip operation would undo the
@@ -141,6 +150,17 @@ upgrade without saying so.
 Upgrade with:
   pip install -U enola-cli
 `, where)
+	}
+	if method == "" {
+		method = "an installer that did not name itself"
+	}
+	return fmt.Sprintf(`enola was installed by %[1]s, which owns %[2]s.
+
+Self-updating would replace that file with upstream's release behind the
+installer's back, and the build it installed may not be upstream's.
+
+Upgrade it through %[1]s.
+`, method, where)
 }
 
 // latestVersion queries the GitHub API for the latest release tag and returns

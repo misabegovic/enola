@@ -3,14 +3,16 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/enola-labs/enola/internal/clientspec"
 	"github.com/enola-labs/enola/internal/intent"
 	"github.com/enola-labs/enola/internal/linkers/vocab"
-	"github.com/enola-labs/enola/internal/providers"
+	"github.com/enola-labs/enola/internal/providerspec"
 )
 
 // Config represents the mcp-arch.yaml configuration.
@@ -70,7 +72,27 @@ type Config struct {
 	// internal/providers for the exchange contract; changing this list changes
 	// emitted facts, so it is folded into the snapshot's config hash and the
 	// ran-provider set is compared between snapshots like the extractor set.
-	Providers []providers.Provider `yaml:"providers"`
+	Providers []providerspec.Spec `yaml:"providers"`
+
+	// ProvidersMode chooses what runs: declared runs the providers: list and
+	// nothing else, every adds each catalogue provider that applies to the
+	// repository (a listed entry replacing the catalogue's of its name), none
+	// runs nothing. Absent, a config that lists providers is declared, and one
+	// that does not takes ENOLA_PROVIDERS, else the build's default, else
+	// declared; see providers.ResolveMode, which the catalogue calls when it runs.
+	ProvidersMode string `yaml:"providers_mode,omitempty"`
+
+	// Interpreters names the ruby and node the catalogue's scripts run under,
+	// each an absolute path or a name on PATH. ENOLA_RUBY and ENOLA_NODE win
+	// over it; with neither, PATH decides. A listed provider's command is never
+	// rewritten: it names its own interpreter.
+	Interpreters map[string]string `yaml:"interpreters,omitempty"`
+
+	// ProvidersListed reports whether the file named `providers:` itself. Not
+	// read from YAML; set by Load, for the reason ExtractorsExplicit is: an
+	// empty list and an absent key unmarshal alike and mean opposite things,
+	// "run none of these" and "the config has not said".
+	ProvidersListed bool `yaml:"-"`
 
 	// Linking overlays the cross-repo linker's tuning vocabulary — the word lists that
 	// decide which names are too generic to link on, and the numeric thresholds. It is
@@ -81,6 +103,19 @@ type Config struct {
 	// hash; two snapshots taken under different vocabularies are not comparable and the
 	// receipt says so.
 	Linking *vocab.Overlay `yaml:"linking,omitempty"`
+
+	// Clients declares in-house HTTP clients: which method on which injected type makes
+	// a request, and where its service name, path and verb sit among the arguments. It
+	// teaches an extractor to read a call site and never declares an edge; see
+	// internal/clientspec. It changes emitted facts, so it is folded into the config
+	// hash and into the reading extractor's cache key.
+	Clients []clientspec.Spec `yaml:"clients,omitempty"`
+
+	// ServiceAliases maps a service name a client passes (a string argument, not a
+	// host) to the repository label that serves it, for when the two differ. It only
+	// chooses between repositories that already serve a called path; it never makes a
+	// repository a candidate. Folded into the config hash.
+	ServiceAliases map[string]string `yaml:"service_aliases,omitempty"`
 
 	// Dashboard configures the localhost dashboard served alongside the MCP
 	// server. Optional: the zero value keeps the built-in defaults.
@@ -101,14 +136,6 @@ type Config struct {
 	// are unchanged. Defaults to true. Set `incremental: false` to force a full
 	// re-extraction every run.
 	Incremental *bool `yaml:"incremental,omitempty"`
-
-	// ChangeVerifyHint is optional extra guidance a host/wrapper can inject into the
-	// change-verification surfaces — the server Instructions block and the runtime
-	// post-snapshot nudge (loopHint). It lets a wrapper that registers additional
-	// change-verification tools draw the agent toward them from the same
-	// generate_snapshot → diff loop the OSS tools advertise. Not read from YAML; set
-	// programmatically before the server is constructed. Empty by default (OSS).
-	ChangeVerifyHint string `yaml:"-"`
 }
 
 // IncrementalEnabled reports whether per-extractor caching is on (the default).
@@ -217,14 +244,17 @@ var KnownExplainers = []string{
 	"cycles", "layers", "crossrepo", "coverage", "unused-routes", "messaging-coverage",
 	"god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers",
 	"intent", "constraints", "domain", "query-loops", "entry-points", "dead-methods",
-	"vendored-candidates", "import-closure",
+	"vendored-candidates", "import-closure", "package-metrics", "dead-code",
+	"performance",
 }
 
 // Default returns a Config with sensible defaults.
 func Default() *Config {
 	return &Config{
 		Repo: ".",
-		Ignore: []string{
+		// enola's own installed files close the list, so Normalize adds nothing to a
+		// default config and its ignore-glob hash is the same before and after.
+		Ignore: append([]string{
 			// Any-depth forms, deliberately: a monorepo's sub-app carries its own
 			// node_modules/dist, and the root-anchored globs these replace let a
 			// nested tree straight into the graph — on one production monolith the
@@ -476,7 +506,7 @@ func Default() *Config {
 			// the bundled mcp-arch.yaml ignore list.
 			"**/*.min.js",
 			"**/*.bundle.js",
-		},
+		}, installedFileGlobs()...),
 		// TestGlobs identify test/spec files. They stay ignored for normal indexing
 		// (still listed in Ignore above) — production architecture facts must not
 		// include test symbols — but the engine collects them separately for
@@ -535,9 +565,9 @@ func Default() *Config {
 			"**/integration_test/**/*.dart",
 			"**/test_driver/**/*.dart",
 		},
-		Extractors: []string{"asyncapi", "cpp", "dart", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "scala", "hcl", "ansible", "mdintent", "manifests"},
+		Extractors: []string{"asyncapi", "cpp", "dart", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "scala", "hcl", "kicad", "ansible", "mdintent", "manifests"},
 		Explainers: append([]string(nil), KnownExplainers...),
-		Renderers:  []string{"llm_context"},
+		Renderers:  []string{"llm_context", "flows", "docs"},
 		Output: OutputConfig{
 			Dir:              defaultOutputDir,
 			MaxContextTokens: 16000,
@@ -563,10 +593,12 @@ func Load(path string) (*Config, error) {
 	// to it unmarshals to the same value. A second pass with a pointer field is
 	// the only way to tell "inherited the defaults" from "chose exactly these".
 	var probe struct {
-		Extractors *[]string `yaml:"extractors"`
+		Extractors *[]string            `yaml:"extractors"`
+		Providers  *[]providerspec.Spec `yaml:"providers"`
 	}
 	if err := yaml.Unmarshal(data, &probe); err == nil {
 		cfg.ExtractorsExplicit = probe.Extractors != nil
+		cfg.ProvidersListed = probe.Providers != nil
 	}
 	// Recorded so Repos entries resolve against the config's own directory; see
 	// RepoPaths.
@@ -627,7 +659,23 @@ func (c *Config) Normalize() error {
 	}
 	c.Output.Dir = dir
 
-	if err := providers.Validate(c.Providers); err != nil {
+	if err := providerspec.Validate(c.Providers); err != nil {
+		return err
+	}
+	if c.ProvidersMode != "" && !providerspec.ValidMode(c.ProvidersMode) {
+		return fmt.Errorf("providers_mode %q is not a providers mode (every, declared, none)", c.ProvidersMode)
+	}
+	for kind := range c.Interpreters {
+		if !providerspec.ValidInterpreter(kind) {
+			return fmt.Errorf("interpreters: %q is not an interpreter the catalogue runs scripts with (ruby, node)", kind)
+		}
+	}
+
+	clientspec.Normalize(c.Clients)
+	if err := clientspec.Validate(c.Clients); err != nil {
+		return err
+	}
+	if err := clientspec.ValidateAliases(c.ServiceAliases); err != nil {
 		return err
 	}
 
@@ -644,7 +692,43 @@ func (c *Config) Normalize() error {
 			c.Ignore = append(c.Ignore, glob)
 		}
 	}
+	// Appended here rather than listed in Default().Ignore for the same reason as the
+	// output directory: a config with its own `ignore:` replaces the defaults, and
+	// these files must stay out of the graph whatever that list says.
+	for _, glob := range installedFileGlobs() {
+		if !contains(c.Ignore, glob) {
+			c.Ignore = append(c.Ignore, glob)
+		}
+	}
 	return nil
+}
+
+// InstalledFiles are the files `enola install` owns outright inside a repository,
+// relative to its root. None of them is the repository's architecture, and indexing
+// them changed it: Pi's extension is JavaScript, and a TypeScript one made a Go
+// repository detect as TypeScript. Files enola only edits a section of (AGENTS.md,
+// settings.json, opencode.json) are the user's and stay indexed.
+//
+// pkg/install asserts that every owned file it writes is listed here.
+var InstalledFiles = []string{
+	".claude/rules/enola.md",
+	".cursor/rules/enola.mdc",
+	".github/instructions/enola.instructions.md",
+	".opencode/enola.md",
+	".opencode/plugin/enola.js",
+	".pi/extensions/enola.js",
+}
+
+// installedFileGlobs is InstalledFiles as ignore globs. `**/<dir>/**/<file>` rather
+// than `**/<dir>/<file>`: pathglob matches the second at most one directory deep, and
+// a monorepo service can carry its own install.
+func installedFileGlobs() []string {
+	out := make([]string, 0, len(InstalledFiles))
+	for _, f := range InstalledFiles {
+		dir, file := path.Split(f)
+		out = append(out, "**/"+dir+"**/"+file)
+	}
+	return out
 }
 
 // cleanOutputDir validates output.dir and returns it in slash form.
@@ -771,8 +855,13 @@ func contains(ss []string, s string) bool {
 }
 
 // LinkingVocab resolves the effective cross-repo linking vocabulary: the built-in
-// defaults with any `linking:` overlay applied. It returns an error for an invalid
-// threshold rather than clamping — see vocab.Apply.
+// defaults with any `linking:` overlay applied, carrying the declared service_aliases so
+// every matcher built from it resolves a service name the same way. It returns an error
+// for an invalid threshold rather than clamping — see vocab.Apply.
 func (c *Config) LinkingVocab() (*vocab.Set, error) {
-	return vocab.Apply(c.Linking)
+	v, err := vocab.Apply(c.Linking)
+	if v != nil && len(c.ServiceAliases) > 0 {
+		v.ServiceAliases = c.ServiceAliases
+	}
+	return v, err
 }

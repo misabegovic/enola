@@ -2,10 +2,14 @@ package intentcheck
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/enola-labs/enola/internal/extractors/mdintent"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/intent"
 )
 
 func consumesFact(repo, target, via string) facts.Fact {
@@ -218,6 +222,54 @@ func TestIntentCheck_AnchorJoinsOrDangles(t *testing.T) {
 	}
 }
 
+func symbolAnchorFact(page, owner, path, symbol string) facts.Fact {
+	f := anchorFact(page, owner, path)
+	f.Name += " " + symbol
+	f.Props["symbol"] = symbol
+	return f
+}
+
+// A symbol anchor joins its file and then its symbol: a measured file that holds
+// no fact of that name is dangling at the file anchor's confidence, and an
+// absent repository stays unasked.
+func TestIntentCheck_SymbolAnchorJoinsItsFact(t *testing.T) {
+	got := explain(t,
+		facts.Fact{Kind: facts.KindSymbol, Repo: "backend", File: "app/models/profile.rb", Name: "Profile"},
+		facts.Fact{Kind: facts.KindSymbol, Repo: "backend", File: "app/models/profile.rb", Name: "Profile#record_ledger"},
+		facts.Fact{Kind: facts.KindSymbol, Repo: "backend", File: "app/models/ledger.rb", Name: "Ledger#post"},
+		symbolAnchorFact("wiki/adrs/ledger.md", "backend", "app/models/profile.rb", "Profile#record_ledger"),
+		symbolAnchorFact("wiki/adrs/class.md", "backend", "app/models/profile.rb", "Profile"),
+		symbolAnchorFact("wiki/adrs/moved.md", "backend", "app/models/profile.rb", "Ledger#post"),
+		symbolAnchorFact("wiki/adrs/gone.md", "backend", "app/models/profile.rb", "Profile#publish"),
+		symbolAnchorFact("wiki/adrs/mob.md", "mobile", "src/App.tsx", "App"),
+	)
+	var dangling []facts.Insight
+	unasked := 0
+	for _, i := range got {
+		switch {
+		case strings.HasPrefix(i.Title, "Dangling code anchor"):
+			dangling = append(dangling, i)
+		case strings.HasPrefix(i.Title, "Anchors not checked"):
+			unasked++
+		}
+	}
+	if len(dangling) != 2 || unasked != 1 {
+		t.Fatalf("want two dangling symbol anchors and one unasked notice, got: %s", titles(got))
+	}
+	for _, i := range dangling {
+		if i.Confidence != danglingAnchorConfidence {
+			t.Fatalf("a dangling symbol anchor is capped like a file anchor, got %+v", i)
+		}
+	}
+	joined := titles(dangling)
+	if !strings.Contains(joined, "Profile#publish") || !strings.Contains(joined, "Ledger#post") {
+		t.Fatalf("the symbol no fact in that file carries is named, including one another file declares, got %s", joined)
+	}
+	if !strings.Contains(dangling[0].Description, "app/models/profile.rb") {
+		t.Fatalf("the finding says which file was read for the symbol, got %q", dangling[0].Description)
+	}
+}
+
 // TestIntentCheck_UnaskedAnchorsAreReportedNotSilent pins the fix for a skip
 // that said nothing. An anchor into a repository this snapshot does not carry
 // stays unasked — accusing its citations of going stale would verdict facts
@@ -425,5 +477,52 @@ func TestIntentCheck_ClaimAboutAbsentRepoUnasked(t *testing.T) {
 	got := explain(t, repoMarker("app"), countClaim, seamClaim)
 	if len(got) != 0 {
 		t.Fatalf("claims about absent repos must be unasked, got: %s", titles(got))
+	}
+}
+
+// A relation to a page of a listed extension is judged as a relation to a
+// markdown page is: silent when the target compiles a page, dangling at the
+// cap when the target is only a document, because it carries no block. The
+// facts come from the page extractor itself, with an invented extension listed
+// through the intent package's seam.
+func TestIntentCheck_ARelationToAListedPageDanglesOnlyWithoutABlock(t *testing.T) {
+	defer intent.UsePageExtensions(".leaf")()
+	from := "---\nenola_intent:\n  page:\n    type: reference\n    relations:\n      - {rel: depends-on, to: wiki/b.leaf}\n---\n# a\n"
+	for _, tc := range []struct {
+		target   string
+		dangling bool
+	}{
+		{"---\ntitle: b\nkind: reference\n---\n# b\n", true},
+		{"---\ntitle: b\nenola_intent:\n  page:\n    type: reference\n---\n# b\n", false},
+	} {
+		dir := t.TempDir()
+		for name, body := range map[string]string{"wiki/a.md": from, "wiki/b.leaf": tc.target} {
+			if err := os.MkdirAll(filepath.Join(dir, "wiki"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ff, err := mdintent.New().Extract(context.Background(), dir, []string{"wiki/a.md", "wiki/b.leaf"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dangling []facts.Insight
+		for _, i := range explain(t, ff...) {
+			if strings.HasPrefix(i.Title, "Dangling knowledge relation") {
+				dangling = append(dangling, i)
+			}
+		}
+		if !tc.dangling {
+			if len(dangling) != 0 {
+				t.Fatalf("a relation to a listed page carrying a block dangles: %s", titles(dangling))
+			}
+			continue
+		}
+		if len(dangling) != 1 || dangling[0].Title != "Dangling knowledge relation: wiki/a.md depends-on wiki/b.leaf" ||
+			dangling[0].Confidence != danglingRelationConfidence {
+			t.Fatalf("a relation to a listed document without a block must dangle at the cap, got %s", titles(dangling))
+		}
 	}
 }

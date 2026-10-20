@@ -77,6 +77,113 @@ seam validates as strictly as the facts and carries into the
 receipt's provider census, the same coverage discipline the engine's
 file census applies to its own walk.
 
+A provider with nothing to read in a repository (a lint reader with
+no results file, a runtime collector with no capture) says so on one
+stderr line prefixed `enola-provider-not-applicable: `, followed by
+what was missing, emits no facts, and exits 0. The seam records it
+as **not applicable** rather than as a run that found nothing: the
+receipt carries `applicable: false` beside `skipped: true` with the
+missing input as the `reason`, and a lint reader with no results file
+no longer reads like one whose results are clean. A provider that
+says it does not apply and emits facts is invalid output, skipped
+like any other. The built-in Rubydex provider is not applicable where
+there is no `Gemfile`, and says so before looking for its library.
+
+## Which providers run
+
+A **providers mode** decides, one of three:
+
+- `declared` runs the config's `providers:` list and nothing else. It
+  is what a list has always meant, and the mode of a build that says
+  nothing.
+- `every` runs each **catalogue** provider that applies to the
+  repository and can run on the machine, with the config's list beside
+  it: a listed entry replaces the catalogue entry of its name, so a
+  config can pin or relocate one provider and still take the rest.
+- `none` runs nothing, list or not.
+
+The mode is resolved once, first match winning: the config's
+`providers_mode` key; `declared` when the config lists its own
+`providers:`, since an explicit list is the config saying what to run;
+the `ENOLA_PROVIDERS` variable; the build's default, a package
+variable a linker flag may set
+(`-X github.com/enola-labs/enola/internal/providers.DefaultMode=every`),
+which is empty, meaning `declared`, in the source. So a build that
+sets nothing generates exactly what it generated before, and a config
+that names no provider hashes exactly as before.
+
+The **catalogue** is what the binary can offer without a config: the
+built-in Rubydex provider under its two names, and the example scripts found in one
+**providers directory**, laid out as `examples/providers` is. The
+directory is the one `ENOLA_PROVIDERS_DIR` names, else the share
+directory a build names by the `ShareDir` linker variable (a relative
+value is taken under `$XDG_DATA_HOME`, else `~/.local/share`), else
+none. Each entry says what makes it apply:
+
+| Entry | Applies where | Runs |
+|---|---|---|
+| `rubydex` | a `Gemfile` | in-process, from its fetched library |
+| `prism` | a `Gemfile` | in-process, from the same index as `rubydex` |
+| `rbs` | Ruby, RBS or RBI files | the script |
+| `zeitwerk` | Ruby files | the script |
+| `runtime` | a `.enola-runtime/*.json` capture | the script |
+| `eslint` | an ESLint results file (`ENOLA_ESLINT_RESULTS`, else `tmp/eslint-results.json`) | the script, under Node |
+
+The Prism reference script is not in the catalogue: alone it spells a
+constant receiver's call `Const#m`, not knowing a class from a value
+constant, and binds a call inside `def self.x` to the instance method,
+where the built-in `prism` writes the same facts with the receiver
+Ruby resolves. A config that names `prism` with a command still runs
+the script, and beside Rubydex the seam respells what both read. The
+Rubydex reference script is not in the catalogue: beside the built-in it binds nothing the built-in does not,
+at two to three times the time. ESLint is offered only with a results
+file, and the engine never sets `ENOLA_ESLINT_RUN`: running `npx` may
+download ESLint, and a snapshot installs nothing.
+
+A script entry runs under an **interpreter named once**: `ENOLA_RUBY`
+or `ENOLA_NODE`, else the config's `interpreters:` block
+(`interpreters: {ruby: /path/to/ruby}`), else the first `ruby` or
+`node` on PATH. A Ruby named by either setting runs without `GEM_HOME`
+and `GEM_PATH`, which a version manager exports for its own Ruby and
+which would point another Ruby at gems built for that one. The seam's
+version probe is the test: an interpreter that cannot load a script is
+a skip whose reason names the interpreter and the first line it
+printed. A listed provider's command is never rewritten; it names its
+own interpreter.
+
+A directory packed beside a binary carries `provider-versions.json`,
+the version each script stated when it was packed, keyed by its path
+under the directory. Those are the catalogue's pins, so a mismatch
+means the script beside the binary is not the one it shipped with. A
+directory without the record runs its scripts unpinned; one whose
+record does not parse runs none of them.
+
+Every `--generate`, `baseline pin` and `check` ends, after everything
+else on standard error, with one summary line per provider the
+catalogue or the list names: `ran` with its version and fact count,
+`skipped` with the reason, or `not applicable` with what was missing.
+A version mismatch is a skip there. With no provider in play the
+summary is empty and the output is what it always was. The exit code
+never changes: a provider does not fail a snapshot, and the summary is
+where a skip is seen.
+
+```
+Providers (every):
+  eslint    not applicable: no ESLint results file (ENOLA_ESLINT_RESULTS, or tmp/eslint-results.json)
+  prism     ran 0.2.0, 64185 facts
+  rbs       ran 0.1.0, 0 facts
+  rubydex   ran 0.4.0, 24754 facts
+  runtime   not applicable: no .enola-runtime/*.json capture
+  zeitwerk  ran 0.1.0, 1149 facts
+```
+
+`providers list` prints the catalogue on this machine: the mode a
+snapshot here would run in and what decided it, the providers
+directory and where it came from, and each entry with its version,
+what it applies to, and whether it can run and why not. `--json`
+gives the same; a config path, if given, supplies its `interpreters:`
+and its mode.
+
 ## Reusing provider facts
 
 Provider facts enter the engine's extractor cache, under the same
@@ -143,6 +250,27 @@ class reaches them; unresolved references and Rubydex's own diagnostics
 are counted in the census rather than guessed around. The ancestry edges
 are what the `ancestor:` component key reads.
 
+A `providers:` entry named `prism` with no `command` reads the same index
+in the same run and writes what the Prism reference script writes, under
+its names: a call whose receiver is the lexical enclosing class
+(`prism-call:`, a `calls` edge, at `lexical-self` when the source writes
+`self` or no receiver and `constant-receiver` when it writes the
+constant), and `new` on a written constant (`prism-new:`, an
+`instantiates` edge at `constant-receiver`, with `one_shot_call` naming
+the message sent to the new object in the same expression when Rubydex
+reads a call of that name exactly there). The callee is the receiver
+Rubydex resolved, so `Board.find` inside `Board` is the singleton the
+script spells `Board#find`. Each fact carries `engine: rubydex` beside
+the `provider: prism` the seam stamps, and the seam never pairs two
+names of one engine as an agreement. A call whose receiver Rubydex types
+as no constant, which the script writes name-only, is counted in the
+census and not written; a call on another class is the `rubydex-call:`
+fact. An implicit or `self` receiver that Rubydex types as the class
+inside an instance method is not written either and is counted as such:
+Rubydex 0.4.0 reads a default parameter's value before it enters the
+method, so `def route!(base = settings)` types `settings` on the class,
+where Ruby evaluates it on the instance. Its version is the library's.
+
 ## The runtime provider
 
 `examples/providers/ruby/runtime/enola_runtime_provider.rb` is the reference
@@ -163,8 +291,9 @@ the identities the extractors own, and every fact carries
 The contract is fail-closed end to end: a boot capture reporting any
 `unreachable` subject is refused whole (an incomplete boot must not
 become partial truth), an unrecognized capture source is refused by
-name, and a repository with no captures contributes zero facts — a
-visible census entry, never an error. After the merge, the engine
+name, and a repository with no captures reads not applicable, with the
+capture directory named: never an error, and never a run that observed
+nothing. After the merge, the engine
 cross-links observations to measurements: an extracted route fact
 whose method and path a `runtime-route:` observation reports gains
 **`runtime_observed: true`** and the merged, sorted `observed_via`

@@ -35,14 +35,6 @@ type Options struct {
 	DryRun bool
 	// Targets restricts the run to named targets; empty means every applicable one.
 	Targets []string
-	// ExtraInstructions is appended to the instruction body every target receives.
-	// The seam for a wrapper binary that serves additional tools: it can name them
-	// without this package knowing they exist, and without forking the shared text.
-	// Empty here — no binary sets it yet, and the output is unchanged while it is.
-	ExtraInstructions string
-	// ExtraHooksNote is appended only when Hooks is set, for a wrapper whose hooks do
-	// something the shared HooksNote does not describe.
-	ExtraHooksNote string
 }
 
 func (o Options) hookCommand() string {
@@ -56,7 +48,8 @@ func (o Options) hookCommand() string {
 //
 // `agents` is the repo-root AGENTS.md, which Codex, Copilot and Pi all read — so the
 // codex/copilot/pi targets below add only what AGENTS.md does NOT already cover: their
-// user-level files, and Copilot's own owned-file format. Writing a second repo-local file
+// user-level files, Copilot's own owned-file format, and Pi's extension, without which
+// Pi cannot call a single enola tool (see piTarget). Writing a second repo-local file
 // for a tool that already reads AGENTS.md would duplicate the instruction into the same
 // context window twice.
 var TargetNames = []string{"claude", "cursor", "agents", "codex", "copilot", "pi", "opencode"}
@@ -92,6 +85,9 @@ func run(o Options, remove bool) ([]Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		for i := range rs {
+			rs[i].Target = name
+		}
 		out = append(out, rs...)
 	}
 	return out, nil
@@ -126,7 +122,7 @@ func runTarget(name string, o Options, remove bool) ([]Result, error) {
 	case "codex":
 		return codexTarget(o, remove)
 	case "pi":
-		return globalAgentsTarget(o, remove, "pi", filepath.Join(".pi", "agent", "AGENTS.md"))
+		return piTarget(o, remove)
 	case "copilot":
 		return copilotTarget(o, remove)
 	case "opencode":
@@ -179,7 +175,7 @@ func codexTarget(o Options, remove bool) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(out, hr...), nil
+	return append(out, withHooks(hr, sessionHooks)...), nil
 }
 
 // globalAgentsTarget maintains enola's block in a tool's USER-level AGENTS.md — Codex
@@ -285,7 +281,7 @@ func claudeTarget(o Options, remove bool) ([]Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, hr...)
+		out = append(out, withHooks(hr, sessionHooks)...)
 	}
 	return out, nil
 }

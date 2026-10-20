@@ -12,6 +12,8 @@ import (
 
 const (
 	CauseNoRuntimeCapture  = "no_runtime_capture"
+	CauseNoFrameInMembers  = "no_frame_in_members"
+	CauseNoAccessEdges     = "no_access_edges"
 	CauseNoCounterparty    = "no_counterparty"
 	CauseNoCompiledPages   = "no_compiled_pages"
 	runtimeQueriesPrefix   = "runtime-queries: "
@@ -245,6 +247,20 @@ func (e *Explainer) verdictCapRuntime(r rule, store *facts.Store, members map[st
 			}
 		}
 	}
+	// A capture keyed by spec files, which upstream's own runner writes, holds
+	// frames and none of them in application code. Judging only the frames in
+	// member files then emits nothing, and a budget nobody measured reads kept.
+	reached := 0
+	for _, f := range frames {
+		if memberFiles[f.File] {
+			reached++
+		}
+	}
+	if reached == 0 {
+		return []facts.Insight{unevaluableRule(r, CauseNoFrameInMembers, "no frame in its members",
+			fmt.Sprintf("cap_runtime reads the frames a runtime capture measured inside the member files of %s, and the capture in this snapshot holds %d frame(s), none of them in a member file (%s). The rule emitted no verdict: a budget whose part the capture never reached must not read as kept. A frame is the method and file a query was attributed to, so a capture keyed by spec files or examples reaches no part of the application; produce the capture with a counter that attributes each query to the application frame that caused it, then regenerate.", r.capRuntime, len(frames), frameFiles(frames, 3)),
+			"Capture with a counter that attributes queries to application frames, or point the rule at the part the capture reaches")}
+	}
 	var out []facts.Insight
 	for _, f := range frames {
 		if !memberFiles[f.File] {
@@ -269,6 +285,67 @@ func (e *Explainer) verdictCapRuntime(r rule, store *facts.Store, members map[st
 	return out
 }
 
+// accessUnmeasured refuses a rule over reads or writes when no fact in the
+// repositories its subject resolves to carries an edge of either kind: the
+// extraction measured no table access there, so a forbid would hold over
+// nothing and read as kept. A subject with no members is left to the
+// dead-selector advisory.
+func accessUnmeasured(r rule, store *facts.Store, memberFacts map[string][]facts.Fact) (facts.Insight, bool) {
+	if !intent.IsAccessVia(r.via) {
+		return facts.Insight{}, false
+	}
+	subject := r.forbid
+	switch {
+	case r.allow != "":
+		subject = r.allow
+	case r.protect != "":
+		subject = r.protect
+	}
+	repos := map[string]bool{}
+	for _, f := range memberFacts[subject] {
+		repos[f.Repo] = true
+	}
+	if len(repos) == 0 {
+		return facts.Insight{}, false
+	}
+	for _, f := range store.FactsRef() {
+		if !repos[f.Repo] {
+			continue
+		}
+		for _, rel := range f.Relations {
+			if facts.IsStorageAccess(rel.Kind) {
+				return facts.Insight{}, false
+			}
+		}
+	}
+	names := make([]string, 0, len(repos))
+	for repo := range repos {
+		names = append(names, repo)
+	}
+	sort.Strings(names)
+	return unevaluableRule(r, CauseNoAccessEdges, "no access edges",
+		fmt.Sprintf("%s is judged over %s edges, which say which table a method reads or writes, and the extraction measured none of either kind in %s, where %s resolves. The rule emitted no verdict: a forbid over an edge kind nobody measured holds over nothing and must not read as kept. Only the Ruby extractor states table access today, and only where a call's receiver names a model exactly.", r.id, r.via, strings.Join(names, ", "), subject),
+		"Index a repository whose extraction states table access, or state this rule over calls to the model's files"), true
+}
+
+// frameFiles names the distinct files of the first few frames, sorted, with
+// the count of the rest, so a refusal says where the capture did reach.
+func frameFiles(frames []facts.Fact, limit int) string {
+	seen := map[string]bool{}
+	var files []string
+	for _, f := range frames {
+		if f.File != "" && !seen[f.File] {
+			seen[f.File] = true
+			files = append(files, f.File)
+		}
+	}
+	sort.Strings(files)
+	if len(files) <= limit {
+		return strings.Join(files, ", ")
+	}
+	return fmt.Sprintf("%s and %d other file(s)", strings.Join(files[:limit], ", "), len(files)-limit)
+}
+
 // verdictRequireConsumer names every member route no client in the snapshot
 // calls; in a single-repository snapshot it refuses.
 func (e *Explainer) verdictRequireConsumer(r rule, store *facts.Store, memberFacts map[string][]facts.Fact) []facts.Insight {
@@ -279,7 +356,7 @@ func (e *Explainer) verdictRequireConsumer(r rule, store *facts.Store, memberFac
 	}
 	var out []facts.Insight
 	for _, f := range memberFacts[r.requireConsumer] {
-		if f.Kind != facts.KindRoute || f.Props[propUnmatchedByClients] != true {
+		if f.Kind != facts.KindRoute || f.PropAny(propUnmatchedByClients) != true {
 			continue
 		}
 		out = append(out, facts.Insight{

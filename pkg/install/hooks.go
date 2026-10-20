@@ -70,11 +70,60 @@ func HookSummary(o Options) []string {
 	return append(out, gateSummary(o)...)
 }
 
-// InstallsSessionHooks reports whether this run writes the session hooks, which only
-// the targets with a hook configuration enola can write do: Claude Code and Codex.
+// InstallsSessionHooks reports whether this run writes the session hooks: Claude Code
+// and Codex through their hook configs, Pi through its extension's events.
 func InstallsSessionHooks(o Options) bool {
 	for _, t := range o.selectedTargets() {
-		if t == "claude" || t == "codex" {
+		if t == "claude" || t == "codex" || t == "pi" {
+			return true
+		}
+	}
+	return false
+}
+
+const sessionHooks = "session start and stop"
+
+func withHooks(rs []Result, hooks string) []Result {
+	for i := range rs {
+		if rs[i].Action != ActionSkipped {
+			rs[i].Hooks = hooks
+		}
+	}
+	return rs
+}
+
+// TargetHooks is what one selected target received from a run.
+type TargetHooks struct {
+	Target string
+	// Hooks names the hooks, or is empty when the target received none: it has no
+	// hook mechanism enola can write, or it was skipped because the agent is not
+	// installed.
+	Hooks string
+}
+
+// HooksByTarget reports, for every target the run selected, the hooks the results
+// install for it. It reads the results rather than the options, because a target
+// asked for can still receive nothing, and saying otherwise is how pi came to be
+// told it had hooks it did not have.
+func HooksByTarget(o Options, rs []Result) []TargetHooks {
+	var out []TargetHooks
+	for _, name := range o.selectedTargets() {
+		th := TargetHooks{Target: name}
+		for _, r := range rs {
+			if r.Target == name && r.Hooks != "" && r.Action != ActionRemoved {
+				th.Hooks = r.Hooks
+			}
+		}
+		out = append(out, th)
+	}
+	return out
+}
+
+// WroteHooks reports whether any result created or updated a hook, which is when a
+// running agent session has something new to load.
+func WroteHooks(rs []Result) bool {
+	for _, r := range rs {
+		if r.Hooks != "" && (r.Action == ActionCreated || r.Action == ActionUpdated) {
 			return true
 		}
 	}

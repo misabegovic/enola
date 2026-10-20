@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/extractors/jvmsrc"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
@@ -79,19 +80,31 @@ func (e *JavaExtractor) Extract(ctx context.Context, repoPath string, files []st
 
 	// extractFileAST is a pure function of (src, relFile); parse files in parallel
 	// and merge in file order for deterministic output.
-	perFileFacts := parallel.MapFiles(ctx, javaFiles, func(relFile string) []facts.Fact {
+	type javaFileResult struct {
+		ff     []facts.Fact
+		pkgDoc string
+	}
+	perFileFacts := parallel.MapFiles(ctx, javaFiles, func(relFile string) javaFileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[java-extractor] error reading %s: %v", relFile, err)
-			return nil
+			return javaFileResult{}
 		}
-		return extractFileAST(src, relFile)
+		r := javaFileResult{ff: extractFileAST(src, relFile)}
+		if isPackageInfo(relFile) {
+			r.pkgDoc = javaPackageDoc(src)
+		}
+		return r
 	})
 
 	modules := make(map[string]bool)
-	for i, ff := range perFileFacts {
-		allFacts = append(allFacts, ff...)
+	pkgDocs := make(map[string]string)
+	for i, r := range perFileFacts {
+		allFacts = append(allFacts, r.ff...)
 		modules[factpath.Dir(javaFiles[i])] = true
+		if r.pkgDoc != "" {
+			pkgDocs[factpath.Dir(javaFiles[i])] = r.pkgDoc
+		}
 	}
 
 	// Cross-language package index (.kt AND .java) so a Java import of a Kotlin
@@ -102,20 +115,33 @@ func (e *JavaExtractor) Extract(ctx context.Context, repoPath string, files []st
 	typeIndex := canonicalizeTargets(allFacts, packageIndex)
 	resolveTableConstants(allFacts)
 
+	// Calls on a receiver of declared type become edges here, now that every type
+	// of the repository is known and the implements targets are canonical.
+	resolveTypedCalls(allFacts, typeIndex)
+
+	// After the targets are canonical: the closure follows calls edges by name. The
+	// walker marks only the round-trip itself (a repository or client method), and
+	// the edges above carry it from there through the services that hold one.
+	ioclosure.Propagate(allFacts)
+
 	// Fold Java/Dubbo SPI service-file registrations in as references so an impl
 	// loaded by name (ExtensionLoader/ServiceLoader) — never called in code — is not
 	// reported as dead code.
 	allFacts = append(allFacts, extractSPIRefs(repoPath, files, typeIndex)...)
 
 	for dir := range modules {
+		props := map[string]any{
+			"language":           "java",
+			facts.PropModuleRole: jvmsrc.ModuleRole(dir),
+		}
+		if doc := pkgDocs[dir]; doc != "" {
+			facts.SetDocProp(props, doc)
+		}
 		allFacts = append(allFacts, facts.Fact{
-			Kind: facts.KindModule,
-			Name: dir,
-			File: dir,
-			Props: map[string]any{
-				"language":           "java",
-				facts.PropModuleRole: jvmsrc.ModuleRole(dir),
-			},
+			Kind:  facts.KindModule,
+			Name:  dir,
+			File:  dir,
+			Props: props,
 		})
 	}
 
@@ -148,9 +174,9 @@ func canonicalizeTargets(allFacts []facts.Fact, crossLangIndex map[string]string
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		switch f.Props["symbol_kind"] {
+		switch f.PropAny("symbol_kind") {
 		case facts.SymbolClass, facts.SymbolInterface, facts.SymbolEnum:
-			fqn, _ := f.Props["fqn"].(string)
+			fqn, _ := f.PropAny("fqn").(string)
 			if fqn == "" {
 				continue
 			}
@@ -250,7 +276,7 @@ func extractSPIRefs(repoPath string, files []string, typeIndex map[string]string
 }
 
 func resolveImport(f *facts.Fact, typeDir, packageDir map[string]string) {
-	imp, _ := f.Props["import"].(string)
+	imp, _ := f.PropAny("import").(string)
 	if imp == "" {
 		return
 	}
@@ -267,7 +293,7 @@ func resolveImport(f *facts.Fact, typeDir, packageDir map[string]string) {
 		// "com.foo"). Skipped for wildcards, whose import string is already the
 		// package — walking to the grandparent would mis-resolve. Only our own
 		// types/packages are in the indices, so this never flags an external import.
-		if wc, _ := f.Props["wildcard"].(bool); !wc {
+		if wc, _ := f.PropAny("wildcard").(bool); !wc {
 			if parent := parentName(imp); parent != "" {
 				if dir, ok = typeDir[parent]; !ok {
 					dir, ok = packageDir[parent]
@@ -278,7 +304,7 @@ func resolveImport(f *facts.Fact, typeDir, packageDir map[string]string) {
 	if !ok {
 		return // external dependency
 	}
-	f.Props["source"] = "internal"
+	f.SetProp("source", "internal")
 	for j := range f.Relations {
 		if f.Relations[j].Kind == facts.RelImports {
 			f.Relations[j].Target = dir
@@ -298,7 +324,7 @@ func resolveTableConstants(allFacts []facts.Fact) {
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		v, ok := f.Props["value"].(string)
+		v, ok := f.PropAny("value").(string)
 		if !ok {
 			continue
 		}
@@ -318,7 +344,7 @@ func resolveTableConstants(allFacts []facts.Fact) {
 		if f.Kind != facts.KindStorage {
 			continue
 		}
-		tbl, ok := f.Props["table"].(string)
+		tbl, ok := f.PropAny("table").(string)
 		if !ok {
 			continue
 		}
@@ -326,8 +352,8 @@ func resolveTableConstants(allFacts []facts.Fact) {
 			continue
 		}
 		if v, ok := values[tbl]; ok {
-			f.Props["table"] = v
-			f.Props["table_constant"] = tbl
+			f.SetProp("table", v)
+			f.SetProp("table_constant", tbl)
 		}
 	}
 }

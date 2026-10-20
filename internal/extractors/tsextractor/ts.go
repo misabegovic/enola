@@ -9,9 +9,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/clientspec"
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
@@ -22,7 +24,11 @@ import (
 )
 
 // TSExtractor extracts architectural facts from TypeScript/TSX source code using tree-sitter.
-type TSExtractor struct{}
+type TSExtractor struct {
+	// clients are the in-house HTTP clients the config declares for TypeScript, handed
+	// over by the engine at registration and read-only afterwards.
+	clients []clientspec.Spec
+}
 
 // New creates a new TSExtractor.
 func New() *TSExtractor {
@@ -32,6 +38,13 @@ func New() *TSExtractor {
 func (e *TSExtractor) Name() string {
 	return "typescript"
 }
+
+// SetClientSpecs implements clientspec.Consumer.
+func (e *TSExtractor) SetClientSpecs(specs []clientspec.Spec) { e.clients = specs }
+
+// ConfigKey implements plugin.ConfigKeyed: the declared clients decide which call sites
+// become routes, so they are part of what a cached result was extracted under.
+func (e *TSExtractor) ConfigKey() string { return clientspec.Fingerprint(e.clients) }
 
 // Detect returns true if the repository (or one of its immediate subdirectories
 // in the case of a monorepo) contains TypeScript markers.
@@ -58,6 +71,9 @@ var unambiguousTSExts = map[string]bool{
 // roslyn, both of them TypeScript tooling parked deep inside a repository written in
 // something else.
 //
+// Last comes the repository written in plain JavaScript, which has none of the above;
+// see javaScriptLeads for why that is decided by count and not by a file's presence.
+//
 // Detecting without a root is already a state this extractor handles: a GraphQL-docs
 // repository has reached Extract with findTSRoot returning no root since that arm was
 // added, and every consumer of it pairs tsRoot with a repoPath fallback.
@@ -76,7 +92,7 @@ func (e *TSExtractor) DetectFiles(repoPath string, files []string) (bool, error)
 			return true, nil
 		}
 	}
-	return false, nil
+	return javaScriptLeads(files), nil
 }
 
 // findTSRoot returns the directory that is the TypeScript project root, along
@@ -197,338 +213,37 @@ func packageJSONDeclaresPackage(dir string) bool {
 	return false
 }
 
-// Extract parses TypeScript/TSX files and emits architectural facts.
-func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []string) ([]facts.Fact, error) {
-	var allFacts []facts.Fact
-
-	// Detect frameworks
-	isNextJS := detectNextJS(repoPath)
-	isVue := detectVue(repoPath)
-	isNuxt := detectNuxt(repoPath)
-	isSvelteKit := detectSvelteKit(repoPath)
-	isEmber := detectEmber(repoPath)
-	isReactNav := detectReactNavigation(repoPath)
-	isAngular := detectAngular(repoPath)
-	// ORM detection is gated on the package.json dependency, exactly as Vue/Nuxt are, so
-	// a class coincidentally decorated @Entity models nothing in a repo without TypeORM.
-	isTypeORM, isDrizzle, isPrisma := detectORMs(repoPath)
-	orms := ormFlags{typeORM: isTypeORM, drizzle: isDrizzle}
-
-	// Parse tsconfig.json path aliases, one root per package for monorepos.
-	aliasRoots := collectTSAliasRoots(repoPath)
-
-	// SvelteKit maps $lib → src/lib by convention.
-	if isSvelteKit {
-		aliasRoots = withSvelteKitLibDefault(aliasRoots)
-	}
-
-	// Restrict to TypeScript files once, then parse them in parallel. The
-	// framework flags and path aliases above are read-only, and extractFile is a
-	// pure function of (src, relFile, …), so per-file work is independent. Results
-	// are merged in file order for deterministic output.
-	var tsFiles, htmlFiles []string
-	knownFiles := make(map[string]bool)
-	for _, relFile := range files {
-		if isTypeScriptFile(relFile) {
-			tsFiles = append(tsFiles, relFile)
-			knownFiles[filepath.ToSlash(relFile)] = true
-			continue
-		}
-		// An Angular component's template is a separate .html file, and the members
-		// and child components it names are frequently referenced nowhere else. It is
-		// read only in an Angular repository: everywhere else a .html file is a page,
-		// a fixture or documentation, and scanning it would model nothing.
-		if isAngular && isAngularTemplateFile(relFile) && !facts.IsTestPath(relFile) {
-			htmlFiles = append(htmlFiles, relFile)
-		}
-	}
-	var nuxtAutoComponents map[string]string
-	if isNuxt {
-		nuxtAutoComponents = nuxtAutoComponentIndex(knownFiles)
-	}
-
-	// Repo-wide pre-pass: resolve generated gRPC-web client stubs (service FQN +
-	// RPC methods + client class) so per-file call-site detection can map a
-	// `client.method(...)` call to its "/pkg.Service/Method" route. Built before
-	// the parallel pass because a client's stub and its call sites usually live
-	// in different files.
-	// Read each source once, in parallel. GraphQL context needs a repository-wide
-	// view before extraction, but it consumes these bytes rather than performing a
-	// serial pre-pass that rereads every file from disk.
-	type sourceResult struct {
-		src []byte
-		err error
-	}
-	readSources := parallel.MapFiles(ctx, tsFiles, func(relFile string) sourceResult {
-		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
-		return sourceResult{src: src, err: err}
-	})
-	sources := make(map[string][]byte, len(tsFiles))
-	for i, read := range readSources {
-		if read.err != nil {
-			log.Printf("[ts-extractor] error reading %s: %v", tsFiles[i], read.err)
-			continue
-		}
-		sources[tsFiles[i]] = read.src
-	}
-	grpcStubs := buildGRPCStubIndex(tsFiles, sources)
-	graphqlServer := detectGraphQLServerUsage(tsFiles, sources)
-
-	perFile := parallel.MapFiles(ctx, tsFiles, func(relFile string) tsFileResult {
-		src := sources[relFile]
-		if src == nil {
-			return tsFileResult{}
-		}
-		if isMinifiedSource(src) {
-			// Minified/bundled artifact (e.g. a checked-in webpack/vendor bundle
-			// served statically). Emitting facts for its obfuscated symbols
-			// pollutes complexity/hotspot/performance analysis, so skip it.
-			log.Printf("[ts-extractor] skipping minified/bundled file %s", relFile)
-			return tsFileResult{}
-		}
-		aliases := aliasesForDir(aliasRoots, factpath.Dir(relFile))
-		var res tsFileResult
-		res.facts, res.angular, res.angularRouter, res.angularInline, res.angularHTTP = e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, isAngular, graphqlServer, orms, aliases, knownFiles, nuxtAutoComponents, grpcStubs)
-		// Routers, mounts and held-back routes for the repo-wide mount pass below.
-		// Collected here because resolving an import needs this file's path aliases,
-		// which are in scope only during the per-file walk. Same test-path gate as
-		// the routes themselves: an e2e suite that mounts its own app contributes
-		// no production surface.
-		if !facts.IsTestPath(relFile) {
-			res.routers = collectRouterFile(src, relFile, aliases, knownFiles)
-		}
-		return res
-	})
-	sources = nil
-
-	// Templates are scanned in parallel with no parser: an Angular template is not
-	// HTML once its @if/@for blocks are in it, and both dialects are live in the
-	// same repositories.
-	templates := make(map[string]*angularTemplate, len(htmlFiles))
-	if len(htmlFiles) > 0 {
-		scans := parallel.MapFiles(ctx, htmlFiles, func(relFile string) *angularTemplate {
-			src, err := os.ReadFile(filepath.Join(repoPath, relFile))
-			if err != nil {
-				log.Printf("[ts-extractor] error reading %s: %v", relFile, err)
-				return nil
-			}
-			return scanAngularTemplate(src, relFile)
-		})
-		for i, t := range scans {
-			if t != nil {
-				templates[htmlFiles[i]] = t
-			}
-		}
-	}
-
-	// Group files by directory for module detection. Files that produced no
-	// facts (unreadable, or skipped as minified/bundled) do not register a
-	// module, so a directory containing only skipped bundles (e.g. a vendored
-	// scripts dir) stays out of the graph rather than surfacing as an empty module.
-	modules := make(map[string]bool)
-	routerFiles := make([]*routerFile, 0, len(perFile))
-	var angular angularCounts
-	var angularRouters []*angularRouterFile
-	var angularHTTPFiles []*angularHTTPFile
-	var angularRoutes, angularRequests angularCounts
-	inlineTemplates := map[string]*angularTemplate{}
-	for i, res := range perFile {
-		if res.routers != nil {
-			routerFiles = append(routerFiles, res.routers)
-		}
-		angular.merge(res.angular)
-		for name, t := range res.angularInline {
-			inlineTemplates[name] = t
-		}
-		if res.angularRouter != nil {
-			angularRouters = append(angularRouters, res.angularRouter)
-		}
-		if res.angularHTTP != nil {
-			angularHTTPFiles = append(angularHTTPFiles, res.angularHTTP)
-		}
-		if len(res.facts) == 0 {
-			continue
-		}
-		allFacts = append(allFacts, res.facts...)
-		modules[factpath.Dir(tsFiles[i])] = true
-	}
-
-	// Express sub-routers mounted from another file. The per-file pass holds their
-	// routes back rather than emitting a fragment path; this is where both halves
-	// are visible and the true runtime path can be composed. See routermount.go.
-	if mounted := composeRouterMounts(routerFiles); len(mounted) > 0 {
-		allFacts = append(allFacts, mounted...)
-		for _, f := range mounted {
-			modules[factpath.Dir(f.File)] = true
-		}
-	}
-
-	// Serial post-pass: propagate the per-body io_direct flag transitively across the
-	// call graph into performs_io, so wrapper-hidden network/file I/O is visible to the
-	// enterprise performance analyzer. Mirrors the Swift extractor's computePerformsIO.
-	if isNuxt {
-		resolveNuxtAutoComposableCalls(allFacts)
-	}
-	computeTSPerformsIO(allFacts)
-
-	// Engine-relative routes compose onto their mount point here, where every
-	// mount in the repo is visible; a per-file pass cannot see both sides.
-	if isEmber {
-		composeEngineMounts(allFacts)
-	}
-
-	// Angular's routes are composed here, where every route array and every lazy
-	// mount in the repository is visible; a per-file pass can see only one end of a
-	// loadChildren. See angularroutes.go.
-	if routes, c := composeAngularRoutes(angularRouters); len(routes) > 0 || c.total() > 0 {
-		allFacts = append(allFacts, routes...)
-		for _, f := range routes {
-			modules[factpath.Dir(f.File)] = true
-		}
-		angularRoutes.merge(c)
-	}
-
-	// Templates are joined to the components that own them here, where the members of
-	// every class and the selector every component declared are both in hand.
-	angularTemplateCounts := attachAngularTemplates(allFacts, templates, inlineTemplates)
-
-	// Requests through an injected HttpClient are composed here: a base URL is a
-	// static of one service and named by many, so the constants are only all in hand
-	// once the repository is read. See angularhttp.go.
-	if reqs, c := composeAngularRequests(angularHTTPFiles); len(reqs) > 0 || c.total() > 0 {
-		allFacts = append(allFacts, reqs...)
-		for _, f := range reqs {
-			modules[factpath.Dir(f.File)] = true
-		}
-		angularRequests.merge(c)
-	}
-
-	// Every injects edge is made to name a symbol this snapshot holds, now that the
-	// whole repository is assembled; see reconcileAngularInjects.
-	if isAngular {
-		angular.merge(reconcileAngularInjects(allFacts))
-		angularRoutes.merge(resolveAngularLazyComponents(allFacts))
-	}
-
-	// What the injection pass could name, and what it could not, by cause. Emitted
-	// only when there were injection sites at all — a zero from an extractor that
-	// never looked reads the same as a zero from one that did, which is the whole
-	// failure this fact exists to prevent.
-	if angular.total() > 0 {
-		if f, ok := extcoverage.Fact(repoPath, "typescript:angular-di", "angular_inject",
-			angular.resolved, angular.unresolved); ok {
-			allFacts = append(allFacts, f)
-		}
-	}
-	if angularTemplateCounts.total() > 0 {
-		if f, ok := extcoverage.Fact(repoPath, "typescript:angular-templates", "angular_template_ref",
-			angularTemplateCounts.resolved, angularTemplateCounts.unresolved); ok {
-			allFacts = append(allFacts, f)
-		}
-	}
-	if angularRequests.total() > 0 {
-		if f, ok := extcoverage.Fact(repoPath, "typescript:angular-requests", "angular_http_call",
-			angularRequests.resolved, angularRequests.unresolved); ok {
-			allFacts = append(allFacts, f)
-		}
-	}
-	if angularRoutes.total() > 0 {
-		if f, ok := extcoverage.Fact(repoPath, "typescript:angular-routes", "angular_route",
-			angularRoutes.resolved, angularRoutes.unresolved); ok {
-			allFacts = append(allFacts, f)
-		}
-	}
-
-	// Prisma models live in schema.prisma — a separate DSL, so tree-sitter never sees it.
-	// Read it off-glob, the same way package.json and tsconfig.json already are.
-	if isPrisma {
-		allFacts = append(allFacts, extractPrismaStorage(repoPath)...)
-	}
-
-	// Emit module facts for each directory
-	pkgNames := collectPackageNames(repoPath)
-	// The workspace project each directory belongs to, where the repository states
-	// one. A monorepo's unit of ownership is its project, not its directory, and
-	// every reading that groups by unit was inferring the boundary from the path.
-	var projects map[string]string
-	if isAngular {
-		projects = angularProjectNames(repoPath)
-	}
-	for dir := range modules {
-		props := map[string]any{
-			"language": "typescript",
-		}
-		// The npm package this directory belongs to. The cross-repo linker reads it
-		// to recognize a repo's own @scope, so an import of a sibling package the
-		// repo itself publishes is not mistaken for a dependency on another repo
-		// that happens to be labeled like the scope.
-		if name := nearestPackageName(pkgNames, dir); name != "" {
-			props["package_name"] = name
-		}
-		if name := nearestProjectName(projects, dir); name != "" {
-			props["workspace_project"] = name
-		}
-		allFacts = append(allFacts, facts.Fact{
-			Kind:  facts.KindModule,
-			Name:  dir,
-			File:  dir,
-			Props: props,
-		})
-	}
-
-	return allFacts, nil
-}
-
 // extractCtx bundles the per-file state threaded through declaration extraction
 // so symbols can be enriched with React/Next.js semantic classification.
 type extractCtx struct {
-	src         []byte
-	relFile     string
-	dir         string
-	isTSX       bool
-	isNextJS    bool
-	isVue       bool
-	isNuxt      bool
-	isSvelteKit bool
-	orms        ormFlags
-	importMap   map[string]string
+	src     []byte
+	relFile string
+	dir     string
+	isTSX   bool
+	tsFrameworks
+	importMap map[string]string
+	// memberRoots are the names `<name>.<member>()` resolves through (see
+	// memberCallRoots), for a component's script block as for a file.
+	memberRoots map[string]string
+	// returnTypes are the file's own functions with a declared class return type
+	// (see fileReturnTypes).
+	returnTypes map[string]string
 	imports     emberImportBindings // the file's import table, read for the module a superclass identifier came from
 	ioBindings  map[string]bool     // local names bound to imports from a network module (I/O sinks)
 	knownFiles  map[string]bool     // repo-relative (slash) paths of all indexed TS/JS files
+	files       *tsFileIndex        // the same files by stem, for a specifier no tsconfig maps
 	aliases     map[string]tsAlias  // this directory's tsconfig path aliases, for resolving an import written as a bare specifier
 }
 
-func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, isAngular bool, graphqlServer graphqlServerContext, orms ormFlags, aliases map[string]tsAlias, knownFiles map[string]bool, nuxtAutoComponents map[string]string, grpcStubs *grpcStubIndex) ([]facts.Fact, angularCounts, *angularRouterFile, map[string]*angularTemplate, *angularHTTPFile) {
+func (e *TSExtractor) extractFile(src []byte, relFile string, rc *repoCtx, aliases map[string]tsAlias) tsFileResult {
 	// The grammar is chosen here, so the kind table is too: TypeScript and TSX assign
 	// different meanings to the same symbol ids, and everything below reads node kinds
 	// through this table. See kinds.go.
 	isTSX := strings.HasSuffix(relFile, ".tsx") || strings.HasSuffix(relFile, ".jsx")
 	kinds := tsKindsFor(isTSX)
 
-	if isVueFile(relFile) {
-		return e.extractVueSFC(kinds, src, relFile, isNuxt, aliases, nuxtAutoComponents), angularCounts{}, nil, nil, nil
-	}
-	if isSvelteFile(relFile) {
-		return e.extractSvelteSFC(kinds, src, relFile, isSvelteKit, aliases), angularCounts{}, nil, nil, nil
-	}
-	if isGraphQLDocFile(relFile) {
-		if facts.IsTestPath(relFile) {
-			return nil, angularCounts{}, nil, nil, nil
-		}
-		if graphqlServer.sdlDocuments[filepath.ToSlash(relFile)] {
-			if routes := extractGraphQLServerSDLDocument(src, relFile); len(routes) > 0 {
-				return routes, angularCounts{}, nil, nil, nil
-			}
-		}
-		return extractGraphQLClientOps(string(src), relFile, facts.RouteSourceGraphQLOperation), angularCounts{}, nil, nil, nil
-	}
-	if isHbsFile(relFile) {
-		// Handlebars is only modeled where Ember's resolver gives the names
-		// deterministic meaning; a lone .hbs in a non-Ember repo stays out.
-		if !isEmber {
-			return nil, angularCounts{}, nil, nil, nil
-		}
-		return e.extractEmberHbs(src, relFile, knownFiles), angularCounts{}, nil, nil, nil
+	if out, ok := e.extractNonScript(kinds, src, relFile, rc, aliases); ok {
+		return tsFileResult{facts: out}
 	}
 	// A Glimmer template-tag file is TypeScript/JavaScript with embedded
 	// <template> blocks: blank the blocks in place (newlines preserved, so every
@@ -541,13 +256,73 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 		src, emberSegments = blankEmberTemplates(src)
 	}
 
-	var result []facts.Fact
+	result, hosts := sourcePatternFacts(src, relFile, rc)
 
+	lang := typescript.LanguageTypescript()
+	if isTSX {
+		lang = typescript.LanguageTSX()
+	}
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(sitter.NewLanguage(lang)); err != nil {
+		return tsFileResult{facts: result}
+	}
+	tree := parser.Parse(src, nil)
+	defer tree.Close()
+	root := tree.RootNode()
+
+	if !facts.IsTestPath(relFile) {
+		result = append(result, astPatternFacts(kinds, root, src, relFile, isTSX, rc.graphqlServer)...)
+	}
+	result = append(result, e.extractImports(kinds, root, src, relFile, aliases, rc.isSvelteKit)...)
+
+	ctx := newFileCtx(kinds, root, src, relFile, isTSX, rc, aliases)
+	result = append(result, e.fileDeclarations(kinds, root, ctx)...)
+
+	// Whole-file reference pass (JSX component rendering, imported-identifier values
+	// like route configs, namespace member access, require()-bound names). Emitted as
+	// a KindFileRef so file-scope references the per-function call walk cannot see do
+	// not leave used code mis-reported as dead.
+	result = append(result, e.collectTSFileRefs(kinds, root, ctx, aliases, facts.KindFileRef)...)
+
+	res := e.frameworkPasses(kinds, root, ctx, aliases, result, isEmberFile, emberSegments)
+	res.hosts = hosts
+	return res
+}
+
+func (e *TSExtractor) extractNonScript(kinds *tsutil.KindTable, src []byte, relFile string, rc *repoCtx, aliases map[string]tsAlias) ([]facts.Fact, bool) {
+	switch {
+	case isVueFile(relFile):
+		return e.extractVueSFC(kinds, src, relFile, rc.isNuxt, aliases, rc.files, rc.nuxtAutoComponents), true
+	case isSvelteFile(relFile):
+		return e.extractSvelteSFC(kinds, src, relFile, rc.isSvelteKit, aliases, rc.files), true
+	case isGraphQLDocFile(relFile):
+		if facts.IsTestPath(relFile) {
+			return nil, true
+		}
+		if rc.graphqlServer.sdlDocuments[filepath.ToSlash(relFile)] {
+			if routes := extractGraphQLServerSDLDocument(src, relFile); len(routes) > 0 {
+				return routes, true
+			}
+		}
+		return extractGraphQLClientOps(string(src), relFile, facts.RouteSourceGraphQLOperation), true
+	case isHbsFile(relFile):
+		// Handlebars is only modeled where Ember's resolver gives the names
+		// deterministic meaning; a lone .hbs in a non-Ember repo stays out.
+		if !rc.isEmber {
+			return nil, true
+		}
+		return e.extractEmberHbs(src, relFile, rc.knownFiles), true
+	}
+	return nil, false
+}
+
+func sourcePatternFacts(src []byte, relFile string, rc *repoCtx) ([]facts.Fact, clientHosts) {
+	var result []facts.Fact
+	var hosts clientHosts
 	// Parse openapi-typescript generated files for backend API route dependencies.
 	// These are client-role route facts showing which backend routes the TS code calls.
-	if openapiRoutes := extractOpenAPITypescriptFacts(src, relFile); len(openapiRoutes) > 0 {
-		result = append(result, openapiRoutes...)
-	}
+	result = append(result, extractOpenAPITypescriptFacts(src, relFile)...)
 
 	// Hand-written fetch / makeRequest / axios API calls are also client-role routes
 	// — but only from PRODUCTION code. A test's HTTP traffic is not an architectural
@@ -560,10 +335,12 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	// resolving test-ness here rather than with a local suffix list is deliberate —
 	// the copies that predated it had drifted apart in both directions.
 	if !facts.IsTestPath(relFile) {
-		if graphqlServer.enabled {
+		if rc.graphqlServer.enabled {
 			result = append(result, extractGraphQLServerSDL(src, relFile)...)
 		}
-		result = append(result, extractHTTPClientFacts(src, relFile)...)
+		var clientFacts []facts.Fact
+		clientFacts, hosts = extractHTTPClientFactsCounted(src, relFile)
+		result = append(result, clientFacts...)
 		// Call-registered server routes (Express/Fastify/Hono/Koa). Same test-path
 		// gate: an e2e suite that spins up its own app would otherwise contribute
 		// server routes no production client calls.
@@ -571,156 +348,173 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	}
 
 	// gRPC-web client call sites become client-role routes to "/pkg.Service/Method".
-	result = append(result, extractGRPCClientFacts(src, relFile, grpcStubs)...)
+	return append(result, extractGRPCClientFacts(src, relFile, rc.grpcStubs)...), hosts
+}
 
-	lang := typescript.LanguageTypescript()
-	if isTSX {
-		lang = typescript.LanguageTSX()
+func astPatternFacts(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, isTSX bool, graphqlServer graphqlServerContext) []facts.Fact {
+	result := extractGraphQLTagFactsAST(src, relFile, kinds, isTSX, root)
+	text := string(src)
+	fetchBody := hasGraphQLFetchBodyCandidate(text)
+	clientCandidate := strings.Contains(text, "graphql-request") || fetchBody
+	var graphqlBindings graphqlImportBindings
+	if clientCandidate || graphqlServer.enabled {
+		graphqlBindings = collectGraphQLImportBindings(kinds, root, src)
 	}
-
-	parser := sitter.NewParser()
-	defer parser.Close()
-	if err := parser.SetLanguage(sitter.NewLanguage(lang)); err != nil {
-		return result, angularCounts{}, nil, nil, nil
+	if clientCandidate {
+		result = append(result, extractGraphQLClientCallFactsAST(src, relFile, kinds, root, fetchBody, graphqlBindings)...)
 	}
-
-	tree := parser.Parse(src, nil)
-	defer tree.Close()
-
-	root := tree.RootNode()
-	if !facts.IsTestPath(relFile) {
-		result = append(result, extractGraphQLTagFactsAST(src, relFile, kinds, isTSX, root)...)
-		text := string(src)
-		fetchBody := hasGraphQLFetchBodyCandidate(text)
-		clientCandidate := strings.Contains(text, "graphql-request") || fetchBody
-		var graphqlBindings graphqlImportBindings
-		if clientCandidate || graphqlServer.enabled {
-			graphqlBindings = collectGraphQLImportBindings(kinds, root, src)
-		}
-		if clientCandidate {
-			result = append(result, extractGraphQLClientCallFactsAST(src, relFile, kinds, root, fetchBody, graphqlBindings)...)
-		}
-		if graphqlServer.enabled {
-			result = append(result, extractGraphQLCodeFirstAST(src, relFile, kinds, root, graphqlBindings)...)
-		}
-		result = append(result, extractTSKafkaFacts(kinds, root, src, relFile)...)
+	if graphqlServer.enabled {
+		result = append(result, extractGraphQLCodeFirstAST(src, relFile, kinds, root, graphqlBindings)...)
 	}
+	return append(result, extractTSKafkaFacts(kinds, root, src, relFile)...)
+}
 
-	// Extract from the tree
-	result = append(result, e.extractImports(kinds, root, src, relFile, aliases)...)
-
-	ctx := &extractCtx{
-		src:         src,
-		relFile:     relFile,
-		dir:         factpath.Dir(relFile),
-		isTSX:       isTSX,
-		isNextJS:    isNextJS,
-		isVue:       isVue,
-		isNuxt:      isNuxt,
-		isSvelteKit: isSvelteKit,
-		orms:        orms,
-		importMap:   buildImportSymbols(kinds, root, src, relFile, aliases),
-		imports:     buildEmberImportBindings(kinds, root, src, relFile, aliases),
-		ioBindings:  buildIOImportBindings(kinds, root, src),
-		knownFiles:  knownFiles,
-		aliases:     aliases,
+func newFileCtx(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, isTSX bool, rc *repoCtx, aliases map[string]tsAlias) *extractCtx {
+	dir := factpath.Dir(relFile)
+	importMap, internalImports := buildImportBindings(kinds, root, src, relFile, aliases, rc.files)
+	fw := rc.tsFrameworks
+	if !fw.isNextJS && inNextJSPackage(relFile, fw.nextDirs) {
+		fw.isNextJS = true
 	}
+	return &extractCtx{
+		tsFrameworks: fw,
+		src:          src,
+		relFile:      relFile,
+		dir:          dir,
+		isTSX:        isTSX,
+		importMap:    importMap,
+		memberRoots:  memberCallRoots(kinds, root, src, dir, internalImports),
+		returnTypes:  fileReturnTypes(kinds, root, src, dir, importMap),
+		imports:      buildEmberImportBindings(kinds, root, src, relFile, aliases),
+		ioBindings:   buildIOImportBindings(kinds, root, src),
+		knownFiles:   rc.knownFiles,
+		files:        rc.files,
+		aliases:      aliases,
+	}
+}
+
+func (e *TSExtractor) fileDeclarations(kinds *tsutil.KindTable, root *sitter.Node, ctx *extractCtx) []facts.Fact {
 	decls := e.extractDeclarations(kinds, root, ctx)
-
 	// A declaration may be exported via a separate `export { A, B }` clause or
 	// `export default Name` statement rather than an inline `export` keyword.
 	// Mark the corresponding symbols as exported.
-	if exported := collectExportedLocalNames(kinds, root, src); len(exported) > 0 {
-		for i := range decls {
-			if decls[i].Kind != facts.KindSymbol {
-				continue
-			}
-			local := decls[i].Name[strings.LastIndexByte(decls[i].Name, '.')+1:]
-			if exported[local] {
-				decls[i].Props["exported"] = true
-			}
+	markExported(decls, collectExportedLocalNames(kinds, root, ctx.src))
+	markDefaultExportedName(kinds, root, ctx, decls)
+	return applyMCPTools(kinds, root, ctx, decls)
+}
+
+func markExported(decls []facts.Fact, exported map[string]bool) {
+	if len(exported) == 0 {
+		return
+	}
+	for i := range decls {
+		if decls[i].Kind != facts.KindSymbol {
+			continue
+		}
+		local := decls[i].Name[strings.LastIndexByte(decls[i].Name, '.')+1:]
+		if exported[local] {
+			decls[i].SetProp("exported", true)
 		}
 	}
-	result = append(result, decls...)
+}
 
-	// Whole-file reference pass (JSX component rendering, imported-identifier values
-	// like route configs, namespace member access, require()-bound names). Emitted as
-	// a KindFileRef so file-scope references the per-function call walk cannot see do
-	// not leave used code mis-reported as dead.
-	result = append(result, e.collectTSFileRefs(kinds, root, ctx, aliases, facts.KindFileRef)...)
-
-	// Detect Next.js routes
-	if isNextJS {
+func (e *TSExtractor) frameworkPasses(kinds *tsutil.KindTable, root *sitter.Node, ctx *extractCtx, aliases map[string]tsAlias, result []facts.Fact, isEmberFile bool, emberSegments []emberTemplateSegment) tsFileResult {
+	src, relFile := ctx.src, ctx.relFile
+	if ctx.isNextJS {
 		if routeFact := detectRoute(relFile); routeFact != nil {
+			if file := reexportedDefaultFile(kinds, root, ctx); file != "" && routeFact.PropString("type") == "page" {
+				routeFact.SetProp(propDefaultFrom, file)
+			}
 			result = append(result, *routeFact)
 		}
 	}
-
-	// Ember: classify component/service/model classes, attach strict-mode
-	// template references, record @service injections for the ember-resolver
-	// binder, and emit the router map's page routes.
-	if isEmberFile || isEmber {
+	if isEmberFile || ctx.isEmber {
+		// Ember: classify component/service/model classes, attach strict-mode
+		// template references, record @service injections for the ember-resolver
+		// binder, and emit the router map's page routes.
 		result = emberEnrich(kinds, result, root, src, relFile, aliases, emberSegments)
 	}
-	if isReactNav && !facts.IsTestPath(relFile) {
+	if ctx.isReactNav && !facts.IsTestPath(relFile) {
 		result = append(result, extractReactNavScreens(kinds, root, src, relFile, aliases)...)
 		result = attachReactNavLinks(kinds, result, root, src, relFile)
 	}
-	if isEmber && isEmberRouterFile(relFile) {
-		result = append(result, extractEmberRoutes(kinds, root, src, relFile)...)
-	}
-	if isEmber {
-		if engine, ok := isEmberEngineRoutesFile(relFile); ok {
-			result = append(result, extractEmberEngineRoutes(kinds, root, src, relFile, engine)...)
-		}
+	if ctx.isEmber {
+		result = append(result, emberRouteFacts(kinds, root, src, relFile)...)
 	}
 
-	// Angular: classify the decorator-declared classes and attach the edges their
-	// dependency injection declares. A post-pass over the declaration facts, as
-	// emberEnrich is, because the decorator that decides a class's role sits above
-	// the node the declaration walk stopped at.
-	var angular angularCounts
-	var router *angularRouterFile
-	var inlineTemplates map[string]*angularTemplate
-	var httpFile *angularHTTPFile
-	if isAngular {
-		result, angular, inlineTemplates, httpFile = angularEnrich(kinds, result, root, ctx, aliases)
+	var out tsFileResult
+	if ctx.isAngular {
+		// Angular: classify the decorator-declared classes and attach the edges their
+		// dependency injection declares. A post-pass over the declaration facts, as
+		// emberEnrich is, because the decorator that decides a class's role sits above
+		// the node the declaration walk stopped at.
+		result, out.angular, out.angularInline, out.angularHTTP = angularEnrich(kinds, result, root, ctx, aliases)
 		// The route arrays and router calls this file declares, for the repo-wide
 		// walk in composeAngularRoutes. A test file's router configures a fixture,
 		// not the application, the same gate the server-route passes apply.
 		if !facts.IsTestPath(relFile) && declaresAngularRouting(src) {
-			router = collectAngularRouterFile(kinds, root, ctx, aliases)
+			out.angularRouter = collectAngularRouterFile(kinds, root, ctx, aliases)
 		}
 	}
 
-	// Detect Vue Router configuration files
-	if (isVue || isNuxt) && containsCreateRouterCall(kinds, root, src) {
-		result = append(result, facts.Fact{
-			Kind: facts.KindRoute,
-			Name: relFile,
-			File: relFile,
-			Line: 1,
-			Props: map[string]any{
-				"type":      "router_config",
-				"language":  "typescript",
-				"framework": "vue",
-			},
-		})
-		result = append(result, extractVueRouterRoutes(kinds, root, src, relFile, aliases)...)
+	// Requests through in-house clients the config declares. Not gated on a framework:
+	// the declared receiver type is what makes a call a request, in a NestJS service as
+	// much as anywhere. Test files excluded, as every other route pass excludes them.
+	// See configuredclient.go.
+	if len(e.clients) > 0 && !facts.IsTestPath(relFile) {
+		var configured []facts.Fact
+		configured, out.clients = configuredClientFacts(kinds, root, ctx, e.clients)
+		result = append(result, configured...)
+	}
+
+	if ctx.isVue || ctx.isNuxt {
+		result = append(result, vueRouterFacts(kinds, root, src, relFile, aliases)...)
 	}
 	// Nuxt accepts render-function pages in addition to .vue SFCs. Vue pages take
 	// the early SFC return above and are emitted by extractVueSFC; emit the other
 	// supported extensions here.
-	if isNuxt && !isVueFile(relFile) {
+	if ctx.isNuxt && !isVueFile(relFile) {
 		if route := detectNuxtRoute(relFile); route != nil {
 			result = append(result, *route)
 		}
 	}
 
-	return result, angular, router, inlineTemplates, httpFile
+	attributeClientCallers(kinds, root, result)
+	out.facts = result
+	return out
 }
 
-func (e *TSExtractor) extractImports(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) []facts.Fact {
+func emberRouteFacts(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string) []facts.Fact {
+	var result []facts.Fact
+	if isEmberRouterFile(relFile) {
+		result = append(result, extractEmberRoutes(kinds, root, src, relFile)...)
+	}
+	if engine, ok := isEmberEngineRoutesFile(relFile); ok {
+		result = append(result, extractEmberEngineRoutes(kinds, root, src, relFile, engine)...)
+	}
+	return result
+}
+
+func vueRouterFacts(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) []facts.Fact {
+	if !containsCreateRouterCall(kinds, root, src) {
+		return nil
+	}
+	// Detect Vue Router configuration files
+	config := facts.Fact{
+		Kind: facts.KindRoute,
+		Name: relFile,
+		File: relFile,
+		Line: 1,
+		Props: map[string]any{
+			"type":      "router_config",
+			"language":  "typescript",
+			"framework": "vue",
+		},
+	}
+	return append([]facts.Fact{config}, extractVueRouterRoutes(kinds, root, src, relFile, aliases)...)
+}
+
+func (e *TSExtractor) extractImports(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias, isSvelteKit bool) []facts.Fact {
 	var result []facts.Fact
 	dir := factpath.Dir(relFile)
 
@@ -753,6 +547,9 @@ func (e *TSExtractor) extractImports(kinds *tsutil.KindTable, root *sitter.Node,
 		if isExternal {
 			importSource = "external"
 		}
+		if isSvelteKit && isSvelteKitVirtualImport(importPath) {
+			importSource = facts.DepSourceFramework
+		}
 
 		props := map[string]any{
 			"language": "typescript",
@@ -763,10 +560,11 @@ func (e *TSExtractor) extractImports(kinds *tsutil.KindTable, root *sitter.Node,
 		}
 
 		result = append(result, facts.Fact{
-			Kind:  facts.KindDependency,
-			Name:  dir + " -> " + resolved,
-			File:  relFile,
-			Line:  int(child.StartPosition().Row) + 1,
+			Kind:    facts.KindDependency,
+			Name:    dir + " -> " + resolved,
+			File:    relFile,
+			Line:    int(child.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(child, src), Column: tsutil.Column(child), EndColumn: tsutil.EndColumn(child, src),
 			Props: props,
 			Relations: []facts.Relation{
 				{Kind: facts.RelImports, Target: resolved},
@@ -802,11 +600,15 @@ func (e *TSExtractor) extractImports(kinds *tsutil.KindTable, root *sitter.Node,
 							if isExternal {
 								source = "external"
 							}
+							if isSvelteKit && isSvelteKitVirtualImport(importPath) {
+								source = facts.DepSourceFramework
+							}
 							result = append(result, facts.Fact{
-								Kind:      facts.KindDependency,
-								Name:      name,
-								File:      relFile,
-								Line:      int(n.StartPosition().Row) + 1,
+								Kind:    facts.KindDependency,
+								Name:    name,
+								File:    relFile,
+								Line:    int(n.StartPosition().Row) + 1,
+								EndLine: tsutil.EndLine(n, src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, src),
 								Props:     map[string]any{"language": "typescript", "source": source, "dynamic": true},
 								Relations: []facts.Relation{{Kind: facts.RelImports, Target: resolved}},
 							})
@@ -819,15 +621,35 @@ func (e *TSExtractor) extractImports(kinds *tsutil.KindTable, root *sitter.Node,
 			walkDeps(n.Child(i))
 		}
 	}
-	walkDeps(root)
+	if mayCallRequireOrImport(src) {
+		walkDeps(root)
+	}
 
 	return result
 }
 
 func (e *TSExtractor) extractDeclarations(kinds *tsutil.KindTable, root *sitter.Node, ctx *extractCtx) []facts.Fact {
+	return e.extractStatements(kinds, root, ctx, wrapperDepth)
+}
+
+// extractStatements emits the declarations among a block's statements. A statement
+// that is a wrapper function called at once contributes the declarations in its body
+// as the file's own (see wrapperBody): exported when the wrapper hands them out (see
+// wrapperExposes), and without the plain variables it keeps to itself (see
+// withoutPlainVariables).
+func (e *TSExtractor) extractStatements(kinds *tsutil.KindTable, block *sitter.Node, ctx *extractCtx, wrappers int) []facts.Fact {
 	var result []facts.Fact
-	for i := range root.ChildCount() {
-		result = append(result, e.extractNode(kinds, root.Child(i), ctx, false, "")...)
+	for i := range block.ChildCount() {
+		stmt := block.Child(i)
+		result = append(result, e.extractNode(kinds, stmt, ctx, false, "")...)
+		if wrappers == 0 {
+			continue
+		}
+		if body := wrapperBody(kinds, stmt); body != nil {
+			inner := e.extractStatements(kinds, body, ctx, wrappers-1)
+			markExposed(inner, ctx.dir, wrapperExposes(kinds, stmt, body, ctx.src))
+			result = append(result, withoutPlainVariables(inner)...)
+		}
 	}
 	return result
 }
@@ -837,341 +659,382 @@ func (e *TSExtractor) extractDeclarations(kinds *tsutil.KindTable, root *sitter.
 // () {}`), derived from the file name; it is ignored when the declaration has its
 // own name.
 func (e *TSExtractor) extractNode(kinds *tsutil.KindTable, node *sitter.Node, ctx *extractCtx, isExported bool, fallbackName string) []facts.Fact {
-	var result []facts.Fact
-	src, dir, relFile := ctx.src, ctx.dir, ctx.relFile
-
 	switch kindOf(kinds, node) {
 	case "export_statement":
-		isDefault := hasChildKind(kinds, node, "default")
-		fb := ""
-		if isDefault {
-			fb = fileSymbolName(relFile)
-		}
-		// Named/inline declaration inside the export.
-		if decl := firstDeclChild(kinds, node); decl != nil {
-			return e.extractNode(kinds, decl, ctx, true, fb)
-		}
-		// Anonymous default export of a value: name it after the file.
-		if isDefault {
-			for _, k := range []string{"function_expression", "generator_function", "class", "arrow_function", "call_expression"} {
-				if c := findChildByKind(kinds, node, k); c != nil {
-					return e.extractNode(kinds, c, ctx, true, fb)
-				}
-			}
-		}
-
+		return e.exportFacts(kinds, node, ctx)
 	case "function_declaration", "function_expression", "generator_function_declaration", "generator_function":
-		name := findChildByKind(kinds, node, "identifier")
 		symbolName := fallbackName
-		if name != nil {
-			symbolName = nodeText(name, src)
+		if name := findChildByKind(kinds, node, "identifier"); name != nil {
+			symbolName = nodeText(name, ctx.src)
 		}
 		if symbolName == "" {
-			break
+			return nil
 		}
-		result = append(result, e.funcSymbol(kinds, node, node, ctx, symbolName, isExported))
-
-	case "arrow_function":
-		if fallbackName != "" {
-			result = append(result, e.funcSymbol(kinds, node, node, ctx, fallbackName, isExported))
+		return []facts.Fact{e.funcSymbol(kinds, node, node, ctx, symbolName, isExported)}
+	case "arrow_function", "call_expression":
+		// A call_expression is reached for `export default memo(...)` / `forwardRef(...)`.
+		if fallbackName == "" {
+			return nil
 		}
-
-	case "call_expression":
-		// Reached for `export default memo(...)` / `forwardRef(...)`.
-		if fallbackName != "" {
-			result = append(result, e.funcSymbol(kinds, node, node, ctx, fallbackName, isExported))
-		}
-
+		return []facts.Fact{e.funcSymbol(kinds, node, node, ctx, fallbackName, isExported)}
 	case "class_declaration", "abstract_class_declaration", "class":
-		name := findChildByKind(kinds, node, "type_identifier")
-		symbolName := fallbackName
-		if name != nil {
-			symbolName = nodeText(name, src)
-		}
-		if symbolName == "" {
-			break
-		}
-		f := facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: dir + "." + symbolName,
-			File: relFile,
-			Line: int(node.StartPosition().Row) + 1,
-			Props: map[string]any{
-				"symbol_kind": facts.SymbolClass,
-				"exported":    isExported,
-				"language":    "typescript",
-			},
-			Relations: []facts.Relation{
-				{Kind: facts.RelDeclares, Target: dir},
-			},
-		}
-
-		// A TS `abstract class` is an abstraction (has unimplemented members and
-		// cannot be instantiated) — tag it so package-metrics counts it toward
-		// abstractness, matching Java/Kotlin/Python. Plain classes stay concrete.
-		if kindOf(kinds, node) == "abstract_class_declaration" {
-			f.Props["abstract"] = true
-		}
-
-		// The base class the source names, and the module the file imported that
-		// name from. No relation accompanies them: the identifier alone is not a
-		// symbol identity (409 classes in one frontend write the same `Controller`
-		// against two unrelated base classes), and the local name a default or
-		// aliased import binds is not the name the exporting file declares, so an
-		// edge built from either would be a resolution nothing measured.
-		if super := tsSuperclassName(kinds, node, src); super != "" {
-			f.Props[superclassProp] = super
-			if module := ctx.imports.modules[super]; module != "" {
-				f.Props[superclassModuleProp] = module
-			}
-		}
-
-		// Check for implements clause (nested under class_heritage)
-		for j := range node.ChildCount() {
-			c := node.Child(j)
-			if kindOf(kinds, c) == "class_heritage" {
-				for k := range c.ChildCount() {
-					heritage := c.Child(k)
-					if kindOf(kinds, heritage) == "implements_clause" {
-						for l := range heritage.ChildCount() {
-							t := heritage.Child(l)
-							if kindOf(kinds, t) == "type_identifier" {
-								f.Relations = append(f.Relations, facts.Relation{
-									Kind:   facts.RelImplements,
-									Target: nodeText(t, src),
-								})
-							}
-						}
-					}
-				}
-			}
-		}
-
-		classBody := findChildByKind(kinds, node, "class_body")
-		classifySymbol(kinds, &f, symbolName, classBody, ctx, facts.SymbolClass)
-		if names := classDecoratorNames(kinds, node, src); names != "" {
-			f.Props["decorators"] = names
-		}
-		result = append(result, f)
-
-		// TypeORM: a class decorated @Entity is a table. The storage fact is a COMPANION
-		// to the symbol above, as in Kotlin/Room and Java/JPA — the class keeps its own
-		// symbol fact.
-		if ctx.orms.typeORM {
-			if sf := typeORMEntityStorage(kinds, node, src, symbolName, relFile, dir,
-				int(node.StartPosition().Row)+1); sf != nil {
-				result = append(result, *sf)
-			}
-		}
-
-		// NestJS/InversifyJS: a class decorated @Controller declares server routes.
-		// Companion facts in the same sense as the @Entity storage above — the class
-		// keeps its symbol, and each verb-decorated method gains a route. Skipped for
-		// test files: an e2e fixture's controller would otherwise mint server routes
-		// that no production client calls, i.e. false unused-route findings (the
-		// counterpart to the v141 client-side gate).
-		if !facts.IsTestPath(relFile) {
-			result = append(result, decoratorRouteFacts(kinds, node, classBody, src, relFile, dir)...)
-		}
-
-		// Extract class methods
-		if classBody != nil {
-			var pendingDecorators []string
-			for j := range classBody.ChildCount() {
-				member := classBody.Child(j)
-				if kindOf(kinds, member) == "decorator" {
-					if dn, _ := decoratorNameArgs(kinds, member, src); dn != "" {
-						pendingDecorators = append(pendingDecorators, dn)
-					}
-					continue
-				}
-				if kindOf(kinds, member) == "comment" || !member.IsNamed() {
-					continue
-				}
-				memberDecorators := append(pendingDecorators, ownDecoratorNames(kinds, member, src)...)
-				pendingDecorators = nil
-				if kindOf(kinds, member) != "method_definition" && kindOf(kinds, member) != "public_field_definition" {
-					continue
-				}
-				methodName := findChildByKind(kinds, member, "property_identifier")
-				if methodName == nil {
-					methodName = findChildByKind(kinds, member, "identifier")
-				}
-				if methodName == nil {
-					continue
-				}
-				mName := nodeText(methodName, src)
-				// A `#`-prefixed member is private to the class in the language's
-				// own sense and has no callers to measure. A constructor does: it
-				// runs on every instantiation, and what it calls is the difference
-				// between a class that builds itself and one that fetches. Skipping
-				// both together left "nothing may be fetched from a constructor"
-				// with no fact to stand on.
-				if strings.HasPrefix(mName, "#") {
-					continue
-				}
-				isPrivate := false
-				for k := range member.ChildCount() {
-					c := member.Child(k)
-					if kindOf(kinds, c) == "accessibility_modifier" && nodeText(c, src) == "private" {
-						isPrivate = true
-						break
-					}
-				}
-				mRels := []facts.Relation{{Kind: facts.RelDeclares, Target: dir}}
-				callRels, m := collectCallsWithMetrics(kinds, member, src, dir, symbolName, ctx.importMap, ctx.ioBindings, dir+"."+symbolName+"."+mName, mName)
-				mRels = append(mRels, callRels...)
-				mProps := map[string]any{
-					"symbol_kind": facts.SymbolMethod,
-					"exported":    isExported && !isPrivate,
-					"language":    "typescript",
-					"receiver":    symbolName,
-				}
-				if names := decoratorSetProp(memberDecorators); names != "" {
-					mProps["decorators"] = names
-				}
-				if takes, ok := declaresParameters(kinds, member); ok {
-					mProps["takes_parameters"] = takes
-				}
-				if isGetterDefinition(kinds, member) {
-					mProps["symbol_kind"] = facts.SymbolGetter
-					mProps["getter_calls"] = countCallRelations(callRels)
-				}
-				if stimulusStaticField(kinds, member, mName, relFile) {
-					mProps["framework"] = "stimulus"
-					mProps["stimulus_static"] = mName
-				}
-				applyTSMetrics(mProps, m)
-				result = append(result, facts.Fact{
-					Kind:      facts.KindSymbol,
-					Name:      dir + "." + symbolName + "." + mName,
-					File:      relFile,
-					Line:      int(member.StartPosition().Row) + 1,
-					Props:     mProps,
-					Relations: mRels,
-				})
-			}
-		}
-
+		return e.classFacts(kinds, node, ctx, isExported, fallbackName)
 	case "expression_statement":
-		// CommonJS export assignment: `exports.name = function` /
-		// `module.exports.name = function`. None of the declaration-shaped cases
-		// fire in a classic Node file, so a CommonJS module's whole public
-		// surface was invisible — an Express controller written as
-		// `exports.index = function(req, res)` emitted nothing at all. Only the
-		// member-assignment-of-a-function shape emits a symbol; a plain value,
-		// a re-exported identifier, or a whole-object `module.exports = {…}`
-		// carries no declaration this pass can name without guessing.
-		assign := findChildByKind(kinds, node, "assignment_expression")
-		if assign == nil {
-			break
-		}
-		name := commonJSExportName(kinds, assign.ChildByFieldName("left"), src)
-		if name == "" {
-			break
-		}
-		if right := assign.ChildByFieldName("right"); right != nil {
-			switch kindOf(kinds, right) {
-			case "function_expression", "arrow_function", "generator_function":
-				result = append(result, e.funcSymbol(kinds, node, right, ctx, name, true))
-			}
-		}
-
-	case "interface_declaration":
-		if name := findChildByKind(kinds, node, "type_identifier"); name != nil {
-			result = append(result, e.simpleSymbol(node, ctx, nodeText(name, src), facts.SymbolInterface, isExported))
-		}
-
-	case "type_alias_declaration":
-		if name := findChildByKind(kinds, node, "type_identifier"); name != nil {
-			result = append(result, e.simpleSymbol(node, ctx, nodeText(name, src), facts.SymbolType, isExported))
-		}
-
-	case "enum_declaration":
-		name := findChildByKind(kinds, node, "identifier")
-		if name == nil {
-			name = findChildByKind(kinds, node, "type_identifier")
-		}
-		if name != nil {
-			result = append(result, e.simpleSymbol(node, ctx, nodeText(name, src), facts.SymbolEnum, isExported))
-		}
-
-	case "internal_module", "module":
-		// TypeScript `namespace X {}` / `module X {}`.
-		name := findChildByKind(kinds, node, "identifier")
-		if name == nil {
-			name = findChildByKind(kinds, node, "nested_identifier")
-		}
-		if name != nil {
-			result = append(result, e.simpleSymbol(node, ctx, nodeText(name, src), "namespace", isExported))
-		}
-
+		return e.commonJSExportFacts(kinds, node, ctx)
+	case "interface_declaration", "type_alias_declaration", "enum_declaration", "internal_module", "module":
+		return e.namedDeclarationFacts(kinds, node, ctx, isExported)
 	case "lexical_declaration", "variable_declaration":
+		var result []facts.Fact
 		for j := range node.ChildCount() {
-			decl := node.Child(j)
-			if kindOf(kinds, decl) != "variable_declarator" {
-				continue
+			if decl := node.Child(j); kindOf(kinds, decl) == "variable_declarator" {
+				result = append(result, e.variableFacts(kinds, node, decl, ctx, isExported)...)
 			}
-			name := findChildByKind(kinds, decl, "identifier")
-			if name == nil {
-				continue
-			}
-			symbolName := nodeText(name, src)
+		}
+		return result
+	}
+	return nil
+}
 
-			// Determine the value node and the symbol kind. Arrow functions and
-			// memo/forwardRef-wrapped values are functions/components; everything
-			// else is a plain variable.
-			symbolKind := facts.SymbolVariable
-			var body *sitter.Node
-			if v := findChildByKind(kinds, decl, "arrow_function"); v != nil {
-				symbolKind = facts.SymbolFunc
-				body = v
-			} else if call := findChildByKind(kinds, decl, "call_expression"); call != nil && isComponentWrapper(kinds, call, src) {
-				symbolKind = facts.SymbolFunc
-				body = call
-			}
-
-			vRels := []facts.Relation{{Kind: facts.RelDeclares, Target: dir}}
-			var vMetrics *tsBodyMetrics
-			if body != nil {
-				callRels, m := collectCallsWithMetrics(kinds, body, src, dir, "", ctx.importMap, ctx.ioBindings, dir+"."+symbolName, symbolName)
-				vRels = append(vRels, callRels...)
-				vMetrics = m
-			}
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + symbolName,
-				File: relFile,
-				Line: int(node.StartPosition().Row) + 1,
-				Props: map[string]any{
-					"symbol_kind": symbolKind,
-					"exported":    isExported,
-					"language":    "typescript",
-				},
-				Relations: vRels,
-			}
-			if symbolKind == facts.SymbolFunc {
-				if takes, ok := declaresParameters(kinds, decl); ok {
-					f.Props["takes_parameters"] = takes
-				}
-				applyTSMetrics(f.Props, vMetrics)
-			}
-			classifySymbol(kinds, &f, symbolName, body, ctx, symbolKind)
-			result = append(result, f)
-
-			// Drizzle: `export const orders = pgTable("orders", {...})` is a table. The
-			// call_expression is already in hand above — it simply fails isComponentWrapper.
-			if ctx.orms.drizzle {
-				if call := findChildByKind(kinds, decl, "call_expression"); call != nil {
-					if sf := drizzleTableStorage(kinds, call, src, symbolName, relFile, dir,
-						int(decl.StartPosition().Row)+1); sf != nil {
-						result = append(result, *sf)
-					}
-				}
+func (e *TSExtractor) exportFacts(kinds *tsutil.KindTable, node *sitter.Node, ctx *extractCtx) []facts.Fact {
+	isDefault := hasChildKind(kinds, node, "default")
+	fb := ""
+	if isDefault {
+		fb = fileSymbolName(ctx.relFile)
+	}
+	// Named/inline declaration inside the export.
+	if decl := firstDeclChild(kinds, node); decl != nil {
+		return markDefaultExport(e.extractNode(kinds, decl, ctx, true, fb), isDefault)
+	}
+	// Anonymous default export of a value: name it after the file.
+	if isDefault {
+		for _, k := range []string{"function_expression", "generator_function", "class", "arrow_function", "call_expression"} {
+			if c := findChildByKind(kinds, node, k); c != nil {
+				return markDefaultExport(e.extractNode(kinds, c, ctx, true, fb), true)
 			}
 		}
 	}
+	return nil
+}
 
+func (e *TSExtractor) classFacts(kinds *tsutil.KindTable, node *sitter.Node, ctx *extractCtx, isExported bool, fallbackName string) []facts.Fact {
+	src, dir, relFile := ctx.src, ctx.dir, ctx.relFile
+	symbolName := fallbackName
+	if name := findChildByKind(kinds, node, "type_identifier"); name != nil {
+		symbolName = nodeText(name, src)
+	}
+	if symbolName == "" {
+		return nil
+	}
+	classBody := findChildByKind(kinds, node, "class_body")
+	result := []facts.Fact{e.classSymbol(kinds, node, classBody, ctx, symbolName, isExported)}
+
+	// TypeORM: a class decorated @Entity is a table. The storage fact is a COMPANION
+	// to the symbol above, as in Kotlin/Room and Java/JPA — the class keeps its own
+	// symbol fact.
+	if ctx.orms.typeORM {
+		if sf := typeORMEntityStorage(kinds, node, src, symbolName, relFile, dir,
+			int(node.StartPosition().Row)+1); sf != nil {
+			result = append(result, *sf)
+		}
+	}
+
+	// NestJS/InversifyJS: a class decorated @Controller declares server routes.
+	// Companion facts in the same sense as the @Entity storage above — the class
+	// keeps its symbol, and each verb-decorated method gains a route. Skipped for
+	// test files: an e2e fixture's controller would otherwise mint server routes
+	// that no production client calls, i.e. false unused-route findings (the
+	// counterpart to the v141 client-side gate).
+	if !facts.IsTestPath(relFile) {
+		result = append(result, decoratorRouteFacts(kinds, node, classBody, src, relFile, dir, symbolName)...)
+	}
+	return append(result, e.classMemberFacts(kinds, classBody, ctx, symbolName, isExported)...)
+}
+
+func (e *TSExtractor) classSymbol(kinds *tsutil.KindTable, node, classBody *sitter.Node, ctx *extractCtx, symbolName string, isExported bool) facts.Fact {
+	src, dir := ctx.src, ctx.dir
+	f := facts.Fact{
+		Kind:    facts.KindSymbol,
+		Name:    dir + "." + symbolName,
+		File:    ctx.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, ctx.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, ctx.src),
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolClass,
+			"exported":    isExported,
+			"language":    "typescript",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+
+	// A TS `abstract class` is an abstraction (has unimplemented members and
+	// cannot be instantiated) — tag it so package-metrics counts it toward
+	// abstractness, matching Java/Kotlin/Python. Plain classes stay concrete.
+	if kindOf(kinds, node) == "abstract_class_declaration" {
+		f.SetProp("abstract", true)
+	}
+
+	// The base class the source names, and the module the file imported that
+	// name from. No relation accompanies them: the identifier alone is not a
+	// symbol identity (409 classes in one frontend write the same `Controller`
+	// against two unrelated base classes), and the local name a default or
+	// aliased import binds is not the name the exporting file declares, so an
+	// edge built from either would be a resolution nothing measured.
+	if super := tsSuperclassName(kinds, node, src); super != "" {
+		f.SetProp(superclassProp, super)
+		if module := ctx.imports.modules[super]; module != "" {
+			f.SetProp(superclassModuleProp, module)
+		}
+	}
+
+	if doc := tsDoc(kinds, node, src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
+	f.Relations = append(f.Relations, implementsRelations(kinds, node, src)...)
+	classifySymbol(kinds, &f, symbolName, classBody, ctx, facts.SymbolClass)
+	if names := classDecoratorNames(kinds, node, src); names != "" {
+		f.SetProp("decorators", names)
+	}
+	return f
+}
+
+// implementsRelations reads the implements clause, nested under class_heritage.
+func implementsRelations(kinds *tsutil.KindTable, node *sitter.Node, src []byte) []facts.Relation {
+	var out []facts.Relation
+	for _, heritage := range childrenOfKind(kinds, node, "class_heritage") {
+		for _, clause := range childrenOfKind(kinds, heritage, "implements_clause") {
+			for _, t := range childrenOfKind(kinds, clause, "type_identifier") {
+				out = append(out, facts.Relation{Kind: facts.RelImplements, Target: nodeText(t, src)})
+			}
+		}
+	}
+	return out
+}
+
+func childrenOfKind(kinds *tsutil.KindTable, node *sitter.Node, kind string) []*sitter.Node {
+	var out []*sitter.Node
+	for i := range node.ChildCount() {
+		if c := node.Child(i); kindOf(kinds, c) == kind {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (e *TSExtractor) classMemberFacts(kinds *tsutil.KindTable, classBody *sitter.Node, ctx *extractCtx, symbolName string, isExported bool) []facts.Fact {
+	if classBody == nil {
+		return nil
+	}
+	src := ctx.src
+	scope := ctx.callScope(kinds, symbolName, classFieldTypes(kinds, classBody, src, ctx.dir, ctx.importMap))
+	var result []facts.Fact
+	var pendingDecorators []string
+	for j := range classBody.ChildCount() {
+		member := classBody.Child(j)
+		if kindOf(kinds, member) == "decorator" {
+			if dn, _ := decoratorNameArgs(kinds, member, src); dn != "" {
+				pendingDecorators = append(pendingDecorators, dn)
+			}
+			continue
+		}
+		if kindOf(kinds, member) == "comment" || !member.IsNamed() {
+			continue
+		}
+		memberDecorators := append(pendingDecorators, ownDecoratorNames(kinds, member, src)...)
+		pendingDecorators = nil
+		if f, ok := e.memberFact(kinds, member, ctx, scope, symbolName, isExported, memberDecorators); ok {
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
+func (e *TSExtractor) memberFact(kinds *tsutil.KindTable, member *sitter.Node, ctx *extractCtx, scope callScope, symbolName string, isExported bool, decorators []string) (facts.Fact, bool) {
+	src, dir, relFile := ctx.src, ctx.dir, ctx.relFile
+	if kindOf(kinds, member) != "method_definition" && kindOf(kinds, member) != "public_field_definition" {
+		return facts.Fact{}, false
+	}
+	methodName := findChildByKind(kinds, member, "property_identifier")
+	if methodName == nil {
+		methodName = findChildByKind(kinds, member, "identifier")
+	}
+	if methodName == nil {
+		return facts.Fact{}, false
+	}
+	mName := nodeText(methodName, src)
+	// A `#`-prefixed member is private to the class in the language's
+	// own sense and has no callers to measure. A constructor does: it
+	// runs on every instantiation, and what it calls is the difference
+	// between a class that builds itself and one that fetches. Skipping
+	// both together left "nothing may be fetched from a constructor"
+	// with no fact to stand on.
+	if strings.HasPrefix(mName, "#") {
+		return facts.Fact{}, false
+	}
+	isPrivate := false
+	for _, c := range childrenOfKind(kinds, member, "accessibility_modifier") {
+		if nodeText(c, src) == "private" {
+			isPrivate = true
+			break
+		}
+	}
+	mRels := []facts.Relation{{Kind: facts.RelDeclares, Target: dir}}
+	callRels, m := collectCallsWithMetrics(member, scope, dir+"."+symbolName+"."+mName, mName)
+	mRels = append(mRels, callRels...)
+	mProps := map[string]any{
+		"symbol_kind": facts.SymbolMethod,
+		"exported":    isExported && !isPrivate,
+		"language":    "typescript",
+		"receiver":    symbolName,
+	}
+	if doc := tsDoc(kinds, member, src); doc != "" {
+		facts.SetDocProp(mProps, doc)
+	}
+	if names := decoratorSetProp(decorators); names != "" {
+		mProps["decorators"] = names
+	}
+	if takes, ok := declaresParameters(kinds, member); ok {
+		mProps["takes_parameters"] = takes
+	}
+	switch accessorKind(kinds, member) {
+	case "get":
+		mProps["symbol_kind"] = facts.SymbolGetter
+		mProps["getter_calls"] = countCallRelations(callRels)
+	case "set":
+		mProps[propAccessor] = "set"
+	}
+	if stimulusStaticField(kinds, member, mName, relFile) {
+		mProps["framework"] = "stimulus"
+		mProps["stimulus_static"] = mName
+	}
+	applyTSMetrics(mProps, m)
+	return facts.Fact{
+		Kind:    facts.KindSymbol,
+		Name:    dir + "." + symbolName + "." + mName,
+		File:    relFile,
+		Line:    int(member.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(member, src), Column: tsutil.Column(member), EndColumn: tsutil.EndColumn(member, src),
+		Props:     mProps,
+		Relations: mRels,
+	}, true
+}
+
+// CommonJS export assignment: `exports.name = function` /
+// `module.exports.name = function`. None of the declaration-shaped cases
+// fire in a classic Node file, so a CommonJS module's whole public
+// surface was invisible — an Express controller written as
+// `exports.index = function(req, res)` emitted nothing at all. Only the
+// member-assignment-of-a-function shape emits a symbol; a plain value,
+// a re-exported identifier, or a whole-object `module.exports = {…}`
+// carries no declaration this pass can name without guessing.
+func (e *TSExtractor) commonJSExportFacts(kinds *tsutil.KindTable, node *sitter.Node, ctx *extractCtx) []facts.Fact {
+	assign := findChildByKind(kinds, node, "assignment_expression")
+	if assign == nil {
+		return nil
+	}
+	name := commonJSExportName(kinds, assign.ChildByFieldName("left"), ctx.src)
+	right := assign.ChildByFieldName("right")
+	if name == "" || right == nil {
+		return nil
+	}
+	switch kindOf(kinds, right) {
+	case "function_expression", "arrow_function", "generator_function":
+		return []facts.Fact{e.funcSymbol(kinds, node, right, ctx, name, true)}
+	}
+	return nil
+}
+
+var namedDeclarations = map[string]struct {
+	symbolKind string
+	nameKinds  []string
+}{
+	"interface_declaration":  {facts.SymbolInterface, []string{"type_identifier"}},
+	"type_alias_declaration": {facts.SymbolType, []string{"type_identifier"}},
+	"enum_declaration":       {facts.SymbolEnum, []string{"identifier", "type_identifier"}},
+	// TypeScript `namespace X {}` / `module X {}`.
+	"internal_module": {"namespace", []string{"identifier", "nested_identifier"}},
+	"module":          {"namespace", []string{"identifier", "nested_identifier"}},
+}
+
+func (e *TSExtractor) namedDeclarationFacts(kinds *tsutil.KindTable, node *sitter.Node, ctx *extractCtx, isExported bool) []facts.Fact {
+	d := namedDeclarations[kindOf(kinds, node)]
+	for _, k := range d.nameKinds {
+		if name := findChildByKind(kinds, node, k); name != nil {
+			return []facts.Fact{e.simpleSymbol(node, ctx, nodeText(name, ctx.src), d.symbolKind, isExported)}
+		}
+	}
+	return nil
+}
+
+func (e *TSExtractor) variableFacts(kinds *tsutil.KindTable, node, decl *sitter.Node, ctx *extractCtx, isExported bool) []facts.Fact {
+	src, dir, relFile := ctx.src, ctx.dir, ctx.relFile
+	name := findChildByKind(kinds, decl, "identifier")
+	if name == nil {
+		return nil
+	}
+	symbolName := nodeText(name, src)
+
+	// Determine the value node and the symbol kind. A function written as
+	// the value (an arrow, or `var f = function () {}`, which is how a script
+	// older than arrows declares most of its functions) and a
+	// memo/forwardRef-wrapped value are functions/components; everything else
+	// is a plain variable.
+	symbolKind := facts.SymbolVariable
+	var body *sitter.Node
+	if v := functionValue(kinds, decl); v != nil {
+		symbolKind = facts.SymbolFunc
+		body = v
+	} else if call := findChildByKind(kinds, decl, "call_expression"); call != nil && isComponentWrapper(kinds, call, src) {
+		symbolKind = facts.SymbolFunc
+		body = call
+	}
+
+	vRels := []facts.Relation{{Kind: facts.RelDeclares, Target: dir}}
+	var vMetrics *tsBodyMetrics
+	if body != nil {
+		callRels, m := collectCallsWithMetrics(body, ctx.callScope(kinds, "", nil), dir+"."+symbolName, symbolName)
+		vRels = append(vRels, callRels...)
+		vMetrics = m
+	}
+	f := facts.Fact{
+		Kind:    facts.KindSymbol,
+		Name:    dir + "." + symbolName,
+		File:    relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, src),
+		Props: map[string]any{
+			"symbol_kind": symbolKind,
+			"exported":    isExported,
+			"language":    "typescript",
+		},
+		Relations: vRels,
+	}
+	if doc := tsDoc(kinds, decl, src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
+	if symbolKind == facts.SymbolFunc {
+		if takes, ok := declaresParameters(kinds, decl); ok {
+			f.SetProp("takes_parameters", takes)
+		}
+		applyTSMetrics(f.Props, vMetrics)
+	}
+	classifySymbol(kinds, &f, symbolName, body, ctx, symbolKind)
+	result := []facts.Fact{f}
+	if symbolKind == facts.SymbolVariable {
+		result = append(result, objectMemberSymbols(kinds, decl.ChildByFieldName("value"), ctx, symbolName, isExported)...)
+	}
+
+	// Drizzle: `export const orders = pgTable("orders", {...})` is a table. The
+	// call_expression is already in hand above — it simply fails isComponentWrapper.
+	if ctx.orms.drizzle {
+		if call := findChildByKind(kinds, decl, "call_expression"); call != nil {
+			if sf := drizzleTableStorage(kinds, call, src, symbolName, relFile, dir,
+				int(decl.StartPosition().Row)+1); sf != nil {
+				result = append(result, *sf)
+			}
+		}
+	}
 	return result
 }
 
@@ -1209,13 +1072,14 @@ func commonJSExportName(kinds *tsutil.KindTable, left *sitter.Node, src []byte) 
 
 func (e *TSExtractor) funcSymbol(kinds *tsutil.KindTable, declNode, body *sitter.Node, ctx *extractCtx, name string, exported bool) facts.Fact {
 	rels := []facts.Relation{{Kind: facts.RelDeclares, Target: ctx.dir}}
-	callRels, m := collectCallsWithMetrics(kinds, body, ctx.src, ctx.dir, "", ctx.importMap, ctx.ioBindings, ctx.dir+"."+name, name)
+	callRels, m := collectCallsWithMetrics(body, ctx.callScope(kinds, "", nil), ctx.dir+"."+name, name)
 	rels = append(rels, callRels...)
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: ctx.dir + "." + name,
-		File: ctx.relFile,
-		Line: int(declNode.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    ctx.dir + "." + name,
+		File:    ctx.relFile,
+		Line:    int(declNode.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(declNode, ctx.src), Column: tsutil.Column(declNode), EndColumn: tsutil.EndColumn(declNode, ctx.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolFunc,
 			"exported":    exported,
@@ -1223,8 +1087,11 @@ func (e *TSExtractor) funcSymbol(kinds *tsutil.KindTable, declNode, body *sitter
 		},
 		Relations: rels,
 	}
+	if doc := tsDoc(kinds, declNode, ctx.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if takes, ok := declaresParameters(kinds, declNode); ok {
-		f.Props["takes_parameters"] = takes
+		f.SetProp("takes_parameters", takes)
 	}
 	applyTSMetrics(f.Props, m)
 	classifySymbol(kinds, &f, name, body, ctx, facts.SymbolFunc)
@@ -1234,10 +1101,11 @@ func (e *TSExtractor) funcSymbol(kinds *tsutil.KindTable, declNode, body *sitter
 // simpleSymbol builds a declaration-only symbol fact (interface, type, enum, namespace).
 func (e *TSExtractor) simpleSymbol(node *sitter.Node, ctx *extractCtx, name, kind string, exported bool) facts.Fact {
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: ctx.dir + "." + name,
-		File: ctx.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    ctx.dir + "." + name,
+		File:    ctx.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, ctx.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, ctx.src),
 		Props: map[string]any{
 			"symbol_kind": kind,
 			"exported":    exported,
@@ -1301,7 +1169,10 @@ func detectRoute(relFile string) *facts.Fact {
 		}
 	}
 
-	// Pages Router
+	// Pages Router. A test's page objects (tests/e2e/pages/LoginPage.ts) are no pages.
+	if facts.IsTestPath(relFile) {
+		return nil
+	}
 	for i, p := range parts {
 		if p == "pages" && i < len(parts)-1 {
 			remaining := parts[i+1:]
@@ -1352,11 +1223,10 @@ func detectRoute(relFile string) *facts.Fact {
 	return nil
 }
 
-// detectNextJS checks if the repository is a Next.js project.
+// detectNextJSRoot checks if the repository is a Next.js project.
 // It searches the TypeScript root directory (which may be a subdirectory in a
 // monorepo) for next.config.* files or a package.json with a "next" dependency.
-func detectNextJS(repoPath string) bool {
-	tsRoot, _ := findTSRoot(repoPath)
+func detectNextJSRoot(repoPath, tsRoot string) bool {
 	return detectNextJSAt(tsRoot) || (tsRoot != repoPath && detectNextJSAt(repoPath))
 }
 
@@ -1439,6 +1309,62 @@ func nearestPackageName(pkgNames map[string]string, dir string) string {
 		}
 		d = d[:i]
 	}
+}
+
+// nextJSPackageDirs returns the repo-relative directories of the packages that are
+// Next.js apps. A workspace whose root package declares no next still holds one
+// (onyx's web/ beside its desktop/ and widget/), and the root-level detection,
+// which reads one directory, cannot see it. The walk skips what
+// collectPackageNames skips, and directories of examples (isExampleDir).
+func nextJSPackageDirs(repoPath string) []string {
+	var out []string
+	_ = filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != repoPath && (strings.HasPrefix(name, ".") || tsSkipDirs[name] || name == "testdata" || isExampleDir(name)) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "package.json" {
+			return nil
+		}
+		dir := filepath.Dir(path) //factpath:host
+		if dir != repoPath && detectNextJSAt(dir) {
+			if rel, err := filepath.Rel(repoPath, dir); err == nil {
+				out = append(out, filepath.ToSlash(rel))
+			}
+		}
+		return nil
+	})
+	return out
+}
+
+// isExampleDir reports whether a directory holds examples, samples or demos of the
+// repository, alone or in a compound name (example-apps, with_demos). A Next.js app
+// there demonstrates the repository and is none of its apps: read as one, the demo
+// excalidraw ships in examples/with-nextjs made the repository a Next.js app.
+func isExampleDir(name string) bool {
+	for _, tok := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool { return r == '-' || r == '_' }) {
+		switch tok {
+		case "example", "examples", "sample", "samples", "demo", "demos":
+			return true
+		}
+	}
+	return false
+}
+
+// inNextJSPackage reports whether a file belongs to one of the Next.js packages.
+func inNextJSPackage(relFile string, dirs []string) bool {
+	for _, d := range dirs {
+		if strings.HasPrefix(relFile, d+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func detectNextJSAt(dir string) bool {
@@ -1623,9 +1549,9 @@ var reactHTTPMethods = map[string]bool{
 func classifySymbol(kinds *tsutil.KindTable, f *facts.Fact, name string, body *sitter.Node, ctx *extractCtx, symbolKind string) {
 	// Next.js App Router route handler: GET/POST/... in a route.{ts,tsx} file.
 	if symbolKind == facts.SymbolFunc && reactHTTPMethods[name] && isAppRouteFile(ctx.relFile) {
-		f.Props["web_component"] = "route_handler"
-		f.Props["method"] = name
-		f.Props["framework"] = "nextjs"
+		f.SetProp("web_component", "route_handler")
+		f.SetProp("method", name)
+		f.SetProp("framework", "nextjs")
 		return
 	}
 	// SvelteKit `load` export: +page.ts/+layout.ts/+page.server.ts/+layout.server.ts
@@ -1633,16 +1559,16 @@ func classifySymbol(kinds *tsutil.KindTable, f *facts.Fact, name string, body *s
 	// never by an in-repo call — same shape as the Next.js case above.
 	if symbolKind == facts.SymbolFunc && name == "load" && ctx.isSvelteKit &&
 		isUnderRoutesDir(ctx.relFile) && svelteKitLoadFileBasenames[svelteKitFileBasename(ctx.relFile)] {
-		f.Props["web_component"] = "route_handler"
-		f.Props["framework"] = "sveltekit"
+		f.SetProp("web_component", "route_handler")
+		f.SetProp("framework", "sveltekit")
 		return
 	}
 	// SvelteKit +server.ts HTTP-method export (GET/POST/...) under routes/.
 	if symbolKind == facts.SymbolFunc && reactHTTPMethods[name] && ctx.isSvelteKit &&
 		isUnderRoutesDir(ctx.relFile) && svelteKitFileBasename(ctx.relFile) == "+server" {
-		f.Props["web_component"] = "route_handler"
-		f.Props["method"] = name
-		f.Props["framework"] = "sveltekit"
+		f.SetProp("web_component", "route_handler")
+		f.SetProp("method", name)
+		f.SetProp("framework", "sveltekit")
 		return
 	}
 	// SvelteKit hooks.server.ts hooks (handle/handleError/handleFetch) — invoked by
@@ -1650,22 +1576,22 @@ func classifySymbol(kinds *tsutil.KindTable, f *facts.Fact, name string, body *s
 	// precedent as Python's framework-hook-name exclusion (gunicorn/ASGI lifespan).
 	if symbolKind == facts.SymbolFunc && svelteKitHookNames[name] && ctx.isSvelteKit &&
 		svelteKitFileBasename(ctx.relFile) == "hooks.server" {
-		f.Props["web_component"] = "route_handler"
-		f.Props["framework"] = "sveltekit"
+		f.SetProp("web_component", "route_handler")
+		f.SetProp("framework", "sveltekit")
 		return
 	}
 	// Composable (Vue/Nuxt) or hook (React): a useXxx function.
 	if symbolKind == facts.SymbolFunc && isHookName(name) {
 		if ctx.isVue || ctx.isNuxt {
-			f.Props["web_component"] = "composable"
+			f.SetProp("web_component", "composable")
 			if ctx.isNuxt {
-				f.Props["framework"] = "nuxt"
+				f.SetProp("framework", "nuxt")
 			} else {
-				f.Props["framework"] = "vue"
+				f.SetProp("framework", "vue")
 			}
 		} else {
-			f.Props["web_component"] = "hook"
-			f.Props["framework"] = "react"
+			f.SetProp("web_component", "hook")
+			f.SetProp("framework", "react")
 		}
 		return
 	}
@@ -1674,11 +1600,11 @@ func classifySymbol(kinds *tsutil.KindTable, f *facts.Fact, name string, body *s
 	// require literal JSX in the body to avoid misclassifying plain classes.
 	if isComponentName(name) && (symbolKind == facts.SymbolFunc || symbolKind == facts.SymbolClass) {
 		if ctx.isTSX || (body != nil && containsJSX(kinds, body)) {
-			f.Props["web_component"] = "component"
+			f.SetProp("web_component", "component")
 			if ctx.isNextJS {
-				f.Props["framework"] = "nextjs"
+				f.SetProp("framework", "nextjs")
 			} else {
-				f.Props["framework"] = "react"
+				f.SetProp("framework", "react")
 			}
 		}
 	}
@@ -1796,9 +1722,7 @@ func findChildByKind(kinds *tsutil.KindTable, node *sitter.Node, kind string) *s
 	return nil
 }
 
-func nodeText(node *sitter.Node, src []byte) string {
-	return string(src[node.StartByte():node.EndByte()])
-}
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
 
 // tsAliasRoot is a directory (repoPath-relative, "" = root) and the alias
 // map its tsconfig declares, already qualified with dir as a prefix.
@@ -1906,98 +1830,168 @@ func aliasesForDir(roots []tsAliasRoot, dir string) map[string]tsAlias {
 	return best.aliases
 }
 
-// withSvelteKitLibDefault adds the "$lib/" -> "<root>/src/lib/" convention
-// to every root that doesn't already define it.
-func withSvelteKitLibDefault(roots []tsAliasRoot) []tsAliasRoot {
-	if len(roots) == 0 {
-		roots = []tsAliasRoot{{dir: "", aliases: map[string]tsAlias{}}}
-	}
-	for i := range roots {
-		if _, ok := roots[i].aliases["$lib/"]; ok {
-			continue
-		}
-		target := "src/lib/"
-		if roots[i].dir != "" {
-			target = roots[i].dir + "/src/lib/"
-		}
-		roots[i].aliases["$lib/"] = tsAlias{replacement: target}
-	}
-	return roots
-}
-
 // tryParseTSConfigAliases reads path alias mappings from a tsconfig.json,
 // e.g. "@/*": ["./src/*"] maps prefix "@/" to replacement "src/". ok is
-// false if the file is missing/invalid or declares no usable paths.
-// tsAliasTarget resolves one `paths` target against the tsconfig's baseUrl.
-//
-// A target that already starts with "./" is relative to the tsconfig's own
-// directory and is left alone; anything else is relative to baseUrl, which is what
-// TypeScript does and what a workspace that sets `"baseUrl": "./src"` relies on.
-func tsAliasTarget(base, target string) string {
-	target = strings.TrimSpace(target)
-	if strings.HasPrefix(target, "./") || strings.HasPrefix(target, "../") {
-		return strings.TrimPrefix(target, "./")
+// false if the file and its relative extends chain are missing/invalid or declare
+// no usable paths. Targets are rebased to the child config's directory so the caller
+// can qualify them exactly as it qualifies aliases declared directly in that child.
+
+type tsConfigAliasFile struct {
+	Extends         string `json:"extends"`
+	CompilerOptions struct {
+		// BaseUrl is what a non-relative `paths` target is resolved against.
+		// TypeScript resolves `"@common/*": ["common/*"]` under a `baseUrl` of
+		// "./src" to src/common/*, and ignoring it resolved one directory too
+		// high — which in one workspace meant every aliased import in the
+		// application resolved to nothing, and with it every module composition
+		// edge those imports carry.
+		BaseURL string              `json:"baseUrl"`
+		Paths   map[string][]string `json:"paths"`
+	} `json:"compilerOptions"`
+}
+
+// stripJSONC removes comments and trailing commas without touching comment-looking
+// text inside strings. tsconfig.json is JSONC in practice; using encoding/json directly
+// made a perfectly ordinary commented config indistinguishable from a missing one.
+func stripJSONC(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	quote, escaped := byte(0), false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if quote != 0 {
+			out = append(out, c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' || c == '`' {
+			quote = c
+			out = append(out, c)
+			continue
+		}
+		if c == '/' && i+1 < len(data) && data[i+1] == '/' {
+			i += 2
+			for i < len(data) && data[i] != '\n' && data[i] != '\r' {
+				i++
+			}
+			if i < len(data) {
+				out = append(out, data[i])
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(data) && data[i+1] == '*' {
+			i += 2
+			for i+1 < len(data) && (data[i] != '*' || data[i+1] != '/') {
+				i++
+			}
+			i++
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				continue
+			}
+		}
+		out = append(out, c)
 	}
-	if base == "" {
-		return target
+	return out
+}
+
+func readTSConfig(path string) (tsConfigAliasFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tsConfigAliasFile{}, err
 	}
-	return base + "/" + target
+	var config tsConfigAliasFile
+	if err := json.Unmarshal(stripJSONC(data), &config); err != nil {
+		return tsConfigAliasFile{}, err
+	}
+	return config, nil
+}
+
+func resolveTSConfigExtends(from, spec string) string {
+	if spec == "" || (!strings.HasPrefix(spec, ".") && !filepath.IsAbs(spec)) {
+		return ""
+	}
+	p := spec
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(filepath.Dir(from), filepath.FromSlash(p)) //factpath:host
+	}
+	if filepath.Ext(p) == "" {
+		p += ".json"
+	}
+	return filepath.Clean(p) //factpath:host
 }
 
 func tryParseTSConfigAliases(tsconfigPath string) (map[string]tsAlias, bool) {
-	data, err := os.ReadFile(tsconfigPath)
-	if err != nil {
-		return nil, false
+	originDir := filepath.Dir(tsconfigPath) //factpath:host
+	path := filepath.Clean(tsconfigPath)    //factpath:host
+	seen := map[string]bool{}
+	for depth := 0; depth < 32; depth++ {
+		if seen[path] {
+			return nil, false
+		}
+		seen[path] = true
+		config, err := readTSConfig(path)
+		if err != nil {
+			return nil, false
+		}
+		// TypeScript replaces (rather than merges) an inherited paths map. The first
+		// declaration while walking child to parent is therefore the effective one.
+		if config.CompilerOptions.Paths != nil {
+			return parseTSConfigAliases(config, path, originDir)
+		}
+		path = resolveTSConfigExtends(path, strings.TrimSpace(config.Extends))
+		if path == "" {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+func parseTSConfigAliases(config tsConfigAliasFile, declaringPath, originDir string) (map[string]tsAlias, bool) {
+	declaringDir := filepath.Dir(declaringPath) //factpath:host
+	base := strings.TrimSpace(config.CompilerOptions.BaseURL)
+	if base == "" {
+		base = "."
+	}
+	absoluteBase := filepath.Clean(filepath.Join(declaringDir, filepath.FromSlash(base))) //factpath:host
+	toOrigin := func(target string) string {
+		target = strings.TrimSpace(target)
+		root := absoluteBase
+		if strings.HasPrefix(target, "./") || strings.HasPrefix(target, "../") {
+			root = declaringDir
+		}
+		abs := filepath.Clean(filepath.Join(root, filepath.FromSlash(target))) //factpath:host
+		rel, err := filepath.Rel(originDir, abs)
+		if err != nil {
+			return filepath.ToSlash(abs)
+		}
+		return filepath.ToSlash(rel)
 	}
 
-	var config struct {
-		CompilerOptions struct {
-			// BaseUrl is what a non-relative `paths` target is resolved against.
-			// TypeScript resolves `"@common/*": ["common/*"]` under a `baseUrl` of
-			// "./src" to src/common/*, and ignoring it resolved one directory too
-			// high — which in one workspace meant every aliased import in the
-			// application resolved to nothing, and with it every module composition
-			// edge those imports carry.
-			BaseURL string              `json:"baseUrl"`
-			Paths   map[string][]string `json:"paths"`
-		} `json:"compilerOptions"`
-	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, false
-	}
-
-	base := strings.Trim(strings.TrimPrefix(strings.TrimSpace(config.CompilerOptions.BaseURL), "./"), "/")
-	if base == "." {
-		base = ""
-	}
 	aliases := make(map[string]tsAlias)
 	for pattern, targets := range config.CompilerOptions.Paths {
 		if len(targets) == 0 {
 			continue
 		}
+		target := toOrigin(targets[0])
 		switch {
-		// "@/*": ["./src/*"] → prefix "@/" maps to replacement "src/"
-		case strings.HasSuffix(pattern, "*") && strings.Contains(targets[0], "*"):
+		case strings.HasSuffix(pattern, "*") && strings.Contains(target, "*"):
 			prefix := strings.TrimSuffix(pattern, "*")
-			head, tail, _ := strings.Cut(targets[0], "*")
-			aliases[prefix] = tsAlias{
-				replacement: tsAliasTarget(base, head),
-				suffix:      tail,
-			}
-
-		// "@acme/common": ["./packages/common/src/index.ts"] — the bare package
-		// specifier, and the dominant way a monorepo names a sibling package. Dropping
-		// this form (as this function did until v134) left every `import { x } from
-		// "@acme/common"` classified external, so the call edge fell back to the
-		// CALLER's directory and landed on a phantom node. Measured on excalidraw:
-		// 4,847 internal call edges dangling, and impact_analysis/traverse returning
-		// nothing for any cross-package symbol. The subpath form resolved fine, which
-		// is exactly why it went unnoticed.
-		case !strings.HasSuffix(pattern, "*") && !strings.HasSuffix(targets[0], "*"):
-			aliases[pattern] = tsAlias{
-				replacement: tsAliasTarget(base, targets[0]),
-				exact:       true,
-			}
+			head, tail, _ := strings.Cut(target, "*")
+			aliases[prefix] = tsAlias{replacement: head, suffix: tail}
+		case !strings.HasSuffix(pattern, "*") && !strings.HasSuffix(target, "*"):
+			aliases[pattern] = tsAlias{replacement: target, exact: true}
 		}
 	}
 	return aliases, len(aliases) > 0
@@ -2090,15 +2084,29 @@ func resolveModuleFile(resolved string, knownFiles map[string]bool) (indexPath, 
 	return "", "", false
 }
 
-// buildImportSymbols returns a map of locally-bound import name → canonical symbol
-// fact name for named imports from internal modules. It lets bare calls to
-// imported functions (e.g. `formatName()`) resolve to the callee's declaration
-// fact. Symbols declared in an imported module are named "<moduleDir>.<exportName>",
-// where moduleDir is the directory of the resolved module file — this matches the
-// common file-module case (e.g. import "./utils" → utils.ts → "<dir>.foo").
-func buildImportSymbols(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) map[string]string {
+// buildImportBindings returns a map of locally-bound import name → canonical symbol
+// fact name for named imports. It lets bare calls to imported functions (e.g.
+// `formatName()`) resolve to the callee's declaration fact. Symbols declared in an
+// imported module are named "<moduleDir>.<exportName>", where moduleDir is the
+// directory of the resolved module file — this matches the common file-module case
+// (e.g. import "./utils" → utils.ts → "<dir>.foo").
+//
+// A name imported from a package is named "<specifier>.<exportName>"
+// (`@acme/sdk.Client`), the way the source spells it. The package may be another
+// loaded repository, whose facts carry their own names for it; the import-aliases
+// binder resolves the one to the other. Left unmapped, the call fell through to the
+// same-directory spelling, which named a symbol of the importing file's own module.
+//
+// The second map holds the local names bound from a module of this repository (a
+// relative, aliased or baseUrl path) rather than from a package, each qualified:
+// the ones whose members can name this repository's symbols. A default import is
+// qualified by its local name, the name a default-exported declaration nearly
+// always carries; it is left out of the import map, where it would change what a
+// bare call to it resolves to.
+func buildImportBindings(kinds *tsutil.KindTable, root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias, files *tsFileIndex) (map[string]string, map[string]string) {
 	fileDir := factpath.Dir(relFile)
 	m := make(map[string]string)
+	internal := make(map[string]string)
 	for i := range root.ChildCount() {
 		child := root.Child(i)
 		if kindOf(kinds, child) != "import_statement" {
@@ -2110,18 +2118,48 @@ func buildImportSymbols(kinds *tsutil.KindTable, root *sitter.Node, src []byte, 
 		}
 		importPath := strings.Trim(nodeText(source, src), `"'`)
 		resolved, isExternal := resolveImportPath(importPath, fileDir, aliases)
+		qualifier := factpath.Dir(resolved)
+		fromRepo := !isExternal
 		if isExternal {
-			continue // external modules have no local declaration facts
+			// A framework alias or a baseUrl path is a file of this repository that
+			// resolveImportPath could not see; anything else is a package.
+			if file, ok := files.resolve(importPath, relFile); ok {
+				qualifier = factpath.Dir(file)
+				fromRepo = true
+			} else {
+				qualifier = importPath
+			}
 		}
-		moduleDir := factpath.Dir(resolved)
 
 		clause := findChildByKind(kinds, child, "import_clause")
 		if clause == nil {
 			continue
 		}
+		if def := findChildByKind(kinds, clause, "identifier"); def != nil && fromRepo {
+			local := nodeText(def, src)
+			internal[local] = qualifier + "." + local
+			// A default import is bound under its local name in the module it comes
+			// from. The exported declaration is not looked up, so this is right
+			// where the import keeps the declaration's name (`import callApi from
+			// './callApi'`), which is the convention, and names nothing otherwise.
+			// Unbound, a call to it fell through to "a function of this directory",
+			// which is right only when the two files are siblings: across
+			// directories the edge named a symbol that does not exist.
+			if _, bound := m[local]; !bound {
+				m[local] = qualifier + "." + local
+			}
+		}
+		// `import * as api from '$lib/api'`: a member of the namespace is the module's
+		// export of that name, so `api.get()` is "<moduleDir>.get". Only the member
+		// roots carry it; the namespace itself is no symbol to call.
+		if ns := findChildByKind(kinds, clause, "namespace_import"); ns != nil && fromRepo {
+			if id := findChildByKind(kinds, ns, "identifier"); id != nil {
+				internal[nodeText(id, src)] = qualifier
+			}
+		}
 		named := findChildByKind(kinds, clause, "named_imports")
 		if named == nil {
-			continue // default/namespace imports are not resolved
+			continue // a default import is bound above, a namespace import in internal
 		}
 		for j := range named.ChildCount() {
 			spec := named.Child(j)
@@ -2137,10 +2175,47 @@ func buildImportSymbols(kinds *tsutil.KindTable, root *sitter.Node, src []byte, 
 			if aliasNode := spec.ChildByFieldName("alias"); aliasNode != nil {
 				local = nodeText(aliasNode, src)
 			}
-			m[local] = moduleDir + "." + exportName
+			m[local] = qualifier + "." + exportName
+			if fromRepo {
+				internal[local] = m[local]
+			}
 		}
 	}
-	return m
+	return m, internal
+}
+
+// memberCallRoots returns the names `<name>.<member>()` resolves through, each
+// mapped to its qualified name: a name imported from this repository, and a
+// top-level declaration of this file whose value holds object-member functions
+// (see objectMemberSymbols). Anything else, a package import above all, is left out:
+// its members name no fact, and resolving them would only add dangling edges.
+func memberCallRoots(kinds *tsutil.KindTable, root *sitter.Node, src []byte, dir string, internal map[string]string) map[string]string {
+	roots := map[string]string{}
+	for local, qualified := range internal {
+		roots[local] = qualified
+	}
+	for i := range root.ChildCount() {
+		stmt := root.Child(i)
+		if kindOf(kinds, stmt) == "export_statement" {
+			if d := stmt.ChildByFieldName("declaration"); d != nil {
+				stmt = d
+			}
+		}
+		if k := kindOf(kinds, stmt); k != "lexical_declaration" && k != "variable_declaration" {
+			continue
+		}
+		for j := range stmt.ChildCount() {
+			decl := stmt.Child(j)
+			if kindOf(kinds, decl) != "variable_declarator" {
+				continue
+			}
+			name := findChildByKind(kinds, decl, "identifier")
+			if name != nil && hasObjectMembers(kinds, decl.ChildByFieldName("value"), src) {
+				roots[nodeText(name, src)] = dir + "." + nodeText(name, src)
+			}
+		}
+	}
+	return roots
 }
 
 // collectTSFileRefs performs a whole-file reference pass for the dead-code detector.
@@ -2487,21 +2562,35 @@ func (e *TSExtractor) ExtractTestRefs(ctx context.Context, repoPath string, file
 
 	aliasRoots := collectTSAliasRoots(repoPath)
 
-	perFile := parallel.MapFiles(ctx, testFiles, func(relFile string) []facts.Fact {
+	type testFile struct {
+		refs  []facts.Fact
+		cases testCaseReading
+	}
+	perFile := parallel.MapFiles(ctx, testFiles, func(relFile string) testFile {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[ts-extractor] error reading test file %s: %v", relFile, err)
-			return nil
+			return testFile{}
 		}
 		if isMinifiedSource(src) {
-			return nil
+			return testFile{}
 		}
-		return e.testRefsFromFile(src, relFile, aliasesForDir(aliasRoots, factpath.Dir(relFile)))
+		refs, cases := e.testRefsFromFile(src, relFile, aliasesForDir(aliasRoots, factpath.Dir(relFile)))
+		return testFile{refs: refs, cases: cases}
 	})
 
 	var out []facts.Fact
-	for _, ff := range perFile {
-		out = append(out, ff...)
+	named, unlabelled := 0, 0
+	for _, tf := range perFile {
+		out = append(out, tf.refs...)
+		out = append(out, tf.cases.cases...)
+		named += len(tf.cases.cases)
+		unlabelled += tf.cases.unlabelled
+	}
+	if unlabelled > 0 {
+		if f, ok := extcoverage.Fact(repoPath, "typescript:test_cases", "test_case", named, map[string]int{"label_not_literal": unlabelled}); ok {
+			out = append(out, f)
+		}
 	}
 	return out, nil
 }
@@ -2510,7 +2599,7 @@ func (e *TSExtractor) ExtractTestRefs(ctx context.Context, repoPath string, file
 // (or nil when it references nothing), reusing collectTSFileRefs' walk. Only the
 // fields collectTSFileRefs reads are populated on the ctx; knownFiles is left nil
 // (see ExtractTestRefs).
-func (e *TSExtractor) testRefsFromFile(src []byte, relFile string, aliases map[string]tsAlias) []facts.Fact {
+func (e *TSExtractor) testRefsFromFile(src []byte, relFile string, aliases map[string]tsAlias) ([]facts.Fact, testCaseReading) {
 	isTSX := strings.HasSuffix(relFile, ".tsx") || strings.HasSuffix(relFile, ".jsx")
 	kinds := tsKindsFor(isTSX)
 
@@ -2522,7 +2611,7 @@ func (e *TSExtractor) testRefsFromFile(src []byte, relFile string, aliases map[s
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(lang)); err != nil {
-		return nil
+		return nil, testCaseReading{}
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
@@ -2533,7 +2622,29 @@ func (e *TSExtractor) testRefsFromFile(src []byte, relFile string, aliases map[s
 		dir:     factpath.Dir(relFile),
 		isTSX:   isTSX,
 	}
-	return e.collectTSFileRefs(kinds, tree.RootNode(), ctx, aliases, facts.KindTestRef)
+	var cases testCaseReading
+	if isJSTestFile(relFile) {
+		cases = tsTestCases(kinds, tree.RootNode(), src, relFile)
+	}
+	return e.collectTSFileRefs(kinds, tree.RootNode(), ctx, aliases, facts.KindTestRef), cases
+}
+
+// jsTestFileCases parses a colocated test file the production pass reads and names
+// its tests.
+func jsTestFileCases(src []byte, relFile string) testCaseReading {
+	isTSX := strings.HasSuffix(relFile, ".tsx") || strings.HasSuffix(relFile, ".jsx")
+	lang := typescript.LanguageTypescript()
+	if isTSX {
+		lang = typescript.LanguageTSX()
+	}
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(sitter.NewLanguage(lang)); err != nil {
+		return testCaseReading{}
+	}
+	tree := parser.Parse(src, nil)
+	defer tree.Close()
+	return tsTestCases(tsKindsFor(isTSX), tree.RootNode(), src, relFile)
 }
 
 // resolveLocalOrImport resolves a bare name used in a value/call position to its
@@ -2593,10 +2704,20 @@ type tsBodyMetrics struct {
 	inLoopSeen         map[string]bool // dedup set for callsInLoop
 	callsInScalingLoop []string        // distinct call targets invoked at scaling (unbounded) depth >= 1
 	inScalingSeen      map[string]bool // dedup set for callsInScalingLoop
-	recursive          bool            // body directly calls the enclosing function
-	ioDirect           bool            // body directly invokes a network/file I/O primitive
-	fieldsWritten      []string        // distinct `this.<name>` targets the body assigns to
-	writeSeen          map[string]bool // dedup set for fieldsWritten
+	scalingCallDepth   map[string]int  // deepest scaling nesting each of those is called at (calldepth.go)
+	// The cross-call hierarchical rule (hierarchy.go): the calls handed a loop
+	// element with the argument position that carries it, and the parameters a
+	// scaling loop of this body walks.
+	callsOnLoopElement    []string
+	callsOnLoopElementArg []int
+	onElementSeen         map[string]bool
+	loopsOverParam        map[int]bool
+	recursive             bool            // body directly calls the enclosing function
+	ioDirect              bool            // body directly invokes a network/file I/O primitive
+	ioCalls               []string        // the resolved calls that are themselves the round trip
+	ioNamedCalls          []string        // resolved calls that are I/O by method name alone, settled per repo
+	fieldsWritten         []string        // distinct `this.<name>` targets the body assigns to
+	writeSeen             map[string]bool // dedup set for fieldsWritten
 }
 
 // tsIterators are array/collection methods whose callback runs once per element —
@@ -2613,7 +2734,7 @@ var tsIterators = map[string]bool{
 
 // tsCheapMethods are obviously-cheap methods that are not I/O. No-arg-ish method
 // calls to these inside loops are not recorded in calls_in_loop, keeping it focused
-// (the enterprise keyword gate is the real precision filter).
+// (the analyzer's keyword gate is the real precision filter).
 var tsCheapMethods = map[string]bool{
 	"toString": true, "push": true, "pop": true, "shift": true, "unshift": true,
 	"slice": true, "splice": true, "join": true, "concat": true, "includes": true,
@@ -2638,7 +2759,7 @@ var tsCheapMethods = map[string]bool{
 // (fetch), a member call on a known receiver (axios.get, fs.readFile), or a call to
 // a local binding imported from a network module (e.g. a `request` helper default-
 // exported from a `.../lib/network/request` module). The io_direct flag is then
-// propagated transitively into performs_io by computeTSPerformsIO, mirroring Swift.
+// propagated transitively into performs_io by ioclosure.Propagate, mirroring Swift.
 
 // tsIOCallNames are bare-identifier callees that are unambiguous network/file I/O.
 var tsIOCallNames = map[string]bool{
@@ -2658,9 +2779,9 @@ var tsIOMemberMethods = map[string]bool{
 
 	// ORM query methods (Prisma, TypeORM, Drizzle) — a real DB round-trip.
 	//
-	// These seed io_direct, which computeTSPerformsIO then propagates transitively into
+	// These seed io_direct, which ioclosure.Propagate then propagates transitively into
 	// performs_io. That is the whole point: a direct in-loop `prisma.post.findMany()` was
-	// already caught by the enterprise analyzer's own name list, but a REPOSITORY WRAPPER
+	// already caught by the analyzer's own name list, but a REPOSITORY WRAPPER
 	// around it was not — the wrapper invokes no network primitive, so it was never
 	// io_direct, so it was never performs_io, so a per-iteration call to it was invisible.
 	//
@@ -2730,7 +2851,7 @@ func tsIsNetworkModule(importPath string) bool {
 // deliberately NOT bound: a network barrel/types module exports pure helpers, error
 // classes, and action-status utilities (`resolved`, `NetworkError`, `assignPaginationDefaults`)
 // alongside any request function, and binding those mislabels every caller as doing I/O.
-// Sibling to buildImportSymbols, which drops external and default imports entirely.
+// Sibling to buildImportBindings, which drops external and default imports entirely.
 func buildIOImportBindings(kinds *tsutil.KindTable, root *sitter.Node, src []byte) map[string]bool {
 	bindings := make(map[string]bool)
 	for i := range root.ChildCount() {
@@ -2775,8 +2896,8 @@ func tsCalleeRoot(recv string) string {
 
 // tsIsIOCall reports whether a call_expression directly performs network/file I/O:
 // a bare global primitive (fetch) or network-imported binding (request); or a member
-// call on a known I/O receiver (axios.get, fs.readFile), a network-imported binding, or
-// an I/O method name (navigator.sendBeacon).
+// call on a known I/O receiver (axios.get, fs.readFile) or a network-imported binding.
+// A call that is I/O by its method name alone is tsIsIONamedCall.
 func tsIsIOCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte, ioBindings map[string]bool) bool {
 	fn := call.ChildByFieldName("function")
 	if fn == nil {
@@ -2788,9 +2909,16 @@ func tsIsIOCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte, ioBindin
 	}
 	if recv, prop := tsMemberCall(kinds, call, src); prop != "" {
 		root := tsCalleeRoot(recv)
-		return tsIOReceivers[root] || ioBindings[root] || tsIOMemberMethods[prop]
+		return tsIOReceivers[root] || ioBindings[root]
 	}
 	return false
+}
+
+// tsIsIONamedCall reports whether a member call is I/O by its method name alone
+// (navigator.sendBeacon, repo.findMany).
+func tsIsIONamedCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte) bool {
+	_, prop := tsMemberCall(kinds, call, src)
+	return tsIOMemberMethods[prop]
 }
 
 // tsIsFunctionLike reports whether a node introduces a function scope (a deferred
@@ -2866,14 +2994,7 @@ func tsMemberCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte) (recv,
 // tsBodyWalker walks a function/method body once, collecting call-edge relations
 // and (when metrics != nil) per-function complexity signals.
 type tsBodyWalker struct {
-	src []byte
-	// kinds names node types for the grammar this file was parsed with. A field is
-	// safe here, unlike on TSExtractor, because a walker belongs to one parse;
-	// TSExtractor is shared across the goroutines parallel.MapFiles runs.
-	kinds               *tsutil.KindTable
-	dir, className      string
-	importMap           map[string]string
-	ioBindings          map[string]bool
+	callScope
 	selfName, selfShort string
 	metrics             *tsBodyMetrics
 	loopDepth           int
@@ -2882,6 +3003,15 @@ type tsBodyWalker struct {
 	// differs from scalingDepth for `while (true)`, which adds no factor of n but whose
 	// body still runs many times — so a query inside it is still an N+1 candidate.
 	repeatDepth int
+	// loopScopes are the enclosing loops' variables, for the hierarchical rule in
+	// hierarchy.go.
+	loopScopes []tsLoopScope
+	// paramScope and paramIndex are the function's parameters, for the cross-call
+	// rule in hierarchy.go.
+	paramScope []tsLoopScope
+	paramIndex map[string]int
+	// constLocals are the locals proven to be literal collections (constbound.go).
+	constLocals map[string]bool
 	rels        []facts.Relation
 	seen        map[string]bool
 }
@@ -2894,6 +3024,53 @@ func (w *tsBodyWalker) recordCall(target string) {
 		w.metrics.recursive = true
 	}
 	w.recordInLoop(target)
+}
+
+// noteLoopOverParam records that a scaling loop of this body walks what the named
+// parameter (or `this`) holds. root is "" when the loop walks something else.
+func (w *tsBodyWalker) noteLoopOverParam(root string) {
+	if w.metrics == nil || root == "" {
+		return
+	}
+	i, ok := w.paramIndex[root]
+	if !ok {
+		return
+	}
+	if w.metrics.loopsOverParam == nil {
+		w.metrics.loopsOverParam = make(map[int]bool)
+	}
+	w.metrics.loopsOverParam[i] = true
+}
+
+// noteCallOnLoopElement records a call, made inside a scaling loop, that hands its
+// callee an element of an enclosing loop: as an argument, or as the receiver.
+func (w *tsBodyWalker) noteCallOnLoopElement(call *sitter.Node, target string) {
+	if w.metrics == nil || w.scalingDepth == 0 || len(w.loopScopes) == 0 || w.metrics.onElementSeen[target] {
+		return
+	}
+	pos, found := 0, false
+	if fn := call.ChildByFieldName("function"); fn != nil && kindOf(w.kinds, fn) == "member_expression" {
+		if tsReachedThroughElement(w.kinds, fn.ChildByFieldName("object"), w.src, w.loopScopes) {
+			pos, found = tsReceiverParam, true
+		}
+	}
+	if args := call.ChildByFieldName("arguments"); !found && args != nil {
+		for i := range args.NamedChildCount() {
+			if tsReachedThroughElement(w.kinds, args.NamedChild(i), w.src, w.loopScopes) {
+				pos, found = int(i), true
+				break
+			}
+		}
+	}
+	if !found {
+		return
+	}
+	if w.metrics.onElementSeen == nil {
+		w.metrics.onElementSeen = make(map[string]bool)
+	}
+	w.metrics.onElementSeen[target] = true
+	w.metrics.callsOnLoopElement = append(w.metrics.callsOnLoopElement, target)
+	w.metrics.callsOnLoopElementArg = append(w.metrics.callsOnLoopElementArg, pos)
 }
 
 func (w *tsBodyWalker) recordInLoop(target string) {
@@ -2915,6 +3092,7 @@ func (w *tsBodyWalker) recordInLoop(target string) {
 		if w.metrics.inScalingSeen == nil {
 			w.metrics.inScalingSeen = make(map[string]bool)
 		}
+		w.metrics.scalingCallDepth = noteCallDepth(w.metrics.scalingCallDepth, target, w.scalingDepth)
 		if !w.metrics.inScalingSeen[target] {
 			w.metrics.inScalingSeen[target] = true
 			w.metrics.callsInScalingLoop = append(w.metrics.callsInScalingLoop, target)
@@ -2935,148 +3113,297 @@ func (w *tsBodyWalker) walk(n *sitter.Node) {
 	// being mis-counted as a per-iteration call. The iterator's own callback is
 	// handled separately in the call_expression branch (its body walks at +1).
 	if w.metrics != nil && tsIsFunctionLike(kind) {
-		saved, savedScaling, savedRepeat := w.loopDepth, w.scalingDepth, w.repeatDepth
-		w.loopDepth, w.scalingDepth, w.repeatDepth = 0, 0, 0
-		for i := range n.ChildCount() {
-			w.walk(n.Child(i))
-		}
-		w.loopDepth, w.scalingDepth, w.repeatDepth = saved, savedScaling, savedRepeat
+		w.walkDeferred(n)
 		return
 	}
-
-	// Complexity metrics: count decision points so the single body walk doubles as
-	// the cyclomatic pass.
+	if kind == "variable_declarator" {
+		w.bindDerivedLocal(n)
+	}
 	if w.metrics != nil {
-		switch kind {
-		case "assignment_expression", "augmented_assignment_expression":
-			w.metrics.noteFieldWrite(w.kinds, n, w.src)
-		case "if_statement", "ternary_expression", "switch_case", "catch_clause":
-			w.metrics.decisions++
-		case "binary_expression":
-			if tsBooleanOp(w.kinds, n) {
-				w.metrics.decisions++
-			}
-		}
+		w.countDecision(kind, n)
 	}
 
-	// Syntactic loops: everything in the body runs per iteration. A loop over a literal
-	// collection (for..of [a,b,c]) or an infinite while(true)/do..while(true) event/retry
-	// loop is bounded — it raises loop_depth but not scaling_loop_depth (the Big-O exponent).
 	switch kind {
 	case "for_statement", "for_in_statement", "while_statement", "do_statement":
-		bounded := tsLoopBounded(w.kinds, n, w.src)
-		repeats := tsLoopRepeats(w.kinds, n)
-		if w.metrics != nil {
-			w.metrics.loopCount++
-			w.metrics.decisions++
-			if w.loopDepth+1 > w.metrics.loopDepth {
-				w.metrics.loopDepth = w.loopDepth + 1
-			}
-			if !bounded && w.scalingDepth+1 > w.metrics.scalingLoopDepth {
-				w.metrics.scalingLoopDepth = w.scalingDepth + 1
-			}
-		}
-		w.loopDepth++
-		if !bounded {
-			w.scalingDepth++
-		}
-		if repeats {
-			w.repeatDepth++
-		}
-		for i := range n.ChildCount() {
-			w.walk(n.Child(i))
-		}
-		w.loopDepth--
-		if !bounded {
-			w.scalingDepth--
-		}
-		if repeats {
-			w.repeatDepth--
-		}
+		w.walkLoop(n, kind)
 		return
-	}
-
-	if kind == "call_expression" {
-		// Seed the performs_io closure: flag the enclosing body when it directly
-		// invokes a network/file I/O primitive. Independent of loop depth — a wrapper
-		// calls its I/O sink once, and the transitive pass carries the signal upward.
-		if w.metrics != nil && !w.metrics.ioDirect && tsIsIOCall(w.kinds, n, w.src, w.ioBindings) {
-			w.metrics.ioDirect = true
+	case "call_expression":
+		if w.walkCall(n) {
+			return
 		}
-		if target := resolveTSCall(w.kinds, n, w.src, w.dir, w.className, w.importMap); target != "" {
-			if !w.seen[target] {
-				w.seen[target] = true
-				w.rels = append(w.rels, facts.Relation{Kind: facts.RelCalls, Target: target})
-			}
-			w.recordCall(target)
-		} else if w.metrics != nil && w.loopDepth > 0 {
-			// Method call on an unknown receiver inside a loop (repo.findMany(),
-			// prisma.user.create()). No graph edge today, but its name feeds the perf
-			// metric so the enterprise analyzer can flag per-iteration ORM/fetch I/O.
-			if recv, prop := tsMemberCall(w.kinds, n, w.src); prop != "" && !tsCheapMethods[prop] {
-				tgt := prop
-				if recv != "" {
-					tgt = recv + "." + prop
-				}
-				w.recordInLoop(tgt)
-			}
-		}
-		// An array-iterator method with a callback (items.map(cb)) is a loop: its
-		// callback body runs per element, but the receiver/other args run once.
-		if w.metrics != nil {
-			if cb := tsIteratorCallback(w.kinds, n, w.src); cb != nil {
-				// A `[a,b,c].map(cb)` over a literal receiver iterates a fixed count — it
-				// raises loop_depth but not the scaling depth. The actual w.loopDepth /
-				// w.scalingDepth bump happens at the callback body inside walkCallbackSubtree;
-				// here we only record the maxes.
-				bounded := tsIteratorReceiverBounded(w.kinds, n, w.src)
-				w.metrics.loopCount++
-				w.metrics.decisions++
-				if w.loopDepth+1 > w.metrics.loopDepth {
-					w.metrics.loopDepth = w.loopDepth + 1
-				}
-				if !bounded && w.scalingDepth+1 > w.metrics.scalingLoopDepth {
-					w.metrics.scalingLoopDepth = w.scalingDepth + 1
-				}
-				for i := range n.ChildCount() {
-					if c := n.Child(i); tsByteContains(c, cb) {
-						w.walkCallbackSubtree(c, cb, bounded)
-					} else {
-						w.walk(c)
-					}
-				}
-				return
-			}
-		}
-	}
-
-	// `new WebSocket(...)` / `new XMLHttpRequest()` opens a network/stream resource —
-	// tag the enclosing body io_direct (constructors are new_expression, not call_expression).
-	if kind == "new_expression" && w.metrics != nil && !w.metrics.ioDirect {
-		if ctor := n.ChildByFieldName("constructor"); ctor != nil && tsIOConstructors[nodeText(ctor, w.src)] {
-			w.metrics.ioDirect = true
-		}
-	}
-
-	// A `this.<member>` reference inside a class method marks that member used, even
-	// when it is not called: React binds event handlers as prop VALUES
-	// (onClick={this.handleClick}), so a handler referenced only in JSX has no call
-	// edge and would otherwise be mis-reported dead. className is the exact class
-	// symbol name, so the target matches the method fact "<dir>.<Class>.<member>".
-	if kind == "member_expression" && w.className != "" {
-		if obj := n.ChildByFieldName("object"); obj != nil && kindOf(w.kinds, obj) == "this" {
-			if prop := n.ChildByFieldName("property"); prop != nil {
-				target := w.dir + "." + w.className + "." + nodeText(prop, w.src)
-				if !w.seen[target] {
-					w.seen[target] = true
-					w.rels = append(w.rels, facts.Relation{Kind: facts.RelCalls, Target: target})
-				}
-			}
-		}
+	case "new_expression":
+		w.noteIOConstructor(n)
+	case "member_expression":
+		w.noteThisMember(n)
 	}
 
 	for i := range n.ChildCount() {
 		w.walk(n.Child(i))
+	}
+}
+
+func (w *tsBodyWalker) walkDeferred(n *sitter.Node) {
+	saved, savedScaling, savedRepeat := w.loopDepth, w.scalingDepth, w.repeatDepth
+	savedScopes := w.loopScopes
+	w.loopDepth, w.scalingDepth, w.repeatDepth = 0, 0, 0
+	w.loopScopes = nil
+	for i := range n.ChildCount() {
+		w.walk(n.Child(i))
+	}
+	w.loopDepth, w.scalingDepth, w.repeatDepth = saved, savedScaling, savedRepeat
+	w.loopScopes = savedScopes
+}
+
+func (w *tsBodyWalker) bindDerivedLocal(n *sitter.Node) {
+	// A local derived from the current element is still the current element:
+	// `const needs = job.needs ?? []` puts `needs` one step from `job`.
+	if len(w.loopScopes) > 0 && tsReachedThroughElement(w.kinds, n.ChildByFieldName("value"), w.src, w.loopScopes) {
+		top := &w.loopScopes[len(w.loopScopes)-1]
+		tsBindPattern(w.kinds, n.ChildByFieldName("name"), w.src, top.addElem)
+	}
+	// The same for a parameter: `const els = frame.elements ?? []` is still frame's.
+	if len(w.paramScope) == 0 {
+		return
+	}
+	if root := tsElementRoot(w.kinds, n.ChildByFieldName("value"), w.src, w.paramScope); root != "" {
+		tsBindPattern(w.kinds, n.ChildByFieldName("name"), w.src, func(name string) {
+			w.paramScope[0].addElem(name)
+			w.paramIndex[name] = w.paramIndex[root]
+		})
+	}
+}
+
+// Complexity metrics: count decision points so the single body walk doubles as
+// the cyclomatic pass.
+func (w *tsBodyWalker) countDecision(kind string, n *sitter.Node) {
+	switch kind {
+	case "assignment_expression", "augmented_assignment_expression":
+		w.metrics.noteFieldWrite(w.kinds, n, w.src)
+	case "if_statement", "ternary_expression", "switch_case", "catch_clause":
+		w.metrics.decisions++
+	case "binary_expression":
+		if tsBooleanOp(w.kinds, n) {
+			w.metrics.decisions++
+		}
+	}
+}
+
+func (w *tsBodyWalker) noteLoop(scales bool) {
+	if w.metrics == nil {
+		return
+	}
+	w.metrics.loopCount++
+	w.metrics.decisions++
+	if w.loopDepth+1 > w.metrics.loopDepth {
+		w.metrics.loopDepth = w.loopDepth + 1
+	}
+	if scales && w.scalingDepth+1 > w.metrics.scalingLoopDepth {
+		w.metrics.scalingLoopDepth = w.scalingDepth + 1
+	}
+}
+
+// Syntactic loops: everything in the body runs per iteration. A loop over a literal
+// collection (for..of [a,b,c]) or an infinite while(true)/do..while(true) event/retry
+// loop is bounded — it raises loop_depth but not scaling_loop_depth (the Big-O exponent).
+func (w *tsBodyWalker) walkLoop(n *sitter.Node, kind string) {
+	repeats := tsLoopRepeats(w.kinds, n, w.src, w.constLocals)
+	bounded, scope := w.loopShape(n, kind, repeats)
+	w.noteLoop(!bounded)
+	// What the loop draws from is evaluated once, before the first iteration:
+	// the collection of a for..of, the initializer of a C-style for. Walking it
+	// with the body read `for (const s of loadSpecs())` as a call per spec, and
+	// an iterator in the header as one more level of nesting.
+	var once *sitter.Node
+	switch kind {
+	case "for_in_statement":
+		once = n.ChildByFieldName("right")
+	case "for_statement":
+		once = n.ChildByFieldName("initializer")
+	}
+	if once != nil {
+		w.walk(once)
+	}
+	w.enterLoop(!bounded, repeats, scope)
+	for i := range n.ChildCount() {
+		if c := n.Child(i); once == nil || c.StartByte() != once.StartByte() || c.EndByte() != once.EndByte() {
+			w.walk(c)
+		}
+	}
+	w.leaveLoop(!bounded, repeats)
+}
+
+// A loop over the children of the element an enclosing loop is on adds no
+// factor of n (hierarchy.go). It still repeats.
+func (w *tsBodyWalker) loopShape(n *sitter.Node, kind string, repeats bool) (bounded bool, scope tsLoopScope) {
+	bounded = tsLoopBounded(w.kinds, n, w.src, w.constLocals)
+	switch kind {
+	case "for_in_statement":
+		if !bounded {
+			w.noteLoopOverParam(tsElementRoot(w.kinds, n.ChildByFieldName("right"), w.src, w.paramScope))
+		}
+		if tsReachedThroughElement(w.kinds, n.ChildByFieldName("right"), w.src, w.loopScopes) {
+			bounded = true
+		}
+		scope = tsForInScope(w.kinds, n, w.src, repeats)
+	case "for_statement":
+		if !bounded {
+			w.noteLoopOverParam(tsForBoundRoot(w.kinds, n, w.src, w.paramScope))
+		}
+		if tsForBoundThroughElement(w.kinds, n, w.src, w.loopScopes) {
+			bounded = true
+		}
+		scope = tsForScope(w.kinds, n, w.src)
+	}
+	return bounded, scope
+}
+
+func (w *tsBodyWalker) enterLoop(scales, repeats bool, scope tsLoopScope) {
+	w.loopDepth++
+	if scales {
+		w.scalingDepth++
+	}
+	if repeats {
+		w.repeatDepth++
+	}
+	w.loopScopes = append(w.loopScopes, scope)
+}
+
+func (w *tsBodyWalker) leaveLoop(scales, repeats bool) {
+	w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
+	w.loopDepth--
+	if scales {
+		w.scalingDepth--
+	}
+	if repeats {
+		w.repeatDepth--
+	}
+}
+
+// walkCall records a call and reports whether it walked the call's children itself.
+func (w *tsBodyWalker) walkCall(n *sitter.Node) bool {
+	target := w.resolve(n)
+	w.noteIOCall(n, target)
+	if target != "" {
+		w.recordResolvedCall(n, target)
+	} else if w.metrics != nil && w.loopDepth > 0 {
+		// Method call on an unknown receiver inside a loop (repo.findMany(),
+		// prisma.user.create()). No graph edge today, but its name feeds the perf
+		// metric so the performance analyzer can flag per-iteration ORM/fetch I/O.
+		if recv, prop := tsMemberCall(w.kinds, n, w.src); prop != "" && !tsCheapMethods[prop] {
+			tgt := prop
+			if recv != "" {
+				tgt = recv + "." + prop
+			}
+			w.recordInLoop(tgt)
+		}
+	}
+	return w.metrics != nil && w.walkIteratorCall(n)
+}
+
+// Seed the performs_io closure: flag the enclosing body when it directly
+// invokes a network/file I/O primitive. Independent of loop depth — a wrapper
+// calls its I/O sink once, and the transitive pass carries the signal upward.
+//
+// A call that is I/O by its method name alone seeds only when it did not resolve.
+// A resolved one is held for settleIONamedCalls (ionamed.go), which needs the whole
+// repository to tell svg.js's findOne from TypeORM's.
+func (w *tsBodyWalker) noteIOCall(n *sitter.Node, target string) {
+	if w.metrics == nil || w.metrics.ioDirect {
+		return
+	}
+	if tsIsIOCall(w.kinds, n, w.src, w.ioBindings) || tsPassesFetch(w.kinds, n, w.src, w.importMap) ||
+		(w.drizzle && tsIsDrizzleQuery(w.kinds, n, w.src)) {
+		w.metrics.ioDirect = true
+		return
+	}
+	if !tsIsIONamedCall(w.kinds, n, w.src) {
+		return
+	}
+	if target == "" {
+		w.metrics.ioDirect = true
+	} else if !slices.Contains(w.metrics.ioNamedCalls, target) {
+		w.metrics.ioNamedCalls = append(w.metrics.ioNamedCalls, target)
+	}
+}
+
+func (w *tsBodyWalker) recordResolvedCall(n *sitter.Node, target string) {
+	// A resolved target that is itself the round trip (iotargets.go).
+	if w.metrics != nil && tsIOTargets[target] {
+		w.metrics.ioDirect = true
+		if !slices.Contains(w.metrics.ioCalls, target) {
+			w.metrics.ioCalls = append(w.metrics.ioCalls, target)
+		}
+	}
+	w.addCallRel(target)
+	w.recordCall(target)
+	w.noteCallOnLoopElement(n, target)
+}
+
+func (w *tsBodyWalker) addCallRel(target string) {
+	if !w.seen[target] {
+		w.seen[target] = true
+		w.rels = append(w.rels, facts.Relation{Kind: facts.RelCalls, Target: target})
+	}
+}
+
+// An array-iterator method with a callback (items.map(cb)) is a loop: its
+// callback body runs per element, but the receiver/other args run once.
+func (w *tsBodyWalker) walkIteratorCall(n *sitter.Node) bool {
+	cb := tsIteratorCallback(w.kinds, n, w.src)
+	if cb == nil {
+		return false
+	}
+	// A `[a,b,c].map(cb)` over a literal receiver iterates a fixed count — it
+	// raises loop_depth but not the scaling depth. The actual w.loopDepth /
+	// w.scalingDepth bump happens at the callback body inside walkCallbackSubtree;
+	// here we only record the maxes.
+	bounded := tsIteratorReceiverBounded(w.kinds, n, w.src, w.constLocals)
+	// `job.needs.map(cb)` under a loop over jobs: the receiver is the
+	// current element's own collection (hierarchy.go).
+	hier := false
+	if fn := n.ChildByFieldName("function"); fn != nil {
+		if !bounded {
+			w.noteLoopOverParam(tsElementRoot(w.kinds, fn.ChildByFieldName("object"), w.src, w.paramScope))
+		}
+		hier = tsReachedThroughElement(w.kinds, fn.ChildByFieldName("object"), w.src, w.loopScopes)
+	}
+	w.noteLoop(!bounded && !hier)
+	for i := range n.ChildCount() {
+		if c := n.Child(i); tsByteContains(c, cb) {
+			w.walkCallbackSubtree(c, cb, bounded, hier, tsCallbackElementAt(w.kinds, n, w.src))
+		} else {
+			w.walk(c)
+		}
+	}
+	return true
+}
+
+// `new WebSocket(...)` / `new XMLHttpRequest()` opens a network/stream resource —
+// tag the enclosing body io_direct (constructors are new_expression, not call_expression).
+func (w *tsBodyWalker) noteIOConstructor(n *sitter.Node) {
+	if w.metrics == nil || w.metrics.ioDirect {
+		return
+	}
+	if ctor := n.ChildByFieldName("constructor"); ctor != nil && tsIOConstructors[nodeText(ctor, w.src)] {
+		w.metrics.ioDirect = true
+	}
+}
+
+// A `this.<member>` reference inside a class method marks that member used, even
+// when it is not called: React binds event handlers as prop VALUES
+// (onClick={this.handleClick}), so a handler referenced only in JSX has no call
+// edge and would otherwise be mis-reported dead. className is the exact class
+// symbol name, so the target matches the method fact "<dir>.<Class>.<member>".
+func (w *tsBodyWalker) noteThisMember(n *sitter.Node) {
+	if w.className == "" {
+		return
+	}
+	obj := n.ChildByFieldName("object")
+	if obj == nil || kindOf(w.kinds, obj) != "this" {
+		return
+	}
+	if prop := n.ChildByFieldName("property"); prop != nil {
+		w.addCallRel(w.dir + "." + w.className + "." + nodeText(prop, w.src))
 	}
 }
 
@@ -3085,7 +3412,7 @@ func (w *tsBodyWalker) walk(n *sitter.Node) {
 // (the receiver, sibling args) at the current depth. When the iterator's receiver is a
 // literal (bounded), the scaling depth is NOT bumped — the callback runs a fixed number
 // of times, so it does not add a factor of n to Big-O.
-func (w *tsBodyWalker) walkCallbackSubtree(n, cb *sitter.Node, bounded bool) {
+func (w *tsBodyWalker) walkCallbackSubtree(n, cb *sitter.Node, bounded, hier bool, elemAt int) {
 	if n == nil {
 		return
 	}
@@ -3096,24 +3423,32 @@ func (w *tsBodyWalker) walkCallbackSubtree(n, cb *sitter.Node, bounded bool) {
 		// the depth — but THIS callback genuinely runs per iteration.
 		// An iterator receiver is either a literal (constant) or data-derived (scaling);
 		// it is never infinite, so repeating and scaling coincide here.
+		// A hierarchical receiver repeats without scaling (hierarchy.go).
+		scales := !bounded && !hier
 		w.loopDepth++
-		if !bounded {
+		if scales {
 			w.scalingDepth++
+		}
+		if !bounded {
 			w.repeatDepth++
 		}
+		w.loopScopes = append(w.loopScopes, tsCallbackScope(w.kinds, cb, w.src, !bounded, elemAt))
 		for i := range cb.ChildCount() {
 			w.walk(cb.Child(i))
 		}
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		w.loopDepth--
-		if !bounded {
+		if scales {
 			w.scalingDepth--
+		}
+		if !bounded {
 			w.repeatDepth--
 		}
 		return
 	}
 	for i := range n.ChildCount() {
 		if c := n.Child(i); tsByteContains(c, cb) {
-			w.walkCallbackSubtree(c, cb, bounded)
+			w.walkCallbackSubtree(c, cb, bounded, hier, elemAt)
 		} else {
 			w.walk(c)
 		}
@@ -3175,9 +3510,15 @@ func declaresParameters(kinds *tsutil.KindTable, member *sitter.Node) (string, b
 	return "no", true
 }
 
-func collectCallsWithMetrics(kinds *tsutil.KindTable, node *sitter.Node, src []byte, dir, className string, importMap map[string]string, ioBindings map[string]bool, selfName, selfShort string) ([]facts.Relation, *tsBodyMetrics) {
+func collectCallsWithMetrics(node *sitter.Node, scope callScope, selfName, selfShort string) ([]facts.Relation, *tsBodyMetrics) {
 	m := &tsBodyMetrics{}
-	w := &tsBodyWalker{src: src, kinds: kinds, dir: dir, className: className, importMap: importMap, ioBindings: ioBindings, selfName: selfName, selfShort: selfShort, metrics: m, seen: make(map[string]bool)}
+	kinds, src := scope.kinds, scope.src
+	w := &tsBodyWalker{callScope: scope, selfName: selfName, selfShort: selfShort, metrics: m, seen: make(map[string]bool)}
+	fn := tsEnclosingFunction(node)
+	paramScope, paramIndex := tsParamScope(kinds, fn, src)
+	w.paramScope, w.paramIndex = []tsLoopScope{paramScope}, paramIndex
+	w.memberRoots = withLocalRoots(scope.memberRoots, tsLocalTypes(kinds, fn, node, src, scope.dir, scope.importMap))
+	w.constLocals = tsConstLiteralLocals(kinds, node, src)
 	w.walk(node)
 	return w.rels, m
 }
@@ -3251,12 +3592,34 @@ func applyTSMetrics(props map[string]any, m *tsBodyMetrics) {
 			m.callsInScalingLoop = []string{}
 		}
 		props["calls_in_scaling_loop"] = m.callsInScalingLoop
+		props["calls_in_scaling_loop_depth"] = callDepths(m.callsInScalingLoop, m.scalingCallDepth)
+	}
+	if len(m.callsOnLoopElement) > 0 {
+		props["calls_on_loop_element"] = m.callsOnLoopElement
+		props["calls_on_loop_element_arg"] = m.callsOnLoopElementArg
+	}
+	if len(m.loopsOverParam) > 0 {
+		props["loops_over_param"] = true
+		idx := make([]int, 0, len(m.loopsOverParam))
+		for i := range m.loopsOverParam {
+			idx = append(idx, i)
+		}
+		sort.Ints(idx)
+		props["loops_over_param_index"] = idx
 	}
 	if m.recursive {
 		props["recursive_self"] = true
 	}
 	if m.ioDirect {
 		props["io_direct"] = true
+	}
+	if len(m.ioCalls) > 0 {
+		sort.Strings(m.ioCalls)
+		props["io_calls"] = m.ioCalls
+	}
+	if len(m.ioNamedCalls) > 0 && !m.ioDirect {
+		sort.Strings(m.ioNamedCalls)
+		props[propIONamedCalls] = m.ioNamedCalls
 	}
 }
 
@@ -3266,26 +3629,29 @@ func applyTSMetrics(props map[string]any, m *tsBodyMetrics) {
 // unbounded (its bound is not statically evident).
 //
 // It does NOT mean the loop runs a constant number of times — see tsLoopRepeats.
-func tsLoopBounded(kinds *tsutil.KindTable, n *sitter.Node, src []byte) bool {
-	return tsLoopConstant(kinds, n) || tsLoopInfinite(kinds, n, src)
+func tsLoopBounded(kinds *tsutil.KindTable, n *sitter.Node, src []byte, consts map[string]bool) bool {
+	return tsLoopConstant(kinds, n, src, consts) || tsLoopInfinite(kinds, n, src)
 }
 
 // tsLoopRepeats reports whether the loop body runs a non-constant number of times, so a
 // call inside it is an N+1 candidate. Only a genuinely constant loop is excluded: a
 // `while (true) { row = await fetch(id) }` reconnect/retry loop queries once per
 // iteration even though its depth is discounted. Scaling and repeating differ.
-func tsLoopRepeats(kinds *tsutil.KindTable, n *sitter.Node) bool {
-	return !tsLoopConstant(kinds, n)
+func tsLoopRepeats(kinds *tsutil.KindTable, n *sitter.Node, src []byte, consts map[string]bool) bool {
+	return !tsLoopConstant(kinds, n, src, consts)
 }
 
-// tsLoopConstant reports whether a for..of / for..in iterates an array/object literal —
-// a compile-time-fixed element count. A while/do loop never qualifies.
-func tsLoopConstant(kinds *tsutil.KindTable, n *sitter.Node) bool {
-	if kindOf(kinds, n) != "for_in_statement" {
-		return false
+// tsLoopConstant reports whether a loop runs a number of times fixed where it is
+// written: a for..of / for..in over a constant collection, or a C-style for against
+// a constant bound (constbound.go). A while/do loop never qualifies.
+func tsLoopConstant(kinds *tsutil.KindTable, n *sitter.Node, src []byte, consts map[string]bool) bool {
+	switch kindOf(kinds, n) {
+	case "for_in_statement":
+		return tsConstantIterable(kinds, n.ChildByFieldName("right"), src, consts)
+	case "for_statement":
+		return tsForConstBounded(kinds, n, src)
 	}
-	r := n.ChildByFieldName("right")
-	return r != nil && tsIterableLiteral(kinds, r)
+	return false
 }
 
 // tsLoopInfinite reports whether a loop is the `while (true)` / `do … while (true)` form,
@@ -3301,23 +3667,14 @@ func tsLoopInfinite(kinds *tsutil.KindTable, n *sitter.Node, src []byte) bool {
 }
 
 // tsIteratorReceiverBounded reports whether an array-iterator call (`recv.map(cb)`) has a
-// literal receiver (`[a,b,c].map(...)`), so the callback runs a fixed number of times.
-func tsIteratorReceiverBounded(kinds *tsutil.KindTable, n *sitter.Node, src []byte) bool {
+// receiver with a fixed number of elements (`[a,b,c].map(...)`, `PACKAGES.forEach(...)`),
+// so the callback runs a fixed number of times. See constbound.go.
+func tsIteratorReceiverBounded(kinds *tsutil.KindTable, n *sitter.Node, src []byte, consts map[string]bool) bool {
 	fn := n.ChildByFieldName("function")
 	if fn == nil || kindOf(kinds, fn) != "member_expression" {
 		return false
 	}
-	obj := fn.ChildByFieldName("object")
-	return obj != nil && tsIterableLiteral(kinds, obj)
-}
-
-// tsIterableLiteral reports whether a node is an array/object literal (a fixed-size iterable).
-func tsIterableLiteral(kinds *tsutil.KindTable, n *sitter.Node) bool {
-	switch kindOf(kinds, n) {
-	case "array", "object":
-		return true
-	}
-	return false
+	return tsConstantIterable(kinds, fn.ChildByFieldName("object"), src, consts)
 }
 
 // tsIsTrueCondition reports whether a loop condition is the constant `true` / a nonzero
@@ -3337,76 +3694,17 @@ func tsIsTrueCondition(kinds *tsutil.KindTable, c *sitter.Node, src []byte) bool
 	return false
 }
 
-// computeTSPerformsIO propagates the walk-time io_direct flag transitively across the
-// call graph into a performs_io prop, so a function that reaches network/file I/O only
-// through helpers is still flagged — the signal the enterprise analyzer reads to catch a
-// per-iteration network call behind a wrapper. Mirrors the Swift computePerformsIO, but
-// simpler: TS call targets are already canonical fact names, so no bare-name fan-out is
-// needed. A monotone fixpoint (only ever flips false→true) makes it cycle-safe.
-func computeTSPerformsIO(allFacts []facts.Fact) {
-	// Index symbol facts by name (a name may map to >1 fact) and record which names exist.
-	exists := make(map[string]bool)
-	for i := range allFacts {
-		if allFacts[i].Kind == facts.KindSymbol {
-			exists[allFacts[i].Name] = true
-		}
-	}
-
-	io := make(map[string]bool)      // name → performs I/O (directly or transitively)
-	adj := make(map[string][]string) // name → called names that are known symbols
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		if b, _ := f.Props["io_direct"].(bool); b {
-			io[f.Name] = true
-		}
-		seen := make(map[string]bool)
-		for _, r := range f.Relations {
-			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
-				continue
-			}
-			seen[r.Target] = true
-			adj[f.Name] = append(adj[f.Name], r.Target)
-		}
-	}
-
-	// Fixpoint: a name performs I/O if any callee does. Monotone, so it terminates
-	// even with call cycles (a no-I/O cycle simply stays false).
-	for changed := true; changed; {
-		changed = false
-		for name, callees := range adj {
-			if io[name] {
-				continue
-			}
-			for _, c := range callees {
-				if io[c] {
-					io[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind == facts.KindSymbol && io[f.Name] {
-			if f.Props == nil {
-				f.Props = map[string]any{}
-			}
-			f.Props["performs_io"] = true
-		}
-	}
-}
-
 // resolveTSCall resolves a single call_expression to a canonical target fact name,
 // or "" when the call cannot be resolved (e.g. a method call on a value of unknown
 // type). It resolves:
 //   - bare calls `foo()` → imported symbol via importMap, else same-module "<dir>.foo"
 //   - `this.method()` inside a class → "<dir>.<className>.method"
-func resolveTSCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte, dir, className string, importMap map[string]string) string {
+//   - `this.field.method()` on a field of stated type T → "<qualified T>.method"
+//   - `x.member()` where x is a member-call root (see memberCallRoots) → "<qualified x>.member"
+//   - `make().method()` where make is a function of this file declared to return T → "<qualified T>.method"
+func (s callScope) resolve(call *sitter.Node) string {
+	kinds, src, dir, className := s.kinds, s.src, s.dir, s.className
+	importMap, fieldTypes, memberRoots, returnTypes := s.importMap, s.fieldTypes, s.memberRoots, s.returnTypes
 	fn := call.ChildByFieldName("function")
 	if fn == nil {
 		return ""
@@ -3428,6 +3726,29 @@ func resolveTSCall(kinds *tsutil.KindTable, call *sitter.Node, src []byte, dir, 
 		// have an unknown type and are left unresolved to avoid dangling edges.
 		if kindOf(kinds, object) == "this" && className != "" {
 			return dir + "." + className + "." + nodeText(property, src)
+		}
+		if kindOf(kinds, object) == "identifier" && kindOf(kinds, property) == "property_identifier" {
+			if root, ok := memberRoots[nodeText(object, src)]; ok {
+				return root + "." + nodeText(property, src)
+			}
+		}
+		// `make().method()`: a call on the result of one of this file's functions,
+		// whose declared return type names the method's class.
+		if kindOf(kinds, object) == "call_expression" && kindOf(kinds, property) == "property_identifier" {
+			if callee := object.ChildByFieldName("function"); callee != nil && kindOf(kinds, callee) == "identifier" {
+				if typ, ok := returnTypes[nodeText(callee, src)]; ok {
+					return typ + "." + nodeText(property, src)
+				}
+			}
+		}
+		// `this.field.method()`: the field's stated type names the method's class.
+		if kindOf(kinds, object) == "member_expression" && kindOf(kinds, property) == "property_identifier" {
+			recv, field := object.ChildByFieldName("object"), object.ChildByFieldName("property")
+			if recv != nil && field != nil && kindOf(kinds, recv) == "this" {
+				if typ, ok := fieldTypes[nodeText(field, src)]; ok {
+					return typ + "." + nodeText(property, src)
+				}
+			}
 		}
 	}
 	return ""

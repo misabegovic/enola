@@ -166,3 +166,38 @@ locals {
 		t.Error("a second locals block was not scanned — every locals block counts")
 	}
 }
+
+// TestHCL_BlockLineIsItsKeyword: a block's line is the line its keyword is on,
+// whatever blank lines or indentation come before it.
+func TestHCL_BlockLineIsItsKeyword(t *testing.T) {
+	src := "provider \"aws\" {\n  region = \"eu\"\n}\n\n\nresource \"aws_instance\" \"web\" {\n  ami = var.ami\n}\n\n  variable \"ami\" {\n}\n\nmodule \"vpc\" {\n  source = \"./vpc\"\n}\n"
+	ff := extractHCL(t, map[string]string{"main.tf": src, "vpc/main.tf": "output \"id\" {\n  value = 1\n}\n"})
+	for name, want := range map[string]int{"provider.aws": 1, "aws_instance.web": 6, "var.ami": 10, "module.vpc": 13} {
+		if f := find(ff, facts.KindSymbol, name); f == nil || f.Line != want {
+			t.Errorf("%s line = %v, want %d", name, f, want)
+		}
+	}
+	if dep := find(ff, facts.KindDependency, ". -> vpc"); dep == nil || dep.Line != 13 {
+		t.Errorf("module dependency = %+v, want line 13", dep)
+	}
+}
+
+// TestSymbolSpanHCL: a block runs from its keyword to its closing brace, past a
+// brace inside a string and a comment; a locals entry, whose value the scanner
+// does not read to its end, and a block the file ends inside have no span.
+func TestSymbolSpanHCL(t *testing.T) {
+	src := "resource \"aws_instance\" \"web\" {\n  tags = { Name = \"}\" } # }\n}\n\n  module \"vpc\" {\n    source = \"./vpc\"\n  }\n\nlocals {\n  zone = \"eu\"\n}\n"
+	ff := extractHCL(t, map[string]string{"main.tf": src, "vpc/main.tf": "output \"id\" {\n  value = 1\n}\n", "broken.tf": "variable \"cut\" {\n  default = {\n  }"})
+	for name, want := range map[string][4]int{"aws_instance.web": {1, 3, 1, 2}, "module.vpc": {5, 7, 3, 4}, "local.zone": {10, 0, 0, 0}, "var.cut": {1, 0, 0, 0}} {
+		f := find(ff, facts.KindSymbol, name)
+		if f == nil {
+			t.Fatalf("no %s", name)
+		}
+		if got := [4]int{f.Line, f.EndLine, f.Column, f.EndColumn}; got != want {
+			t.Errorf("%s span = %v, want %v", name, got, want)
+		}
+	}
+	if dep := find(ff, facts.KindDependency, ". -> vpc"); dep == nil || dep.EndLine != 7 {
+		t.Errorf("module dependency = %+v, want the module block's span", dep)
+	}
+}

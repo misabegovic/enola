@@ -179,7 +179,7 @@ func extractGRPCClientFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir, m
 
 	var out []facts.Fact
 	seen := map[string]bool{}
-	emit := func(iface, method string, pos token.Pos) {
+	emit := func(iface, method string, call *ast.CallExpr) {
 		stub := idx.byClient[iface]
 		if stub == nil {
 			return
@@ -188,13 +188,13 @@ func extractGRPCClientFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir, m
 		if path == "" {
 			return
 		}
-		line := fset.Position(pos).Line
+		line := fset.Position(call.Pos()).Line
 		key := path + "\x00" + strconv.Itoa(line)
 		if seen[key] {
 			return
 		}
 		seen[key] = true
-		out = append(out, facts.Fact{
+		route := facts.Fact{
 			Kind: facts.KindRoute,
 			Name: path,
 			File: relFile,
@@ -210,7 +210,9 @@ func extractGRPCClientFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir, m
 				"rpc_method":        grpcMethodOf(path),
 			},
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: pkgDir}},
-		})
+		}
+		spanOf(fset, call).set(&route)
+		out = append(out, route)
 	}
 
 	for _, decl := range f.Decls {
@@ -246,7 +248,7 @@ func extractGRPCClientFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir, m
 			// in no function body).
 			if recv, ok := sel.X.(*ast.Ident); ok {
 				if iface := pkgVarClients[recv.Name]; iface != "" {
-					emit(iface, sel.Sel.Name, call.Pos())
+					emit(iface, sel.Sel.Name, call)
 					return true
 				}
 			}
@@ -258,7 +260,7 @@ func extractGRPCClientFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir, m
 				resolved := resolveChain(chain, ctx)
 				iface := afterLastDot(strings.TrimSuffix(resolved, "."+method))
 				if stub := idx.byClient[iface]; stub != nil && stub.methods[method] != "" {
-					emit(iface, method, call.Pos())
+					emit(iface, method, call)
 					return true
 				}
 			}
@@ -266,7 +268,7 @@ func extractGRPCClientFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir, m
 			// returns nil for a call-on-call, so handle it directly.
 			if inner, ok := sel.X.(*ast.CallExpr); ok {
 				if iface := clientCtorInterface(inner); iface != "" {
-					emit(iface, sel.Sel.Name, call.Pos())
+					emit(iface, sel.Sel.Name, call)
 				}
 			}
 			return true

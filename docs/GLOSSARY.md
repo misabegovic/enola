@@ -53,6 +53,9 @@ vocabulary you type, not internals:
 | `dead-methods` | a Ruby method whose name no call edge in the graph uses, or only spec files use |
 | `vendored-candidates` | a directory carrying its own licence under a conventional dependency parent — reported so you can decide, never excluded |
 | `import-closure` | what `import yourpackage` actually executes, and the package `__init__.py` files responsible for most of it |
+| `package-metrics` | how stable and how abstract a package is, and how far that puts it from Martin's main sequence |
+| `dead-code` | a symbol nothing in the snapshot references, in any language, reported with a confidence tier rather than a verdict |
+| `performance` | a call inside a loop or a recursion, with its estimated Big-O, or loops that nest, within a function or across calls, with their depth (a count, not a complexity) |
 
 Only the first four ever reach confidence `1.0`. The rest estimate — see
 [docs/EXPLAINERS.md](EXPLAINERS.md) for what each computes and why that distinction is
@@ -77,6 +80,18 @@ statistical outlier or a convention match, and reasonable people can disagree wi
 detect outbound call sites it could not resolve. Reported separately from `isolated`
 precisely because "depends on nothing" and "enola could not tell" look identical in a
 graph, and only one of them is good news.
+
+**Entry** - a symbol something outside the code invokes: the handler of a served
+route, a program's `main`, or a symbol a framework calls. It is where a flow starts.
+A subcommand, a callback, and a handler written as a function literal are not entries.
+
+**Flow** - one entry and every symbol the calls from it reach. `enola flows` ranks
+them and `flows.json` holds the largest. A flow is a floor: the walk ends at any call
+whose target is no symbol in the graph, which is most often a call into the standard
+library or an imported package.
+
+**Stage** - one of the steps that account for most of a flow, shown as a tree under
+its entry with each step's share of the flow.
 
 ## What enola keeps
 

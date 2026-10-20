@@ -222,10 +222,12 @@ properties, each enforced by a test rather than by intention:
   `snapshot_id`.
 - **Deleting it loses convenience, never truth.**
 
-The third point is why `previous/` and `baseline/` are still full copies under `.enola/` rather than
+The third point is why `previous/` and `baseline/` are still whole files under `.enola/` rather than
 references into the history. Making them references would save a few megabytes and would mean that
-removing the history could change what `enola check` says — which is exactly the dependency the rule
-forbids.
+removing the history could change what `enola check` says, which is exactly the dependency the rule
+forbids. (They are hard links to the snapshot's own files where the filesystem allows, and copies
+where it does not. Every artifact is written as a new file renamed over its name, so a link keeps the
+bytes it was taken with exactly as a copy would.)
 
 ### When enola itself changes
 

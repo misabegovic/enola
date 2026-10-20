@@ -1,0 +1,31 @@
+{
+  "budget": 20,
+  "counted": 7,
+  "items": [
+    {
+      "kind": "symbol",
+      "file": "pkg/a/a.go",
+      "name": "pkg/a.Alpha",
+      "line": 7,
+      "end_line": 9,
+      "tokens": 7,
+      "counted": true
+    },
+    {
+      "kind": "file",
+      "file": "pkg/a/a.go",
+      "tokens": 415,
+      "counted": false,
+      "mark": "search"
+    },
+    {
+      "kind": "file",
+      "file": "main.go",
+      "tokens": 62,
+      "counted": false,
+      "mark": "search"
+    }
+  ],
+  "left_out": 0,
+  "estimate": "tokens are estimated at four characters each"
+}

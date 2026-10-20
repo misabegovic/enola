@@ -84,6 +84,10 @@ type hclBlock struct {
 	file    string
 	line    int
 	body    string
+
+	// The block's extent, from its keyword to its closing brace; zero for a
+	// locals entry, whose value the scanner does not read to its end.
+	endLine, column, endColumn int
 }
 
 // Extract parses HCL files and emits facts. Directories are processed as
@@ -137,7 +141,7 @@ func (e *Extractor) Extract(ctx context.Context, repoPath string, files []string
 				Kind: facts.KindSymbol,
 				Name: prefix + b.address,
 				File: b.file,
-				Line: b.line,
+				Line: b.line, EndLine: b.endLine, Column: b.column, EndColumn: b.endColumn,
 				Props: map[string]any{
 					"language":    "hcl",
 					"symbol_kind": "type",
@@ -161,7 +165,7 @@ func (e *Extractor) Extract(ctx context.Context, repoPath string, files []string
 							Kind: facts.KindDependency,
 							Name: dir + " -> " + resolved,
 							File: b.file,
-							Line: b.line,
+							Line: b.line, EndLine: b.endLine, Column: b.column, EndColumn: b.endColumn,
 							Props: map[string]any{
 								"language": "hcl",
 								"source":   "internal",
@@ -169,8 +173,8 @@ func (e *Extractor) Extract(ctx context.Context, repoPath string, files []string
 							Relations: []facts.Relation{{Kind: facts.RelImports, Target: resolved}},
 						})
 					} else {
-						f.Props["module_source"] = src
-						f.Props["external"] = true
+						f.SetProp("module_source", src)
+						f.SetProp("external", true)
 					}
 				}
 			}
@@ -180,7 +184,9 @@ func (e *Extractor) Extract(ctx context.Context, repoPath string, files []string
 	return out, nil
 }
 
-// scanHCLBlocks reads a file's top-level blocks with brace-depth extents.
+// scanHCLBlocks reads a file's top-level blocks with brace-depth extents. A block
+// starts at its keyword: the patterns' leading \s* runs across line breaks, so the
+// match itself can start on a blank line above.
 func scanHCLBlocks(text, relFile string) []hclBlock {
 	var blocks []hclBlock
 	type opening struct {
@@ -195,7 +201,7 @@ func scanHCLBlocks(text, relFile string) []hclBlock {
 		if kind == "data" {
 			addr = "data." + addr
 		}
-		opens = append(opens, opening{kind: kind, address: addr, start: m[0], line: 1 + strings.Count(text[:m[0]], "\n")})
+		opens = append(opens, opening{kind: kind, address: addr, start: m[2], line: 1 + strings.Count(text[:m[2]], "\n")})
 	}
 	for _, m := range namedBlock.FindAllStringSubmatchIndex(text, -1) {
 		kind := text[m[2]:m[3]]
@@ -211,7 +217,7 @@ func scanHCLBlocks(text, relFile string) []hclBlock {
 		case "provider":
 			addr = "provider." + name
 		}
-		opens = append(opens, opening{kind: kind, address: addr, start: m[0], line: 1 + strings.Count(text[:m[0]], "\n")})
+		opens = append(opens, opening{kind: kind, address: addr, start: m[2], line: 1 + strings.Count(text[:m[2]], "\n")})
 	}
 	searchFrom := 0
 	for {
@@ -234,13 +240,19 @@ func scanHCLBlocks(text, relFile string) []hclBlock {
 	}
 	sort.Slice(opens, func(i, j int) bool { return opens[i].start < opens[j].start })
 	for _, o := range opens {
-		blocks = append(blocks, hclBlock{
+		b := hclBlock{
 			kind:    o.kind,
 			address: o.address,
 			file:    relFile,
 			line:    o.line,
 			body:    hclBlockBody(text, o.start),
-		})
+		}
+		if closeAt := hclBlockClose(text, o.start); closeAt >= 0 {
+			b.column = o.start - strings.LastIndexByte(text[:o.start], '\n')
+			b.endLine = 1 + strings.Count(text[:closeAt], "\n")
+			b.endColumn = closeAt - strings.LastIndexByte(text[:closeAt], '\n') + 1
+		}
+		blocks = append(blocks, b)
 	}
 	return blocks
 }
@@ -251,7 +263,28 @@ func hclBlockBody(text string, start int) string {
 	if open < 0 {
 		return ""
 	}
-	i := start + open + 1
+	i, _ := hclScanToClose(text, start+open+1)
+	return text[start+open+1 : i-1]
+}
+
+// hclBlockClose is the offset of the brace that closes the block opening at
+// start, or -1 when the file ends first.
+func hclBlockClose(text string, start int) int {
+	open := strings.IndexByte(text[start:], '{')
+	if open < 0 {
+		return -1
+	}
+	i, closed := hclScanToClose(text, start+open+1)
+	if !closed {
+		return -1
+	}
+	return i - 1
+}
+
+// hclScanToClose walks from just inside an opening brace to one past the brace
+// that closes it, skipping quoted strings and # comments, and reports whether
+// that brace was found before the file ended.
+func hclScanToClose(text string, i int) (int, bool) {
 	depth := 1
 	for i < len(text) && depth > 0 {
 		switch text[i] {
@@ -274,7 +307,7 @@ func hclBlockBody(text string, start int) string {
 		}
 		i++
 	}
-	return text[start+open+1 : i-1]
+	return i, depth == 0
 }
 
 // hclReferences collects the literal addresses a block's body references,

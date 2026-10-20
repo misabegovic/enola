@@ -1,0 +1,34 @@
+PASS — 1 new finding reported, nothing enforced: no policy set.
+could not see: 2 files and 0 directories excluded by ignore globs
+
+New findings (reported — no failure policy set):
+  - [dead-code] 0.80 — Dead code candidate: function pkg/a.UsesGamma
+      function · unreferenced · pkg/a/gamma.go:6
+      pkg/a/gamma.go:6
+      func UsesGamma() string { return c.Gamma() }
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+No --fail-on policy is set, so nothing in this run could fail the build. These are
+reported for you to judge. Enforce the ones you want enforced: --fail-on=layers
+(`enola check --help` lists all 22).
+
+What changed
+  modules      +1
+  symbols      +2
+  dependencies +1
+  edges        +4  (imports +1, calls +1, declares +2)
+
+Added (4):
+  module     pkg/c                                        pkg/c
+  symbol     pkg/a.UsesGamma                              pkg/a/gamma.go:6
+  symbol     pkg/c.Gamma                                  pkg/c/c.go:4
+  dependency pkg/a -> example.com/gosample/pkg/c          pkg/a/gamma.go:3
+
+New coupling (4):
+  pkg/a                                        --imports--> pkg/c
+  pkg/a.UsesGamma                              --calls--> pkg/c.Gamma
+  pkg/a.UsesGamma                              --declares--> pkg/a
+  pkg/c.Gamma                                  --declares--> pkg/c
+
+New coupling is reported, not failed: an added call edge is what ordinary work
+looks like. Inspect the list above if it is more than you expected.

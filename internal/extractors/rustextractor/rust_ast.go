@@ -4,47 +4,49 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 )
 
-// extractFileAST parses a Rust file with tree-sitter and emits architectural
-// facts: module-directory-scoped symbols (functions, methods, structs, enums,
-// traits, type aliases, consts/statics), dependency facts for `use`
-// declarations, RelCalls/RelInstantiates relations, per-function cyclomatic
-// complexity, and (Axum) route facts. impl-trait observations are returned
-// separately (see implPair) because attaching them requires the full, merged
-// fact set.
-// extractFileAST is the two-value form used by tests; production code calls
-// extractFileASTFull to also receive the file's Axum router-builder observations
-// (consumed by composeAxumPrefixes in the crate-wide pass).
-func extractFileAST(src []byte, relFile string, crates []crateInfo, moduleDirs map[string]bool) ([]facts.Fact, []implPair) {
-	ff, impls, _ := extractFileASTFull(src, relFile, crates, moduleDirs)
-	return ff, impls
+func extractFileASTFull(src []byte, relFile string, crates []crateInfo, moduleDirs map[string]bool) ([]facts.Fact, []implPair, []axumBuilder, string) {
+	ff, impls, builders, _, doc := extractFileASTRecords(src, relFile, crates, moduleDirs)
+	return ff, impls, builders, doc
 }
 
-func extractFileASTFull(src []byte, relFile string, crates []crateInfo, moduleDirs map[string]bool) ([]facts.Fact, []implPair, []axumBuilder) {
+// It also returns the file's inner doc, the doc of the module the file opens.
+func extractFileASTRecords(src []byte, relFile string, crates []crateInfo, moduleDirs map[string]bool) ([]facts.Fact, []implPair, []axumBuilder, *rustFileRecs, string) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(rust.Language())); err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil, ""
 	}
 
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
 	root := tree.RootNode()
 
+	// Item-macro bodies are parsed again as items (readItemMacro), with a
+	// parser of their own so the file's tree stays intact.
+	macroParser := sitter.NewParser()
+	defer macroParser.Close()
+	if err := macroParser.SetLanguage(sitter.NewLanguage(rust.Language())); err != nil {
+		macroParser = nil
+	}
+
 	dir := factpath.Dir(relFile)
 	w := &astWalker{
-		src:        src,
-		relFile:    relFile,
-		dir:        dir,
-		crateDir:   nearestCrateDir(dir, crates),
-		crates:     crates,
-		moduleDirs: moduleDirs,
-		fileRefIdx: -1,
+		src:         src,
+		relFile:     relFile,
+		dir:         dir,
+		crateDir:    nearestCrateDir(dir, crates),
+		crates:      crates,
+		moduleDirs:  moduleDirs,
+		fileRefIdx:  -1,
+		macroParser: macroParser,
+		recs:        &rustFileRecs{file: relFile, dir: dir, scopes: map[string]*rustModScope{}, testRef: -1},
 	}
 	w.walkSourceFile(root)
 
@@ -60,12 +62,13 @@ func extractFileASTFull(src []byte, relFile string, crates []crateInfo, moduleDi
 			Props:     map[string]any{"language": "rust"},
 			Relations: w.testRefRels,
 		})
+		w.recs.testRef = len(w.out) - 1
 	}
 
 	w.out = append(w.out, extractAxumRoutes(root, src, relFile, dir)...)
 	w.out = append(w.out, extractUtoipaRoutes(root, src, relFile, dir)...)
 
-	return w.out, w.impls, collectAxumBuilders(root, src, relFile)
+	return w.out, w.impls, collectAxumBuilders(root, src, relFile), w.recs, rustFileDoc(root, src)
 }
 
 type astWalker struct {
@@ -125,13 +128,15 @@ type astWalker struct {
 	decisions int
 
 	// Loop/IO complexity state, mirroring the Python/Kotlin extractors so the
-	// enterprise performance analyzer works for Rust too. The walk-time depth
+	// performance analyzer works for Rust too. The walk-time depth
 	// counters track the loop nesting at the current node; the fn-prefixed
 	// accumulators collect the per-function peak/collection that becomes the
 	// symbol's loop_depth/scaling_loop_depth/calls_in_loop/... props. All are
 	// saved/zeroed/restored around each function body alongside `decisions`.
 	loopDepth    int // syntactic loop nesting (for/while/loop)
 	scalingDepth int // nesting of loops with a data-dependent (non-constant) trip count
+	// loopScopes are the enclosing loops' variables, for the rule in hierarchy.go.
+	loopScopes []rustLoopScope
 
 	fnMaxLoop        int             // peak loopDepth seen in the current function
 	fnMaxScaling     int             // peak scalingDepth seen in the current function
@@ -140,15 +145,18 @@ type astWalker struct {
 	fnCallsInScaling []string        // resolved callees invoked at repeatDepth > 0 (scaling subset)
 	fnInLoopSeen     map[string]bool // dedup set for fnCallsInLoop
 	fnInScalingSeen  map[string]bool // dedup set for fnCallsInScaling
-	fnIODirect       bool            // the current function makes a direct I/O call
-	fnRecursive      bool            // the current function calls itself
-	fnSelfName       string          // canonical name of the current function (for recursion)
+	// fnScalingCallDepth is the deepest scaling nesting each of those is called at
+	// (calldepth.go).
+	fnScalingCallDepth map[string]int
+	fnIODirect         bool   // the current function makes a direct I/O call
+	fnRecursive        bool   // the current function calls itself
+	fnSelfName         string // canonical name of the current function (for recursion)
 
 	// importMap maps a `use`-imported simple name to its canonical symbol fact
 	// name (e.g. "run" -> "src/helper.run") when the import resolved to a known
 	// internal directory, or to "" when it resolved to an external/stdlib crate
 	// (imported, but no local fact — a bare call to it must not be resolved).
-	// Populated by emitDependency; consulted by resolveCall.
+	// Populated by emitDependency; consulted by emitBareCall and emitValueRef.
 	importMap map[string]string
 
 	// inTestMod is true while walking inside a #[cfg(test)] module's subtree.
@@ -156,6 +164,9 @@ type astWalker struct {
 	// production symbols), and calls are redirected into testRefRels instead of
 	// the owner stack — see enterTestMod.
 	inTestMod bool
+	// testModDepth counts the #[cfg(test)] modules the walk is inside, which
+	// modStack leaves out.
+	testModDepth int
 	// testRefRels accumulates the (deduplicated) RelCalls edges a #[cfg(test)]
 	// module makes into production code, later emitted as a single KindTestRef
 	// fact for the file. Built as a plain slice rather than a pointer held into
@@ -163,6 +174,30 @@ type astWalker struct {
 	// backing array and silently orphan writes through a stale pointer.
 	testRefRels []facts.Relation
 	testRefSeen map[string]bool
+	// testModPath names the #[cfg(test)] modules the walk is inside, which
+	// modStack leaves out, for the names test cases are listed under.
+	testModPath []string
+
+	// recs carries this file's module scopes, impl/trait/struct declarations
+	// and syntactically typed call sites to the crate-wide resolution pass.
+	recs           *rustFileRecs
+	macroParser    *sitter.Parser
+	implStack      []int
+	bindStack      []*rustBindings
+	genStack       []map[string]bool
+	selfWrapStack  []bool
+	whereDepth     int
+	skipUseAliases bool
+
+	// compileTimeDepth is non-zero while walking a const/static initializer.
+	// Local functions there can exist solely to make the compiler type-check or
+	// lint their bodies, even when no runtime call reaches them.
+	compileTimeDepth int
+
+	// registeredNestedDepth is non-zero inside an attribute macro that turns
+	// nested function declarations into runtime-dispatched registrations (for
+	// example starlark_module).
+	registeredNestedDepth int
 }
 
 // calleeForm classifies how a call_expression's callee was written, so the
@@ -183,9 +218,9 @@ func (w *astWalker) qualify(name string) string {
 	return strings.Join(parts, ".")
 }
 
-// qualifyMod is like qualify but drops typeStack — used by resolveCall's
-// same-scope fallback, so it doesn't mistake a bare call to an unrelated
-// top-level function for a call scoped to the caller's enclosing impl block.
+// qualifyMod is like qualify but drops typeStack, so a bare call to a function
+// the file declares is not mistaken for a call scoped to the caller's
+// enclosing impl block.
 func (w *astWalker) qualifyMod(name string) string {
 	parts := make([]string, 0, len(w.modStack)+1)
 	parts = append(parts, w.modStack...)
@@ -220,9 +255,10 @@ func (w *astWalker) currentMethods() map[string]bool {
 }
 
 func (w *astWalker) walkSourceFile(root *sitter.Node) {
+	w.recs.scopes[""] = newRustModScope(root, w.src, w.macroParser)
 	w.modFnStack = append(w.modFnStack, collectFnNames(root, w.src))
 	w.modSubmoduleStack = append(w.modSubmoduleStack, collectSubmoduleNames(root, w.src))
-	w.walkItemsTrackingAttrs(root)
+	w.walkItems(root)
 	w.modSubmoduleStack = w.modSubmoduleStack[:len(w.modSubmoduleStack)-1]
 	w.modFnStack = w.modFnStack[:len(w.modFnStack)-1]
 }
@@ -251,41 +287,97 @@ func (w *astWalker) isKnownSubmodule(name string) bool {
 	return false
 }
 
-// walkItemsTrackingAttrs iterates parent's children like walkChild, but first
-// tracks preceding attribute_item siblings so a `#[cfg(test)] mod { ... }` can
-// be detected and routed into test mode (enterTestMod) instead of being walked
-// as ordinary production code. Attributes are separate sibling nodes in the
-// grammar, not children of the item they annotate, so this bookkeeping can't
-// live in walkChild itself. Used at file scope and inside mod bodies — the two
-// places a Rust test module can appear; impl/trait bodies never contain one.
-func (w *astWalker) walkItemsTrackingAttrs(parent *sitter.Node) {
-	sawCfgTest := false
-	sawTestAttr := false
+// rustItemAttrs is the one-pass interpretation of the attribute_item siblings
+// attached to a Rust item. Keeping this typed summary avoids rescanning raw
+// attribute text in each consumer and makes attribute ownership explicit.
+type rustItemAttrs struct {
+	cfgTest             bool
+	exactCfgTest        bool
+	test                bool
+	runtimeEntrypoint   bool
+	registersNested     bool
+	executableTokenTree []*sitter.Node
+}
+
+func (a *rustItemAttrs) add(item *sitter.Node, src []byte) {
+	if strings.Join(strings.Fields(nodeText(item, src)), "") == "#[cfg(test)]" {
+		a.exactCfgTest = true
+	}
+	attr, ok := parseRustAttribute(item, src)
+	if !ok {
+		return
+	}
+	a.cfgTest = a.cfgTest || attr.isCfgTest(src)
+	a.test = a.test || isTestAttribute(attr.path)
+	a.runtimeEntrypoint = a.runtimeEntrypoint || rustRuntimeEntrypoint(attr, src)
+	a.registersNested = a.registersNested || attr.path == "starlark_module"
+	if attr.path == "instrument" || attr.path == "tracing::instrument" {
+		if attr.args != nil {
+			a.executableTokenTree = append(a.executableTokenTree, attr.args)
+		}
+	}
+}
+
+// rustAttribute is the structural portion of an attribute used for
+// classification. In particular, path never includes token-tree contents or
+// string literals, so documentation such as `#[doc = "#[pymodule]"]` cannot
+// masquerade as an entrypoint attribute.
+type rustAttribute struct {
+	path string
+	args *sitter.Node
+}
+
+func parseRustAttribute(item *sitter.Node, src []byte) (rustAttribute, bool) {
+	attr := findChildByKind(item, "attribute")
+	if attr == nil || attr.NamedChildCount() == 0 {
+		return rustAttribute{}, false
+	}
+	name := attr.NamedChild(0)
+	switch kindOf(name) {
+	case "identifier", "scoped_identifier":
+	default:
+		return rustAttribute{}, false
+	}
+	return rustAttribute{
+		path: strings.Join(strings.Fields(nodeText(name, src)), ""),
+		args: findChildByKind(attr, "token_tree"),
+	}, true
+}
+
+// walkItems pairs attributes with the item they annotate before dispatching it.
+// tree-sitter represents attributes as siblings, so comments must be skipped
+// without consuming the pending attributes. Used for file, module, impl and
+// trait bodies. A `#[cfg(test)] mod { ... }` is routed into test mode
+// (enterTestMod), and a #[test] function is recorded as a test case (testAttrs).
+func (w *astWalker) walkItems(parent *sitter.Node) {
+	var attrs rustItemAttrs
+	var tests testAttrs
 	for i := uint(0); i < uint(parent.ChildCount()); i++ {
 		c := parent.Child(i)
+		tests.see(w, c)
 		if kindOf(c) == "attribute_item" {
-			text := nodeText(c, w.src)
-			if isCfgTestAttribute(text) {
-				sawCfgTest = true
-			}
-			if isTestAttribute(text) {
-				sawTestAttr = true
-			}
+			attrs.add(c, w.src)
+			continue
+		}
+		if kindOf(c) == "line_comment" || kindOf(c) == "block_comment" {
 			continue
 		}
 		switch {
-		case kindOf(c) == "mod_item" && sawCfgTest:
+		case kindOf(c) == "mod_item" && attrs.cfgTest:
 			w.enterTestMod(c)
-		case kindOf(c) == "function_item" && sawTestAttr:
+		case kindOf(c) == "function_item" && attrs.test:
 			saved := w.inTestMod
 			w.inTestMod = true
 			w.walkTestItem(c)
 			w.inTestMod = saved
-		default:
+		case kindOf(c) == "use_declaration" && attrs.exactCfgTest:
+			w.skipUseAliases = true
 			w.walkChild(c)
+			w.skipUseAliases = false
+		default:
+			w.walkItem(c, attrs)
 		}
-		sawCfgTest = false
-		sawTestAttr = false
+		attrs = rustItemAttrs{}
 	}
 }
 
@@ -293,22 +385,30 @@ func (w *astWalker) walkItemsTrackingAttrs(parent *sitter.Node) {
 // test (#[test], #[tokio::test], #[wasm_bindgen_test]) — catching a #[test]
 // fn wherever it lives (a plain tests.rs file, an un-gated mod tests {}),
 // not just inside a #[cfg(test)] module.
-func isTestAttribute(text string) bool {
-	inner := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(text), "#["), "]")
-	if i := strings.IndexAny(inner, "(["); i >= 0 {
-		inner = inner[:i]
-	}
-	inner = strings.TrimSpace(inner)
-	return inner == "test" || strings.HasSuffix(inner, "::test") || inner == "wasm_bindgen_test"
+func isTestAttribute(path string) bool {
+	return path == "test" || strings.HasSuffix(path, "::test") || path == "wasm_bindgen_test"
 }
 
-// isCfgTestAttribute reports whether an attribute_item's raw text is a
-// `#[cfg(test)]`-shaped gate. A coarse substring check (rather than requiring
-// an exact `cfg(test)` match) also catches compound forms like
-// `#[cfg(all(test, feature = "x"))]`, at the cost of a vanishingly unlikely
-// false positive (an attribute mentioning both words for an unrelated reason).
-func isCfgTestAttribute(text string) bool {
-	return strings.Contains(text, "cfg") && strings.Contains(text, "test")
+// isCfgTest reports whether this is a cfg gate containing the test predicate.
+// Walking identifier nodes catches compound forms such as
+// `#[cfg(all(test, feature = "x"))]` without matching text in string literals.
+func (a rustAttribute) isCfgTest(src []byte) bool {
+	return a.path == "cfg" && containsRustIdentifier(a.args, "test", src)
+}
+
+func containsRustIdentifier(node *sitter.Node, want string, src []byte) bool {
+	if node == nil {
+		return false
+	}
+	if kindOf(node) == "identifier" && nodeText(node, src) == want {
+		return true
+	}
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		if containsRustIdentifier(node.NamedChild(i), want, src) {
+			return true
+		}
+	}
+	return false
 }
 
 // enterTestMod walks a #[cfg(test)] module's body in test mode: no symbol
@@ -324,9 +424,15 @@ func (w *astWalker) enterTestMod(node *sitter.Node) {
 	}
 	saved := w.inTestMod
 	w.inTestMod = true
+	w.testModDepth++
+	w.testModPath = append(w.testModPath, modName(node, w.src))
+	var tests testAttrs
 	for i := uint(0); i < uint(body.ChildCount()); i++ {
+		tests.see(w, body.Child(i))
 		w.walkTestItem(body.Child(i))
 	}
+	w.testModPath = w.testModPath[:len(w.testModPath)-1]
+	w.testModDepth--
 	w.inTestMod = saved
 }
 
@@ -346,9 +452,15 @@ func (w *astWalker) walkTestItem(c *sitter.Node) {
 		}
 	case "mod_item":
 		if body := c.ChildByFieldName("body"); body != nil {
+			w.testModDepth++
+			w.testModPath = append(w.testModPath, modName(c, w.src))
+			var tests testAttrs
 			for i := uint(0); i < uint(body.ChildCount()); i++ {
+				tests.see(w, body.Child(i))
 				w.walkTestItem(body.Child(i))
 			}
+			w.testModPath = w.testModPath[:len(w.testModPath)-1]
+			w.testModDepth--
 		}
 	case "use_declaration":
 		w.handleUse(c)
@@ -360,6 +472,65 @@ func (w *astWalker) walkTestItem(c *sitter.Node) {
 	}
 }
 
+// testAttrs follows the attributes above each item of one body, so a function
+// under #[test] (or #[tokio::test], or any other attribute isTestAttribute
+// accepts) is recorded as a test case. A comment between the attribute and the
+// function does not separate them, as it does not for the compiler. A function
+// under #[test_case(...)] or #[rstest] runs once per case under names its cases
+// build (area::toml), so it is counted rather than named.
+type testAttrs struct{ pending, parameterised bool }
+
+func (t *testAttrs) see(w *astWalker, c *sitter.Node) {
+	switch kindOf(c) {
+	case "attribute_item":
+		attr, ok := parseRustAttribute(c, w.src)
+		switch {
+		case !ok:
+		case isTestAttribute(attr.path):
+			t.pending = true
+		case isParameterisedTestAttribute(attr.path):
+			t.parameterised = true
+		}
+	case "line_comment", "block_comment":
+	case "function_item":
+		switch {
+		case t.pending:
+			w.recordTest(c)
+		case t.parameterised:
+			w.recs.parameterisedTests++
+		}
+		t.pending, t.parameterised = false, false
+	default:
+		t.pending, t.parameterised = false, false
+	}
+}
+
+func isParameterisedTestAttribute(path string) bool {
+	return path == "test_case" || path == "rstest" || strings.HasSuffix(path, "::test_case") || strings.HasSuffix(path, "::rstest")
+}
+
+// recordTest keeps a test function for the crate-wide pass, which knows the
+// module path of the file and so the name cargo lists the test under.
+func (w *astWalker) recordTest(fn *sitter.Node) {
+	nameNode := fn.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	segs := append(append([]string(nil), w.modStack...), w.testModPath...)
+	endLine, col, endCol := tsutil.Span(fn, w.src)
+	w.recs.tests = append(w.recs.tests, rustTestRec{
+		segs: segs, name: nodeText(nameNode, w.src),
+		line: int(fn.StartPosition().Row) + 1, endLine: endLine, column: col, endColumn: endCol,
+	})
+}
+
+func modName(mod *sitter.Node, src []byte) string {
+	if n := mod.ChildByFieldName("name"); n != nil {
+		return nodeText(n, src)
+	}
+	return ""
+}
+
 // walkChild dispatches an item declaration to its own handler (creating a new
 // owner/type scope as needed) or, for anything else, falls through to
 // walkForCalls so calls/decisions nested in ordinary statements are still
@@ -367,11 +538,27 @@ func (w *astWalker) walkTestItem(c *sitter.Node) {
 // item declarations nested inside a function body (Rust allows local `fn`,
 // `struct`, etc.).
 func (w *astWalker) walkChild(c *sitter.Node) {
+	// Test mode is reference-only. In particular, a local `fn` nested inside a
+	// #[test] body must not escape through the normal declaration dispatcher and
+	// become a production symbol (dbt-core uses several function-pointer stubs
+	// of exactly this shape).
+	if w.inTestMod {
+		w.walkTestItem(c)
+		return
+	}
+	w.walkItem(c, rustItemAttrs{})
+}
+
+func (w *astWalker) walkItem(c *sitter.Node, attrs rustItemAttrs) {
 	switch kindOf(c) {
 	case "use_declaration":
 		w.handleUse(c)
 	case "extern_crate_declaration":
 		w.handleExternCrate(c)
+	case "foreign_mod_item":
+		// An extern block declares functions implemented outside this repository.
+		// They are imports, not removable Rust function bodies.
+		return
 	case "mod_item":
 		w.handleMod(c)
 	case "struct_item":
@@ -383,7 +570,7 @@ func (w *astWalker) walkChild(c *sitter.Node) {
 	case "impl_item":
 		w.handleImpl(c)
 	case "function_item":
-		w.handleFunction(c)
+		w.handleFunction(c, attrs)
 	case "function_signature_item":
 		w.handleFunctionSignature(c)
 	case "type_item":
@@ -407,9 +594,17 @@ func (w *astWalker) handleMod(node *sitter.Node) {
 		name = nodeText(n, w.src)
 	}
 	w.modStack = append(w.modStack, name)
+	if !w.inTestMod {
+		scope := newRustModScope(body, w.src, w.macroParser)
+		if prev := w.recs.scopes[w.modKey()]; prev != nil {
+			prev.merge(scope)
+		} else {
+			w.recs.scopes[w.modKey()] = scope
+		}
+	}
 	w.modFnStack = append(w.modFnStack, collectFnNames(body, w.src))
 	w.modSubmoduleStack = append(w.modSubmoduleStack, collectSubmoduleNames(body, w.src))
-	w.walkItemsTrackingAttrs(body)
+	w.walkItems(body)
 	w.modSubmoduleStack = w.modSubmoduleStack[:len(w.modSubmoduleStack)-1]
 	w.modFnStack = w.modFnStack[:len(w.modFnStack)-1]
 	w.modStack = w.modStack[:len(w.modStack)-1]
@@ -426,10 +621,11 @@ func (w *astWalker) handleStruct(node *sitter.Node) {
 	}
 	name := nodeText(nameNode, w.src)
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolStruct,
 			"exported":    isExported(node),
@@ -437,7 +633,9 @@ func (w *astWalker) handleStruct(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
+	w.setDoc(node)
 	ownerIdx := len(w.out) - 1
+	w.recordStruct(node, name)
 	w.pushOwner(ownerIdx)
 	w.scanAttributeFnRefs(node.ChildByFieldName("body"))
 	w.popOwner()
@@ -450,10 +648,11 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 	}
 	name := nodeText(nameNode, w.src)
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolEnum,
 			"exported":    isExported(node),
@@ -461,6 +660,7 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
+	w.setDoc(node)
 	ownerIdx := len(w.out) - 1
 	w.pushOwner(ownerIdx)
 	w.scanAttributeFnRefs(node.ChildByFieldName("body"))
@@ -474,10 +674,11 @@ func (w *astWalker) handleTrait(node *sitter.Node) {
 	}
 	name := nodeText(nameNode, w.src)
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolInterface,
 			"exported":    isExported(node),
@@ -485,14 +686,16 @@ func (w *astWalker) handleTrait(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
+	w.setDoc(node)
 
 	body := node.ChildByFieldName("body")
 	w.pushType(name, collectFnNames(body, w.src))
+	w.recordTrait(body, name)
+	w.implStack = append(w.implStack, -1)
 	if body != nil {
-		for i := uint(0); i < uint(body.ChildCount()); i++ {
-			w.walkChild(body.Child(i))
-		}
+		w.walkItems(body)
 	}
+	w.implStack = w.implStack[:len(w.implStack)-1]
 	w.popType()
 }
 
@@ -514,18 +717,29 @@ func (w *astWalker) handleImpl(node *sitter.Node) {
 
 	body := node.ChildByFieldName("body")
 	w.pushType(typeName, collectFnNames(body, w.src))
+	w.implStack = append(w.implStack, w.recordImpl(node, body))
+	w.genStack = append(w.genStack, rustGenericNames(node.ChildByFieldName("type_parameters"), w.src, nil))
+	implWhere := findChildByKind(node, "where_clause") != nil
+	if implWhere {
+		w.whereDepth++
+	}
+	defer func() {
+		w.implStack = w.implStack[:len(w.implStack)-1]
+		w.genStack = w.genStack[:len(w.genStack)-1]
+		if implWhere {
+			w.whereDepth--
+		}
+	}()
 	savedImplTrait := w.implTrait
 	w.implTrait = traitName
 	if body != nil {
-		for i := uint(0); i < uint(body.ChildCount()); i++ {
-			w.walkChild(body.Child(i))
-		}
+		w.walkItems(body)
 	}
 	w.implTrait = savedImplTrait
 	w.popType()
 }
 
-func (w *astWalker) handleFunction(node *sitter.Node) {
+func (w *astWalker) handleFunction(node *sitter.Node, attrs rustItemAttrs) {
 	nameNode := node.ChildByFieldName("name")
 	if nameNode == nil {
 		return
@@ -538,10 +752,11 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	}
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    isExported(node),
@@ -549,14 +764,23 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := rustDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if len(w.typeStack) > 0 {
-		f.Props["receiver"] = w.typeStack[len(w.typeStack)-1]
+		f.SetProp("receiver", w.typeStack[len(w.typeStack)-1])
 		if !hasSelfParam(node.ChildByFieldName("parameters")) {
-			f.Props["static"] = true
+			f.SetProp("static", true)
 		}
 	}
 	if compilerInvokedTraitMethods[w.implTrait][name] {
-		f.Props["override"] = true
+		f.SetProp("override", true)
+	}
+	if attrs.runtimeEntrypoint || w.registeredNestedDepth > 0 {
+		f.SetProp("framework_registered", true)
+	}
+	if w.compileTimeDepth > 0 {
+		f.SetProp("compile_time_context", true)
 	}
 
 	w.out = append(w.out, f)
@@ -570,7 +794,11 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	savedMaxLoop, savedMaxScaling, savedLoopCount := w.fnMaxLoop, w.fnMaxScaling, w.fnLoopCount
 	savedCIL, savedCIS := w.fnCallsInLoop, w.fnCallsInScaling
 	savedILSeen, savedISSeen := w.fnInLoopSeen, w.fnInScalingSeen
+	savedCallDepth := w.fnScalingCallDepth
+	w.fnScalingCallDepth = nil
 	savedIO, savedRec, savedSelf := w.fnIODirect, w.fnRecursive, w.fnSelfName
+	savedScopes := w.loopScopes
+	w.loopScopes = nil
 	w.decisions = 0
 	w.loopDepth, w.scalingDepth = 0, 0
 	w.fnMaxLoop, w.fnMaxScaling, w.fnLoopCount = 0, 0, 0
@@ -578,30 +806,51 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	w.fnInLoopSeen, w.fnInScalingSeen = nil, nil
 	w.fnIODirect, w.fnRecursive = false, false
 	w.fnSelfName = f.Name
+	w.scanItemAttributeCalls(attrs)
 
 	if body := node.ChildByFieldName("body"); body != nil {
+		w.bindStack = append(w.bindStack, collectBindings(node.ChildByFieldName("parameters"), body, w.src))
+		w.selfWrapStack = append(w.selfWrapStack, selfParamWrapped(node.ChildByFieldName("parameters"), w.src))
+		hasWhere := findChildByKind(node, "where_clause") != nil
+		if hasWhere {
+			w.whereDepth++
+		}
+		w.genStack = append(w.genStack, rustGenericNames(node.ChildByFieldName("type_parameters"), w.src, nil))
 		w.modFnStack = append(w.modFnStack, collectFnNames(body, w.src))
+		if attrs.registersNested {
+			w.registeredNestedDepth++
+		}
 		w.walkForCalls(body)
+		if attrs.registersNested {
+			w.registeredNestedDepth--
+		}
 		w.modFnStack = w.modFnStack[:len(w.modFnStack)-1]
+		w.genStack = w.genStack[:len(w.genStack)-1]
+		w.bindStack = w.bindStack[:len(w.bindStack)-1]
+		w.selfWrapStack = w.selfWrapStack[:len(w.selfWrapStack)-1]
+		if hasWhere {
+			w.whereDepth--
+		}
 	}
-	w.out[ownerIdx].Props["cyclomatic"] = 1 + w.decisions
+	w.out[ownerIdx].SetProp("cyclomatic", 1+w.decisions)
 	// Emit the loop/IO props using the identical string keys the Python/Kotlin
-	// extractors and enterprise perf.go already consume. The scaling values and
+	// extractors and internal/perf already consume. The scaling values and
 	// call collections are emitted whenever the function contains any loop (even
 	// when the scaling subset is empty) so the consumer can tell "all bounded"
 	// from "no loop signal at all".
 	if w.fnLoopCount > 0 {
-		w.out[ownerIdx].Props["loop_depth"] = w.fnMaxLoop
-		w.out[ownerIdx].Props["loop_count"] = w.fnLoopCount
-		w.out[ownerIdx].Props["scaling_loop_depth"] = w.fnMaxScaling
-		w.out[ownerIdx].Props["calls_in_loop"] = nonNilStrings(w.fnCallsInLoop)
-		w.out[ownerIdx].Props["calls_in_scaling_loop"] = nonNilStrings(w.fnCallsInScaling)
+		w.out[ownerIdx].SetProp("loop_depth", w.fnMaxLoop)
+		w.out[ownerIdx].SetProp("loop_count", w.fnLoopCount)
+		w.out[ownerIdx].SetProp("scaling_loop_depth", w.fnMaxScaling)
+		w.out[ownerIdx].SetProp("calls_in_loop", nonNilStrings(w.fnCallsInLoop))
+		w.out[ownerIdx].SetProp("calls_in_scaling_loop", nonNilStrings(w.fnCallsInScaling))
+		w.out[ownerIdx].SetProp("calls_in_scaling_loop_depth", callDepths(w.fnCallsInScaling, w.fnScalingCallDepth))
 	}
 	if w.fnRecursive {
-		w.out[ownerIdx].Props["recursive_self"] = true
+		w.out[ownerIdx].SetProp("recursive_self", true)
 	}
 	if w.fnIODirect {
-		w.out[ownerIdx].Props["io_direct"] = true
+		w.out[ownerIdx].SetProp("io_direct", true)
 	}
 
 	w.decisions = savedDecisions
@@ -609,9 +858,54 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	w.fnMaxLoop, w.fnMaxScaling, w.fnLoopCount = savedMaxLoop, savedMaxScaling, savedLoopCount
 	w.fnCallsInLoop, w.fnCallsInScaling = savedCIL, savedCIS
 	w.fnInLoopSeen, w.fnInScalingSeen = savedILSeen, savedISSeen
+	w.fnScalingCallDepth = savedCallDepth
 	w.fnIODirect, w.fnRecursive, w.fnSelfName = savedIO, savedRec, savedSelf
+	w.loopScopes = savedScopes
 
 	w.popOwner()
+}
+
+// rustRuntimeEntrypoint reports whether compact attribute text marks a function
+// invoked through a generated ABI or framework registry rather than an ordinary
+// Rust call edge.
+// Keep this list to attributes with entry-point semantics: treating arbitrary
+// proc macros as registration would hide genuinely unused functions.
+var rustRuntimeEntrypointAttrs = map[string]struct{}{
+	"pymodule":             {},
+	"proc_macro":           {},
+	"proc_macro_attribute": {},
+	"proc_macro_derive":    {},
+	"no_mangle":            {},
+	"export_name":          {},
+	"wasm_bindgen":         {},
+	"tauri::command":       {},
+	"ctor::ctor":           {},
+	"divan::bench":         {},
+}
+
+func rustRuntimeEntrypoint(attr rustAttribute, src []byte) bool {
+	if _, ok := rustRuntimeEntrypointAttrs[attr.path]; ok {
+		return true
+	}
+	// Rust 2024 requires unsafe attributes to use #[unsafe(no_mangle)]. Match
+	// the exact nested identifier rather than arbitrary text in the arguments.
+	return attr.path == "unsafe" && tokenTreeSingleIdentifier(attr.args, "no_mangle", src)
+}
+
+func tokenTreeSingleIdentifier(tree *sitter.Node, want string, src []byte) bool {
+	return tree != nil && tree.NamedChildCount() == 1 &&
+		kindOf(tree.NamedChild(0)) == "identifier" && nodeText(tree.NamedChild(0), src) == want
+}
+
+// scanItemAttributeCalls records calls evaluated by selected attribute macros.
+// `tracing::instrument(fields(...))` is the common case: its field expressions
+// execute on function entry and can be the only reference to a helper. A
+// curated list avoids interpreting descriptive identifiers in arbitrary
+// attributes as code references.
+func (w *astWalker) scanItemAttributeCalls(attrs rustItemAttrs) {
+	for _, tree := range attrs.executableTokenTree {
+		w.walkForCalls(tree)
+	}
 }
 
 // nonNilStrings returns s, or an empty (non-nil) slice when s is nil, so a
@@ -627,6 +921,13 @@ func nonNilStrings(s []string) []string {
 // without a body (`fn foo(&self);`) — a real part of the trait's contract,
 // but with nothing to walk for calls/complexity.
 func (w *astWalker) handleFunctionSignature(node *sitter.Node) {
+	// Body-less functions are valid only inside a trait or an extern block.
+	// A top-level signature therefore represents foreign code (including modern
+	// `unsafe extern` syntax parsed through error recovery by the pinned grammar),
+	// never a removable implementation from this repository.
+	if len(w.typeStack) == 0 {
+		return
+	}
 	nameNode := node.ChildByFieldName("name")
 	if nameNode == nil {
 		return
@@ -637,10 +938,11 @@ func (w *astWalker) handleFunctionSignature(node *sitter.Node) {
 		symbolKind = facts.SymbolMethod
 	}
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    isExported(node),
@@ -649,8 +951,11 @@ func (w *astWalker) handleFunctionSignature(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := rustDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if len(w.typeStack) > 0 {
-		f.Props["receiver"] = w.typeStack[len(w.typeStack)-1]
+		f.SetProp("receiver", w.typeStack[len(w.typeStack)-1])
 	}
 	w.out = append(w.out, f)
 }
@@ -662,10 +967,11 @@ func (w *astWalker) handleTypeAlias(node *sitter.Node) {
 	}
 	name := nodeText(nameNode, w.src)
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolType,
 			"exported":    isExported(node),
@@ -673,6 +979,7 @@ func (w *astWalker) handleTypeAlias(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
+	w.setDoc(node)
 }
 
 func (w *astWalker) handleConstOrStatic(node *sitter.Node, symbolKind string) {
@@ -682,10 +989,11 @@ func (w *astWalker) handleConstOrStatic(node *sitter.Node, symbolKind string) {
 	}
 	name := nodeText(nameNode, w.src)
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    isExported(node),
@@ -693,10 +1001,15 @@ func (w *astWalker) handleConstOrStatic(node *sitter.Node, symbolKind string) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := rustDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	w.out = append(w.out, f)
 	w.pushOwner(len(w.out) - 1)
 	if valueNode := node.ChildByFieldName("value"); valueNode != nil {
+		w.compileTimeDepth++
 		w.walkForCalls(valueNode)
+		w.compileTimeDepth--
 	}
 	w.popOwner()
 }
@@ -706,9 +1019,25 @@ func (w *astWalker) handleUse(node *sitter.Node) {
 	if argNode == nil {
 		return
 	}
-	line := int(node.StartPosition().Row) + 1
 	for _, segs := range collectUseItems(argNode, w.src, nil) {
-		w.emitDependency(segs, line)
+		w.emitDependency(segs, node)
+	}
+	if w.inTestMod || w.skipUseAliases {
+		return
+	}
+	sc := w.recs.scopes[w.modKey()]
+	if sc == nil {
+		return
+	}
+	paths, aliases := collectUseAliases(argNode, w.src, nil)
+	for i, segs := range paths {
+		if aliases[i] == "*" {
+			sc.globs = append(sc.globs, segs[:len(segs)-1])
+			continue
+		}
+		if aliases[i] != "_" {
+			sc.addUse(aliases[i], segs)
+		}
 	}
 }
 
@@ -717,13 +1046,14 @@ func (w *astWalker) handleExternCrate(node *sitter.Node) {
 	if nameNode == nil {
 		return
 	}
-	w.emitDependency([]string{nodeText(nameNode, w.src)}, int(node.StartPosition().Row)+1)
+	w.emitDependency([]string{nodeText(nameNode, w.src)}, node)
 }
 
 // emitDependency classifies a `use`/`extern crate` path, emits the dependency
-// fact, and records the imported simple name in importMap so a later bare call
-// to it resolves (see resolveCall).
-func (w *astWalker) emitDependency(segs []string, line int) {
+// fact, and records the imported simple name in importMap, where an external
+// import drops a bare call to it and an internal one marks a value reference
+// for the crate-wide pass (see emitBareCall and emitValueRef).
+func (w *astWalker) emitDependency(segs []string, decl *sitter.Node) {
 	if len(segs) == 0 || segs[len(segs)-1] == "" {
 		return
 	}
@@ -741,16 +1071,18 @@ func (w *astWalker) emitDependency(segs []string, line int) {
 	}
 	raw := strings.Join(segs, "::")
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindDependency,
-		Name: w.dir + " -> " + raw,
-		File: w.relFile,
-		Line: line,
+		Kind:    facts.KindDependency,
+		Name:    w.dir + " -> " + raw,
+		File:    w.relFile,
+		Line:    int(decl.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(decl, w.src), Column: tsutil.Column(decl), EndColumn: tsutil.EndColumn(decl, w.src),
 		Props: map[string]any{
 			"language": "rust",
 			"source":   source,
 		},
 		Relations: []facts.Relation{{Kind: facts.RelImports, Target: target}},
 	})
+	w.recs.uses = append(w.recs.uses, rustUseLeaf{fact: len(w.out) - 1, segs: segs, modKey: w.modKey(), test: w.inTestMod, testMods: w.testModDepth})
 	w.recordImportMapping(segs, target, source)
 }
 
@@ -841,6 +1173,12 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	}
 	switch kindOf(node) {
+	case "let_declaration":
+		// A local bound from the current element is still the current element:
+		// `let frames = trace.frames();` puts `frames` one step from `trace`.
+		if len(w.loopScopes) > 0 && rustReachedThroughElement(node.ChildByFieldName("value"), w.src, w.loopScopes) {
+			rustBindPattern(node.ChildByFieldName("pattern"), w.src, &w.loopScopes[len(w.loopScopes)-1])
+		}
 	case "if_expression", "match_arm", "try_expression":
 		w.decisions++
 	case "while_expression", "for_expression", "loop_expression":
@@ -861,6 +1199,16 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		w.scanArgumentReferences(node)
 	case "field_initializer":
 		w.emitValueReference(node.ChildByFieldName("value"))
+	case "shorthand_field_initializer":
+		if node.NamedChildCount() > 0 {
+			w.emitValueReference(node.NamedChild(0))
+		}
+	case "type_cast_expression":
+		value := node.ChildByFieldName("value")
+		if value == nil && node.NamedChildCount() > 0 {
+			value = node.NamedChild(0)
+		}
+		w.emitValueReference(value)
 	case "reference_expression":
 		w.emitValueReference(node.ChildByFieldName("value"))
 	case "scoped_identifier":
@@ -886,6 +1234,15 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 // no data-dependent Big-O factor, so an in-loop call is not counted as N+1.
 func (w *astWalker) walkLoop(node *sitter.Node) {
 	bounded := w.rustLoopBounded(node)
+	// The scope is built before the hierarchical test discounts the loop: a loop
+	// with a constant trip count has no factor of n to pass on, a hierarchical one
+	// passes its parent's.
+	scope := rustLoopScope{amortizes: !bounded}
+	pattern, value := rustLoopSource(node)
+	rustBindPattern(pattern, w.src, &scope)
+	if !bounded && rustReachedThroughElement(value, w.src, w.loopScopes) {
+		bounded = true
+	}
 
 	w.fnLoopCount++
 	if w.loopDepth+1 > w.fnMaxLoop {
@@ -895,13 +1252,26 @@ func (w *astWalker) walkLoop(node *sitter.Node) {
 		w.fnMaxScaling = w.scalingDepth + 1
 	}
 
+	// A `for` evaluates what it iterates once, before the first iteration; walking
+	// it with the body read `for x in load()` as a load per element. A `while let`
+	// scrutinee is different: it is re-evaluated every time round.
+	var once *sitter.Node
+	if kindOf(node) == "for_expression" {
+		if once = value; once != nil {
+			w.walkChild(once)
+		}
+	}
 	w.loopDepth++
 	if !bounded {
 		w.scalingDepth++
 	}
+	w.loopScopes = append(w.loopScopes, scope)
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
-		w.walkChild(node.Child(i))
+		if c := node.Child(i); once == nil || c.StartByte() != once.StartByte() || c.EndByte() != once.EndByte() {
+			w.walkChild(c)
+		}
 	}
+	w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 	w.loopDepth--
 	if !bounded {
 		w.scalingDepth--
@@ -935,16 +1305,57 @@ func rustConstIterable(val *sitter.Node, src []byte) bool {
 	}
 	switch kindOf(val) {
 	case "range_expression":
-		return rustRangeLiteralBounds(val, src)
+		return rustRangeConstBounds(val, src)
 	case "array_expression", "tuple_expression":
 		return true
+	case "reference_expression", "parenthesized_expression":
+		// `&TABLE`, `(0..N)`
+		if v := val.ChildByFieldName("value"); v != nil {
+			return rustConstIterable(v, src)
+		}
+		return val.NamedChildCount() > 0 && rustConstIterable(val.NamedChild(0), src)
+	case "identifier", "scoped_identifier":
+		// `for x in TABLE`, `for x in config::TABLE`
+		return rustConstName(val, src)
+	case "call_expression":
+		// `TABLE.iter()`, `(0..N).rev()`: an argument-less adaptor of a constant.
+		fn, args := val.ChildByFieldName("function"), val.ChildByFieldName("arguments")
+		if fn != nil && kindOf(fn) == "field_expression" && (args == nil || args.NamedChildCount() == 0) {
+			return rustConstIterable(fn.ChildByFieldName("value"), src)
+		}
 	}
 	return false
 }
 
-// rustRangeLiteralBounds reports whether every bound operand of a range
-// expression is an integer literal (so the trip count is a constant).
-func rustRangeLiteralBounds(node *sitter.Node, src []byte) bool {
+// rustConstName reports whether a path names a `const` or `static` by the
+// convention the compiler itself lints for: SCREAMING_SNAKE_CASE. One capital
+// letter counts here, unlike elsewhere: `const N: usize` and a const generic `N`
+// are both fixed at compile time, and rustc warns on any other use of the form.
+func rustConstName(n *sitter.Node, src []byte) bool {
+	name := nodeText(n, src)
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	if name == "" {
+		return false
+	}
+	hasLetter := false
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
+	}
+	return hasLetter
+}
+
+// rustRangeConstBounds reports whether every bound operand of a range
+// expression is an integer literal or a named constant (`0..3`, `0..CHUNK_SIZE`),
+// so the trip count is fixed at compile time.
+func rustRangeConstBounds(node *sitter.Node, src []byte) bool {
 	saw := false
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		c := node.Child(i)
@@ -952,6 +1363,11 @@ func rustRangeLiteralBounds(node *sitter.Node, src []byte) bool {
 		case "..", "..=", "...":
 			continue // the range operator itself
 		case "integer_literal":
+			saw = true
+		case "identifier", "scoped_identifier":
+			if !rustConstName(c, src) {
+				return false // a variable bound (e.g. `0..n`) scales
+			}
 			saw = true
 		default:
 			return false // a non-literal bound (e.g. items.len()) — scales
@@ -989,12 +1405,21 @@ func (w *astWalker) scanTokenTreeCalls(node *sitter.Node) {
 				continue
 			}
 			if i > 0 && kindOf(node.Child(i-1)) == "." {
-				w.emitEdge(facts.RelCalls, name)
+				if w.inExprMacro(node) {
+					p, cause := w.tokenTreeReceiver(node, i, name)
+					w.emitCall(name, cause, p)
+				} else {
+					w.emitCall(name, "receiver_in_user_macro", nil)
+				}
 				continue
 			}
-			if target := w.resolveCall(name); target != "" {
-				w.emitEdge(facts.RelCalls, target)
+			if i > 0 && kindOf(node.Child(i-1)) == "::" {
+				p, cause := w.tokenTreePath(node, i, name)
+				w.emitCall(name, cause, p)
+				continue
 			}
+			w.emitBareCall(name, c.StartByte())
+			w.noteBareSelfCall(name, c.StartByte())
 			continue
 		}
 		// Not applied as a call: may still be a function passed by name as a
@@ -1011,9 +1436,7 @@ func (w *astWalker) scanTokenTreeCalls(node *sitter.Node) {
 				continue
 			}
 		}
-		if target := w.resolveValueReference(nodeText(c, w.src)); target != "" {
-			w.emitEdge(facts.RelCalls, target)
-		}
+		w.emitValueRef(nodeText(c, w.src), c.StartByte(), false)
 	}
 }
 
@@ -1021,15 +1444,38 @@ func (w *astWalker) scanTokenTreeCalls(node *sitter.Node) {
 // literal item) for a function passed by name (`.map_err(f)`, `&[f, g]`
 // dispatch tables), which produces no call_expression since it isn't applied.
 func (w *astWalker) scanArgumentReferences(node *sitter.Node) {
-	for i := uint(0); i < node.NamedChildCount(); i++ {
-		w.emitValueReference(node.NamedChild(i))
+	allowUnresolved := false
+	if kindOf(node) == "arguments" {
+		if call := node.Parent(); call != nil && kindOf(call) == "call_expression" {
+			if name, _ := w.calleeTrailing(call.ChildByFieldName("function")); rustCallbackMethods[name] {
+				allowUnresolved = true
+			}
+		}
 	}
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		w.emitValueReferenceWithFallback(node.NamedChild(i), allowUnresolved)
+	}
+}
+
+// rustCallbackMethods accept callable values. For these APIs, an unresolved
+// bare identifier is still emitted by short name: wildcard imports make exact
+// resolution impossible, while the orphan detector already matches references
+// conservatively by their final segment.
+var rustCallbackMethods = map[string]bool{
+	"and_then": true, "filter": true, "filter_map": true, "flat_map": true,
+	"for_each": true, "inspect": true, "inspect_err": true, "map": true,
+	"map_err": true, "or_else": true, "sort_by": true, "sort_by_key": true,
+	"then": true,
 }
 
 // emitValueReference treats a bare identifier/generic-function/scoped-path
 // as a reference when passed as a value rather than called (`&f`, `diff_fn:
 // f`). A nested call like `foo(f())` is unaffected — f() isn't a leaf shape.
 func (w *astWalker) emitValueReference(v *sitter.Node) {
+	w.emitValueReferenceWithFallback(v, false)
+}
+
+func (w *astWalker) emitValueReferenceWithFallback(v *sitter.Node, allowUnresolved bool) {
 	if v == nil {
 		return
 	}
@@ -1039,14 +1485,12 @@ func (w *astWalker) emitValueReference(v *sitter.Node) {
 		if isCapitalized(name) {
 			return
 		}
-		if target := w.resolveValueReference(name); target != "" {
-			w.emitEdge(facts.RelCalls, target)
-		}
+		w.emitValueRef(name, v.StartByte(), allowUnresolved)
 	case "generic_function":
-		w.emitValueReference(v.ChildByFieldName("function"))
+		w.emitValueReferenceWithFallback(v.ChildByFieldName("function"), allowUnresolved)
 	case "scoped_identifier":
 		if nameNode := v.ChildByFieldName("name"); nameNode != nil {
-			w.emitEdge(facts.RelCalls, nodeText(nameNode, w.src))
+			w.emitCall(nodeText(nameNode, w.src), "value_path", nil)
 		}
 	}
 }
@@ -1084,23 +1528,37 @@ func (w *astWalker) handleCallExpression(node *sitter.Node) {
 	}
 	switch form {
 	case calleeBare:
-		if target := w.resolveCall(name); target != "" {
-			w.emitEdge(facts.RelCalls, target)
-		}
+		w.emitBareCall(name, fn.StartByte())
+		w.noteBareSelfCall(name, fn.StartByte())
 	case calleeSelfRef:
-		if methods := w.currentMethods(); methods[name] {
-			w.emitEdge(facts.RelCalls, w.dir+"."+w.qualify(name))
+		callee := fn
+		if callee != nil && kindOf(callee) == "generic_function" {
+			callee = callee.ChildByFieldName("function")
+		}
+		if kindOf(callee) == "field_expression" && w.selfWrappedFor(name) {
+			w.emitCall(name, "self_wrapped", nil)
 			break
 		}
-		// Not a sibling of this impl block (another impl block, a trait
-		// default) — still unambiguously a method call, so fall back.
-		w.emitEdge(facts.RelCalls, name)
+		if kindOf(callee) == "scoped_identifier" {
+			if p := callee.ChildByFieldName("path"); p != nil && w.generics()[nodeText(p, w.src)] {
+				w.emitCall(name, "generic", nil)
+				break
+			}
+		}
+		if methods := w.currentMethods(); methods[name] {
+			w.emitSelfSibling(callee, name)
+			if w.implTrait == "" {
+				w.noteSelfCall(w.dir + "." + w.qualify(name))
+			}
+			break
+		}
+		p, cause := w.pendingFor(fn, name)
+		w.emitCall(name, cause, p)
 	case calleeOther:
-		// Receiver/path type is unknown without full type inference. Emitting
-		// the bare member name still lets short-name dead-code matching mark
-		// the (unqualified) target used, mirroring the Kotlin extractor's
-		// navigation_expression fallback.
-		w.emitEdge(facts.RelCalls, name)
+		// The bare member name stays as the target unless the crate-wide pass
+		// grounds it, so short-name dead-code matching keeps working.
+		p, cause := w.pendingFor(fn, name)
+		w.emitCall(name, cause, p)
 	}
 }
 
@@ -1112,19 +1570,13 @@ func (w *astWalker) handleCallExpression(node *sitter.Node) {
 // in test mode, it's file-scope macro content (see fileRefIdx) — recorded
 // there instead of dropped.
 func (w *astWalker) emitEdge(kind, target string) {
-	if w.inTestMod {
-		if w.testRefSeen == nil {
-			w.testRefSeen = make(map[string]bool)
-		}
-		if w.testRefSeen[target] {
-			return
-		}
-		w.testRefSeen[target] = true
-		w.testRefRels = append(w.testRefRels, facts.Relation{Kind: facts.RelCalls, Target: target})
+	if kind == facts.RelCalls {
+		w.emitCall(target, "", nil)
 		return
 	}
-	if kind == facts.RelCalls {
-		w.recordCallMetrics(target)
+	if w.inTestMod {
+		w.testRefCall(target, "")
+		return
 	}
 	owner := w.currentOwner()
 	if owner == nil {
@@ -1135,14 +1587,35 @@ func (w *astWalker) emitEdge(kind, target string) {
 	owner.Relations = append(owner.Relations, facts.Relation{Kind: kind, Target: target})
 }
 
-// recordCallMetrics attributes a resolved production call to the current
-// function's loop/recursion metrics: it feeds calls_in_loop (any enclosing
-// loop), the calls_in_scaling_loop subset (a data-dependent loop only), and
-// recursive_self (a call whose target is the function itself).
-func (w *astWalker) recordCallMetrics(target string) {
+// noteSelfCall flags direct recursion, and is reached only from a call written in
+// a form that can name the enclosing function: `self.f()` / `Self::f()` for a
+// method, a bare `f()` for a free function.
+//
+// It used to sit in recordCallMetrics, which sees every RelCalls edge, and the
+// edges are deliberately liberal: a bare identifier resolves to a sibling method
+// so that dead-code analysis keeps the method alive. An edge is not a call. A
+// method that takes a parameter of its own name (`fn fmt(&self, fmt: &mut
+// Formatter)` passing `fmt` on, `fn arg(self, arg)` forwarding to an inner
+// builder) and `Drop::drop` calling the prelude's free `drop(x)` each produced an
+// edge to themselves and were reported as recursive: 9 of the 12 recursion
+// findings sampled on an async runtime.
+func (w *astWalker) noteSelfCall(target string) {
 	if w.fnSelfName != "" && target == w.fnSelfName {
 		w.fnRecursive = true
 	}
+}
+
+func (w *astWalker) noteBareSelfCall(name string, at uint) {
+	if !w.bindings().binds(name, at) {
+		w.noteSelfCall(w.dir + "." + w.qualifyMod(name))
+	}
+}
+
+// recordCallMetrics attributes a resolved production call to the current
+// function's loop metrics: it feeds calls_in_loop (any enclosing loop) and the
+// calls_in_scaling_loop subset (a data-dependent loop only). Recursion is
+// noteSelfCall's, which needs the call form and not just the edge.
+func (w *astWalker) recordCallMetrics(target string) {
 	if w.loopDepth > 0 {
 		if w.fnInLoopSeen == nil {
 			w.fnInLoopSeen = make(map[string]bool)
@@ -1153,6 +1626,7 @@ func (w *astWalker) recordCallMetrics(target string) {
 		}
 	}
 	if w.scalingDepth > 0 {
+		w.fnScalingCallDepth = noteCallDepth(w.fnScalingCallDepth, target, w.scalingDepth)
 		if w.fnInScalingSeen == nil {
 			w.fnInScalingSeen = make(map[string]bool)
 		}
@@ -1259,41 +1733,8 @@ func (w *astWalker) scanAttribute(attr *sitter.Node) {
 		if name == "" {
 			continue
 		}
-		w.emitEdge(facts.RelCalls, name)
+		w.emitCall(name, "attribute_reference", nil)
 	}
-}
-
-// resolveCall maps a bare call name to a canonical symbol fact name, in order
-// of preference: a sibling method of the enclosing impl/trait block, a name
-// brought into scope by a `use` import (internal target, or "" to suppress an
-// external/stdlib one), or a same-directory top-level function as the final
-// fallback.
-func (w *astWalker) resolveCall(name string) string {
-	if methods := w.currentMethods(); methods[name] {
-		return w.dir + "." + w.qualify(name)
-	}
-	if target, ok := w.importMap[name]; ok {
-		return target
-	}
-	if rustBuiltins[name] {
-		return ""
-	}
-	return w.dir + "." + w.qualifyMod(name)
-}
-
-// resolveValueReference is resolveCall without the final directory guess,
-// since a bare value is more often a variable than a function name.
-func (w *astWalker) resolveValueReference(name string) string {
-	if methods := w.currentMethods(); methods[name] {
-		return w.dir + "." + w.qualify(name)
-	}
-	if w.isKnownFn(name) {
-		return w.dir + "." + w.qualifyMod(name)
-	}
-	if target, ok := w.importMap[name]; ok {
-		return target
-	}
-	return ""
 }
 
 // calleeTrailing extracts a call_expression's callee simple name and reports
@@ -1468,6 +1909,12 @@ func collectFnNames(body *sitter.Node, src []byte) map[string]bool {
 	}
 	for i := uint(0); i < uint(body.ChildCount()); i++ {
 		c := body.Child(i)
+		if kindOf(c) == "foreign_mod_item" {
+			for k := range collectFnNames(c.ChildByFieldName("body"), src) {
+				names[k] = true
+			}
+			continue
+		}
 		if kindOf(c) != "function_item" && kindOf(c) != "function_signature_item" {
 			continue
 		}
@@ -1593,9 +2040,32 @@ func findChildByKind(node *sitter.Node, kind string) *sitter.Node {
 	return nil
 }
 
-func nodeText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
+
+// emitValueRef records a function named as a value (`.map(parse)`, `&[f, g]`).
+// A local binding of the name is the value, and a bare name never denotes a
+// method, so neither yields an edge; an imported name goes through the
+// crate-wide pass like a call.
+func (w *astWalker) emitValueRef(name string, at uint, allowUnresolved bool) {
+	if w.bindings().binds(name, at) {
+		return
 	}
-	return string(src[node.StartByte():node.EndByte()])
+	if w.isKnownFn(name) {
+		w.emitCall(w.dir+"."+w.qualifyMod(name), "", nil)
+		return
+	}
+	target, imported := w.importMap[name]
+	switch {
+	case imported && target != "":
+		w.emitCall(name, "", &rustPendingCall{form: rustCallPath})
+	case !imported && allowUnresolved && !rustBuiltins[name]:
+		w.emitCall(name, "", &rustPendingCall{form: rustCallPath})
+	}
+}
+
+// setDoc sets the doc prop of the item node on the fact just appended for it.
+func (w *astWalker) setDoc(node *sitter.Node) {
+	if doc := rustDoc(node, w.src); doc != "" {
+		facts.SetDoc(&w.out[len(w.out)-1], doc)
+	}
 }

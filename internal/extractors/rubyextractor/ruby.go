@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -130,6 +131,12 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 	var clientMu sync.Mutex
 	clientDerived := 0
 	clientMisses := map[string]int{}
+	var queues queueCounts
+	accessByFile := map[string][]accessCall{}
+	readWhole := 0
+	var readInPart []string
+	var constAssigns []rubyConstAssign
+	var constSinks []rubyConstSink
 	perFileFacts := parallel.MapFiles(ctx, rbFiles, func(relFile string) []facts.Fact {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
@@ -140,11 +147,23 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 		// extractFileAST emits symbols, imports, mixins, constants, attrs, calls,
 		// and ActiveRecord storage/associations in a single AST pass;
 		// extractRubyHTTPClientFacts adds outbound HTTP-client routes.
-		ff := extractFileAST(src, relFile, isRails, exported)
+		ff, fileQueues, fileAccess, partial := extractFileASTWithAccess(src, relFile, isRails, exported)
 		clientFacts, derived, misses := extractRubyHTTPClientFactsCounted(src, relFile)
+		assigns, sinks := scanRubyClientConstants(src, relFile)
 		clientMu.Lock()
+		if partial {
+			readInPart = append(readInPart, relFile)
+		} else {
+			readWhole++
+		}
 		clientDerived += derived
 		mergeCounts(clientMisses, misses)
+		queues.merge(fileQueues)
+		if len(fileAccess) > 0 {
+			accessByFile[relFile] = fileAccess
+		}
+		constAssigns = append(constAssigns, assigns...)
+		constSinks = append(constSinks, sinks...)
 		clientMu.Unlock()
 		ff = append(ff, clientFacts...)
 		ff = append(ff, extractGraphQLRubyRoutes(src, relFile)...)
@@ -193,7 +212,8 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 
 	// Parse Rails route files.
 	if isRails {
-		routeFacts := extractAllRoutes(repoPath, files)
+		routeFacts, namespaceOf := extractAllRoutes(repoPath, files)
+		bindRouteHandlers(routeFacts, allFacts, namespaceOf)
 		allFacts = append(allFacts, routeFacts...)
 
 		assocFacts, assocUnresolved := extractAssociations(repoPath, files)
@@ -216,11 +236,53 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 	// a table a model already claims lands its census on that model's fact.
 	allFacts = append(allFacts, applySchemaDump(repoPath, allFacts)...)
 
+	// What each migration under db/migrate would do to a live table, recorded on
+	// its class so a deploy-time rule can name the one that locks a table. Not
+	// gated on isRails: a Rails app may sit below the repository root, and each
+	// app root is checked on its own.
+	allFacts = append(allFacts, applyMigrations(repoPath, rbFiles, allFacts)...)
+
+	// What runs this code in production, from the deploy files beside each Rails
+	// app: after the class pass, because a unit's runs edges name the job classes
+	// and the queues those classes declare.
+	allFacts = append(allFacts, applyRuntimeUnits(repoPath, files, isRails, allFacts)...)
+
+	// Which table each method reads and writes, where the receiver names the
+	// model exactly: a repository-wide question, since which constants are
+	// models and which associations each declares is known only now.
+	var accessCalls []accessCall
+	for _, relFile := range rbFiles {
+		accessCalls = append(accessCalls, accessByFile[relFile]...)
+	}
+	if resolved, unresolved, ok := resolveAccess(allFacts, accessCalls); ok {
+		if fact, emitted := extcoverage.Fact(repoPath, "ruby:access", "ruby_access", resolved, unresolved); emitted {
+			allFacts = append(allFacts, fact)
+		}
+	}
+
 	resolvedCalls, unresolvedCalls := countResolvedCalls(allFacts)
 	if fact, ok := callCoverageFact(repoPath, resolvedCalls, unresolvedCalls); ok {
 		allFacts = append(allFacts, fact)
 	}
 	if fact, ok := extcoverage.Fact(repoPath, "ruby:http-client", "ruby_client_path_parameter", clientDerived, clientMisses); ok {
+		allFacts = append(allFacts, fact)
+	}
+	if fact, ok := extcoverage.Fact(repoPath, "ruby:job-queues", "ruby_job_queue", queues.declared, queues.misses); ok {
+		allFacts = append(allFacts, fact)
+	}
+	if fact, ok := partialParseFact(repoPath, readWhole, readInPart); ok {
+		allFacts = append(allFacts, fact)
+	}
+
+	// Client calls whose path is a constant resolve after the AST pass: a
+	// `self.class::PATH` sink in a base class is answered by subclasses in
+	// other files, which only the repository's class symbols connect. The
+	// parallel scan collected its inputs in completion order, so they are
+	// sorted first for a reproducible output.
+	sortConstInputs(constAssigns, constSinks)
+	constFacts, constDerived, constMisses := resolveRubyClientConstants(allFacts, constAssigns, constSinks)
+	allFacts = append(allFacts, constFacts...)
+	if fact, ok := extcoverage.Fact(repoPath, "ruby:http-client-constants", "ruby_client_path_constant", constDerived, constMisses); ok {
 		allFacts = append(allFacts, fact)
 	}
 
@@ -256,6 +318,10 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 		allFacts = append(allFacts, ff...)
 	}
 
+	// Calls on self, on a new instance and on a namespaced constant reach the method
+	// they name only once every class is known.
+	resolveRubyCalls(allFacts)
+
 	// Resolve constant references (inheritance, mixins, associations, calls),
 	// require_relative paths, and Packwerk dependencies into internal module
 	// coupling edges. Without this, Ruby imports never match module Names
@@ -281,17 +347,31 @@ func (e *RubyExtractor) ExtractTestRefs(ctx context.Context, repoPath string, te
 			rbFiles = append(rbFiles, relFile)
 		}
 	}
-	perFile := parallel.MapFiles(ctx, rbFiles, func(relFile string) []facts.Fact {
+	type testFile struct {
+		refs  []facts.Fact
+		cases testCaseReading
+	}
+	perFile := parallel.MapFiles(ctx, rbFiles, func(relFile string) testFile {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[ruby-extractor] error reading test file %s: %v", relFile, err)
-			return nil
+			return testFile{}
 		}
-		return extractTestRefsAST(src, relFile)
+		refs, cases := rubyTestFile(src, relFile)
+		return testFile{refs: refs, cases: cases}
 	})
 	var out []facts.Fact
-	for _, ff := range perFile {
-		out = append(out, ff...)
+	named, unlabelled := 0, 0
+	for _, tf := range perFile {
+		out = append(out, tf.refs...)
+		out = append(out, tf.cases.cases...)
+		named += len(tf.cases.cases)
+		unlabelled += tf.cases.unlabelled
+	}
+	// A test whose label is built at run time gets no fact; the count of them is
+	// what says the named ones are not all there are.
+	if f, ok := extcoverage.Fact(repoPath, "ruby:test_cases", "test_case", named, map[string]int{"label_not_literal": unlabelled}); ok && unlabelled > 0 {
+		out = append(out, f)
 	}
 	return out, nil
 }
@@ -451,4 +531,22 @@ func countResolvedCalls(all []facts.Fact) (int, map[string]int) {
 		}
 	}
 	return resolved, unresolved
+}
+
+// partialParseFact accounts for the Ruby files the parser read whole and the
+// ones whose tree held an error node, naming the latter, so a graph that lacks
+// what such a file declares says so instead of reading as complete.
+func partialParseFact(repoPath string, whole int, inPart []string) (facts.Fact, bool) {
+	unresolved := map[string]int{}
+	if len(inPart) > 0 {
+		unresolved["tree_sitter_error_node"] = len(inPart)
+	}
+	fact, ok := extcoverage.Fact(repoPath, "ruby:parse", "ruby_file", whole, unresolved)
+	if !ok || len(inPart) == 0 {
+		return fact, ok
+	}
+	sorted := append([]string(nil), inPart...)
+	sort.Strings(sorted)
+	fact.SetProp(facts.PropParsedWithErrors, sorted)
+	return fact, true
 }

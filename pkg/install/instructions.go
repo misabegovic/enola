@@ -41,6 +41,9 @@ Before changing code whose blast radius is not obvious:
   reconstructing it by reading files.
 - ` + "`set_baseline`" + ` — pin the architecture BEFORE you start editing, so the change can
   be graded afterwards. Do this once, early.
+- ` + "`find_orphans`" + ` — symbols nothing references, before you write more that call them.
+- ` + "`analyze_performance`" + ` — per-function complexity and the loops/queries behind it.
+- ` + "`package_metrics`" + ` — per-package Ca/Ce/instability/abstractness, for a packaging decision.
 
 After a structural change, re-run ` + "`generate_snapshot`" + ` and ` + "`diff_snapshot`" + ` to see what
 the change actually did: findings introduced or resolved, coupling added, symbols added
@@ -67,10 +70,10 @@ say that nothing was enforced, and ask whether to accept it, change it, or set a
 (` + "`--fail-on`" + `) that would fail on it next time. Do not revert work over it on your
 own initiative, and do not describe the session as clean without mentioning it.
 
-It speaks in one other case: when it could not grade the change at all, because the
-baseline is not comparable to the current snapshot. That is NOT a verdict about your
-change — it means no verdict was reached — and the remedy is to re-pin the baseline.
-Said once per cause, not once per session.`
+When it cannot grade at all, because the baseline is not comparable to the current
+snapshot, it tells the user directly, not you. That is enola's setup, not your change.
+Do not re-pin a baseline you did not pin in this session: it may be the "before" the
+user chose to keep.`
 
 // block wraps content in the sentinels used for files the user also maintains.
 func block(content string) string {
@@ -104,25 +107,12 @@ func header() string {
 		"     and `enola uninstall` will remove this file. -->\n\n"
 }
 
-// body composes what actually gets written: the shared instructions, the hooks note when
-// hooks are installed, and whatever the calling binary appends.
-//
-// ExtraInstructions is the seam for a wrapper that serves tools the OSS build does not,
-// so it can tell the agent they exist without this package having to know about them —
-// and without a wrapper having to fork the instruction text to add two lines. Empty for
-// every current caller; the shared output is byte-identical while it stays empty.
+// body composes what actually gets written: the shared instructions, plus the hooks note
+// when hooks are installed.
 func body(o Options) string {
 	out := Instructions
 	if o.Hooks {
 		out += HooksNote
-	}
-	if extra := strings.TrimSpace(o.ExtraInstructions); extra != "" {
-		out += "\n\n" + extra
-	}
-	if o.Hooks {
-		if extra := strings.TrimSpace(o.ExtraHooksNote); extra != "" {
-			out += "\n\n" + extra
-		}
 	}
 	return out
 }
@@ -145,9 +135,6 @@ func opencodeInstructions(o Options) string {
 	out := Instructions
 	if o.Hooks {
 		out += OpencodeGateNote
-	}
-	if extra := strings.TrimSpace(o.ExtraInstructions); extra != "" {
-		out += "\n\n" + extra
 	}
 	return header() + out + "\n"
 }

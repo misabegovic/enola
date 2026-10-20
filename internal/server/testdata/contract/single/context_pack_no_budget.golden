@@ -1,0 +1,2 @@
+[tool error]
+validating "arguments": validating root: required: missing properties: ["budget"]

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,12 +20,14 @@ import (
 	"github.com/enola-labs/enola/internal/updatecheck"
 	"github.com/enola-labs/enola/internal/upgrade"
 	"github.com/enola-labs/enola/internal/version"
+	"github.com/enola-labs/enola/internal/workspace"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/cli"
 	"github.com/enola-labs/enola/pkg/command"
 	"github.com/enola-labs/enola/pkg/dashboard"
 	"github.com/enola-labs/enola/pkg/explain"
 	"github.com/enola-labs/enola/pkg/status"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func main() {
@@ -46,18 +50,46 @@ func main() {
 	// switch over os.Args and cannot parse `--flag=value`. Each subcommand owns its own
 	// FlagSet instead.
 	//
-	// `upgrade` is handled here rather than in pkg/command because it is OSS-only: a
-	// wrapper binary ships through its own release path and must not offer to replace
-	// itself with an enola build. It is still declared to the Runner (below) so a typo
-	// like `enola upgrad` is recognised as a near-miss rather than as an unknown word.
+	// `upgrade` is handled here rather than in pkg/command because replacing this binary
+	// in place is cmd/enola's own business: it knows the release path it shipped from. It
+	// is still declared to the Runner (below) so a typo like `enola upgrad` is recognised
+	// as a near-miss rather than as an unknown word.
+	cmds := command.New(binary(), "upgrade")
+	// `help <cmd>` and `--help <cmd>` become `<cmd> --help` before anything dispatches,
+	// so they reach the same page as that spelling, upgrade's included.
+	args, err := cmds.HelpArgs(args)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	if len(args) > 0 && args[0] == "upgrade" {
+		// upgrade takes no arguments and used to ignore them, so `enola upgrade --help`
+		// replaced the binary instead of describing what it would do.
+		if command.HelpRequested(args[1:]) {
+			fmt.Fprint(os.Stderr, "Usage: enola upgrade\n\n"+
+				"Download and install the latest enola release, replacing the running\n"+
+				"binary in place. A dev build is always treated as out of date. An\n"+
+				"install managed by a package manager (pip, for one) is left alone, with\n"+
+				"the command that upgrades it instead.\n\n"+
+				"Exit codes:\n"+
+				"  0  upgraded, already current, or left to the package manager\n"+
+				"  1  the upgrade failed\n"+
+				cmds.HelpFooter("upgrade"))
+			os.Exit(2)
+		}
 		if err := upgrade.Run(ctx, version.Version); err != nil {
 			log.Fatalf("upgrade failed: %v", err)
 		}
 		os.Exit(0)
 	}
-	cmds := command.New(binary(), "upgrade")
 	cmds.Dispatch(ctx, args) // returns only when this was not a subcommand
+
+	// After the subcommands, so `enola check --listen x` stays an error the
+	// subcommand's own flag set reports rather than a flag silently dropped.
+	args, listenFlag, err := splitListenFlag(args)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	generateMode := false
 	refreshMode := false
@@ -65,6 +97,8 @@ func main() {
 	statusMode := false
 	statusAll := false
 	noDashboard := false
+	small := false     // serve the small-window tool profile
+	noCluster := false // index a folder of repositories as one repository
 	cfgPath := "mcp-arch.yaml"
 	repoArg := "" // optional positional repo path, for --explain and --generate
 
@@ -107,7 +141,7 @@ func main() {
 			cli.RenderHelp(os.Stderr, helpSpec())
 			os.Exit(0)
 		case "--list":
-			fmt.Fprint(os.Stderr, cli.RenderToolList(cli.ToolListSpec{}))
+			fmt.Fprint(os.Stderr, cli.RenderToolList())
 			os.Exit(0)
 		case "--generate":
 			generateMode = true
@@ -121,6 +155,10 @@ func main() {
 			statusAll = true
 		case "--no-dashboard":
 			noDashboard = true
+		case "--small":
+			small = true
+		case "--no-cluster":
+			noCluster = true
 		default:
 			// The positional argument is a REPOSITORY when it names a directory and a
 			// CONFIG FILE when it names a file, so both `--explain /path/to/repo` and
@@ -148,6 +186,10 @@ func main() {
 				log.Fatalf("%s", cmds.UnknownArgHelp(arg))
 			}
 		}
+	}
+
+	if listenFlag != "" && (generateMode || explainMode || statusMode) {
+		log.Fatalf("--listen names a socket the MCP server also serves on; --generate, --explain and --status start no server")
 	}
 
 	// --status reads only the recorded usage under ~/.enola/usage/, so it runs
@@ -184,6 +226,33 @@ func main() {
 		cfg.Repo, cfg.Repos = abs, nil
 	}
 
+	// A folder holding several git repositories, given as a repository, would be indexed
+	// as ONE repository, with the cross-repo half of enola off. --generate indexes it as a
+	// cluster instead and says so, unless the folder is itself a git repository (nested
+	// checkouts belong to it) or --no-cluster asks for one repository. Everything else
+	// warns and goes on as before.
+	foldDir, folded := foldedRepos(cfg)
+	if len(folded) > 0 && !refreshMode {
+		switch {
+		case noCluster:
+			folded = nil
+		case generateMode && !workspace.IsRepo(foldDir):
+			clusterCfg, clusterPath, err := clusterConfig(os.Stderr, binary().Name, cfg, foldDir, folded)
+			if err != nil {
+				log.Fatalf("failed to read cluster config: %v", err)
+			}
+			if clusterPath != "" {
+				cfgPath = clusterPath
+			}
+			repoArg, folded, cfg = "", nil, clusterCfg
+			if eng, err = bootstrap.NewEngineFromConfig(cfg); err != nil {
+				log.Fatalf("failed to create engine: %v", err)
+			}
+		default:
+			fmt.Fprint(os.Stderr, workspace.FoldWarning(binary().Name, foldDir, folded))
+		}
+	}
+
 	if explainMode {
 		runExplain(ctx, eng, cfg)
 		// Explicit rather than deferred: this path exits, and a deferred Report
@@ -210,6 +279,9 @@ func main() {
 		// whole run to complete and the notice can be current on this run, not the next.
 		command.SpawnUpdateRefresh()
 
+		// Every repository is written below, so the last turn's id pass writes the
+		// facts file it hashes and the first write renames it into place.
+		eng.SetWritesArtifacts(true)
 		var snapshot *facts.Snapshot
 		for i, repoPath := range repoPaths {
 			// The first repository resets the store; the rest append to it, which is
@@ -254,30 +326,65 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  Artifacts:   %d\n", len(snapshot.Artifacts))
 		fmt.Fprintf(os.Stderr, "  Duration:    %s\n", snapshot.Meta.Duration)
 		fmt.Fprintf(os.Stderr, "  Output:      %s\n", filepath.Join(repoPaths[len(repoPaths)-1], cfg.Output.Dir))
+		if len(folded) > 0 {
+			fmt.Fprintf(os.Stderr, "  Warning:     %d git repositories indexed as one; to link them: %s\n",
+				len(folded), workspace.Remedy(binary().Name, foldDir))
+		}
 		if cli.ShowDashboardHint(os.Stderr) {
 			printDashboardHint(os.Stderr, repoArg, cfgPath)
 		}
 		updatecheck.Fprint(os.Stderr, engine.ExtractorVersion())
 		memWatch.Report(os.Stderr, snapshot.Meta.FactCount)
+		// Last, so a skipped provider is the end of the output rather than one
+		// log line among hundreds above it.
+		eng.WriteProviderSummary(os.Stderr, repoPaths)
 		os.Exit(0)
 	}
 
-	restoredCorpus := bootstrap.AutoLoadSnapshot(eng, cfg)
+	// The socket is claimed before the server starts, so a second server asked
+	// for the same path is refused at once rather than after it began serving.
+	// A caller that connects meanwhile waits in the backlog until the server
+	// accepts.
+	listenPath := listenFlag
+	if listenPath == "" {
+		listenPath = os.Getenv(listenEnv)
+	}
+	var socket *net.UnixListener
+	if listenPath != "" {
+		ln, release, err := claimSocket(listenPath)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		defer release()
+		socket = ln
+	}
 
-	srv, err := bootstrap.NewServer(eng, cfg)
+	// Read once, here, so the handshake, every answer and the instance record
+	// compare the file on disk against the same reading of it.
+	exe, err := status.SelfExecutable()
+	if err != nil {
+		log.Printf("[server] could not read its own binary (%v); it will not say when an install replaces it", err)
+	}
+	serverOpts := []bootstrap.ServerOption{bootstrap.Executable(exe)}
+	if small {
+		serverOpts = append(serverOpts, bootstrap.SmallProfile())
+	}
+	srv, err := bootstrap.NewServer(eng, cfg, serverOpts...)
 	if err != nil {
 		log.Fatalf("failed to create server: %v", err)
 	}
 
-	// Size the restored graph before serving, so queries against it are priced
-	// correctly without waiting for a snapshot this process does not need.
-	srv.SeedCorpus(restoredCorpus)
+	// Restore the last graph while serving, not before: a large one loads for tens of
+	// seconds, and a process that has not started reading stdin cannot answer the
+	// handshake or notice its agent quit. Tool calls wait for it, and it seeds the
+	// corpus when it publishes.
+	srv.RestoreInBackground(eng, cfg)
 
 	// Record per-tool usage so a later `enola --status` has something to report.
 	// Per-repo counters are loaded lazily from ~/.enola/usage/ on first touch, so
 	// they survive restarts; the config's repo is the fallback for calls made
-	// before any snapshot is loaded. srv.StartTime() is only set once Run() is
-	// called, so stamp the start time here to get a correct uptime.
+	// before any snapshot is loaded. The server does not start its own clock until
+	// Run(), so stamp the start time here to get a correct uptime.
 	repoPath, _ := filepath.Abs(cfg.Repo)
 	tracker := status.NewTracker(repoPath)
 	tracker.SetStartTime(time.Now())
@@ -285,12 +392,20 @@ func main() {
 	// registry — a user typically runs one server per agent terminal, and every
 	// dashboard and --status listing is built from these records.
 	wd, _ := os.Getwd()
-	tracker.SetIdentity(status.Identity{
+	identity := status.Identity{
 		Binary:     "enola",
 		Version:    version.Version,
 		ConfigPath: cfgPath,
 		WorkDir:    wd,
-	})
+		Executable: exe,
+		// The agent session this server serves, so a hook or CLI command that agent runs
+		// can find its session by walking up to it (status.AgentPID).
+		ClientPID: os.Getppid(),
+	}
+	if socket != nil {
+		identity.Socket = socket.Addr().String()
+	}
+	tracker.SetIdentity(identity)
 	tracker.SetGraphFunc(bootstrap.GraphStateFunc(eng))
 	// Deregister on the way out so the registry reflects the shutdown at once
 	// rather than waiting for a reader to reap a dead PID.
@@ -322,7 +437,11 @@ func main() {
 	}
 	tracker.PersistStartup()
 
-	if err := srv.Run(ctx); err != nil && !isNormalServerShutdown(err) {
+	serve := srv.Run
+	if socket != nil {
+		serve = func(ctx context.Context) error { return srv.Serve(ctx, &mcp.StdioTransport{}, socket) }
+	}
+	if err := serve(ctx); err != nil && !isNormalServerShutdown(err) {
 		// Deregister explicitly: log.Fatalf exits without running deferred calls.
 		tracker.Close()
 		log.Fatalf("server error: %v", err)
@@ -390,6 +509,34 @@ func splitMemFlags(argv []string) (rest []string, profilePath string, enabled bo
 		}
 	}
 	return rest, profilePath, enabled, nil
+}
+
+// splitListenFlag takes --listen and its path off the argument list, as
+// splitMemFlags does for the memory flags and for the same reason: the path is
+// a value, and the flag loop is an exact-match switch that would read it as a
+// repository.
+func splitListenFlag(argv []string) (rest []string, path string, err error) {
+	for i := 0; i < len(argv); i++ {
+		switch argv[i] {
+		case "--listen":
+			if i+1 >= len(argv) {
+				return nil, "", errors.New("--listen needs a socket path, e.g. --listen /run/user/1000/enola.sock")
+			}
+			path = argv[i+1]
+			i++
+		default:
+			joined, ok := strings.CutPrefix(argv[i], "--listen=")
+			if !ok {
+				rest = append(rest, argv[i])
+				continue
+			}
+			if joined == "" {
+				return nil, "", errors.New("--listen= needs a socket path")
+			}
+			path = joined
+		}
+	}
+	return rest, path, nil
 }
 
 // factCount reports how many facts the engine currently holds, or 0 when it holds
@@ -505,6 +652,7 @@ func runRefresh(ctx context.Context, eng *bootstrap.Engine, cfg *config.Config, 
 	if !held {
 		log.Fatalf("the restored union does not hold %s; run a full --generate so every configured repository is in it", target)
 	}
+	eng.SetWritesArtifacts(true)
 	snapshot, err := eng.GenerateSnapshot(ctx, target, true)
 	if err != nil {
 		log.Fatalf("refresh failed for %s: %v", target, err)

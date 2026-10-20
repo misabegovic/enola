@@ -6,9 +6,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/extcoverage"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
@@ -31,7 +34,8 @@ const relFuncPtrCandidate = "func_ptr_candidate"
 
 // relReceiverCallCandidate is emitted for obj.method()/ptr->method() when the
 // file AST gives obj an explicit type. The project pass keeps it as a real call
-// only when that type and qualified method resolve uniquely.
+// only when that type and qualified method resolve uniquely: to one declaration in
+// the repository, or to the one declaration the caller can see (typeIndex.resolve).
 const relReceiverCallCandidate = "receiver_call_candidate"
 
 // CppExtractor extracts architectural facts from C and C++ source code using
@@ -126,7 +130,7 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 
 	modules := make(map[string]bool)
 	dirLang := make(map[string]string)              // dir -> module language ("c"/"cpp")
-	typeIndex := make(map[string]string)            // simple type name -> dir
+	types := newTypeIndex()                         // simple type name -> declaring dirs
 	funcNames := make(map[string]bool)              // short names of all functions/methods
 	moduleRefs := make(map[string][]facts.Relation) // dir -> file-scope macro-call refs
 
@@ -161,23 +165,30 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 		}
 	}
 
-	// extractFileAST is pure; parse in parallel. The type/header indices below are
-	// then rebuilt by iterating the per-file results in file order, so they (and
-	// their last-write-wins on duplicate names) are identical to a serial run.
-	perFileFacts := parallel.MapFiles(ctx, cppFiles, func(relFile string) []facts.Fact {
+	// extractFileAST is pure; parse in parallel. The type index below is then
+	// rebuilt by iterating the per-file results in file order, so it (and the order
+	// of the directories declaring a duplicated name) is identical to a serial run.
+	perFileFacts := parallel.MapFiles(ctx, cppFiles, func(relFile string) cppFileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[cpp-extractor] error reading %s: %v", relFile, err)
-			return nil
+			return cppFileResult{}
 		}
-		return extractFileAST(src, relFile, langByFile[relFile], macros)
+		ff, tests := extractFileWithTests(src, relFile, langByFile[relFile], macros)
+		return cppFileResult{facts: ff, tests: tests}
 	})
 
-	for i, fileFacts := range perFileFacts {
+	includes := make([][]fileInclude, len(perFileFacts))
+	for i, result := range perFileFacts {
 		relFile := cppFiles[i]
 		dir := factpath.Dir(relFile)
 
-		for _, f := range fileFacts {
+		for _, f := range result.facts {
+			if f.Kind == facts.KindDependency {
+				if inc := f.PropString("include"); inc != "" {
+					includes[i] = append(includes[i], fileInclude{path: inc, style: f.PropString("include_style")})
+				}
+			}
 			// The walker emits a KindModule fact only to host file-scope macro-call
 			// references; fold those into the per-dir set and emit one canonical
 			// module fact per directory below.
@@ -198,21 +209,49 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 		}
 
 		// Index declared types so edge targets resolve.
-		for _, fact := range fileFacts {
+		for _, fact := range result.facts {
 			if fact.Kind != facts.KindSymbol {
 				continue
 			}
-			sk, _ := fact.Props["symbol_kind"].(string)
+			sk, _ := fact.PropAny("symbol_kind").(string)
 			switch sk {
 			case facts.SymbolClass, facts.SymbolStruct, facts.SymbolEnum, facts.SymbolInterface:
 				if simple := lastScopeComponent(fact.Name); simple != "" {
-					typeIndex[simple] = dir
+					types.add(simple, dir, fact.Name)
 				}
 			case facts.SymbolFunc, facts.SymbolMethod:
 				if simple := lastScopeComponent(fact.Name); simple != "" {
 					funcNames[simple] = true
 				}
 			}
+		}
+	}
+	gtestFiles, catchFiles := testFrameworkReach(cppFiles, includes, buildHeaderFileIndex(cppFiles))
+	named, unlabelled, instantiated := 0, 0, 0
+	for i, result := range perFileFacts {
+		for _, reading := range []struct {
+			testCaseReading
+			reached bool
+		}{{result.tests.gtest, gtestFiles[cppFiles[i]]}, {result.tests.catch, catchFiles[cppFiles[i]]}} {
+			if !reading.reached {
+				continue
+			}
+			allFacts = append(allFacts, reading.cases...)
+			named += len(reading.cases)
+			unlabelled += reading.unlabelled
+			instantiated += reading.instantiated
+		}
+	}
+	if unlabelled+instantiated > 0 {
+		unnamed := map[string]int{}
+		if unlabelled > 0 {
+			unnamed["label_not_literal"] = unlabelled
+		}
+		if instantiated > 0 {
+			unnamed["instantiated_name"] = instantiated
+		}
+		if f, ok := extcoverage.Fact(repoPath, "cpp:test_cases", "test_case", named, unnamed); ok {
+			allFacts = append(allFacts, f)
 		}
 	}
 
@@ -247,7 +286,7 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 	// the repository has the same short name, bind it to that declaration. This
 	// recovers free functions declared through headers without guessing among
 	// overloads or common helper names.
-	resolution := canonicalizeTargets(allFacts, typeIndex, indexFunctionNames(allFacts), buildIncludeVisibility(allFacts, headerIndex))
+	resolution := canonicalizeTargets(allFacts, types, indexFunctionNames(allFacts), buildIncludeVisibility(allFacts, headerIndex))
 	log.Printf("[cpp-extractor] call resolution: total=%d exact=%d type_scoped=%d unique_short=%d qualified_suffix=%d receiver_resolved=%d receiver_rejected=%d rejected_no_include_path=%d unresolved=%d",
 		resolution.total, resolution.exact, resolution.typeScoped, resolution.uniqueShort, resolution.qualifiedSuffix, resolution.receiverResolved, resolution.receiverRejected, resolution.noIncludePath, resolution.unresolved)
 
@@ -255,72 +294,12 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 	// graph, so a function reaching a file/socket primitive through a wrapper is
 	// also performs_io — lets the performance analyzer flag an in-loop wrapper call
 	// as an N+1.
-	computeCppPerformsIO(allFacts)
+	ioclosure.Propagate(allFacts)
 
 	// Resolve quoted #include targets to module dirs.
 	allFacts = resolveIncludeDependencies(allFacts, headerIndex)
 
 	return allFacts, nil
-}
-
-// computeCppPerformsIO seeds performs_io from io_direct and propagates it over
-// RelCalls edges whose target is a known symbol Name, via a monotone false->true
-// fixpoint (a port of the Python/Rust/PHP extractors' pass). Call targets are
-// canonical "<dir>.<name>" after canonicalizeTargets, matching symbol Names, so a
-// same- or cross-directory resolved call propagates the flag.
-func computeCppPerformsIO(allFacts []facts.Fact) {
-	exists := make(map[string]bool)
-	for i := range allFacts {
-		if allFacts[i].Kind == facts.KindSymbol {
-			exists[allFacts[i].Name] = true
-		}
-	}
-
-	io := make(map[string]bool)      // name -> performs I/O (directly or transitively)
-	adj := make(map[string][]string) // name -> called names that are known symbols
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		if b, _ := f.Props["io_direct"].(bool); b {
-			io[f.Name] = true
-		}
-		seen := make(map[string]bool)
-		for _, r := range f.Relations {
-			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
-				continue
-			}
-			seen[r.Target] = true
-			adj[f.Name] = append(adj[f.Name], r.Target)
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for name, callees := range adj {
-			if io[name] {
-				continue
-			}
-			for _, c := range callees {
-				if io[c] {
-					io[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind == facts.KindSymbol && io[f.Name] {
-			if f.Props == nil {
-				f.Props = map[string]any{}
-			}
-			f.Props["performs_io"] = true
-		}
-	}
 }
 
 // dedupeSymbols merges duplicate symbol facts that share a canonical name — most
@@ -382,34 +361,36 @@ func dedupeSymbols(in []facts.Fact) []facts.Fact {
 }
 
 func mergeSymbol(dst *facts.Fact, src facts.Fact) {
-	dstHasBody, _ := dst.Props["has_body"].(bool)
-	srcHasBody, _ := src.Props["has_body"].(bool)
+	dstHasBody, _ := dst.PropAny("has_body").(bool)
+	srcHasBody, _ := src.PropAny("has_body").(bool)
 
-	// Prefer the definition's location.
+	// Prefer the definition's location, and its doc; a prototype's doc stands in
+	// for a definition that has none, through the union below.
 	if srcHasBody && !dstHasBody {
 		dst.File = src.File
 		dst.Line = src.Line
+		facts.CopyDoc(dst, src)
 	}
 
 	// Union props, preferring truthy booleans and keeping a non-empty receiver.
 	for k, v := range src.Props {
-		switch existing := dst.Props[k]; existing {
+		switch existing := dst.PropAny(k); existing {
 		case nil:
-			dst.Props[k] = v
+			dst.SetProp(k, v)
 		default:
 			if b, ok := v.(bool); ok && b {
-				dst.Props[k] = true
+				dst.SetProp(k, true)
 			}
 			if k == "receiver" {
 				if s, ok := v.(string); ok && s != "" {
-					dst.Props[k] = s
+					dst.SetProp(k, s)
 				}
 			}
 		}
 	}
 	// A method identity wins over a plain function (out-of-line defs are methods).
-	if skSrc, _ := src.Props["symbol_kind"].(string); skSrc == facts.SymbolMethod {
-		dst.Props["symbol_kind"] = facts.SymbolMethod
+	if skSrc, _ := src.PropAny("symbol_kind").(string); skSrc == facts.SymbolMethod {
+		dst.SetProp("symbol_kind", facts.SymbolMethod)
 	}
 
 	// Union relations (dedup by kind+target).
@@ -441,7 +422,7 @@ type callResolutionStats struct {
 	receiverResolved, receiverRejected, noIncludePath, unresolved int
 }
 
-func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, functions functionNames, visibility *includeVisibility) callResolutionStats {
+func canonicalizeTargets(allFacts []facts.Fact, types typeIndex, functions functionNames, visibility *includeVisibility) callResolutionStats {
 	var stats callResolutionStats
 	known := make(map[string]bool)
 	for i := range allFacts {
@@ -452,39 +433,54 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, fun
 	for i := range allFacts {
 		rels := allFacts[i].Relations
 		kept := rels[:0]
+		source := sourceDir(&allFacts[i])
 		for _, r := range rels {
+			// declaresMember narrows a duplicated type name to the directories whose
+			// copy has the member this edge names.
+			member := r.Target
+			declaresMember := func(dir string) bool {
+				_, scoped := functions.scoped[dir+"."+member]
+				return scoped || known[dir+"."+member]
+			}
 			switch r.Kind {
 			case facts.RelImplements, facts.RelDependsOn:
 				if !strings.Contains(r.Target, ".") {
-					if dir, ok := typeIndex[r.Target]; ok {
-						r.Target = dir + "." + r.Target
+					if dir := types.resolve(r.Target, source, visibility, nil); dir != "" {
+						r.Target = types.canonical(dir, r.Target)
 					}
 				}
 			case facts.RelInstantiates:
 				if !strings.Contains(r.Target, ".") {
-					dir, ok := typeIndex[r.Target]
-					if !ok {
-						continue // drop: not a known type (macro / external function)
+					dir := types.resolve(r.Target, source, visibility, nil)
+					if dir == "" {
+						// drop: not a known type (macro / external function), or a
+						// name declared in several directories none of which the
+						// caller can be shown to mean.
+						continue
 					}
-					r.Target = dir + "." + r.Target
+					r.Target = types.canonical(dir, r.Target)
 				}
 			case relReceiverCallCandidate:
 				stats.total++
 				typ, _, ok := strings.Cut(r.Target, "::")
-				dir := typeIndex[typ]
-				if !ok || dir == "" {
+				if !ok || len(types.dirs[typ]) == 0 {
 					stats.receiverRejected++
 					continue
 				}
-				candidate := dir + "." + r.Target
-				if known[candidate] {
-					r.Kind = facts.RelCalls
-					r.Target = candidate
-					stats.receiverResolved++
-					break
+				if dir := types.resolve(typ, source, visibility, declaresMember); dir != "" {
+					candidate := dir + "." + r.Target
+					if !known[candidate] {
+						candidate = functions.scoped[candidate]
+					}
+					if candidate != "" {
+						r.Kind = facts.RelCalls
+						r.Target = candidate
+						stats.receiverResolved++
+						break
+					}
 				}
 				canonical := functions.qualified[r.Target]
-				if canonical == "" || !visibility.allows(allFacts[i].File, canonical) {
+				if canonical == "" || !visibility.allows(source, canonical) {
 					stats.receiverRejected++
 					continue
 				}
@@ -501,14 +497,14 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, fun
 				if !strings.Contains(r.Target, ".") {
 					// "Scope::name" — resolve the scope (a class/namespace type) to its dir.
 					if idx := strings.Index(r.Target, "::"); idx >= 0 {
-						if dir, ok := typeIndex[r.Target[:idx]]; ok {
+						if dir := types.resolve(r.Target[:idx], source, visibility, declaresMember); dir != "" {
 							r.Target = dir + "." + r.Target
 							if known[r.Target] {
 								stats.typeScoped++
 								resolved = true
 							}
 						} else if canonical := functions.qualified[r.Target]; canonical != "" {
-							if visibility.allows(allFacts[i].File, canonical) {
+							if visibility.allows(source, canonical) {
 								r.Target = canonical
 								stats.qualifiedSuffix++
 								resolved = true
@@ -521,12 +517,17 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, fun
 				if !resolved && !known[r.Target] {
 					// A type-index rewrite may already have supplied the declaring
 					// directory while omitting an enclosing namespace (dir.Type::m
-					// versus dir.DB::Type::m). Resolve its qualified suffix first.
-					if dot := strings.Index(r.Target, "."); dot >= 0 {
+					// versus dir.DB::Type::m). Resolve its qualified suffix first:
+					// within that directory, then across the repository.
+					if canonical := functions.scoped[r.Target]; canonical != "" {
+						r.Target = canonical
+						stats.qualifiedSuffix++
+						resolved = true
+					} else if dot := strings.Index(r.Target, "."); dot >= 0 {
 						candidate := r.Target[dot+1:]
 						if strings.Contains(candidate, "::") {
 							if canonical := functions.qualified[candidate]; canonical != "" {
-								if visibility.allows(allFacts[i].File, canonical) {
+								if visibility.allows(source, canonical) {
 									r.Target = canonical
 									stats.qualifiedSuffix++
 									resolved = true
@@ -539,13 +540,18 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, fun
 					// resolveCall scopes an unqualified call to the current directory.
 					// Only rewrite that exact shape; qualified calls have different C++
 					// lookup rules and need their own evidence.
-					dir := factpath.Dir(allFacts[i].File)
-					prefix := dir + "."
-					if !resolved && strings.HasPrefix(r.Target, prefix) {
+					//
+					// A module fact is left out. Its edges are file-scope macro
+					// arguments, kept as references by name alone, and a bare
+					// identifier there is too weak a signal to bind to a function
+					// in another directory: on a C++ tree it ties modules to
+					// whatever unrelated function shares a variable's name.
+					prefix := source + "."
+					if !resolved && allFacts[i].Kind != facts.KindModule && strings.HasPrefix(r.Target, prefix) {
 						candidate := strings.TrimPrefix(r.Target, prefix)
 						if strings.Contains(candidate, "::") {
 							if canonical := functions.qualified[candidate]; canonical != "" {
-								if visibility.allows(allFacts[i].File, canonical) {
+								if visibility.allows(source, canonical) {
 									r.Target = canonical
 									stats.qualifiedSuffix++
 									resolved = true
@@ -555,7 +561,7 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, fun
 							}
 						} else {
 							if canonical := functions.short[candidate]; canonical != "" {
-								if visibility.allows(allFacts[i].File, canonical) {
+								if visibility.allows(source, canonical) {
 									r.Target = canonical
 									stats.uniqueShort++
 									resolved = true
@@ -575,6 +581,88 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string, fun
 		allFacts[i].Relations = kept
 	}
 	return stats
+}
+
+// typeIndex records every directory that declares a simple type name, in file
+// order. Most names have one; a name with several (vendored copies of a header, or
+// two modules that each define a Config) is resolved per referencing fact, never
+// by which declaration happened to be indexed last.
+type typeIndex struct {
+	dirs map[string][]string
+	// names maps "<dir>.<simple name>" to the fact that declares it there, so a
+	// type inside a namespace or another type (dir.ns::Type) is reached by its
+	// simple name. Empty when the directory declares that simple name twice.
+	names map[string]string
+}
+
+func newTypeIndex() typeIndex {
+	return typeIndex{dirs: map[string][]string{}, names: map[string]string{}}
+}
+
+func (t typeIndex) add(name, dir, factName string) {
+	if !slices.Contains(t.dirs[name], dir) {
+		t.dirs[name] = append(t.dirs[name], dir)
+	}
+	indexUniqueName(t.names, dir+"."+name, factName)
+}
+
+// canonical names the declaration of name in dir.
+func (t typeIndex) canonical(dir, name string) string {
+	if declared := t.names[dir+"."+name]; declared != "" {
+		return declared
+	}
+	return dir + "." + name
+}
+
+// resolve returns the directory whose declaration of name a fact in sourceDir
+// refers to, or "" when the name is unknown or cannot be told apart. declares, when
+// set, narrows the candidates to the copies that have the member being referenced
+// (it is ignored when no copy passes, so a namespace-wrapped member still gets a
+// directory for the qualified-suffix pass to work from). One candidate is taken as
+// is, the same as a name declared once; among several, the fact's own directory
+// wins, then the single directory its includes reach. Anything else is ambiguous.
+func (t typeIndex) resolve(name, sourceDir string, visibility *includeVisibility, declares func(dir string) bool) string {
+	candidates := t.dirs[name]
+	if len(candidates) > 1 && declares != nil {
+		var narrowed []string
+		for _, dir := range candidates {
+			if declares(dir) {
+				narrowed = append(narrowed, dir)
+			}
+		}
+		if len(narrowed) > 0 {
+			candidates = narrowed
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return ""
+	case 1:
+		return candidates[0]
+	}
+	if slices.Contains(candidates, sourceDir) {
+		return sourceDir
+	}
+	visible := ""
+	for _, dir := range candidates {
+		if !visibility.reaches(sourceDir, dir) {
+			continue
+		}
+		if visible != "" {
+			return ""
+		}
+		visible = dir
+	}
+	return visible
+}
+
+// sourceDir is the directory a fact's edges originate from. A module fact's File
+// is already its directory.
+func sourceDir(f *facts.Fact) string {
+	if f.Kind == facts.KindModule {
+		return f.Name
+	}
+	return factpath.Dir(f.File)
 }
 
 type includeVisibility struct {
@@ -606,13 +694,17 @@ func buildIncludeVisibility(allFacts []facts.Fact, headerIndex headerPathIndex) 
 	return v
 }
 
-func (v *includeVisibility) allows(sourceFile, targetName string) bool {
-	source := factpath.Dir(sourceFile)
+func (v *includeVisibility) allows(source, targetName string) bool {
 	dot := strings.Index(targetName, ".")
 	if dot < 0 {
 		return false
 	}
-	target := targetName[:dot]
+	return v.reaches(source, targetName[:dot])
+}
+
+// reaches reports whether target is source itself or a module its quoted includes
+// lead to, directly or transitively.
+func (v *includeVisibility) reaches(source, target string) bool {
 	if source == target {
 		return true
 	}
@@ -638,13 +730,16 @@ func (v *includeVisibility) allows(sourceFile, targetName string) bool {
 
 type functionNames struct {
 	short, qualified map[string]string
+	// scoped is qualified restricted to one directory, keyed "<dir>.<suffix>": the
+	// lookup for a call whose directory is already known.
+	scoped map[string]string
 }
 
 // indexFunctionNames maps both short names and namespace/class-qualified suffixes
 // to canonical fact names. A value is usable only when the repository declares
 // that spelling once; an empty value marks ambiguity.
 func indexFunctionNames(allFacts []facts.Fact) functionNames {
-	out := functionNames{short: map[string]string{}, qualified: map[string]string{}}
+	out := functionNames{short: map[string]string{}, qualified: map[string]string{}, scoped: map[string]string{}}
 	for i := range allFacts {
 		f := &allFacts[i]
 		if f.Kind != facts.KindSymbol {
@@ -668,6 +763,9 @@ func indexFunctionNames(allFacts []facts.Fact) functionNames {
 				// across the repository remains resolvable.
 				for candidate := qualified; strings.Contains(candidate, "::"); {
 					indexUniqueName(out.qualified, candidate, f.Name)
+					if candidate != qualified {
+						indexUniqueName(out.scoped, f.Name[:dot+1]+candidate, f.Name)
+					}
 					i := strings.Index(candidate, "::")
 					candidate = candidate[i+2:]
 				}
@@ -697,7 +795,7 @@ func resolveIncludeDependencies(allFacts []facts.Fact, headerIndex headerPathInd
 			kept = append(kept, *f)
 			continue
 		}
-		inc, _ := f.Props["include"].(string)
+		inc, _ := f.PropAny("include").(string)
 		if inc == "" {
 			kept = append(kept, *f)
 			continue
@@ -708,12 +806,12 @@ func resolveIncludeDependencies(allFacts []facts.Fact, headerIndex headerPathInd
 					f.Relations[j].Target = dir
 				}
 			}
-			f.Props["source"] = "internal"
+			f.SetProp("source", "internal")
 		} else {
 			if f.PropString("include_style") == "angle" {
 				continue
 			}
-			f.Props["source"] = "external"
+			f.SetProp("source", "external")
 		}
 		kept = append(kept, *f)
 	}
@@ -726,13 +824,24 @@ type headerPathIndex map[string]string
 // is unique. Thus "jemalloc/internal/mutex.h" cannot be stolen by re2's mutex.h,
 // while a genuinely unambiguous local "other.h" remains resolvable.
 func buildHeaderPathIndex(files []string) headerPathIndex {
+	return indexHeaders(files, factpath.Dir)
+}
+
+// buildHeaderFileIndex resolves an include to the header file itself rather than
+// its module, by the same suffix rule, for questions the module graph is too
+// coarse to answer: which files a test file reaches.
+func buildHeaderFileIndex(files []string) headerPathIndex {
+	return indexHeaders(files, func(file string) string { return file })
+}
+
+func indexHeaders(files []string, canonical func(string) string) headerPathIndex {
 	index := headerPathIndex{}
 	for _, file := range files {
 		if !isHeaderExt(file) {
 			continue
 		}
 		for suffix := path.Clean(filepath.ToSlash(file)); suffix != "."; {
-			indexUniqueName(index, suffix, factpath.Dir(file))
+			indexUniqueName(index, suffix, canonical(file))
 			i := strings.IndexByte(suffix, '/')
 			if i < 0 {
 				break
@@ -869,4 +978,9 @@ func (e *CppExtractor) OwnsFile(relFile string) bool {
 		return true
 	}
 	return strings.ToLower(filepath.Ext(relFile)) == ".h"
+}
+
+type cppFileResult struct {
+	facts []facts.Fact
+	tests testCandidates
 }

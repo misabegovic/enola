@@ -9,6 +9,7 @@ import (
 
 	"github.com/enola-labs/enola/internal/config"
 	"github.com/enola-labs/enola/internal/hookstate"
+	"github.com/enola-labs/enola/internal/workspace"
 	"github.com/enola-labs/enola/pkg/install"
 )
 
@@ -42,6 +43,7 @@ func (r *Runner) Install(args []string, remove bool) {
 		}
 		fmt.Fprint(os.Stderr, "Flags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, name)
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -69,13 +71,20 @@ func (r *Runner) Install(args []string, remove bool) {
 		Hooks:       *hooks && !remove,
 		DryRun:      *dryRun,
 		HookCommand: hookBinary(),
-		// Empty for the OSS binary, so its output is unchanged; a wrapper names the
-		// tools only it serves. See Runner.WithInstructions.
-		ExtraInstructions: r.extraInstructions,
-		ExtraHooksNote:    r.extraHooksNote,
 	}
 	if *global {
 		opts.Scope = install.ScopeGlobal
+	}
+	// The session hooks snapshot the directory they run in as one repository, so in a
+	// folder of repositories they could only ever skip. Installing them there would
+	// configure a mechanism that does nothing, and hide that until `doctor` is read.
+	hooksRefused := opts.Hooks && opts.Scope == install.ScopeLocal && workspace.IsFolderOfRepos(repoDir)
+	if hooksRefused {
+		opts.Hooks = false
+		fmt.Printf("Not installing hooks: %s is a folder of repositories, not a repository, and\n", repoDir)
+		fmt.Println("the hooks would snapshot all of them as one. Run `install --hooks` inside each")
+		fmt.Println("repository you want graded. Instructions and the MCP setup are still installed.")
+		fmt.Println()
 	}
 	if *targets != "" {
 		for _, t := range strings.Split(*targets, ",") {
@@ -129,12 +138,23 @@ func (r *Runner) Install(args []string, remove bool) {
 			if install.InstallsSessionHooks(opts) {
 				fmt.Println("            Never blocks, and never interrupts on failure.")
 			}
+			// Per target, from the plan rather than the request: a target can be
+			// asked for and still receive nothing, and the run must say so.
+			for _, th := range install.HooksByTarget(opts, planned) {
+				hooks := th.Hooks
+				if hooks == "" {
+					hooks = "no hook"
+				}
+				fmt.Printf("            %-9s %s\n", th.Target+":", hooks)
+			}
 		} else if install.InstallsOpencodePlugin(opts) && !install.InstallsSessionHooks(opts) {
 			// opencode's --hooks is a plugin, not the grading loop. Offering "the loop"
 			// here would name a mechanism this run cannot install however it is re-run.
 			fmt.Println("Hooks:      no — instructions only, which an agent is free to ignore.")
 			fmt.Println("            Re-run with --hooks for opencode's plugin, which points a")
 			fmt.Println("            session's first searches at the index instead.")
+		} else if hooksRefused {
+			fmt.Println("Hooks:      no — a folder of repositories (see above).")
 		} else {
 			fmt.Println("Hooks:      no — instructions only. Re-run with --hooks to automate the loop.")
 		}
@@ -193,7 +213,7 @@ func (r *Runner) Install(args []string, remove bool) {
 		}
 	}
 
-	if !remove && opts.Hooks {
+	if !remove && install.WroteHooks(applied) {
 		fmt.Println("\nRestart your agent session for the hooks to take effect.")
 		// `doctor` reads the heartbeat the session hooks write, and only they write it.
 		// Offering it after an opencode-only install would send the user to a report
@@ -211,6 +231,25 @@ func (r *Runner) Install(args []string, remove bool) {
 		// registered mid-session are both invisible until it is restarted.
 		fmt.Println("\nopencode loads its configuration once at startup — quit and restart it for these to take effect.")
 	}
+	if !remove && install.InstallsPiExtension(opts) && touchedPi(applied) {
+		// Without trust Pi skips `.pi/extensions/` silently and still loads AGENTS.md, so
+		// the session looks configured and has no enola tools.
+		fmt.Println("\nPi loads a project's extensions only once the project is trusted: start Pi here and")
+		fmt.Println("accept the trust prompt, run `/trust` inside it, or start it with `pi --approve`.")
+	}
+}
+
+// touchedPi reports whether this run wrote or updated Pi's extension.
+func touchedPi(rs []install.Result) bool {
+	for _, r := range rs {
+		if !strings.HasSuffix(filepath.ToSlash(r.Path), "/.pi/"+install.PiExtensionFile) {
+			continue
+		}
+		if r.Action == install.ActionCreated || r.Action == install.ActionUpdated {
+			return true
+		}
+	}
+	return false
 }
 
 // touchedOpencode reports whether this run changed anything opencode reads.

@@ -36,6 +36,7 @@ func (r *Runner) Dashboard(ctx context.Context, args []string) {
 		fmt.Fprintln(os.Stderr, "The server binds to 127.0.0.1 and stays attached until Ctrl-C.")
 		fmt.Fprintln(os.Stderr, "Run `"+r.name()+" --status` in another terminal to recover its URL.")
 		fmt.Fprintln(os.Stderr, "If Safari blocks local HTTP in HTTPS-Only mode, allow this local address or use another browser.")
+		r.writeHelpFooter(os.Stderr, args, "dashboard")
 	}
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -77,11 +78,8 @@ func (r *Runner) Dashboard(ctx context.Context, args []string) {
 	defer tracker.Close()
 
 	port := dashboard.ResolveStablePort(t.engine.Config().Dashboard.Port)
-	// The binary's own options — title, overlay panels, and the InsightLabels
-	// admission list that decides which explainers' findings the page will show at
-	// all. Tracker and StablePort are this command's to set, and are stamped over
-	// whatever the callback returned: they describe THIS process, not the binary.
-	opts := r.dashboardOptions(t.engine)
+	// Tracker and StablePort describe THIS process, not the repository.
+	opts := dashboard.Options{}
 	opts.Tracker, opts.StablePort = tracker, port
 	opts.SnapshotPath = snapshotDir
 	opts.GenerateCommand = r.dashboardGenerateCommand(arg)

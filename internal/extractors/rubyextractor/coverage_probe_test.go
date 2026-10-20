@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
 
 // TestCorpusParseCoverage measures what the vendored Ruby grammar can actually read on

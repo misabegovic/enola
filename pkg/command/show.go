@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/diff"
-	"github.com/enola-labs/enola/pkg/facts"
+	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/pkg/history"
 )
 
@@ -33,6 +33,7 @@ func (r *Runner) Show(args []string) {
 				"A revision is a snapshot id or its prefix, a git commit, HEAD~N, @<seq>, a ref\n"+
 				"name, or `latest` (the default).\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "show")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -94,6 +95,7 @@ func (r *Runner) Diff(args []string) {
 				"each side came from.\n\n"+
 				"Flags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "diff")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)

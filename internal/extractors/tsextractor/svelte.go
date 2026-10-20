@@ -69,13 +69,12 @@ func extractSvelteScriptBlocks(src []byte) []*svelteScriptBlock {
 	return blocks
 }
 
-func detectSvelte(repoPath string) bool {
-	tsRoot, _ := findTSRoot(repoPath)
-	return hasPkgDependency(tsRoot, "svelte") || (tsRoot != repoPath && hasPkgDependency(repoPath, "svelte"))
-}
-
 func detectSvelteKit(repoPath string) bool {
 	tsRoot, _ := findTSRoot(repoPath)
+	return detectSvelteKitRoot(repoPath, tsRoot)
+}
+
+func detectSvelteKitRoot(repoPath, tsRoot string) bool {
 	return detectSvelteKitAt(tsRoot) || (tsRoot != repoPath && detectSvelteKitAt(repoPath))
 }
 
@@ -86,6 +85,135 @@ func detectSvelteKitAt(dir string) bool {
 		}
 	}
 	return hasPkgDependency(dir, "@sveltejs/kit")
+}
+
+var svelteAliasEntryRe = regexp.MustCompile(`(?m)(?:["']([^"']+)["']|([A-Za-z_$][A-Za-z0-9_$@./-]*))\s*:\s*["']([^"']+)["']`)
+
+// isSvelteKitVirtualImport identifies modules supplied by SvelteKit's compiler rather
+// than by a source file. They are neither third-party packages nor unresolved local
+// aliases, so dependency facts classify them separately as framework-provided.
+func isSvelteKitVirtualImport(path string) bool {
+	return path == "$service-worker" || strings.HasPrefix(path, "$app/") || strings.HasPrefix(path, "$env/")
+}
+
+// staticSvelteKitAliases reads literal entries from kit.alias without executing the
+// config. Dynamic expressions, spreads, computed keys and imported constants are
+// deliberately skipped: deterministic partial coverage is safer than evaluating user
+// code during a snapshot or guessing what an expression returns.
+func staticSvelteKitAliases(path string) map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	clean := stripJSONC(data)
+	kit := jsObjectPropertyBody(clean, "kit")
+	if kit == nil {
+		return nil
+	}
+	body := jsObjectPropertyBody(kit, "alias")
+	if body == nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, m := range svelteAliasEntryRe.FindAllSubmatch(body, -1) {
+		key := string(m[1])
+		if key == "" {
+			key = string(m[2])
+		}
+		out[key] = string(m[3])
+	}
+	return out
+}
+
+// jsObjectPropertyBody returns the inside of a literal object assigned to prop.
+// It balances nested objects and strings but intentionally understands no JavaScript
+// expressions beyond that shape; callers use it only as a boundary for literal reads.
+func jsObjectPropertyBody(data []byte, prop string) []byte {
+	pattern := `(?:\b` + regexp.QuoteMeta(prop) + `\b|["']` + regexp.QuoteMeta(prop) + `["'])\s*:\s*\{`
+	loc := regexp.MustCompile(pattern).FindIndex(data)
+	if loc == nil {
+		return nil
+	}
+	open := bytes.LastIndexByte(data[loc[0]:loc[1]], '{') + loc[0]
+	depth, quote, escaped := 0, byte(0), false
+	end := -1
+	for i := open; i < len(data); i++ {
+		c := data[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' || c == '`' {
+			quote = c
+			continue
+		}
+		switch c {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i
+				i = len(data)
+			}
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	return data[open+1 : end]
+}
+
+// withSvelteKitAliasFallbacks overlays only aliases absent from the effective
+// tsconfig. That preserves the precedence contract: generated/inherited paths win,
+// static config literals fill gaps, and $lib is the final convention fallback.
+func withSvelteKitAliasFallbacks(repoPath string, roots []tsAliasRoot) []tsAliasRoot {
+	if len(roots) == 0 {
+		roots = []tsAliasRoot{{dir: "", aliases: map[string]tsAlias{}}}
+	}
+	for i := range roots {
+		if roots[i].aliases == nil {
+			roots[i].aliases = map[string]tsAlias{}
+		}
+		configDir := filepath.Join(repoPath, filepath.FromSlash(roots[i].dir)) //factpath:host
+		for _, name := range []string{"svelte.config.js", "svelte.config.ts", "svelte.config.mjs"} {
+			for key, target := range staticSvelteKitAliases(filepath.Join(configDir, name)) {
+				addSvelteAlias(roots[i].aliases, roots[i].dir, key, target)
+			}
+		}
+		if _, ok := roots[i].aliases["$lib/"]; !ok {
+			target := factpath.Join(roots[i].dir, "src/lib") + "/"
+			roots[i].aliases["$lib/"] = tsAlias{replacement: target}
+		}
+	}
+	return roots
+}
+
+func addSvelteAlias(aliases map[string]tsAlias, root, key, target string) {
+	key, target = strings.TrimSpace(key), strings.TrimSpace(target)
+	if key == "" || target == "" || filepath.IsAbs(target) || strings.Contains(target, "${") {
+		return
+	}
+	target = factpath.Clean(factpath.Join(root, target))
+	if strings.HasSuffix(key, "/*") {
+		prefix := strings.TrimSuffix(key, "*")
+		if _, exists := aliases[prefix]; !exists {
+			aliases[prefix] = tsAlias{replacement: strings.TrimSuffix(target, "*")}
+		}
+		return
+	}
+	if _, exists := aliases[key]; !exists {
+		aliases[key] = tsAlias{replacement: target, exact: true}
+	}
+	if _, exists := aliases[key+"/"]; !exists {
+		aliases[key+"/"] = tsAlias{replacement: target + "/"}
+	}
 }
 
 // detectSvelteKitRoute checks if a file path corresponds to a SvelteKit route.
@@ -318,12 +446,12 @@ func extractSvelteMarkupRefs(rawSrc []byte, relFile string) *facts.Fact {
 }
 
 // extractSvelteSFC extracts architectural facts from a Svelte Single File Component.
-func (e *TSExtractor) extractSvelteSFC(kinds *tsutil.KindTable, rawSrc []byte, relFile string, isSvelteKit bool, aliases map[string]tsAlias) []facts.Fact {
+func (e *TSExtractor) extractSvelteSFC(kinds *tsutil.KindTable, rawSrc []byte, relFile string, isSvelteKit bool, aliases map[string]tsAlias, files *tsFileIndex) []facts.Fact {
 	var result []facts.Fact
 	blocks := extractSvelteScriptBlocks(rawSrc)
 
 	for _, block := range blocks {
-		result = append(result, e.extractSvelteScriptBlock(kinds, block, relFile, isSvelteKit, aliases)...)
+		result = append(result, e.extractSvelteScriptBlock(kinds, block, relFile, isSvelteKit, aliases, files)...)
 	}
 
 	if ref := extractSvelteMarkupRefs(rawSrc, relFile); ref != nil {
@@ -341,8 +469,8 @@ func (e *TSExtractor) extractSvelteSFC(kinds *tsutil.KindTable, rawSrc []byte, r
 	found := false
 	for i := range result {
 		if result[i].Kind == facts.KindSymbol && result[i].Name == factName {
-			result[i].Props["web_component"] = "component"
-			result[i].Props["framework"] = fw
+			result[i].SetProp("web_component", "component")
+			result[i].SetProp("framework", fw)
 			found = true
 			break
 		}
@@ -373,7 +501,7 @@ func (e *TSExtractor) extractSvelteSFC(kinds *tsutil.KindTable, rawSrc []byte, r
 	return result
 }
 
-func (e *TSExtractor) extractSvelteScriptBlock(kinds *tsutil.KindTable, block *svelteScriptBlock, relFile string, isSvelteKit bool, aliases map[string]tsAlias) []facts.Fact {
+func (e *TSExtractor) extractSvelteScriptBlock(kinds *tsutil.KindTable, block *svelteScriptBlock, relFile string, isSvelteKit bool, aliases map[string]tsAlias, files *tsFileIndex) []facts.Fact {
 	isTSX := block.Lang == "tsx"
 	lang := typescript.LanguageTypescript()
 	if isTSX {
@@ -392,15 +520,17 @@ func (e *TSExtractor) extractSvelteScriptBlock(kinds *tsutil.KindTable, block *s
 	root := tree.RootNode()
 
 	var result []facts.Fact
-	result = append(result, e.extractImports(kinds, root, block.Content, relFile, aliases)...)
+	result = append(result, e.extractImports(kinds, root, block.Content, relFile, aliases, isSvelteKit)...)
 
+	importMap, internalImports := buildImportBindings(kinds, root, block.Content, relFile, aliases, files)
 	ctx := &extractCtx{
-		src:       block.Content,
-		relFile:   relFile,
-		dir:       factpath.Dir(relFile),
-		isTSX:     isTSX,
-		importMap: buildImportSymbols(kinds, root, block.Content, relFile, aliases),
-		imports:   buildEmberImportBindings(kinds, root, block.Content, relFile, aliases),
+		src:         block.Content,
+		relFile:     relFile,
+		dir:         factpath.Dir(relFile),
+		isTSX:       isTSX,
+		importMap:   importMap,
+		memberRoots: memberCallRoots(kinds, root, block.Content, factpath.Dir(relFile), internalImports),
+		imports:     buildEmberImportBindings(kinds, root, block.Content, relFile, aliases),
 	}
 	decls := e.extractDeclarations(kinds, root, ctx)
 
@@ -411,7 +541,7 @@ func (e *TSExtractor) extractSvelteScriptBlock(kinds *tsutil.KindTable, block *s
 			}
 			local := decls[i].Name[strings.LastIndexByte(decls[i].Name, '.')+1:]
 			if exported[local] {
-				decls[i].Props["exported"] = true
+				decls[i].SetProp("exported", true)
 			}
 		}
 	}

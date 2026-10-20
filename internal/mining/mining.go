@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/explainers/constraints"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/intent"
 )
@@ -30,10 +31,23 @@ type Config struct {
 	MinConfidence      float64
 	MaxExceptions      int
 	IncludeTautologies bool
+	// MinResolution is component mode's floor: the share of an edge kind's
+	// edges that must land on something measured before a candidate over
+	// that kind is proposed rather than listed as one that cannot be checked.
+	MinResolution float64
+	// Rejections are the candidates a person rejected, read from the
+	// repository's rejections file; a candidate one names is not proposed.
+	Rejections []Rejection
+	// WithCrossings lets component mode propose a forbid or an allow-only
+	// the code already crosses. Off by default: a crossing between declared
+	// parts reads as a seam the declaration may intend, and over three
+	// repositories whose pages draw their arrows 33 of 39 such forbids named
+	// a pair the page draws.
+	WithCrossings bool
 }
 
 func DefaultConfig() Config {
-	return Config{MinSupport: 10, MinConfidence: 0.9, MaxExceptions: 20}
+	return Config{MinSupport: 10, MinConfidence: 0.9, MaxExceptions: 20, MinResolution: DefaultMinResolution}
 }
 
 type Exception struct {
@@ -68,6 +82,8 @@ type Candidate struct {
 	Components  []intent.ConstraintComponent `json:"-"`
 	Rule        intent.ConstraintRule        `json:"-"`
 	YAML        string                       `json:"yaml"`
+	// Support is set in component mode only: what the candidate rests on.
+	Support *Support `json:"support,omitempty"`
 
 	pairKey string
 }
@@ -79,6 +95,9 @@ type SuppressedCount struct {
 	BelowSupportFloor    int    `json:"below_support_floor"`
 	OverExceptionCeiling int    `json:"over_exception_ceiling"`
 	Tautological         int    `json:"tautological"`
+	// Crossed counts component-mode candidates the code already crosses,
+	// held back unless WithCrossings is set.
+	Crossed int `json:"crossed,omitempty"`
 }
 
 type Report struct {
@@ -86,6 +105,26 @@ type Report struct {
 	FactCount  int
 	Candidates []Candidate
 	Suppressed []SuppressedCount
+
+	// Grouping is GroupingComponent for a report mined over declared parts;
+	// empty is the directory grouping, whose report reads as it always has.
+	Grouping    string
+	Parts       []constraints.Part
+	UnreadParts []constraints.UnreadPart
+	// DeclaredRules are the declared edge rules between parts, the ones a
+	// candidate is compared with before it is proposed.
+	DeclaredRules []constraints.DeclaredEdgeRule
+	Resolution    []KindResolution
+	// Unchecked are candidates over a kind resolving under the floor: found,
+	// and not proposed, because the graph cannot tell their zero from its own
+	// blindness.
+	Unchecked []Candidate
+	// Declared are candidates a declared rule already states.
+	Declared []DeclaredCandidate
+	// Rejected are candidates a person rejected; StaleRejections the
+	// rejections that named no candidate this run.
+	Rejected        []RejectedCandidate
+	StaleRejections []Rejection
 }
 
 func Mine(store *facts.Store, cfg Config) *Report {
@@ -112,6 +151,7 @@ func Mine(store *facts.Store, cfg Config) *Report {
 	}
 
 	report := &Report{Config: cfg, FactCount: store.Count()}
+	candidates, report.Rejected, report.StaleRejections = applyRejections(candidates, cfg.Rejections)
 	report.Candidates = finalize(candidates)
 	for _, family := range familyOrder {
 		report.Suppressed = append(report.Suppressed, *suppressed[family])

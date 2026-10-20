@@ -2,13 +2,10 @@
 // (`check`, `baseline`), the reports (`coverage`, `doctor`), the installer
 // (`install`/`uninstall`) and the session hooks (`hook`).
 //
-// It exists because a wrapper binary cannot reach them otherwise. They are built on
-// enola's internal packages — the engine's baseline resolution, the hook heartbeat, the
-// file lock — none of which cross a module boundary, so a separate module can neither
-// import them nor reimplement them without carrying a second copy of the gate's exit-code
-// contract and the hook's silence rules. Keeping the commands here, INSIDE enola, lets
-// them go on using those internals while a wrapper reaches them through one exported
-// surface.
+// They are built on enola's internal packages — the engine's baseline resolution, the
+// hook heartbeat, the file lock — and gathering them behind one surface keeps the gate's
+// exit-code contract and the hook's silence rules in a single place rather than restated
+// at every call site.
 //
 // Deliberately not folded into pkg/cli: that package is pure text (help and the tool
 // catalogue) and anything wanting only `--help` would otherwise pull in the whole engine.
@@ -29,14 +26,13 @@ import (
 	"github.com/enola-labs/enola/internal/version"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/cli"
-	"github.com/enola-labs/enola/pkg/dashboard"
 )
 
 // Runner runs the shared subcommands on behalf of one binary.
 //
 // The binary is held rather than passed per call because it reaches almost every
 // user-facing string: usage blocks, error prefixes, and — the part that matters — the
-// commands suggested in remedies. A gate that tells an enola-enterprise user to run
+// commands suggested in remedies. A gate that tells the user to run
 // `enola baseline pin` names a binary they may not have installed.
 type Runner struct {
 	bin cli.Binary
@@ -45,92 +41,13 @@ type Runner struct {
 	// accepts, so they belong in the typo suggestions and the "expected one of" list —
 	// otherwise `enola upgrad` is told upgrade is not a command of any kind.
 	own []string
-	// setup configures every engine the shared commands build, so a wrapper's plugins
-	// are present in the gate, the hook and the reports — not only in its MCP server.
-	//
-	// These commands construct their OWN engines (a gate has to snapshot the tree it is
-	// grading), so a wrapper that registered plugins on the server's engine alone got a
-	// plain OSS engine here. That is how `baseline pin` came to write a snapshot with a
-	// different explainer set than `--generate` on the same tree, from the same binary.
-	setup func(*bootstrap.Engine)
-	// dashboardOpts builds the options the standalone `dashboard` command serves with,
-	// so a wrapper's page is its own here as well as on its MCP server. See
-	// WithDashboard.
-	dashboardOpts func(*bootstrap.Engine) dashboard.Options
-	// extraInstructions and extraHooksNote are what a wrapper adds to the agent
-	// instructions `install` writes, so its own tools are named there. See
-	// WithInstructions.
-	extraInstructions string
-	extraHooksNote    string
 }
 
-// WithDashboard registers the dashboard options `dashboard` serves with. Returns the
-// Runner so it can be chained onto New.
-//
-// It exists for the same reason WithEngine does, one layer further out. This command
-// starts a dashboard of its OWN — a standalone one, without an MCP server — so a wrapper
-// that only passed its options to bootstrap's server got the plain OSS page here: OSS
-// title, no licensed panel, and, worse, no licensed entries in Options.InsightLabels.
-// That map is the page's admission list, so the dead-code, performance and
-// package-metrics findings the wrapper's own explainers had just computed were filtered
-// out of its own Insights modal. Licensed value, silently absent from the newest surface
-// that shows it.
-//
-// The callback takes the Engine because a wrapper's options are computed per engine (the
-// Package Metrics panel reads the live store); Tracker and StablePort are set by this
-// package afterwards and must not be set here — see Dashboard.
-func (r *Runner) WithDashboard(opts func(*bootstrap.Engine) dashboard.Options) *Runner {
-	r.dashboardOpts = opts
-	return r
-}
-
-// dashboardOptions is the options a dashboard this package starts is built from: the
-// wrapper's, when it registered any, and the OSS defaults otherwise.
-func (r *Runner) dashboardOptions(eng *bootstrap.Engine) dashboard.Options {
-	if r.dashboardOpts == nil {
-		return dashboard.Options{}
-	}
-	return r.dashboardOpts(eng)
-}
-
-// WithInstructions registers text appended to the agent instructions `install` writes,
-// and to the hooks note it adds under --hooks. Returns the Runner so it can be chained
-// onto New.
-//
-// install.Options has carried these two seams since it was written, for a wrapper that
-// serves tools this package cannot know about. Nothing reached them: `install` built its
-// Options here and left both empty, so a licensed binary wrote instruction files that
-// named only the OSS tools, and an agent in that repository had no way to learn its
-// licensed tools existed. Either string may be empty.
-func (r *Runner) WithInstructions(extra, hooksNote string) *Runner {
-	r.extraInstructions, r.extraHooksNote = extra, hooksNote
-	return r
-}
-
-// WithEngine registers a hook applied to every engine these commands construct. Returns
-// the Runner so it can be chained onto New.
-//
-// The callback takes only the Engine: a wrapper outside this module cannot name
-// *config.Config, but it can reach the same value through Engine.Config() and mutate it
-// there. Keeping the signature to one exported type is what makes this usable across the
-// module boundary at all.
-func (r *Runner) WithEngine(setup func(*bootstrap.Engine)) *Runner {
-	r.setup = setup
-	return r
-}
-
-// newEngine builds an engine for a shared command and applies the wrapper's setup.
-// Every command that needs an engine must go through here; calling bootstrap.NewEngine
-// directly silently opts that command out of whatever the binary registers.
+// newEngine builds an engine for a shared command. Every command that needs one must go
+// through here rather than calling bootstrap.NewEngine directly, so there is a single
+// place to configure what these commands construct.
 func (r *Runner) newEngine(opts bootstrap.Options) (*bootstrap.Engine, *config.Config, error) {
-	eng, cfg, err := bootstrap.NewEngine(opts)
-	if err != nil {
-		return nil, nil, err
-	}
-	if r.setup != nil {
-		r.setup(eng)
-	}
-	return eng, cfg, nil
+	return bootstrap.NewEngine(opts)
 }
 
 // New returns a Runner for the given binary. ownSubcommands names commands the binary
@@ -140,10 +57,11 @@ func New(bin cli.Binary, ownSubcommands ...string) *Runner {
 	return &Runner{bin: bin, own: ownSubcommands}
 }
 
-// knownSubcommands is everything the binary accepts: what this package dispatches, plus
-// whatever the binary dispatches for itself.
+// knownSubcommands is everything the binary accepts: what this package dispatches,
+// whatever the binary dispatches for itself, and `help`, which HelpArgs rewrites away
+// before either sees it.
 func (r *Runner) knownSubcommands() []string {
-	return append(append([]string{}, Subcommands()...), r.own...)
+	return append(append(append([]string{}, Subcommands()...), r.own...), "help")
 }
 
 // name is the binary as a user types it, used in usage lines and suggested commands.
@@ -193,10 +111,10 @@ func (r *Runner) updateNotice(w io.Writer) {
 // a binary that advertises one it does not dispatch sends the caller into whatever its
 // argument parser does with an unrecognised word.
 //
-// `upgrade` is deliberately absent. It is OSS-only — a wrapper ships through its own
+// `upgrade` is deliberately absent. It is dispatched by cmd/enola itself, which ships
 // release path — so cmd/enola dispatches it itself, before calling Dispatch.
 func Subcommands() []string {
-	return []string{"check", "constraints", "plan", "coverage", "endpoint", "doctor", "providers", "dashboard", "baseline", "log", "show", "diff", "blame", "gc", "history", "install", "uninstall", "hook"}
+	return []string{"check", "cluster", "constraints", "contract", "plan", "pack", "coverage", "endpoint", "path", "impact", "flows", "doctor", "providers", "dashboard", "baseline", "log", "show", "diff", "blame", "gc", "history", "install", "uninstall", "hook"}
 }
 
 // Dispatch runs the subcommand named by args[0], if it is one of Subcommands().
@@ -225,9 +143,16 @@ func (r *Runner) Dispatch(ctx context.Context, args []string) bool {
 		SpawnUpdateRefresh()
 	}
 
+	if slices.Contains(Subcommands(), args[0]) && HelpRequested(args[1:]) {
+		args = helpPath(args)
+	}
+
 	switch args[0] {
 	case "check":
 		r.Check(ctx, args[1:]) // exits with the verdict's code
+	case "cluster":
+		r.Cluster(args[1:])
+		os.Exit(0)
 	case "constraints":
 		// lint exits with its own verdict (0 valid, 1 problems, 2 could not run) and
 		// mine exits 0 itself, but init and explain RETURN on success — and a handler
@@ -238,8 +163,14 @@ func (r *Runner) Dispatch(ctx context.Context, args []string) bool {
 		// had to read what it wrote and ignore the code it exited with.
 		r.Constraints(args[1:])
 		os.Exit(0)
+	case "contract":
+		r.Contract(args[1:])
+		os.Exit(0)
 	case "plan":
 		r.Plan(ctx, args[1:])
+		os.Exit(0)
+	case "pack":
+		r.Pack(ctx, args[1:])
 		os.Exit(0)
 	case "coverage":
 		r.Coverage(ctx, args[1:])
@@ -247,6 +178,13 @@ func (r *Runner) Dispatch(ctx context.Context, args []string) bool {
 	case "endpoint":
 		r.Endpoint(ctx, args[1:])
 		os.Exit(0)
+	case "path":
+		r.Path(ctx, args[1:])
+		os.Exit(0)
+	case "impact":
+		r.Impact(ctx, args[1:]) // exits with its own code
+	case "flows":
+		r.Flows(ctx, args[1:]) // exits with its own code
 	case "doctor":
 		r.Doctor(args[1:])
 		os.Exit(0)
@@ -299,6 +237,10 @@ func (r *Runner) Dispatch(ctx context.Context, args []string) bool {
 func (r *Runner) UnknownArgHelp(arg string) string {
 	if !strings.HasPrefix(arg, "-") && !strings.ContainsAny(arg, "/\\.") {
 		if near := r.closestSubcommand(arg); near != "" {
+			if near == "help" {
+				return fmt.Sprintf("unknown command %q — did you mean %q?\n\n    %s help\n    %s help <command>",
+					arg, near, r.name(), r.name())
+			}
 			return fmt.Sprintf("unknown command %q — did you mean %q?\n\n    %s %s --help\n\nRun `%s --help` for all commands.",
 				arg, near, r.name(), near, r.name())
 		}
@@ -343,6 +285,23 @@ func editDistance(a, b string) int {
 		prev, cur = cur, prev
 	}
 	return prev[len(b)]
+}
+
+// HelpRequested reports whether args ask for help: -h, -help or --help anywhere before a
+// bare "--". It exists for the commands whose arguments the flag package never sees as
+// flags, because a word comes first: `baseline pin --help` stops parsing at "pin", and the
+// --help after it arrived as a path. Those commands ran instead of describing themselves,
+// and for `baseline pin` and `upgrade` running is not harmless.
+func HelpRequested(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "--":
+			return false
+		case "-h", "-help", "--help":
+			return true
+		}
+	}
+	return false
 }
 
 // IsDirectory reports whether path names an existing directory. Used throughout to tell

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/enola-labs/enola/internal/diff"
@@ -15,6 +16,7 @@ import (
 	"github.com/enola-labs/enola/internal/updatecheck"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
+	"github.com/enola-labs/enola/pkg/install"
 )
 
 // runDoctor is `enola doctor`: does the loop actually run in this repository?
@@ -44,6 +46,7 @@ func (r *Runner) Doctor(args []string) {
 				"success either way. This asks the only question that settles it: when did the\n"+
 				"hooks last run?\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "doctor")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -66,7 +69,8 @@ func (r *Runner) Doctor(args []string) {
 
 	outDir := hookOutputDir(repoDir)
 	state := hookstate.Load(outDir)
-	installed := hooksConfigured(repoDir)
+	where := hooksConfiguredIn(repoDir)
+	installed := where != ""
 	baselineIssue := r.baselineUsability(repoDir, outDir)
 
 	memLimit, memSource := bootstrap.MemoryLimit()
@@ -157,7 +161,7 @@ func (r *Runner) Doctor(args []string) {
 		fmt.Println("  at session start, and the change graded when the session ends.")
 		return
 	}
-	fmt.Println("  configured in .claude/settings.json")
+	fmt.Printf("  configured in %s\n", where)
 	if !state.InstalledAt.IsZero() {
 		fmt.Printf("  installed        %s (%s ago)\n",
 			state.InstalledAt.Format(time.RFC3339), humanSince(state.InstalledAt))
@@ -188,6 +192,12 @@ func (r *Runner) Doctor(args []string) {
 	// The verdict, stated rather than left for the reader to assemble.
 	fmt.Println()
 	switch {
+	case outcomeIs(state, hookstate.EventStop, hookstate.OutcomeNotARepo) ||
+		outcomeIs(state, hookstate.EventSessionStart, hookstate.OutcomeNotARepo):
+		fmt.Println("  The hooks are firing and doing nothing, on purpose: this is a folder of")
+		fmt.Println("  repositories, not a repository, and grading it would snapshot all of them as")
+		fmt.Printf("  one. Install the hooks inside each repository instead (`%s install --hooks`\n", r.name())
+		fmt.Println("  run there).")
 	case !state.Fired(hookstate.EventStop) && !state.Fired(hookstate.EventSessionStart):
 		fmt.Println("  NEITHER HOOK HAS EVER RUN.")
 		fmt.Println("  The configuration exists but nothing is invoking it. Start a session in this")
@@ -230,6 +240,21 @@ func (r *Runner) baselineUsability(repoDir, outDir string) string {
 	}
 	v := check.Evaluate(&diff.SnapshotDiff{Comparability: diff.CompareMeta(base.Meta, *current)}, check.Policy{})
 	return v.DeclineReason()
+}
+
+// hooksConfiguredIn names the file that installs enola's session hooks for this
+// repository, or "" when none does: `.claude/settings.json` with an entry enola owns, or
+// Pi's extension written with its hooks switched on.
+func hooksConfiguredIn(repoDir string) string {
+	if hooksConfigured(repoDir) {
+		return filepath.Join(".claude", "settings.json")
+	}
+	rel := filepath.Join(".pi", filepath.FromSlash(install.PiExtensionFile))
+	if data, err := os.ReadFile(filepath.Join(repoDir, rel)); err == nil &&
+		strings.Contains(string(data), install.PiHooksMarker) {
+		return rel
+	}
+	return ""
 }
 
 // hooksConfigured reports whether .claude/settings.json carries an entry enola owns.
@@ -302,4 +327,11 @@ func humanSince(t time.Time) string {
 	default:
 		return fmt.Sprintf("%d day(s)", int(d.Hours()/24))
 	}
+}
+
+// outcomeIs reports whether event last ran with outcome o. Nil-safe: an event that
+// never fired has no record.
+func outcomeIs(state hookstate.State, e hookstate.Event, o hookstate.Outcome) bool {
+	r := state.Get(e)
+	return r != nil && r.LastOutcome == o
 }

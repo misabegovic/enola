@@ -120,6 +120,12 @@ end
 
 lines = []
 captures = Dir.glob(File.join(CAPTURE_DIR, "*.json"), base: root).sort
+if captures.empty?
+  # Nothing observed is not the same as observing nothing: the seam records the
+  # provider as not applicable here, never as a run that found zero facts.
+  warn "enola-provider-not-applicable: no #{CAPTURE_DIR}/*.json capture"
+  exit 0
+end
 captures.each do |rel|
   capture = begin
     JSON.parse(File.read(File.join(root, rel)))

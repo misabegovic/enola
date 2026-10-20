@@ -1,8 +1,10 @@
 # Ruby — what enola extracts
 
-Parsed with tree-sitter. Detected by a `Gemfile` at the repository root. Rails
-conventions are recognised, but a plain Ruby project still produces modules, symbols and
-call edges.
+Parsed with tree-sitter, through the grammar vendored under
+`internal/extractors/rubyextractor/grammar/` (tree-sitter-ruby v0.23.1 patched so
+anonymous block forwarding such as `}, &` at the end of a line parses). Detected by a
+`Gemfile` at the repository root. Rails conventions are recognised, but a plain Ruby
+project still produces modules, symbols and call edges.
 
 Fixture: [`ruby_sample`](../../internal/engine/testdata/repos/ruby_sample/)
 
@@ -253,6 +255,78 @@ dumpers actually emit: composite foreign keys and unrecognised lines are skipped
 guessed. The correction above runs *before* the fold, so a prefixed table's census
 lands on the model that reads it rather than on whichever model the unprefixed name
 collided with.
+
+### Migrations, read for what they would do to a live table
+
+Each migration under a Rails app's `db/migrate` (the generator's `<version>_<name>.rb`, or
+`<version>_<name>.<engine>.rb` for one an engine copied in; the app may sit below the
+repository root, and a `db/migrate` under no Rails app is not read) records on
+its class what a deploy-time rule needs, in props every migration carries so a clean
+one reads zero rather than unmeasured:
+
+```
+symbol  AddIndexToComments  props: migration_version=20240101120000,
+          migration_unsafe_indexes=1, migration_unsafe_index_tables="comments",
+          migration_concurrent_in_transaction=0, migration_rollback_unsafe_indexes=0,
+          migration_unsafe_references=0, migration_not_null_without_default=0,
+          migration_disable_ddl_transaction=false, migration_creates_tables="", …
+```
+
+An index is unsafe when its table is not one the same file creates and the call does
+not pass `algorithm: :concurrently`; a concurrent one in a migration that keeps its DDL
+transaction (no `disable_ddl_transaction!`) is counted under
+`migration_concurrent_in_transaction`, since it fails when run. Indexes a `down` method
+adds, and those `add_reference` creates by default, are counted apart. A NOT NULL
+column is one `add_column` gives `null: false` with no `default:`, or one
+`change_column_null` sets to false; `migration_changed_columns` and
+`migration_removed_columns` name `table.column`. The reader is line-based like the
+schema readers: a call continued over lines (an open bracket, a trailing comma or
+backslash) is one statement, and a table that is not a literal names nothing. It does
+not read `change_table` blocks or `reversible` directions. `ruby:migrations` counts the
+files read.
+
+### Runtime units — what the deploy files say runs the code
+
+Each Rails app's deploy files (at the repository root or below it; a deploy file
+under no Rails app is not read) become `runtime_unit` facts, one per thing they say
+runs in production, named `<declaring file>::<unit>` so two files' `web` are two
+nodes. A unit's `runs` edges name the job classes its entrypoint reaches:
+
+```
+runtime_unit  Procfile::worker  props: unit_kind=process, provider=procfile,
+                command="env MALLOC_ARENA_MAX=2 bin/start-sidekiq",
+                config="config/sidekiq.yml", queues="default mailers",
+                concurrency_unresolved=true, environment=production
+              runs -> MailJob, TidyJob
+runtime_unit  config/schedule.yml::nightly_report  props: unit_kind=schedule,
+                provider=sidekiq-periodic, schedule="0 3 * * *",
+                entrypoint=ReportJob, entrypoint_kind=job_class
+              runs -> ReportJob
+```
+
+Read: `Procfile` and `Procfile.<env>` (a process running Sidekiq carries the queues
+and concurrency its `-C` config lists, `config/sidekiq.yml` without one; a
+`…QUEUE_NAMES=` or `…QUEUES=` assignment in the command names its queues; a Puma,
+Thruster, Unicorn or `rails server` command is `entrypoint_kind=web`), Sidekiq
+configs no process names, periodic schedules in `config/schedule.yml` (the shape
+Sidekiq Enterprise, sidekiq-cron and sidekiq-scheduler share), Solid Queue's
+`config/queue.yml` workers and `config/recurring.yml` tasks for `production`, else
+`default`, whenever's `config/schedule.rb` (each `runner`, `rake` or `command` line,
+named by its line), Kamal's `config/deploy.yml` roles and accessories with their hosts
+(`placeholder_host=true` where a role still names the address `kamal init` writes; a
+role running `bin/jobs` drains the Solid Queue workers' queues), `railway.toml`'s
+start command and replicas, a `Dockerfile`'s last `CMD`, and `fly.toml`'s processes.
+
+A worker on the queues it lists runs every job class of its own app declaring one of them (the
+`ruby-job-queue` topic facts' `code_symbol`); a class naming no queue is on
+`default`, and `*` runs every job class. A schedule naming a class the repository
+does not declare carries `entrypoint_missing=true` and runs nothing. A `recurring:`
+key in `queue.yml` is read, marked `read_by_runtime=false` with `not_read_because`,
+when the locked `solid_queue` is 0.9 or later, which reads recurring tasks only from
+`config/recurring.yml`. What a file computes (ERB, an environment variable) is
+recorded as `<setting>_unresolved`, never guessed. A web process carries no edges to
+the routes it serves. `ruby:runtime-units` counts the units read and names files
+that would not parse. Terraform, Kubernetes and serverless manifests are not read here.
 
 ## Associations — what a model says it is related to
 

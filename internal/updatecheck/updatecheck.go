@@ -119,7 +119,7 @@ type Notice struct {
 
 // Suppressed reports whether this environment must never be told about updates.
 //
-// Three reasons, none of them about preference:
+// Four reasons, none of them about preference:
 //
 //   - ENOLA_NO_UPDATE_CHECK is the opt-out. Set to anything.
 //   - CI is set. A build pipeline cannot act on the advice and did not ask for it, and
@@ -128,8 +128,12 @@ type Notice struct {
 //     telling its author to upgrade would be both wrong and constant. (internal/upgrade
 //     treats "dev" as out of date, which is right for a command someone typed and wrong
 //     for an unprompted nudge.)
+//   - The build names no manifest. A build whose linker flags emptied manifestURL ships
+//     through a release path this manifest does not describe, so a fetch could only
+//     fail, and would still create ~/.enola and take the lock on the way.
 func Suppressed() bool {
-	return os.Getenv(DisableEnv) != "" || os.Getenv("CI") != "" || version.Version == "dev"
+	return os.Getenv(DisableEnv) != "" || os.Getenv("CI") != "" || version.Version == "dev" ||
+		manifestURL == ""
 }
 
 // Refresh fetches the manifest and caches it. It is the ONLY function here that touches
@@ -254,12 +258,20 @@ func HumanLine(extractorVersion string) string {
 // The imperative is the point of HumanLine, so it cannot simply be dropped for a
 // pip install, and it cannot stay `enola upgrade` either: that command refuses on
 // a pip install (see internal/upgrade.externallyManaged), so telling someone to
-// run it would cost them a round trip to be told to do something else.
+// run it would cost them a round trip to be told to do something else. The same
+// holds for every install method but "source", since that command refuses them all,
+// so those are sent to the installer that named itself.
 func upgradeImperative() string {
-	if version.InstallMethod == "pip" {
+	switch version.InstallMethod {
+	case "source":
+		return "Run `enola upgrade`."
+	case "pip":
 		return "Run `pip install -U enola-cli`."
+	case "":
+		return "Upgrade through the tool that installed it."
+	default:
+		return "Upgrade through " + version.InstallMethod + "."
 	}
-	return "Run `enola upgrade`."
 }
 
 // Fprint writes HumanLine to w, set off by a blank line, when there is something to

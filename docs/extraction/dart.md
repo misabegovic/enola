@@ -22,6 +22,7 @@ is copied from the golden the test suite asserts against.
 | `import` / `export` | `dependency` (`stdlib` / `internal` / `external`) |
 | `GoRoute`, `AutoRoute`, `routes:` map | `route` (`type: page`) |
 | `http`/`dio` call site, `@GET(...)` | `route` (`role: client`) |
+| a retrofit/chopper client's annotated method | a `symbol` flagged as doing network I/O, so a call to it in a loop is reported |
 | drift `Table`, isar/hive/objectbox/floor, Firestore | `storage` |
 
 ## The module model is the pub package
@@ -182,7 +183,7 @@ The C# extractor draws the same line for the same reason.
 
 ## Abstractness is computed, not read off the keyword
 
-`abstract` is authoritative for the enterprise package-metrics explainer, and Dart
+`abstract` is authoritative for the package-metrics explainer, and Dart
 cannot let the keyword decide. **Every Dart class is an implicit interface** others may
 `implement`, so "is implementable" says nothing; and a `mixin` routinely carries its
 whole implementation, exactly as a Scala trait does.
@@ -246,7 +247,7 @@ elsewhere: the network is almost always two wrapper layers below the widget that
 triggers it, so without the closure an in-loop call to `loadPage` carries no evidence
 that it reaches the network at all.
 
-The enterprise `analyze_performance` tool reads these through a Dart-specific gate of
+The `analyze_performance` tool reads these through a Dart-specific gate of
 its own. Dart is the fourth ecosystem to need one: the shared keyword list carries `where` for Ruby, where
 `Model.where(...)` is a lazy query — but Dart's `.where()` is `Iterable.where`, the
 in-memory filter and the direct equivalent of JavaScript's `.filter()`.

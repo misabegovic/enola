@@ -3,6 +3,7 @@ package facts
 import (
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -88,7 +89,41 @@ const (
 	// with because-prose and a ratchet and the check's one comment covers
 	// both engines. Props: lint_engine, lint_rule, lint_severity, line, message.
 	KindLint = "lint"
+
+	// KindTestCase is one test a language's usual runner can select: a Go Test
+	// function, a pytest function, an RSpec example, a #[test] fn. It exists so a
+	// caller can name the lines of one test without reading its whole file, and it
+	// carries a span and nothing else: no relations, since the file's test_ref (or
+	// the symbol the language already emits for it) holds the test's references,
+	// and a second copy here would count every call twice. Reference-only like
+	// KindTestRef, so nothing counts it as coupling and a constraints component
+	// selects it only by naming the kind.
+	//
+	// Its Name is the file path, then "::", then runner_name, because every named
+	// fact is a node in the graph's name table and a bare label such as `run` or
+	// `works` would share a node with a symbol of that name. Props: language,
+	// label (the test's own name as written), groups (the enclosing module, class,
+	// describe or group labels, outermost first) and runner_name (the name the
+	// runner prints and filters on). A test whose label is not a literal emits no
+	// fact and is counted on its extractor's coverage instead, the way an
+	// association whose target cannot be named is.
+	KindTestCase = "test_case"
+
+	// KindRuntimeUnit is one thing a deploy file says runs in production: a
+	// Procfile process, a worker draining queues, a periodic schedule, a
+	// container's command, a deploy role. Its Name is the declaring file, then
+	// "::", then the unit's name there, so two files' `web` are two nodes.
+	// Reference-only like a route: an entry point, not coupling. Its runs
+	// edges name the symbols its entrypoint reaches; what the file computes
+	// (ERB, an environment variable) is recorded as unresolved, never guessed.
+	KindRuntimeUnit = "runtime_unit"
 )
+
+// TestCaseName is the fact name of a test_case: its file, then "::", then the
+// name its runner prints.
+func TestCaseName(relFile, runnerName string) string {
+	return relFile + "::" + runnerName
+}
 
 // pathShapedName names the kinds whose Name IS a repo-relative path, and which the
 // store therefore normalises to forward slashes on the way in (see Store.Add).
@@ -136,10 +171,19 @@ const (
 	RelInstantiates  = "instantiates"   // Source constructs an instance of target via a constructor call.
 	RelInjects       = "injects"        // Source declares target as a DI-injected constructor parameter.
 	RelHasMethod     = "has_method"     // Owner type (struct/interface/class) declares target as a method. Synthesized in NewGraph.
-	RelHandledBy     = "handled_by"     // A route/endpoint is served by target (e.g. a gRPC RPC route → its Go handler method). Added post-extraction.
+	RelHandledBy     = "handled_by"     // A route/endpoint is served by target, its handler symbol. Written at extraction where the route sits on its handler, and by post-link binders elsewhere.
 	RelImplementedBy = "implemented_by" // A declared contract operation is implemented by a code symbol. Added post-extraction.
 	RelNames         = "names"          // Source names target by symbol literal without calling it: a method name passed as data (`perform_async(id, :on_done)`) for something else to dispatch. A reference, not a call; read by dead-code questions, ignored by call metrics.
+	RelReads         = "reads"          // Source method issues a query that reads the table of target, a storage fact. A fact about storage, not a call between code: ignored by call metrics and by every walk that means code reaching code.
+	RelWrites        = "writes"         // Source method issues a statement that writes the table of target, a storage fact. Read like RelReads.
+	RelRuns          = "runs"           // A runtime unit runs target, the symbol its entrypoint reaches: a schedule's job class, the job classes of a worker's queues. An entry point, not a call.
 )
+
+// IsStorageAccess reports whether a relation kind says which table a method
+// reads or writes. Those edges land on storage rather than on code, so a walk
+// that asks what code reaches what code (fan-in, cycles, blast radius, a cut)
+// leaves them out; only a rule that names them reads them.
+func IsStorageAccess(kind string) bool { return kind == RelReads || kind == RelWrites }
 
 // PropTargetFile is the repo-relative file a producer reports a relation's
 // target to be defined in, carried on the dependency fact beside the relation
@@ -255,7 +299,8 @@ func ModuleRoleForPath(dir string) string {
 // Insight represents an architectural insight produced by an explainer.
 type Insight struct {
 	Title       string     `json:"title"`
-	Source      string     `json:"source,omitempty"` // Name of the explainer that produced it (e.g. "unused-routes"). Set centrally by the engine.
+	Source      string     `json:"source,omitempty"`   // Name of the explainer that produced it (e.g. "unused-routes"). Set centrally by the engine.
+	Identity    string     `json:"identity,omitempty"` // diff.FindingIdentity, the key the diff pairs findings on. Stamped where a finding leaves the binary as JSON (insights.json, check's document); a finding built in memory carries none.
 	Description string     `json:"description"`
 	Confidence  float64    `json:"confidence"` // 0.0 - 1.0
 	Evidence    []Evidence `json:"evidence"`
@@ -375,6 +420,12 @@ type SnapshotMeta struct {
 	FactCount    int        `json:"fact_count"`
 	InsightCount int        `json:"insight_count"`
 
+	// TestFileHashes are the test files the reference-only pass read, which
+	// FileHashes leaves out because they are not indexed as production. They are
+	// recorded so a reader naming a test by its lines can say whether the file
+	// it names still holds them; drift over the production tree never reads them.
+	TestFileHashes []FileHash `json:"test_file_hashes,omitempty"`
+
 	// Providers is the external-provider census: one record per configured
 	// provider, whether it contributed facts or was skipped. It feeds the
 	// receipt and the provider-set comparability check.
@@ -452,6 +503,10 @@ type UnseenCensus struct {
 	// indexed. Outside, never unresolved: the target exists, it is simply not
 	// in this graph.
 	OutsideGraph map[string]int `json:"outside_graph,omitempty"`
+	// OutsideGraphPrefixes keeps the leading path/package prefix for unresolved
+	// imports. It turns a large count into a diagnosis: thousands of `src/...`
+	// targets point to one missing alias, unlike thousands of unrelated packages.
+	OutsideGraphPrefixes map[string]int `json:"outside_graph_prefixes,omitempty"`
 	// DeadExemptions counts declared exemptions whose witness matched no
 	// violation, the constraints explainer's own finding.
 	DeadExemptions int `json:"dead_exemptions"`
@@ -507,6 +562,13 @@ type ProviderRecord struct {
 	FactCount int    `json:"fact_count"`
 	Skipped   bool   `json:"skipped,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	// Applicable is false when nothing the provider reads is in this
+	// repository (no results file, no capture, no Gemfile), so it did not run.
+	// That is neither a failure nor a run that found nothing, and a reader told
+	// either would draw the wrong conclusion about the graph. Such a record is
+	// also Skipped, so every reader asking whether a provider contributed keeps
+	// its answer; Reason says what was missing. Absent means it applied.
+	Applicable *bool `json:"applicable,omitempty"`
 	// ExcludedByIgnore counts facts dropped because they described a file the
 	// repository's ignore globs exclude. A provider walks the tree itself and
 	// cannot know the configuration, so the seam enforces it; the count is
@@ -576,6 +638,10 @@ type ProviderCensus struct {
 	SkipCauses         []CensusCause `json:"skip_causes,omitempty"`
 }
 
+// NotApplicable reports whether the provider did not run because nothing it
+// reads was there.
+func (r ProviderRecord) NotApplicable() bool { return r.Applicable != nil && !*r.Applicable }
+
 // RanProviders returns the names of the providers that actually contributed to
 // a census (not skipped), sorted. This is the set comparability compares: a
 // provider that ran on one side only makes all of its facts appear added or
@@ -616,6 +682,12 @@ type GitInfo struct {
 	// unreachable in a shallow clone, which is what CI checkouts default to.
 	Remote string `json:"remote,omitempty"`
 }
+
+// PropParsedWithErrors is the list an extractor's extraction fact carries of
+// the files its parser read only in part: the tree held an error node, so what
+// follows it may be unread. The engine counts each one as a parse error in the
+// receipt, from the facts, so a run that reuses cached facts counts them too.
+const PropParsedWithErrors = "parsed_with_errors"
 
 // ParseError records a non-fatal extraction failure — an extractor that could
 // not detect or parse its inputs. These are counted rather than swallowed so a
@@ -800,6 +872,28 @@ type GraphReceipt struct {
 	CrossRepoEdgeCount int              `json:"cross_repo_edge_count"` // consumer->provider edges in the cross-repo "graph of graphs" (NOT the total dependency-fact count, which also covers ordinary imports)
 	Coverage           *CoverageSummary `json:"coverage,omitempty"`    // cross-repo edge-coverage rollup, nil in single-repo mode
 	Repos              []GraphRepoEntry `json:"repos"`                 // one entry per repository in the graph, sorted by Label
+	Writer             *GraphWriter     `json:"writer,omitempty"`      // the process that wrote this receipt; nil in receipts written before it was recorded
+}
+
+// RepoLabels lists the receipt's repositories for a one-line message, naming at most
+// max of them and counting the rest.
+func (gr *GraphReceipt) RepoLabels(max int) string {
+	labels := make([]string, 0, len(gr.Repos))
+	for _, r := range gr.Repos {
+		labels = append(labels, r.Label)
+	}
+	if len(labels) > max {
+		return strings.Join(labels[:max], ", ") + " and " + strconv.Itoa(len(labels)-max) + " more"
+	}
+	return strings.Join(labels, ", ")
+}
+
+// GraphWriter identifies the process behind a graph receipt. Several agent sessions
+// in one workspace share its receipt, so a server restoring or reloading from it must
+// be able to tell its own graph from a sibling session's.
+type GraphWriter struct {
+	PID       int `json:"pid"`                  // the enola process
+	ClientPID int `json:"client_pid,omitempty"` // the agent process it served; zero for a CLI run
 }
 
 // GraphRepoEntry describes one repository's membership in the current graph.

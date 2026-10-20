@@ -62,6 +62,7 @@ var extractorDocs = map[string]extractorDoc{
 	"dotnet":     {Labels: []string{".NET"}, Page: "dotnet.md"},
 	"typescript": {Labels: []string{"TypeScript", "TypeScript / JavaScript"}, Page: "typescript.md"},
 	"hcl":        {Labels: []string{"Terraform / HCL"}, Page: "hcl.md"},
+	"kicad":      {Labels: []string{"KiCad"}, Page: "kicad.md"},
 	"ansible":    {Labels: []string{"Ansible"}, Page: "ansible.md"},
 	"asyncapi":   {Labels: []string{"AsyncAPI"}, Page: "asyncapi.md"},
 	"openapi":    {Labels: []string{"OpenAPI", "gRPC and OpenAPI"}, Page: "grpc-openapi.md"},
@@ -83,7 +84,7 @@ var extractorDocs = map[string]extractorDoc{
 
 // languageTables are the surfaces that promise a complete list of what enola parses.
 var languageTables = []struct{ Doc, Section, Why string }{
-	{"README.md", "Supported languages",
+	{"docs/LANGUAGES.md", "",
 		"the first place anyone checks whether their stack is covered"},
 	{"ARCHITECTURE.md", "Supported languages",
 		"the parser used and the exact files that trigger detection"},

@@ -92,6 +92,10 @@ func indexCaseInsensitive(src, needle []byte) int {
 
 func detectVue(repoPath string) bool {
 	tsRoot, _ := findTSRoot(repoPath)
+	return detectVueRoot(repoPath, tsRoot)
+}
+
+func detectVueRoot(repoPath, tsRoot string) bool {
 	return detectVueAt(tsRoot) || (tsRoot != repoPath && detectVueAt(repoPath))
 }
 
@@ -101,6 +105,10 @@ func detectVueAt(dir string) bool {
 
 func detectNuxt(repoPath string) bool {
 	tsRoot, _ := findTSRoot(repoPath)
+	return detectNuxtRoot(repoPath, tsRoot)
+}
+
+func detectNuxtRoot(repoPath, tsRoot string) bool {
 	return detectNuxtAt(tsRoot) || (tsRoot != repoPath && detectNuxtAt(repoPath))
 }
 
@@ -432,7 +440,7 @@ func containsCreateRouterCall(kinds *tsutil.KindTable, node *sitter.Node, src []
 }
 
 // extractVueSFC extracts architectural facts from a Vue Single File Component.
-func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relFile string, isNuxt bool, aliases map[string]tsAlias, nuxtAutoComponents map[string]string) []facts.Fact {
+func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relFile string, isNuxt bool, aliases map[string]tsAlias, files *tsFileIndex, nuxtAutoComponents map[string]string) []facts.Fact {
 	var result []facts.Fact
 	blocks := extractVueScriptBlocks(rawSrc)
 	allBindings := emberImportBindings{internal: map[string]string{}, external: map[string]string{}, modules: map[string]string{}}
@@ -445,7 +453,7 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 		if block.IsSetup {
 			isSetup = true
 		}
-		blockFacts, bindings, macros, contracts, declaredTypes := e.extractVueScriptBlock(kinds, block, relFile, isNuxt, aliases)
+		blockFacts, bindings, macros, contracts, declaredTypes := e.extractVueScriptBlock(kinds, block, relFile, isNuxt, aliases, files)
 		result = append(result, blockFacts...)
 		for name, target := range bindings.internal {
 			allBindings.internal[name] = target
@@ -482,10 +490,10 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 	found := false
 	for i := range result {
 		if result[i].Kind == facts.KindSymbol && result[i].Name == factName {
-			result[i].Props["web_component"] = "component"
-			result[i].Props["framework"] = fw
+			result[i].SetProp("web_component", "component")
+			result[i].SetProp("framework", fw)
 			if isSetup {
-				result[i].Props["vue_setup"] = true
+				result[i].SetProp("vue_setup", true)
 			}
 			found = true
 			break
@@ -507,7 +515,7 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: dir}},
 		}
 		if isSetup {
-			compFact.Props["vue_setup"] = true
+			compFact.SetProp("vue_setup", true)
 		}
 		result = append(result, compFact)
 	}
@@ -521,9 +529,9 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 			if result[i].Kind != facts.KindSymbol || result[i].Name != factName {
 				continue
 			}
-			result[i].Props["vue_macros"] = macros
+			result[i].SetProp("vue_macros", macros)
 			for _, macro := range macros {
-				result[i].Props["vue_"+strings.TrimPrefix(strings.ToLower(macro), "define")] = true
+				result[i].SetProp("vue_"+strings.TrimPrefix(strings.ToLower(macro), "define"), true)
 			}
 			for contract, names := range macroContracts {
 				var ordered []string
@@ -531,7 +539,7 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 					ordered = append(ordered, name)
 				}
 				sort.Strings(ordered)
-				result[i].Props[contract] = ordered
+				result[i].SetProp(contract, ordered)
 			}
 			if len(macroTypes) > 0 {
 				declared := make([]string, 0, len(macroTypes))
@@ -539,7 +547,7 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 					declared = append(declared, contract+"="+typeText)
 				}
 				sort.Strings(declared)
-				result[i].Props["vue_contract_types"] = declared
+				result[i].SetProp("vue_contract_types", declared)
 			}
 			break
 		}
@@ -577,7 +585,7 @@ func (e *TSExtractor) extractVueSFC(kinds *tsutil.KindTable, rawSrc []byte, relF
 
 // extractVueScriptBlock parses a single <script> block from a Vue SFC and
 // returns the extracted facts with line numbers adjusted to the original file.
-func (e *TSExtractor) extractVueScriptBlock(kinds *tsutil.KindTable, block *vueScriptBlock, relFile string, isNuxt bool, aliases map[string]tsAlias) ([]facts.Fact, emberImportBindings, []string, map[string][]string, map[string]string) {
+func (e *TSExtractor) extractVueScriptBlock(kinds *tsutil.KindTable, block *vueScriptBlock, relFile string, isNuxt bool, aliases map[string]tsAlias, files *tsFileIndex) ([]facts.Fact, emberImportBindings, []string, map[string][]string, map[string]string) {
 	isTSX := block.Lang == "tsx"
 	lang := typescript.LanguageTypescript()
 	if isTSX {
@@ -605,7 +613,7 @@ func (e *TSExtractor) extractVueScriptBlock(kinds *tsutil.KindTable, block *vueS
 	declaredTypes := vueMacroDeclaredTypes(kinds, calls, block.Content)
 
 	var result []facts.Fact
-	result = append(result, e.extractImports(kinds, root, block.Content, relFile, aliases)...)
+	result = append(result, e.extractImports(kinds, root, block.Content, relFile, aliases, false)...)
 	// Vue/Nuxt script blocks are parsed independently from ordinary .ts files,
 	// so run the shared GraphQL tag extractor over their AST as well. This covers
 	// Nuxt Apollo composables such as useAsyncQuery(gql`...`) and useMutation,
@@ -614,15 +622,16 @@ func (e *TSExtractor) extractVueScriptBlock(kinds *tsutil.KindTable, block *vueS
 		result = append(result, extractGraphQLTagFactsAST(block.Content, relFile, kinds, isTSX, root)...)
 	}
 
+	importMap, internalImports := buildImportBindings(kinds, root, block.Content, relFile, aliases, files)
 	ctx := &extractCtx{
-		src:       block.Content,
-		relFile:   relFile,
-		dir:       factpath.Dir(relFile),
-		isTSX:     isTSX,
-		isVue:     true,
-		isNuxt:    isNuxt,
-		importMap: buildImportSymbols(kinds, root, block.Content, relFile, aliases),
-		imports:   buildEmberImportBindings(kinds, root, block.Content, relFile, aliases),
+		src:          block.Content,
+		relFile:      relFile,
+		dir:          factpath.Dir(relFile),
+		isTSX:        isTSX,
+		tsFrameworks: tsFrameworks{isVue: true, isNuxt: isNuxt},
+		importMap:    importMap,
+		memberRoots:  memberCallRoots(kinds, root, block.Content, factpath.Dir(relFile), internalImports),
+		imports:      buildEmberImportBindings(kinds, root, block.Content, relFile, aliases),
 	}
 	decls := e.extractDeclarations(kinds, root, ctx)
 
@@ -633,7 +642,7 @@ func (e *TSExtractor) extractVueScriptBlock(kinds *tsutil.KindTable, block *vueS
 			}
 			local := decls[i].Name[strings.LastIndexByte(decls[i].Name, '.')+1:]
 			if exported[local] {
-				decls[i].Props["exported"] = true
+				decls[i].SetProp("exported", true)
 			}
 		}
 	}

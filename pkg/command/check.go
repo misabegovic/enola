@@ -6,21 +6,20 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/enola-labs/enola/internal/config"
-	"github.com/enola-labs/enola/internal/conformance"
-	"github.com/enola-labs/enola/internal/diff"
 	"github.com/enola-labs/enola/internal/engine"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/workspace"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
 	"github.com/enola-labs/enola/pkg/cli"
-	pkghistory "github.com/enola-labs/enola/pkg/history"
+	"github.com/enola-labs/enola/pkg/grade"
+	"github.com/enola-labs/enola/pkg/status"
 )
 
 // target is the repository the gate operates on, plus how it was resolved — reported to
@@ -82,6 +81,16 @@ func (r *Runner) resolveTarget(arg string) target {
 		note = "config " + cfg.SourcePath
 	}
 	if repoOverride != "" {
+		// A directory whose own config lists a cluster is still read alone, so its
+		// pin is the directory's, not the cluster's; say which, or a caller asking
+		// for the cluster's verdict reads a decline against a pin it never meant.
+		if n := othersListed(cfg, repoOverride); n > 0 {
+			listed := "other listed repositories are"
+			if n == 1 {
+				listed = "other listed repository is"
+			}
+			note += fmt.Sprintf(", whose %d %s not read; name the config itself to read the cluster", n, listed)
+		}
 		note = "repo " + repoOverride + " (" + note + ")"
 	}
 	if repoOverride != "" {
@@ -94,7 +103,34 @@ func (r *Runner) resolveTarget(arg string) target {
 	if err != nil {
 		r.checkFatal("failed to resolve repo path: %v", err)
 	}
+	// A folder of several git repositories resolves to one repository here, as it does
+	// everywhere. Say so on stderr, which leaves --json output a clean document.
+	if len(cfg.Repos) == 0 && len(repoPaths) == 1 {
+		if folded := workspace.Folded(repoPaths[0], cfg.SourcePath); len(folded) > 0 {
+			fmt.Fprint(os.Stderr, workspace.FoldWarning(r.name(), repoPaths[0], folded))
+		}
+	}
 	return target{engine: eng, repoPaths: repoPaths, configNote: note, cfgPath: cfgPath, historyDir: cfg.History.Dir}
+}
+
+// othersListed counts the repositories cfg lists besides dir, the ones a
+// directory argument leaves unread. A config it cannot resolve counts none:
+// the note is a courtesy, and the resolution that matters fails later, named.
+func othersListed(cfg *config.Config, dir string) int {
+	if len(cfg.Repos) == 0 {
+		return 0
+	}
+	paths, err := cfg.RepoPaths()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, p := range paths {
+		if filepath.Clean(p) != filepath.Clean(dir) {
+			n++
+		}
+	}
+	return n
 }
 
 // parseFailOn splits a --fail-on spec into the explainer names that exist and the ones
@@ -110,21 +146,10 @@ func (r *Runner) resolveTarget(arg string) target {
 // what fails. A spec mixing good and bad names reports the bad ones rather than quietly
 // enforcing the good half — half a policy is the same defect wearing a smaller number.
 func parseFailOn(spec string) (named, unknown []string) {
-	for _, raw := range strings.Split(spec, ",") {
-		n := strings.TrimSpace(raw)
-		if n == "" {
-			continue
-		}
-		if slices.Contains(config.KnownExplainers, n) {
-			named = append(named, n)
-			continue
-		}
-		unknown = append(unknown, n)
-	}
-	return named, unknown
+	return grade.ParseFailOn([]string{spec})
 }
 
-// runCheck is the `enola check` gate: snapshot the repo, diff it against a baseline,
+// Check is the `enola check` gate: snapshot the repo, diff it against a baseline,
 // grade the delta, and exit with a code CI can act on.
 //
 // It never returns — it exits with the verdict's code. Exit codes are the contract:
@@ -166,6 +191,7 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 			"  2  error      the gate could not run (no baseline, bad flag, inverted pair)\n"+
 			"  3  declined   the baseline is not comparable; refusing to grade\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "check")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(check.StatusUsageError.ExitCode())
@@ -227,141 +253,97 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 	// The baseline is anchored on the FIRST repo: that is the one whose snapshot reset
 	// the graph, and it is where `enola baseline pin` writes.
 	anchor := repoPaths[0]
-	// gradeRepo is the member the comparison speaks for. Without -member it is the
-	// anchor, which is the behaviour this command always had.
-	gradeRepo := anchor
-	var base *facts.Snapshot
+	output := check.Output{
+		Format: outFormat,
+		Host:   outHost,
+		Link:   *link,
+		// A SARIF document is uploaded and attributed, so it names the
+		// binary that actually graded the change. See check.Tool.
+		Tool: check.Tool{Name: r.name(), Version: r.buildVersion()},
+	}
 
+	// Run by an agent, the grade belongs to that agent's session, so a baseline
+	// another running session pinned is named as such; from a terminal, to none.
+	agent := status.AgentPID()
+	var (
+		text      string
+		reused    string
+		providers string
+		status    check.Status
+	)
 	if *member != "" {
 		if *write {
 			r.checkFatal("-member is read-only by design: artifacts are written by a generate, never by a member grade")
 		}
-		base, gradeRepo = r.replayMemberBaseline(ctx, eng, anchor, *member, *baseline)
+		// A member grade replays the pin with the member re-read into it, which no
+		// tool call does, so it grades here, with the same code the grade tool
+		// runs.
+		base, gradeRepo := r.replayMemberBaseline(ctx, eng, anchor, *member, *baseline)
+		res, err := grade.Compute(eng, grade.Request{
+			Anchor: anchor, GradeRepo: gradeRepo, RepoPaths: repoPaths, Baseline: *baseline, Base: base,
+			Policy: policy, Focus: *focus, Target: *target, Expected: splitList(*expected),
+			Reviewers: *reviewers, ReviewerWindow: *reviewWindow, Author: *author, HistoryDir: tgt.historyDir,
+			OtherSession: otherSessionBefore(engine.ResolveBaselineDir(eng.OutputDir(anchor), *baseline), *baseline, agent),
+		}, time.Now())
+		if err != nil {
+			r.checkFatal("%v", err)
+		}
+		if text, err = grade.Render(res, output, *detail); err != nil {
+			r.checkFatal("%v", err)
+		}
+		status = res.Verdict.Status
+		var summary strings.Builder
+		eng.WriteProviderSummary(&summary, repoPaths)
+		providers = summary.String()
 	} else {
-		// Read-only unless --write. Skipping WriteArtifacts is what makes it read-only:
-		// that is where the snapshot is persisted AND where the previous/ rotation happens,
-		// so a bare `enola check` leaves both the pinned baseline and previous/ untouched
-		// and can be run repeatedly against the same baseline. SetPersistCache(false)
-		// additionally keeps the extractor cache off disk, matching --explain.
-		if !*write {
-			eng.SetPersistCache(false)
-		}
-		for i, repoPath := range repoPaths {
-			if _, err := eng.GenerateSnapshot(ctx, repoPath, i > 0); err != nil {
-				r.checkFatal("snapshot generation failed for %s: %v", repoPath, err)
-			}
-		}
 		if *write {
-			for _, repoPath := range repoPaths {
-				if err := eng.WriteArtifacts(repoPath); err != nil {
-					r.checkFatal("failed to write artifacts for %s: %v", repoPath, err)
-				}
+			if err := r.currentSnapshot(ctx, eng, repoPaths, engine.ResolveBaselineDir(eng.OutputDir(anchor), *baseline), true); err != nil {
+				r.checkFatal("%v", err)
 			}
 		}
-	}
-
-	snap := eng.Snapshot()
-	if snap == nil || eng.Store().Count() == 0 {
-		r.checkFatal("snapshot produced no facts for %s", strings.Join(repoPaths, ", "))
-	}
-	// Build current from the store so it reflects the whole (possibly multi-repo) graph
-	// rather than only the last repo indexed — the same construction diff_snapshot uses,
-	// FactsRef included: diff.Compute reads its inputs and the published bundle is
-	// immutable, so copying the fact set here would buy nothing. The meta is the
-	// gradeRepo's: the pin carries that member's provenance, so the current side is
-	// read for the same member.
-	current := &facts.Snapshot{Meta: eng.MetaFor(gradeRepo), Facts: eng.Store().FactsRef(), Insights: snap.Insights}
-	if base == nil {
-		baseDir := engine.ResolveBaselineDir(eng.OutputDir(anchor), *baseline)
-		var err error
-		base, err = bootstrap.LoadSnapshotDir(baseDir)
+		// The grade tool answers what check prints, over this engine: it grades
+		// what --write just published, or reads the snapshot on disk when it is
+		// the one a regenerate would produce, or regenerates in memory.
+		args := map[string]any{
+			"repo":            anchor,
+			"baseline":        *baseline,
+			"fail_on":         policy.FailExplainers,
+			"min_confidence":  *minConfidence,
+			"warn_only":       *warnOnly,
+			"focus":           *focus,
+			"target":          *target,
+			"expected":        splitList(*expected),
+			"reviewers":       *reviewers,
+			"reviewer_window": *reviewWindow,
+			"author":          *author,
+			"format":          string(outFormat),
+			"host":            string(outHost),
+			"link":            *link,
+			"detail":          *detail,
+			"max_tokens":      -1,
+		}
+		if *maxSpillover >= 0 {
+			args["max_spillover"] = *maxSpillover
+		}
+		eng.SetSessionClient(agent)
+		res, err := r.callToolResult(ctx, eng, eng.Config(), "grade", args)
 		if err != nil {
-			r.checkFatal("%s", r.baselineHelp(*baseline, baseDir, anchor, err))
+			r.checkFatal("%v", err)
 		}
-	}
-
-	// The committed suppression ledger joins the policy before grading. A ledger
-	// that cannot be parsed is an operational failure, never a silent skip: half
-	// a ledger would silence findings nobody signed off, or fail ones somebody did.
-	suppressions, err := check.LoadSuppressions(gradeRepo)
-	if err != nil {
-		r.checkFatal("%v", err)
-	}
-	policy.Suppressions = suppressions
-
-	d := diff.ComputeChanged(base, current, changedFilesBetween(gradeRepo, base.Meta.Git, current.Meta.Git))
-	if *focus != "" {
-		d = d.Focused(*focus)
-	}
-
-	// Conformance: did the change stay inside what the caller declared? Computed only
-	// when something WAS declared — a gate that graded scope nobody stated would be
-	// grading its own guess.
-	var measurements []check.Measurement
-	var conf *conformance.Report
-	if *target != "" || *expected != "" {
-		baseStore := facts.NewStore()
-		baseStore.Add(base.Facts...)
-		rep := conformance.Compute(baseStore, eng.Store(), d, conformance.Options{
-			Target:           *target,
-			ExpectedPackages: splitList(*expected),
-		})
-		conf = &rep
-		// Reported as a MEASUREMENT, not graded here. Whether spillover fails a build is
-		// policy, and policy lives in one place — otherwise this gate and any other
-		// surface computing the same number would come to disagree about it.
-		measurements = append(measurements, check.Measurement{
-			Name:  "spillover_packages",
-			Label: "package(s) reached outside the declared scope",
-			Count: len(rep.Spillover),
-		})
-	}
-
-	// EvaluateCurrent, not Evaluate: strict-mode constraint violations grade
-	// against the CURRENT snapshot, baselined or not — the one deliberate
-	// exception to delta scoping.
-	verdict := check.EvaluateCurrent(d, policy, current.Insights, measurements...)
-	blame := check.NewBlameReader(gradeRepo, eng.OutputDir(gradeRepo))
-	verdict = check.ApplyTime(verdict, base, r.revisionAt(gradeRepo, tgt.historyDir), blame.Age)
-	if err := blame.Save(); err != nil {
-		fmt.Fprintf(os.Stderr, "enola: blame cache not written: %v\n", err)
-	}
-	verdict = check.RegradeIntersection(verdict, base, current, policy,
-		check.OwnershipFromExtractors(eng.Extractors()), current.Insights, *focus, measurements...)
-	verdict = check.AttachGuidance(verdict, eng.Store())
-	// Opt-in, and gated here rather than inside AttachReviewers, so that without the
-	// flag no git author name is read, computed, or printed at all.
-	if *reviewers {
-		verdict = check.AttachReviewers(verdict, eng.Store(),
-			check.ReadAuthorship(gradeRepo, *reviewWindow, eng.Store()),
-			check.Actor(gradeRepo, *author))
-	}
-	verdict = check.AttachCensus(verdict, current.Meta, policy, current.Insights)
-	verdict = check.AttachLedger(verdict, eng.Store(), policy, current.Insights, time.Now())
-
-	switch outFormat {
-	case check.FormatText:
-		if conf != nil {
-			fmt.Print(conf.Render())
+		if res.IsError {
+			r.checkFatal("%s", resultText(res))
 		}
-		fmt.Print(verdict.Render())
-		if *detail {
-			fmt.Printf("\n%s\n", verdict.Detail())
-		}
-	default:
-		out, err := verdict.Write(check.Output{
-			Format: outFormat,
-			Host:   outHost,
-			Link:   *link,
-			// A SARIF document is uploaded and attributed, so it names the
-			// binary that actually graded the change. See check.Tool.
-			Tool: check.Tool{Name: r.name(), Version: r.buildVersion()},
-		})
-		if err != nil {
-			r.checkFatal("failed to encode verdict: %v", err)
-		}
-		fmt.Println(strings.TrimRight(string(out), "\n"))
+		text = resultText(res)
+		reused = resultMeta(res, "reused")
+		providers = resultMeta(res, "providers")
+		name, _ := resultField(res, "status").(string)
+		status = check.Status(name)
 	}
+
+	if reused != "" {
+		fmt.Fprintf(os.Stderr, r.name()+" check: %s\n", reused)
+	}
+	fmt.Print(text)
 	// After the verdict and on STDERR, in both output modes. Stderr because `--json`
 	// promises stdout is a verdict document and nothing else, and after because a
 	// housekeeping note must never be the first thing read when the gate just failed.
@@ -372,7 +354,46 @@ func (r *Runner) Check(ctx context.Context, args []string) {
 		fmt.Fprint(os.Stderr, cli.DashboardHint(r.name(), arg))
 	}
 	r.updateNotice(os.Stderr)
-	os.Exit(verdict.ExitCode())
+	fmt.Fprint(os.Stderr, providers)
+	os.Exit(status.ExitCode())
+}
+
+// currentSnapshot publishes the current side of the comparison in eng, for the
+// baseline at baseDir.
+//
+// Read-only unless write. Skipping WriteArtifacts is what makes it read-only:
+// that is where the snapshot is persisted AND where the previous/ rotation happens,
+// so a bare `enola check` leaves both the pinned baseline and previous/ untouched
+// and can be run repeatedly against the same baseline. SetPersistCache(false)
+// additionally keeps the extractor cache off disk, matching --explain.
+//
+// A read-only check grades the snapshot on disk when it is the one a regenerate
+// would produce (snapshotServesCheck), which reads and writes nothing more. With
+// write it always regenerates: persisting a new snapshot and rotating the old one
+// into previous/ is what --write asks for.
+func (r *Runner) currentSnapshot(ctx context.Context, eng *bootstrap.Engine, repoPaths []string, baseDir string, write bool) error {
+	if !write {
+		members, stale := grade.ServesCheck(eng, repoPaths, baseDir, time.Now())
+		reused, err := grade.Publish(ctx, eng, repoPaths, members, stale)
+		if reused {
+			fmt.Fprintf(os.Stderr, r.name()+" check: %s\n", grade.ReuseNote(eng, members))
+		}
+		return err
+	}
+	for i, repoPath := range repoPaths {
+		// Only the last turn's union is written; an earlier turn's facts would be
+		// staged for a write that never takes them.
+		eng.SetWritesArtifacts(i == len(repoPaths)-1)
+		if _, err := eng.GenerateSnapshot(ctx, repoPath, i > 0); err != nil {
+			return fmt.Errorf("snapshot generation failed for %s: %v", repoPath, err)
+		}
+	}
+	for _, repoPath := range repoPaths {
+		if err := eng.WriteArtifacts(repoPath); err != nil {
+			return fmt.Errorf("failed to write artifacts for %s: %v", repoPath, err)
+		}
+	}
+	return nil
 }
 
 // splitList parses a comma-separated flag into a trimmed, non-empty list.
@@ -392,23 +413,7 @@ func splitList(v string) []string {
 // repoHint is the repository the caller named, echoed back into the suggested commands so
 // they can be pasted as-is rather than adapted.
 func (r *Runner) baselineHelp(selector, dir, repoHint string, err error) string {
-	switch strings.ToLower(strings.TrimSpace(selector)) {
-	case "", "pinned":
-		return fmt.Sprintf("no pinned baseline at %s\n\n"+
-			"The gate needs a \"before\" to compare against, pinned BEFORE you edit:\n"+
-			"    "+r.name()+" baseline pin %s\n"+
-			"    …make your change…\n"+
-			"    "+r.name()+" check %s\n\n"+
-			"Or compare against the immediately-preceding snapshot with --baseline=previous.",
-			dir, repoHint, repoHint)
-	case "previous":
-		return fmt.Sprintf("no previous snapshot at %s — that requires at least two snapshots "+
-			"written with `"+r.name()+" --generate` (note `"+r.name()+" check` is read-only by default and does "+
-			"not rotate it).\n\nFor a stable baseline across several rounds of edits, prefer:\n"+
-			"    "+r.name()+" baseline pin %s", dir, repoHint)
-	default:
-		return fmt.Sprintf("could not load baseline from %q: %v", dir, err)
-	}
+	return grade.BaselineHelp(r.name(), selector, dir, repoHint, err)
 }
 
 // checkFatal reports an operational failure and exits 2 — distinct from a regression,
@@ -535,12 +540,13 @@ func (r *Runner) Baseline(args []string) {
 			"  pin    freeze the current .enola snapshot as the diff baseline\n"+
 			"  show   report whether a baseline exists, and what it describes\n"+
 			"  clear  remove the pinned baseline\n")
+		r.writeHelpFooter(os.Stderr, args, "baseline")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(check.StatusUsageError.ExitCode())
 	}
 	rest := fs.Args()
-	if len(rest) == 0 {
+	if len(rest) == 0 || HelpRequested(rest) {
 		fs.Usage()
 		os.Exit(check.StatusUsageError.ExitCode())
 	}
@@ -567,6 +573,10 @@ func (r *Runner) Baseline(args []string) {
 		// as "the state before my change", so the reuse below is gated on the on-disk
 		// snapshot proving it describes today's tree under today's build and config.
 		fmt.Fprintf(os.Stderr, r.name()+" baseline: %s\n", tgt.configNote)
+		// Run by an agent, the pin belongs to that agent's session; from a terminal, to none.
+		agent := status.AgentPID()
+		eng.SetSessionClient(agent)
+		replaced := otherSessionPin(baseDir, agent)
 		// A snapshot that already describes every working tree under this build and
 		// config is the snapshot a regenerate would produce, byte for byte, so it is
 		// pinned as it stands. Anything less (a moved file, another extractor version,
@@ -576,6 +586,7 @@ func (r *Runner) Baseline(args []string) {
 			fmt.Fprintf(os.Stderr, r.name()+" baseline: the snapshot written %s matches every working tree under this build and config; pinned without regenerating\n", generatedAt)
 		} else {
 			fmt.Fprintf(os.Stderr, r.name()+" baseline: regenerating, %s\n", stale)
+			eng.SetWritesArtifacts(true)
 			for i, repoPath := range tgt.repoPaths {
 				eng.SetDeferLinking(i < len(tgt.repoPaths)-1)
 				if _, err := eng.GenerateSnapshot(context.Background(), repoPath, i > 0); err != nil {
@@ -592,10 +603,15 @@ func (r *Runner) Baseline(args []string) {
 			r.checkFatal("could not pin baseline: %v", err)
 		}
 		fmt.Printf("Baseline pinned for %s\n", anchor)
+		if replaced != nil {
+			fmt.Fprintf(os.Stderr, r.name()+" baseline: this replaced a baseline another running agent session pinned at %s; "+
+				"that session's diffs and its end-of-session grade now compare against this one\n", replaced.At)
+		}
 		if snap, err := bootstrap.LoadSnapshotDir(baseDir); err == nil {
 			describeBaseline(snap)
 		}
 		fmt.Printf("\nNow make your changes, then run:\n    %s check %s\n", r.name(), anchor)
+		eng.WriteProviderSummary(os.Stderr, tgt.repoPaths)
 	case "show":
 		snap, err := bootstrap.LoadSnapshotDir(baseDir)
 		if err != nil {
@@ -651,71 +667,4 @@ func shortCommit(s string) string {
 		return s[:12]
 	}
 	return orUnknown(s)
-}
-
-// revisionAt reads the architecture history for a dated rule: the newest
-// revision at or before the date, reconstructed from its blob, and the first
-// revision's date for a rule that predates the record.
-func (r *Runner) revisionAt(repoPath, historyDir string) check.RevisionAt {
-	return func(date time.Time) (*facts.Snapshot, string, string, bool) {
-		root, err := pkghistory.Root(repoPath, historyDir)
-		if err != nil {
-			return nil, "", "", false
-		}
-		entries, err := pkghistory.Read(root)
-		if err != nil || len(entries) == 0 {
-			return nil, "", "", false
-		}
-		first := ""
-		var chosen *pkghistory.Entry
-		for i := range entries {
-			e := entries[i]
-			at, err := time.Parse(time.RFC3339, e.At)
-			if err != nil || e.Blob == nil {
-				continue
-			}
-			if first == "" || at.Format("2006-01-02") < first {
-				first = at.Format("2006-01-02")
-			}
-			if !at.After(date.Add(24*time.Hour-time.Nanosecond)) && (chosen == nil || e.At > chosen.At) {
-				chosen = &entries[i]
-			}
-		}
-		if chosen == nil {
-			return nil, "", first, false
-		}
-		snap, err := pkghistory.Load(root, *chosen)
-		if err != nil {
-			return nil, "", first, false
-		}
-		return snap, chosen.At[:10], first, true
-	}
-}
-
-// changedFilesBetween asks git which files the change touched between the
-// two snapshots' commits, plus the working tree's own changes when the
-// current snapshot was taken dirty. Nil when either side has no commit or
-// git cannot answer, which hands the diff its fact-based fallback.
-func changedFilesBetween(repoPath string, base, current *facts.GitInfo) []string {
-	if base == nil || current == nil || base.Commit == "" || current.Commit == "" {
-		return nil
-	}
-	args := []string{"-C", repoPath, "diff", "--name-only", base.Commit, current.Commit}
-	out, err := exec.Command("git", args...).Output()
-	if err != nil {
-		return nil
-	}
-	files := strings.Fields(string(out))
-	if current.Dirty {
-		if dirty, err := exec.Command("git", "-C", repoPath, "diff", "--name-only", "HEAD").Output(); err == nil {
-			files = append(files, strings.Fields(string(dirty))...)
-		}
-		if untracked, err := exec.Command("git", "-C", repoPath, "ls-files", "--others", "--exclude-standard").Output(); err == nil {
-			files = append(files, strings.Fields(string(untracked))...)
-		}
-	}
-	if files == nil {
-		files = []string{}
-	}
-	return files
 }

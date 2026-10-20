@@ -358,6 +358,52 @@ func TestAutoLoadSnapshot_IgnoresForeignGlobalReceipt(t *testing.T) {
 	}
 }
 
+// TestAutoLoadSnapshot_RestoresThisSessionsGraph: several agent sessions started in
+// one directory share a workspace, and so its receipt. A restart must bring back the
+// graph THIS session held, not whichever session snapshotted last; only a session with
+// no graph of its own falls back to the workspace receipt.
+func TestAutoLoadSnapshot_RestoresThisSessionsGraph(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	workspace := t.TempDir()
+	const sessionOne, sessionTwo, newSession = 424201, 424202, 424203
+
+	snapshotIn := func(client int, repo string) int {
+		t.Helper()
+		eng, _ := engineFor(t, workspace)
+		eng.SetSessionClient(client)
+		snap, err := eng.GenerateSnapshot(context.Background(), repo, false)
+		if err != nil {
+			t.Fatalf("GenerateSnapshot(%s): %v", repo, err)
+		}
+		if err := eng.WriteArtifacts(repo); err != nil {
+			t.Fatalf("WriteArtifacts(%s): %v", repo, err)
+		}
+		if err := eng.WriteGlobalReceipt(); err != nil {
+			t.Fatalf("WriteGlobalReceipt(%s): %v", repo, err)
+		}
+		return snap.Meta.FactCount
+	}
+	mine := snapshotIn(sessionOne, writeGoRepo(t))
+	theirs := snapshotIn(sessionTwo, writeBiggerGoRepo(t))
+	if mine == theirs {
+		t.Fatalf("test setup: both graphs have %d facts, so the restore cannot be told apart", mine)
+	}
+
+	restarted, cfg := engineFor(t, workspace)
+	restarted.SetSessionClient(sessionOne)
+	bootstrap.AutoLoadSnapshot(restarted, cfg)
+	if got := restarted.Store().Count(); got != mine {
+		t.Errorf("session one restarted onto %d facts, want its own %d; %d is the sibling session's graph", got, mine, theirs)
+	}
+
+	fresh, cfg := engineFor(t, workspace)
+	fresh.SetSessionClient(newSession)
+	bootstrap.AutoLoadSnapshot(fresh, cfg)
+	if got := fresh.Store().Count(); got != theirs {
+		t.Errorf("a session with no graph of its own restored %d facts, want the workspace's latest %d", got, theirs)
+	}
+}
+
 func TestLoadDashboardSnapshotKeepsOrdinaryRepoScope(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	repo := writeGoRepo(t)
@@ -393,7 +439,7 @@ func TestLoadDashboardSnapshotKeepsOrdinaryRepoScope(t *testing.T) {
 }
 
 // TestNewServer exercises the public server constructor and its accessors,
-// which enterprise code relies on to register license-gated tools before Run.
+// which the end-to-end tests rely on to register an extra tool before Run.
 func TestNewServer(t *testing.T) {
 	eng, cfg, err := bootstrap.NewEngine(bootstrap.Options{
 		ConfigPath: filepath.Join(t.TempDir(), "no-such-config.yaml"),
@@ -406,7 +452,7 @@ func TestNewServer(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	if srv.MCP() == nil {
-		t.Error("MCP() returned nil; enterprise code needs it to register extra tools")
+		t.Error("MCP() returned nil; the end-to-end tests need it to connect a transport")
 	}
 }
 
@@ -417,4 +463,43 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// TestAutoLoadSnapshot_SkipsAFolderOfRepositories: a snapshot of a folder of
+// repositories taken as ONE repository is what the session hooks once left in a user's
+// development folder: every repository they had, 9M facts in a 6 GB facts.jsonl. The
+// server loaded it at startup, before it read stdin, so it grew to tens of GB and a
+// quit did not end it. A folder's graph restores through its workspace receipt; its
+// own .enola is never loaded as one repository.
+func TestAutoLoadSnapshot_SkipsAFolderOfRepositories(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	eng, cfg, err := bootstrap.NewEngine(bootstrap.Options{
+		ConfigPath: filepath.Join(t.TempDir(), "no-such-config.yaml"),
+	})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	folder := t.TempDir()
+	for _, repo := range []string{"alpha", "beta"} {
+		if err := os.MkdirAll(filepath.Join(folder, repo, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enolaDir := filepath.Join(folder, cfg.Output.Dir)
+	if err := os.MkdirAll(enolaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := facts.NewStore()
+	store.Add(facts.Fact{Kind: facts.KindModule, Name: "alpha", File: "alpha"})
+	if err := store.WriteJSONLFile(filepath.Join(enolaDir, "facts.jsonl")); err != nil {
+		t.Fatalf("WriteJSONLFile: %v", err)
+	}
+
+	cfg.Repo = folder
+	bootstrap.AutoLoadSnapshot(eng, cfg)
+	if n := eng.Store().Count(); n != 0 {
+		t.Errorf("restored %d facts from a folder of repositories' own .enola, want none", n)
+	}
 }

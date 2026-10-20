@@ -33,6 +33,10 @@ const (
 
 func detectReactNavigation(repoPath string) bool {
 	tsRoot, _ := findTSRoot(repoPath)
+	return detectReactNavigationRoot(repoPath, tsRoot)
+}
+
+func detectReactNavigationRoot(repoPath, tsRoot string) bool {
 	if hasPkgDependency(tsRoot, "@react-navigation/native") ||
 		(tsRoot != repoPath && hasPkgDependency(repoPath, "@react-navigation/native")) {
 		return true
@@ -191,7 +195,7 @@ func attachReactNavLinks(kinds *tsutil.KindTable, result []facts.Fact, root *sit
 		sort.Strings(links)
 		for i := range result {
 			if result[i].Kind == facts.KindSymbol && result[i].Name == factName {
-				result[i].Props[NavRouteLinksProp] = links
+				result[i].SetProp(NavRouteLinksProp, links)
 				break
 			}
 		}

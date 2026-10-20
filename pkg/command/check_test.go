@@ -74,6 +74,44 @@ func TestResolveTarget_PicksUpConfigInsideTheRepo(t *testing.T) {
 	}
 }
 
+// A directory whose own config lists a cluster is graded alone, against the
+// directory's own pin. A CI step that named a cluster's root this way, meaning
+// the cluster, was answered against a stale single-repository pin and could not
+// tell; the note names the repositories that were set aside and how to grade
+// them.
+func TestResolveTarget_DirectoryWithAClusterConfigSaysTheClusterIsNotRead(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "hub")
+	for _, dir := range []string{repo, filepath.Join(root, "svc")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inner := filepath.Join(repo, "mcp-arch.yaml")
+	if err := os.WriteFile(inner, []byte("repos:\n  - ../svc\n  - .\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := chdir(t, t.TempDir())
+	defer restore()
+
+	tgt := testRunner().resolveTarget(repo)
+
+	if len(tgt.repoPaths) != 1 {
+		t.Fatalf("repoPaths = %v, want the directory alone", tgt.repoPaths)
+	}
+	if !strings.Contains(tgt.configNote, "1 other listed repository is not read") || !strings.Contains(tgt.configNote, "name the config itself") {
+		t.Errorf("configNote = %q, want it to say the 1 other listed repository is not read and how to read them", tgt.configNote)
+	}
+
+	plain := t.TempDir()
+	if err := os.WriteFile(filepath.Join(plain, "mcp-arch.yaml"), []byte("ignore:\n  - \"vendor/**\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if note := testRunner().resolveTarget(plain).configNote; strings.Contains(note, "not read") {
+		t.Errorf("configNote = %q names a cluster a config without repos never declared", note)
+	}
+}
+
 // TestResolveTarget_FileArgumentIsAConfig — the other half of the disambiguation: a file
 // is a config, so `enola check cluster.yaml` still works.
 func TestResolveTarget_FileArgumentIsAConfig(t *testing.T) {

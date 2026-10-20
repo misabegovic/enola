@@ -176,22 +176,6 @@ func nearestModule(dir string, prod, test map[string]bool) string {
 	return dir
 }
 
-// IsExternalImport reports whether an import target points outside the repo
-// (Go stdlib, third-party, or an npm package) rather than at an internal module.
-func IsExternalImport(path string) bool {
-	// Go external imports contain dots (fmt, net/http, github.com/...).
-	// TS external imports don't start with . or / and aren't relative.
-	if strings.HasPrefix(path, ".") || strings.HasPrefix(path, "/") {
-		return false
-	}
-	// Go standard library or third-party.
-	if strings.Contains(path, ".") || !strings.Contains(path, "/") {
-		// Likely a Go stdlib or npm package (e.g., "fmt", "react", "@types/node").
-		return true
-	}
-	return false
-}
-
 // ResolveRelativeImport resolves a "./x" or "../x" import target against the
 // source module's path, yielding an absolute (repo-relative) module path.
 func ResolveRelativeImport(sourceModule, target string) string {
@@ -257,7 +241,7 @@ func BuildModuleGraph(store *facts.Store) map[string][]string {
 // and 2 of the 10 cycles ran through them: an explainer whose entire output was test
 // scaffolding. Where the prop is absent, fall back to the path.
 func IsTestModule(m facts.Fact) bool {
-	switch role, _ := m.Props[facts.PropModuleRole].(string); role {
+	switch role, _ := m.PropAny(facts.PropModuleRole).(string); role {
 	case facts.ModuleRoleTest:
 		return true
 	case facts.ModuleRoleProduction, facts.ModuleRoleTooling:
@@ -291,6 +275,7 @@ func BuildModuleGraphExcluding(store *facts.Store, excludeKinds ...string) map[s
 		}
 	}
 
+	imported := facts.NewImportTargets(func() []facts.Fact { return store.ByKind(facts.KindSymbol) })
 	deps := store.ByKind(facts.KindDependency)
 	for _, dep := range deps {
 		// Attribute the edge to the file's nearest ENCLOSING module, not its raw
@@ -316,7 +301,7 @@ func BuildModuleGraphExcluding(store *facts.Store, excludeKinds ...string) map[s
 			continue // edge out of a test bundle — not production architecture
 		}
 		if excluded != nil {
-			if ck, _ := dep.Props[facts.PropCouplingKind].(string); excluded[ck] {
+			if ck, _ := dep.PropAny(facts.PropCouplingKind).(string); excluded[ck] {
 				continue
 			}
 		}
@@ -327,7 +312,15 @@ func BuildModuleGraphExcluding(store *facts.Store, excludeKinds ...string) map[s
 			}
 			target := rel.Target
 
-			if strings.HasPrefix(target, ".") {
+			// A target naming a symbol, with the file it is declared in carried
+			// beside it, lands on that file's module; a symbol name walked up by
+			// "/" would land on the parent (facts.ImportTargets).
+			if dir, carried := imported.Dir(dep, target); carried {
+				if dir == "" {
+					continue
+				}
+				target = dir
+			} else if strings.HasPrefix(target, ".") {
 				target = ResolveRelativeImport(sourceModule, target)
 			}
 

@@ -3,28 +3,36 @@ package scalaextractor
 import (
 	"strings"
 
+	scala "github.com/enola-labs/enola/internal/extractors/scalaextractor/grammar"
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 )
 
-// extractFileAST parses one Scala file with tree-sitter and emits its declaration
-// symbols, import dependencies, and the type-reference edges visible from this file
-// alone. Edge targets are emitted as fully qualified names (resolved through the
-// file's own imports and package), which canonicalizeTargets rewrites to canonical
-// "<dir>.<Type>" fact names once every file has been merged.
-func extractFileAST(src []byte, relFile string, packageIndex map[string]string) []facts.Fact {
-	ff, _ := extractFileASTFull(src, relFile, packageIndex)
-	return ff
+// extractFileFacts runs BOTH Scala source passes over ONE parse of the file: the
+// declaration walk and the route/storage DSL walks. They used to parse the same
+// bytes twice, once each, which made Scala the corpus's allocation outlier at
+// 50 MiB per file against Java's 0.5 on the same parser infrastructure.
+func extractFileFacts(src []byte, relFile string, packageIndex map[string]string, scalatra bool) ([]facts.Fact, string) {
+	return withScalaTree(src, func(root *sitter.Node) ([]facts.Fact, string) {
+		handlers := pekkoHandlerBlocks(root, src, relFile)
+		routes, actions := scalatraRoutes(root, src, relFile, scalatra)
+		for k, v := range actions {
+			if handlers == nil {
+				handlers = map[handlerKey]string{}
+			}
+			handlers[k] = v
+		}
+		ff, pkg := walkFileAST(root, src, relFile, packageIndex, handlers)
+		ff = append(ff, routes...)
+		return append(ff, dslFactsFrom(root, src, relFile)...), pkg
+	})
 }
 
-// extractFileASTFull additionally returns the file's declared package, which
-// canonicalizeTargets needs to resolve a BARE type reference: only the file knows
-// which package a name like `Base` would be in, and only the merged fact set knows
-// whether such a type exists. Neither half can decide alone, so the walker records
-// the package rather than guessing with it (see resolveTypeName).
-func extractFileASTFull(src []byte, relFile string, packageIndex map[string]string) ([]facts.Fact, string) {
+// withScalaTree parses src once and hands the root to fn, closing the tree after.
+// A nil-returning parser setup yields the zero value, as every caller expects.
+func withScalaTree(src []byte, fn func(root *sitter.Node) ([]facts.Fact, string)) ([]facts.Fact, string) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(scala.Language())); err != nil {
@@ -32,16 +40,21 @@ func extractFileASTFull(src []byte, relFile string, packageIndex map[string]stri
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
+	return fn(tree.RootNode())
+}
 
+// walkFileAST is extractFileASTFull over a tree the caller already parsed.
+func walkFileAST(root *sitter.Node, src []byte, relFile string, packageIndex map[string]string, inlineHandlers map[handlerKey]string) ([]facts.Fact, string) {
 	w := &astWalker{
-		src:          src,
-		relFile:      relFile,
-		dir:          factpath.Dir(relFile),
-		packageIndex: packageIndex,
-		imports:      map[string]string{},
-		ownerStack:   []int{},
+		src:            src,
+		relFile:        relFile,
+		dir:            factpath.Dir(relFile),
+		packageIndex:   packageIndex,
+		imports:        map[string]string{},
+		ownerStack:     []int{},
+		inlineHandlers: inlineHandlers,
 	}
-	w.walk(tree.RootNode())
+	w.walk(root)
 	return w.out, w.pkg
 }
 
@@ -49,6 +62,10 @@ type astWalker struct {
 	src     []byte
 	relFile string
 	dir     string
+
+	// inlineHandlers are the file's inline route handlers (pekko blocks, Scalatra
+	// actions), each with the symbol name its route is bound to.
+	inlineHandlers map[handlerKey]string
 
 	packageIndex map[string]string
 
@@ -241,6 +258,10 @@ func (w *astWalker) walk(n *sitter.Node) {
 	if n == nil {
 		return
 	}
+	if name, ok := w.inlineHandlers[keyOf(n)]; ok {
+		w.handleInlineHandler(n, name)
+		return
+	}
 	switch kindOf(n) {
 	case "package_clause":
 		w.handlePackage(n)
@@ -310,6 +331,11 @@ func (w *astWalker) walk(n *sitter.Node) {
 	case "if_expression":
 		w.m.decisions++
 	case "case_clause":
+		// An http4s route is a clause of HttpRoutes.of, and its body is the handler.
+		if method := http4sRouteClause(n, w.src); method != "" {
+			w.handleInlineRoute(n, method)
+			return
+		}
 		// A match arm and a catch clause are the same node; both branch.
 		w.m.decisions++
 	case "guard":
@@ -967,10 +993,11 @@ func (w *astWalker) emitDependency(n *sitter.Node, fqn string, wildcard bool) {
 		props["wildcard"] = true
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindDependency,
-		Name:      w.dir + " -> " + fqn,
-		File:      w.relFile,
-		Line:      w.line(n),
+		Kind:    facts.KindDependency,
+		Name:    w.dir + " -> " + fqn,
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelImports, Target: fqn}},
 	})
@@ -992,6 +1019,9 @@ func (w *astWalker) handleTypeLike(n *sitter.Node, symbolKind string) {
 	}
 	if fqn := w.fqnFor(name); fqn != "" {
 		props["fqn"] = fqn
+	}
+	if doc := scalaDoc(n, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
 	}
 	// A Scala `object` is a singleton — a class at the bytecode level and a value
 	// at the source level. It keeps symbol_kind=class (no new vocabulary) and says
@@ -1042,10 +1072,11 @@ func (w *astWalker) handleTypeLike(n *sitter.Node, symbolKind string) {
 
 	idx := len(w.out)
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      w.qualify(name),
-		File:      w.relFile,
-		Line:      w.line(n),
+		Kind:    facts.KindSymbol,
+		Name:    w.qualify(name),
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
@@ -1061,6 +1092,33 @@ func (w *astWalker) handleTypeLike(n *sitter.Node, symbolKind string) {
 	popScope()
 	w.memberStack = w.memberStack[:len(w.memberStack)-1]
 	w.typeStack = w.typeStack[:len(w.typeStack)-1]
+}
+
+// handleInlineRoute gives an http4s route's case clause a symbol of its own, named
+// as the route walk names it.
+func (w *astWalker) handleInlineRoute(n *sitter.Node, method string) {
+	w.handleInlineHandler(n, inlineHandlerName(w.dir, w.typeStack, method, int(n.StartPosition().Row)+1))
+}
+
+// handleInlineHandler gives an inline route handler the symbol name and walks it
+// with that symbol as the owner of its calls.
+func (w *astWalker) handleInlineHandler(n *sitter.Node, name string) {
+	line := int(n.StartPosition().Row) + 1
+	w.out = append(w.out, facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: name,
+		File: w.relFile,
+		Line: line,
+		Props: map[string]any{
+			"symbol_kind":          facts.SymbolFunc,
+			"language":             "scala",
+			"framework_registered": true,
+		},
+		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
+	})
+	w.ownerStack = append(w.ownerStack, len(w.out)-1)
+	w.walkChildren(n)
+	w.ownerStack = w.ownerStack[:len(w.ownerStack)-1]
 }
 
 // walkBodyAndParams walks everything under a type declaration EXCEPT the name and
@@ -1135,10 +1193,11 @@ func (w *astWalker) emitEnumCase(n *sitter.Node, name string) int {
 	}
 	idx := len(w.out)
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.qualify(name),
-		File: w.relFile,
-		Line: w.line(n),
+		Kind:    facts.KindSymbol,
+		Name:    w.qualify(name),
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props: map[string]any{
 			"language":    "scala",
 			"symbol_kind": facts.SymbolConstant,
@@ -1147,6 +1206,9 @@ func (w *astWalker) emitEnumCase(n *sitter.Node, name string) int {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
+	if doc := scalaDoc(n, w.src); doc != "" {
+		facts.SetDoc(&w.out[idx], doc)
+	}
 	return idx
 }
 
@@ -1169,6 +1231,9 @@ func (w *astWalker) handleFunction(n *sitter.Node) {
 		props["receiver"] = w.typeStack[len(w.typeStack)-1]
 	}
 	props["symbol_kind"] = kind
+	if doc := scalaDoc(n, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if kindOf(n) == "function_declaration" {
 		// No body: an abstract member of a trait or abstract class.
 		props["abstract"] = true
@@ -1182,10 +1247,11 @@ func (w *astWalker) handleFunction(n *sitter.Node) {
 
 	idx := len(w.out)
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      w.qualify(name),
-		File:      w.relFile,
-		Line:      w.line(n),
+		Kind:    facts.KindSymbol,
+		Name:    w.qualify(name),
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
@@ -1233,6 +1299,9 @@ func (w *astWalker) handleValue(n *sitter.Node, symbolKind string) {
 		"symbol_kind": symbolKind,
 		"exported":    w.isExported(n),
 	}
+	if doc := scalaDoc(n, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if mods := w.modifierText(n); strings.Contains(mods, "implicit") {
 		props["implicit"] = true
 	}
@@ -1242,10 +1311,11 @@ func (w *astWalker) handleValue(n *sitter.Node, symbolKind string) {
 
 	idx := len(w.out)
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      w.qualify(name),
-		File:      w.relFile,
-		Line:      w.line(n),
+		Kind:    facts.KindSymbol,
+		Name:    w.qualify(name),
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
@@ -1267,14 +1337,18 @@ func (w *astWalker) handleTypeAlias(n *sitter.Node) {
 		"symbol_kind": facts.SymbolType,
 		"exported":    w.isExported(n),
 	}
+	if doc := scalaDoc(n, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if fqn := w.fqnFor(name); fqn != "" {
 		props["fqn"] = fqn
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      w.qualify(name),
-		File:      w.relFile,
-		Line:      w.line(n),
+		Kind:    facts.KindSymbol,
+		Name:    w.qualify(name),
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
@@ -1317,16 +1391,20 @@ func (w *astWalker) handleGiven(n *sitter.Node) {
 		"exported":    w.isExported(n),
 		"scala_given": true,
 	}
+	if doc := scalaDoc(n, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if anonymous {
 		props["anonymous"] = true
 	}
 
 	idx := len(w.out)
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      w.qualify(name),
-		File:      w.relFile,
-		Line:      w.line(n),
+		Kind:    facts.KindSymbol,
+		Name:    w.qualify(name),
+		File:    w.relFile,
+		Line:    w.line(n),
+		EndLine: tsutil.EndLine(n, w.src), Column: tsutil.Column(n), EndColumn: tsutil.EndColumn(n, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})

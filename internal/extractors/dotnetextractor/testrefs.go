@@ -53,7 +53,7 @@ func (e *CSharpExtractor) ExtractTestRefs(ctx context.Context, repoPath string, 
 		if isGeneratedSource(relFile, src) {
 			return nil
 		}
-		return testRefsFromFile(src, relFile)
+		return append(testRefsFromFile(src, relFile), csTestCases(src, relFile)...)
 	})
 
 	var out []facts.Fact

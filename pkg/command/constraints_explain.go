@@ -30,11 +30,19 @@ func (r *Runner) ConstraintsExplain(args []string) {
 			"For a file: the components its facts belong to and the selector that admitted\n"+
 			"each, the edges the file makes, the edges landing on it by kind and part, and\n"+
 			"the verdicts that would appear or vanish if the file left every part.\n"+
-			"For a declared part: its members by file, public face, edges in and out by\n"+
-			"part, and the laws naming it. Read from the current snapshot, never a gate.\n")
+			"For a declared part: its members by file, public face, the edges it makes by\n"+
+			"kind, edges in and out by part and kind (read as the forbid and allow-only\n"+
+			"verdicts read them), and the laws naming it. Read from the current snapshot,\n"+
+			"never a gate.\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "constraints explain")
 	}
-	if err := fs.Parse(args); err != nil || fs.NArg() < 1 {
+	// Parse has already printed the usage for a bad flag or --help; printing it again
+	// here showed the page twice.
+	if err := fs.Parse(args); err != nil {
+		os.Exit(check.StatusUsageError.ExitCode())
+	}
+	if fs.NArg() < 1 {
 		fs.Usage()
 		os.Exit(check.StatusUsageError.ExitCode())
 	}
@@ -180,8 +188,9 @@ func RenderPartExplanation(p constraints.PartExplanation) string {
 			fmt.Fprintf(&b, "    %s\n", m)
 		}
 	}
-	renderPartEdges(&b, "fan-in (edges landing on the part, by source part)", p.FanIn)
-	renderPartEdges(&b, "fan-out (edges the part makes, by target part)", p.FanOut)
+	renderPartMade(&b, p.Made)
+	renderPartEdges(&b, "fan-in (edges landing on the part, by source part and kind)", p.FanIn)
+	renderPartEdges(&b, "fan-out (edges the part makes, by target part and kind)", p.FanOut)
 	if len(p.Laws) == 0 {
 		b.WriteString("  laws naming the part: none\n")
 	} else {
@@ -200,8 +209,31 @@ func renderPartEdges(b *strings.Builder, heading string, edges []constraints.Par
 	}
 	fmt.Fprintf(b, "  %s:\n", heading)
 	for _, e := range edges {
-		fmt.Fprintf(b, "    %-24s %6d\n", e.Component, e.Count)
+		var kinds []string
+		for _, k := range constraints.ExplainedKinds {
+			if n := e.Kinds[k]; n > 0 {
+				kinds = append(kinds, fmt.Sprintf("%s %d", k, n))
+			}
+		}
+		fmt.Fprintf(b, "    %-24s %s\n", e.Component, strings.Join(kinds, ", "))
 	}
+}
+
+// renderPartMade says how many edges of each kind the part makes and how
+// many land on something measured, so a zero in the fan-out is read against
+// what the part had the chance to reach.
+func renderPartMade(b *strings.Builder, made []constraints.PartMade) {
+	var kinds []string
+	for _, m := range made {
+		if m.Made > 0 {
+			kinds = append(kinds, fmt.Sprintf("%s %d (%d resolved)", m.Kind, m.Made, m.Resolved))
+		}
+	}
+	if len(kinds) == 0 {
+		b.WriteString("  edges made: none\n")
+		return
+	}
+	fmt.Fprintf(b, "  edges made: %s\n", strings.Join(kinds, ", "))
 }
 
 func renderOrigin(b *strings.Builder, o *constraints.Origin) {
@@ -222,13 +254,6 @@ func renderOrigin(b *strings.Builder, o *constraints.Origin) {
 	default:
 		fmt.Fprintf(b, "  read from: the snapshot at %s, generated %s\n", commit, o.GeneratedAt)
 	}
-}
-
-// RenderRadius is the text form of a blast radius, shared by explain and plan.
-func RenderRadius(r constraints.BlastRadius) string {
-	var b strings.Builder
-	renderRadius(&b, r)
-	return b.String()
 }
 
 func renderRadius(b *strings.Builder, r constraints.BlastRadius) {

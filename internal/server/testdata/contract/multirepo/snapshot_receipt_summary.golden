@@ -1,0 +1,2 @@
+[tool error]
+snapshot_receipt answers for one repository, and this snapshot holds 2: api, consumer. Pass repo as one of them.

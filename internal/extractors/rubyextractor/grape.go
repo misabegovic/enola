@@ -8,11 +8,11 @@ import (
 	"sort"
 	"strings"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
 
 // Grape is the second HTTP framework a Rails codebase serves from, and the extractor
@@ -168,10 +168,10 @@ func grapeAPIFiles(classFacts []facts.Fact) []string {
 		if f.Kind != facts.KindSymbol || f.Props == nil {
 			continue
 		}
-		if f.Props["symbol_kind"] != facts.SymbolClass {
+		if f.PropAny("symbol_kind") != facts.SymbolClass {
 			continue
 		}
-		super, _ := f.Props["superclass"].(string)
+		super, _ := f.PropAny("superclass").(string)
 		if super == "" {
 			continue
 		}

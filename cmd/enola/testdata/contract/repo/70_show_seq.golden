@@ -1,0 +1,18 @@
+$ enola show @1 .
+exit: 0
+--- stdout
+# revision 6b9b3ce · <TIME>
+
+This is the FIRST recorded revision, so there is nothing before it to compare
+against. What follows is what the graph held at this point, not what changed.
+
+  facts     23
+    dependency   4
+    intent       3
+    module       3
+    symbol       9
+    test_case    2
+    test_ref     2
+  findings  4
+  built by  enola dev · extractors go, manifests
+--- stderr

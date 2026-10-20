@@ -2,7 +2,11 @@
 
 Use this guide when another tool runs enola, reads its snapshot artifacts, and
 loads the graph into its own store. For interactive CLI use, see
-[CLI.md](CLI.md). For field definitions, see [schema/](schema/README.md).
+[CLI.md](CLI.md). For what the graph contains and how it is built, see
+[GRAPH.md](GRAPH.md). For field definitions, see [schema/](schema/README.md).
+
+One implementation of the core workflow is already live: [Cognee](https://github.com/topoteretes/cognee).
+The [Cognee section below](#cognee) documents its precise behavior and validation boundaries.
 
 ## Artifacts
 
@@ -81,7 +85,10 @@ Generation writes more than the three contract artifacts:
 
 Enola does not run a daemon for this integration. Do not assume that generation
 is network-isolated: the CLI may perform an update check, and configured
-external provider commands control their own network behavior.
+external provider commands control their own network behavior. Set
+`ENOLA_NO_UPDATE_CHECK=1` in the subprocess environment to keep a pinned run
+network-quiet, and `ENOLA_NO_PROMPTS=1` when nothing reads its output. That is
+the pair a pinned consumer such as Cognee uses.
 
 ## 3. Validate the receipt
 
@@ -155,6 +162,13 @@ Use `target_id` when present. Current writers resolve it as follows:
 2. Emit an ID when all matching local facts have the same identity.
 3. If there is no local match, emit an ID only when all matches across the
    snapshot have the same identity.
+4. Drop the ID from a `calls` or `instantiates` relation written in Ruby when
+   the matched fact is neither a `symbol` nor an `association`: a bare Ruby
+   call such as `config` otherwise matches the `config` module by name.
+5. Drop the ID from a `calls` or `instantiates` relation in any language when
+   the matched fact is a `service`, or is neither a `symbol` nor an
+   `association` and sits in another repository: in a union a bare call such
+   as `default` otherwise matches another repository's queue by name.
 
 When `target_id` is absent, the target may be external, ambiguous, or written by
 an older writer. Preserve `target` as an unresolved reference. Do not select an
@@ -193,6 +207,21 @@ artifacts from its pinned writer can validate the current required fields.
 Upgrading the enola binary changes `snapshot_id` even when source code has not
 changed because the enola version is part of the fingerprint. Plan to re-ingest
 snapshots after an upgrade.
+
+## Cognee
+
+[Cognee](https://github.com/topoteretes/cognee) is a Python framework that builds a knowledge graph from repositories, documents and conversations. Its code-graph route implements the core integration flow: a pinned release of enola run as a subprocess, the snapshot loaded into its own graph database, and the result served through a deterministic `SearchType.CODE` search that needs no LLM key. Its current behavior is:
+
+- **Install (step 1).** Cognee declares `enola-cli` as a core dependency pinned to the release it has validated, so the binary arrives with the cognee install and nothing is fetched at runtime. The wheel installs it into the Python environment's scripts directory - `.venv/bin/enola`, or `Scripts\enola.exe` on Windows - the same place a direct `pip install enola-cli` puts it.
+- **Binary discovery.** Cognee resolves the binary in this order: `ENOLA_PATH` (an explicit override that always wins; a path to a missing file is a loud error, not a silent fallback), then the environment's scripts directory directly, then `PATH`. The scripts-directory step is what makes it work when the venv is not on `PATH` - container entrypoints, service units and schedulers run the interpreter by path. When nothing is found, cognee raises `EnolaNotInstalledError`; its documented fix is to reinstall cognee, never to download.
+- **Run generation (step 2).** It runs `enola --generate <repo>` from the repository directory with the step-2 environment pair set - `ENOLA_NO_UPDATE_CHECK=1` and `ENOLA_NO_PROMPTS=1` - which disables enola's own update check and prompts. A repository-local configuration can still invoke an external provider with its own network behavior. The snapshot lands in `.enola/` inside the repository; cognee's `.gitignore` carries that entry, and yours should too.
+- **Artifacts (steps 3-6).** It reads the three contract artifacts - `facts.jsonl`, `insights.json` and `receipt.json` - and a receipt whose `format_version` cognee does not understand is a hard error whose message points at upgrading cognee, not at editing the receipt. A missing receipt is tolerated for compatibility with historical snapshots, while an unparseable receipt is logged and ignored. Cognee checks `fact_count` and surfaces extraction-quality signals, but does not currently verify `insight_count` or `output_hashes`.
+- **Upgrade compatibility (step 7).** It stores the receipt's `snapshot_id` on its repository node and skips the load when it is unchanged; a new pinned enola release changes the id, so the pin is bumped deliberately rather than floating.
+- **How users drive it.** `cognee.remember(path, content_type="code")` runs the route in one call; `add()` accepts a repository directory or a GitHub/GitLab URL, and remote repositories are shallow-cloned under `~/.cognee/repos`. A list passed to `remember()` is processed as one enola run per repository into the same dataset; cognee does not currently create the single multi-repository snapshot described in [CLUSTERS.md](CLUSTERS.md), so it does not resolve cross-repository edges through that workflow.
+
+The discovery order, the error name and the clone directory above are facts about cognee's current implementation, not part of enola's contract. If cognee changes them, its documentation - not this page - is the source of truth.
+
+If you use cognee rather than build on enola, [COGNEE.md](COGNEE.md) shows where the binary is and how to use it directly.
 
 ## Unsupported dependencies
 

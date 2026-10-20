@@ -8,34 +8,6 @@ import (
 	"github.com/enola-labs/enola/internal/facts"
 )
 
-func TestIsExternalImport(t *testing.T) {
-	tests := []struct {
-		path string
-		want bool
-	}{
-		{"fmt", true},                // Go stdlib (no slash)
-		{"react", true},              // npm package (no slash)
-		{"github.com/foo/bar", true}, // Go third-party (has dot)
-		{"./relative", false},        // relative import
-		{"../parent", false},         // parent relative import
-		{"/absolute/path", false},    // absolute path
-		{"internal/pkg", false},      // internal module (has slash, no dot)
-		{"src/components", false},    // internal path (has slash, no dot)
-		// Known edge case: @types/node has slash but is npm-external.
-		// Current implementation returns false (treats as internal) because
-		// it has "/" and no ".". This documents the behavior.
-		{"@types/node", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.path, func(t *testing.T) {
-			if got := IsExternalImport(tt.path); got != tt.want {
-				t.Errorf("IsExternalImport(%q) = %v, want %v", tt.path, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestResolveRelativeImport(t *testing.T) {
 	tests := []struct {
 		source string
@@ -502,5 +474,41 @@ func TestSymbolModuleIn(t *testing.T) {
 		if got := SymbolModuleIn(tt.name, declared); got != tt.want {
 			t.Errorf("SymbolModuleIn(%q) = %q, want %q", tt.name, got, tt.want)
 		}
+	}
+}
+
+// itemImportStore holds the three shapes every module-graph reader meets once
+// an import names an item: a Rust item import carrying its file, one carrying
+// a file the name is not declared in, and a directory import with no file.
+func itemImportStore() *facts.Store {
+	s := facts.NewStore()
+	for _, m := range []string{"src", "src/core", "src/hooks", "src/cli"} {
+		s.Add(facts.Fact{Kind: facts.KindModule, Name: m, File: m})
+	}
+	s.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "src/core.count", File: "src/core/count.rs"},
+		facts.Fact{Kind: facts.KindDependency, Name: "src/hooks -> crate::core::count", File: "src/hooks/run.rs",
+			Props:     map[string]any{facts.PropTargetFile: "src/core/count.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/core.count"}}},
+		facts.Fact{Kind: facts.KindDependency, Name: "src/cli -> crate::core::count", File: "src/cli/main.rs",
+			Props:     map[string]any{facts.PropTargetFile: "src/core/other.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/core.count"}}},
+		facts.Fact{Kind: facts.KindDependency, Name: "src/cli -> crate::hooks", File: "src/cli/main.rs",
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/hooks"}}},
+	)
+	return s
+}
+
+// An item target walked up by "/" names the parent module (src), not the
+// module of the file it is declared in (src/core).
+func TestBuildModuleGraph_ItemTargetLandsOnItsFilesModule(t *testing.T) {
+	graph := BuildModuleGraph(itemImportStore())
+	if edges := graph["src/hooks"]; len(edges) != 1 || edges[0] != "src/core" {
+		t.Errorf("src/hooks edges = %v, want [src/core]", edges)
+	}
+	// The carried file does not declare the name: refused, no edge. The
+	// directory import beside it reads as before.
+	if edges := graph["src/cli"]; len(edges) != 1 || edges[0] != "src/hooks" {
+		t.Errorf("src/cli edges = %v, want [src/hooks]", edges)
 	}
 }

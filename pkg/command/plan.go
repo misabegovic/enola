@@ -40,6 +40,7 @@ func (r *Runner) Plan(ctx context.Context, args []string) {
 			"  2  the command could not run (bad patch, missing snapshot for --symbols,\n"+
 			"     invalid declaration)\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "plan")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(check.StatusUsageError.ExitCode())
@@ -68,24 +69,10 @@ func (r *Runner) Plan(ctx context.Context, args []string) {
 	eng.SetPersistCache(false)
 	anchor := tgt.repoPaths[0]
 	label := filepath.Base(anchor)
-	outDir := eng.OutputDir(anchor)
 
-	info := plan.SnapshotInfo{}
-	var measured []facts.Fact
-	snap, snapErr := bootstrap.LoadSnapshotDir(outDir)
-	switch {
-	case snapErr != nil && len(symbols) > 0:
-		r.planFatal("symbol targets resolve against a snapshot, and none exists at %s — run `%s baseline pin %s` first", outDir, r.name(), anchor)
-	case snapErr != nil:
-		info.Note = fmt.Sprintf("no snapshot at %s — governance answers from the declarations alone; blast radius is unmeasured", outDir)
-	default:
-		measured = snap.Facts
-		info.GeneratedAt = snap.Meta.GeneratedAt
-		if err := eng.RestoreFromDir(outDir, map[string]string{label: anchor}, label); err == nil {
-			if d, dErr := eng.Drift(anchor); dErr == nil && (d.Unknown || d.Any()) {
-				info.Staleness = d.Summary(5)
-			}
-		}
+	info, measured, err := r.planSnapshot(eng, anchor, len(symbols) > 0)
+	if err != nil {
+		r.planFatal("%v", err)
 	}
 
 	store, err := plan.ContractStore(anchor, measured, eng.Config().Intent[label])
@@ -126,6 +113,25 @@ func (r *Runner) Plan(ctx context.Context, args []string) {
 		return
 	}
 	fmt.Print(report.Render())
+}
+
+// planSnapshot reads what plan answers from: the snapshot's facts, when it was
+// taken, and how far the tree has moved since. No snapshot is an answer rather
+// than an error, unless the targets are symbols, which only a snapshot resolves.
+func (r *Runner) planSnapshot(eng *bootstrap.Engine, anchor string, needSnapshot bool) (plan.SnapshotInfo, []facts.Fact, error) {
+	outDir := eng.OutputDir(anchor)
+	info := plan.SnapshotInfo{}
+	snap, snapErr := loadSnapshotDir(outDir)
+	switch {
+	case snapErr != nil && needSnapshot:
+		return info, nil, fmt.Errorf("symbol targets resolve against a snapshot, and none exists at %s — run `%s baseline pin %s` first", outDir, r.name(), anchor)
+	case snapErr != nil:
+		info.Note = fmt.Sprintf("no snapshot at %s — governance answers from the declarations alone; blast radius is unmeasured", outDir)
+		return info, nil, nil
+	}
+	info.GeneratedAt = snap.Meta.GeneratedAt
+	info.Staleness = snapshotStaleness(eng, anchor, snap.Meta)
+	return info, snap.Facts, nil
 }
 
 func splitPlanPositionals(args []string) (repoArg string, paths []string) {

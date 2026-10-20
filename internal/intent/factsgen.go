@@ -156,6 +156,9 @@ func CompileFacts(d *Declaration) []facts.Fact {
 			"mode":    mode,
 			"because": r.Because,
 		}
+		if r.Said != "" {
+			extra["said"] = r.Said
+		}
 		edgeFormProps(r, extra)
 		memberFormProps(r, extra)
 		namingAndGuidanceProps(r, extra)
@@ -246,16 +249,22 @@ func CompilePageFacts(p *PageIntent, pageFile string) []facts.Fact {
 			})
 		}
 		for _, a := range pg.Anchors {
+			name := fmt.Sprintf("anchor: %s %s", a.Repo, a.Path)
+			props := map[string]any{
+				"intent_kind":  "anchor",
+				"intent_owner": a.Repo,
+				"path":         a.Path,
+				"source":       pageFile,
+			}
+			if a.Symbol != "" {
+				name += " " + a.Symbol
+				props["symbol"] = a.Symbol
+			}
 			out = append(out, facts.Fact{
-				Kind: facts.KindIntent,
-				Name: fmt.Sprintf("anchor: %s %s", a.Repo, a.Path),
-				File: pageFile,
-				Props: map[string]any{
-					"intent_kind":  "anchor",
-					"intent_owner": a.Repo,
-					"path":         a.Path,
-					"source":       pageFile,
-				},
+				Kind:  facts.KindIntent,
+				Name:  name,
+				File:  pageFile,
+				Props: props,
 				// Repo-qualified, because that is how a file is named everywhere
 				// else in a union and an unqualified path would bind to whichever
 				// repository happened to have one by that name.

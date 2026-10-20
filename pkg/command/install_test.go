@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -170,5 +171,59 @@ func TestCountChanged_IgnoresSkippedAndUnchanged(t *testing.T) {
 	}
 	if got := countChanged(rs); got != 3 {
 		t.Errorf("countChanged = %d, want 3", got)
+	}
+}
+
+func runInstallInHome(t *testing.T, home string, args ...string) string {
+	t.Helper()
+	t.Setenv("HOME", home)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = prev }()
+	New(cli.Binary{Name: "enola"}, "upgrade").Install(args, false)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// pi was told "Hooks: yes" and to restart its session while nothing but its AGENTS.md
+// block was written. The summary now names what each target received, from the plan.
+func TestInstall_SummaryNamesTheHooksEachTargetReceived(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".pi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := runInstallInHome(t, home, "--yes", "--hooks", "--global", "--targets", "pi")
+	if !regexp.MustCompile(`(?m)^\s+pi:\s+session start and stop$`).MatchString(out) {
+		t.Errorf("the summary does not say pi received the session hooks:\n%s", out)
+	}
+	if !strings.Contains(out, "Restart your agent session") {
+		t.Errorf("a run that wrote pi's extension did not ask for a restart:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".pi", "agent", "extensions", "enola.js")); err != nil {
+		t.Errorf("the extension was not written: %v", err)
+	}
+
+	repo := t.TempDir()
+	out = runInstallInHome(t, t.TempDir(), "--yes", "--hooks", "--targets", "cursor", repo)
+	if !regexp.MustCompile(`(?m)^\s+cursor:\s+no hook$`).MatchString(out) {
+		t.Errorf("the summary does not say cursor received no hook:\n%s", out)
+	}
+	if strings.Contains(out, "Restart your agent session") {
+		t.Errorf("a run that wrote no hook asked for a restart:\n%s", out)
+	}
+
+	out = runInstallInHome(t, t.TempDir(), "--yes", "--hooks", "--global", "--targets", "pi")
+	if !regexp.MustCompile(`(?m)^\s+pi:\s+no hook$`).MatchString(out) || strings.Contains(out, "Restart your agent session") {
+		t.Errorf("without ~/.pi the summary must say pi received no hook and ask for no restart:\n%s", out)
 	}
 }

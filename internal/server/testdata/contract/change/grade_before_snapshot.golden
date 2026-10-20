@@ -1,0 +1,9 @@
+[tool error]
+no pinned baseline at <CWD>/.enola/baseline
+
+The gate needs a "before" to compare against, pinned BEFORE you edit:
+    <BIN> baseline pin <CWD>
+    …make your change…
+    <BIN> check <CWD>
+
+Or compare against the immediately-preceding snapshot with --baseline=previous.

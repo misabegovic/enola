@@ -19,7 +19,7 @@ describes the current graph across repositories.
 | `repo_path` | string | Absolute analyzed repository path |
 | `git` | object, when a Git repository | `{ref, commit, dirty, remote}` at snapshot time. `remote` is normalized without scheme, credentials, port, or `.git` suffix |
 | `extractors` / `explainers` / `renderers` | array of string | Plugins used during generation |
-| `providers` | array, when set | External provider records. Contract fields are `name`, `fact_count`, and, when set, `version`, `skipped`, and `reason`; other counters are diagnostic |
+| `providers` | array, when set | External provider records. Contract fields are `name`, `fact_count`, and, when set, `version`, `skipped`, `applicable`, and `reason`; `applicable: false` (always beside `skipped: true`) says nothing the provider reads was in the repository, and `reason` says what was missing; other counters are diagnostic |
 | `config_hash` | string, `"sha256:..."`, when set | Hash of the effective configuration |
 | `ignore_glob_hash` | string, `"sha256:..."`, when set | Hash of sorted ignore and test globs |
 | `output_hashes` | object, when set | Artifact filename to SHA-256 hash of written bytes |
@@ -41,7 +41,7 @@ The receipt itself is not byte-stable because `generated_at`, `duration`, and
 | `files_parsed` | Distinct files that produced at least one fact |
 | `files_skipped` / `dirs_skipped` | Ignored files visited and ignored directories pruned |
 | `skipped_sample` | Capped sample of skipped paths and their matching globs |
-| `parse_errors` | Non-fatal extractor detection or parsing failures |
+| `parse_errors` | Non-fatal extractor detection or parsing failures, and one per file an extractor read only in part (its parser left an error node; the extraction fact names the file under `parsed_with_errors`) |
 | `parse_error_sample` | Capped sample of `{extractor, file?, msg}` records |
 | `heuristic_insights` | Insights with confidence below `1.0` |
 | `coverage` | Multi-repo coverage summary: `{services_total, coverage_gaps, unresolved_edges, external_edges?, extractors_reporting?, extraction_unresolved?}` |

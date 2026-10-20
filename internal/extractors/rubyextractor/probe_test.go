@@ -3,8 +3,8 @@ package rubyextractor
 import (
 	"testing"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
 
 // TestGrammarSmoke is the ABI guard, and it is the most important test in this package.
@@ -17,20 +17,21 @@ import (
 // tree-sitter-python, tree-sitter-scala and the vendored Dart parser all carry a pin or a
 // regeneration step today.
 //
-// tree-sitter-ruby v0.23.1 is both the newest release and still ABI 14, so nothing is
-// pinned back here. This test exists for the day upstream regenerates at ABI 15 and
-// dependabot proposes it: the bump then fails loudly here instead of quietly deleting
-// every Ruby fact from the graph.
+// The grammar is vendored under grammar/ (tree-sitter-ruby v0.23.1 with the anonymous
+// forwarding patch) and its parser regenerated at ABI 14, the way the Dart, Swift and
+// Scala grammars are. This test exists for the day it is regenerated with a CLI that
+// emits ABI 15, or upstream's ABI 15 parser is copied in: that fails loudly here instead
+// of quietly deleting every Ruby fact from the graph.
 //
-// If this fails after a dependency bump, the fix is to pin the grammar to the last ABI-14
-// release, not to loosen the assertion.
+// If this fails after a regeneration, the fix is to regenerate with --abi 14, not to
+// loosen the assertion.
 func TestGrammarSmoke(t *testing.T) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(ruby.Language())); err != nil {
 		t.Fatalf("SetLanguage failed — the grammar is almost certainly built against a "+
-			"newer tree-sitter ABI than the vendored runtime accepts. Pin tree-sitter-ruby "+
-			"to the last ABI-14 release. Error: %v", err)
+			"newer tree-sitter ABI than the vendored runtime accepts. Regenerate grammar/ "+
+			"with --abi 14. Error: %v", err)
 	}
 
 	// Each case exercises a different half of the grammar, so a regeneration that broke

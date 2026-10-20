@@ -1,0 +1,354 @@
+{
+  "$defs": {
+    "command.ContractRuleForm": {
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "requires": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "walks_edges": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "requires",
+        "walks_edges"
+      ],
+      "type": "object"
+    },
+    "command.ContractStatus": {
+      "properties": {
+        "exit_code": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exit_code",
+        "status"
+      ],
+      "type": "object"
+    },
+    "command.ContractVocabulary": {
+      "properties": {
+        "access_rule_vias": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "check_statuses": {
+          "items": {
+            "$ref": "#/$defs/command.ContractStatus"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "component_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "component_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "counterpart_roles": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "edge_directions": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "fact_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "guidance_modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "lint_component_states": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "lint_resolutions": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "match_dialect": {
+          "$ref": "#/$defs/intent.Dialect"
+        },
+        "name_dialect": {
+          "$ref": "#/$defs/intent.Dialect"
+        },
+        "origin_channels": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "page_extensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "page_relations": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "relation_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "rule_forms": {
+          "items": {
+            "$ref": "#/$defs/command.ContractRuleForm"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "rule_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "rule_modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "rule_vias": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "seam_vias": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "token_pattern": {
+          "type": "string"
+        },
+        "unverdicted_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "access_rule_vias",
+        "check_statuses",
+        "component_keys",
+        "component_kinds",
+        "counterpart_roles",
+        "edge_directions",
+        "fact_kinds",
+        "guidance_modes",
+        "lint_component_states",
+        "lint_resolutions",
+        "match_dialect",
+        "name_dialect",
+        "origin_channels",
+        "page_extensions",
+        "page_relations",
+        "relation_kinds",
+        "rule_forms",
+        "rule_keys",
+        "rule_modes",
+        "rule_vias",
+        "seam_vias",
+        "token_pattern",
+        "unverdicted_reasons"
+      ],
+      "type": "object"
+    },
+    "intent.Dialect": {
+      "properties": {
+        "forms": {
+          "items": {
+            "$ref": "#/$defs/intent.DialectForm"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "metacharacters": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "forms",
+        "metacharacters",
+        "name"
+      ],
+      "type": "object"
+    },
+    "intent.DialectForm": {
+      "properties": {
+        "example": {
+          "type": "string"
+        },
+        "form": {
+          "type": "string"
+        },
+        "means": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "example",
+        "form",
+        "means"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "contract_version": {
+      "type": "integer"
+    },
+    "extractor_version": {
+      "type": "string"
+    },
+    "format_version": {
+      "type": "integer"
+    },
+    "schemas": {
+      "additionalProperties": {
+        "additionalProperties": {},
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "version": {
+      "type": "string"
+    },
+    "vocabulary": {
+      "$ref": "#/$defs/command.ContractVocabulary"
+    }
+  },
+  "required": [
+    "contract_version",
+    "extractor_version",
+    "format_version",
+    "schemas",
+    "version",
+    "vocabulary"
+  ],
+  "title": "contract --json",
+  "type": "object"
+}

@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "filename": "ctl.kicad_pro",
+    "version": 3
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.2,
+        "track_width": 0.2
+      },
+      {
+        "name": "Power",
+        "clearance": 0.2,
+        "track_width": 0.4
+      }
+    ],
+    "netclass_assignments": null,
+    "netclass_patterns": [
+      {
+        "netclass": "Power",
+        "pattern": "+3V3"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "GND"
+      }
+    ]
+  }
+}

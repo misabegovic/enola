@@ -11,7 +11,7 @@ import (
 // rubyParameterSink matches a client call whose path is a bare identifier,
 // optionally wrapped once: `connection.get(build_url(path), ...)` or
 // `client.post(path)`. It captures receiver, verb and the identifier.
-var rubyParameterSink = regexp.MustCompile(`(?:^|[^.\w@$])([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\.(get|post|put|patch|delete|head)\b\s*\(?\s*(?:[a-z_][\w]*[!?]?\s*\(\s*)?([a-z_][\w]*)\s*[,)]`)
+var rubyParameterSink = regexp.MustCompile(`(?:^|[^.\w@$])` + rubyReceiver + `\.(get|post|put|patch|delete|head)\b\s*\(?\s*(?:[a-z_][\w]*[!?]?\s*\(\s*)?([a-z_][\w]*)\s*[,)]`)
 
 // rubyDefAnyLine captures a method definition's name and its parameter list,
 // parenthesised or bare.
@@ -94,7 +94,14 @@ func extractParameterClientFacts(lines []string, relFile, api, envHint string) (
 				misses[parameterNonLiteral]++
 				continue
 			}
-			path, ok := cleanRubyPath(arg[1 : len(arg)-1])
+			path, host, ok, refused := rubyClientURL(arg[1 : len(arg)-1])
+			if (host != "" || refused) && rubyCommentLine(line) {
+				continue
+			}
+			if refused {
+				misses[clientHostInterpolated]++
+				continue
+			}
 			if !ok {
 				misses[parameterNonLiteral]++
 				continue
@@ -122,6 +129,7 @@ func extractParameterClientFacts(lines []string, relFile, api, envHint string) (
 				},
 				Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: factpath.Dir(relFile)}},
 			})
+			markExternal(&out[len(out)-1], host)
 		}
 	}
 	return out, resolved, misses

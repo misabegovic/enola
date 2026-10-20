@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,8 +24,16 @@ type Store struct {
 	// Indexes for fast lookups
 	byKind map[string][]int // kind -> indices into facts
 	byFile map[string][]int // file -> indices into facts
-	byName map[string][]int // name -> indices into facts
-	byRepo map[string][]int // repo label -> indices into facts
+	// byName maps a name to the facts carrying it, in a form sized for how names
+	// actually distribute: on a kernel-sized graph 1.9M names index 2.06M facts and
+	// 98.2% of them carry exactly one. A map[string][]int spends a 24-byte slice
+	// header per name plus a separate heap object holding one int; this spends four
+	// bytes and no object. A non-negative value IS the fact index; a negative value
+	// v means ^v indexes byNameDup, which holds the full index list for that name.
+	// Measured at that shape: 167 MiB against 71.
+	byName    map[string]int32
+	byNameDup [][]int32
+	byRepo    map[string][]int // repo label -> indices into facts
 
 	// Graph provides adjacency-list traversal over fact relations
 	graph *Graph
@@ -38,6 +47,36 @@ type Store struct {
 	// Relations slices are now SHARED between facts. See Freeze for what that
 	// forbids.
 	frozen bool
+
+	// targetAliases maps a relation target that names no fact to the one fact it
+	// refers to in another repository, keyed by the target exactly as written. See
+	// SetTargetAliases.
+	targetAliases map[string]FactKey
+
+	// docTexts holds the whole comment of each fact whose PropDoc summarizes more
+	// than it says, keyed by the fact's identity. TakeDocTexts fills it from the
+	// facts' own PropDocText, which it removes, so the comment's full text reaches
+	// the docs renderer without riding on the fact into facts.jsonl or any tool's
+	// output.
+	docTexts map[FactKey]string
+}
+
+// FactKey is a fact's identity: the four fields its id is computed from.
+type FactKey struct {
+	Repo, Kind, Name, File string
+}
+
+// SetTargetAliases records which fact a relation target names when the target is
+// not any fact's name: a consumer names a symbol of another loaded repository the
+// way its own source spells it (a Go import path, an npm package), while the
+// provider's fact carries its repo-relative name. WriteJSONL resolves target_id
+// through these when name resolution finds nothing, so the id is exact without
+// renaming the target, which would make it collide with same-named facts of the
+// consumer. A later call replaces the whole table; nil clears it.
+func (s *Store) SetTargetAliases(aliases map[string]FactKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.targetAliases = aliases
 }
 
 // NewStore creates an empty fact store.
@@ -45,7 +84,7 @@ func NewStore() *Store {
 	return &Store{
 		byKind: make(map[string][]int),
 		byFile: make(map[string][]int),
-		byName: make(map[string][]int),
+		byName: make(map[string]int32),
 		byRepo: make(map[string][]int),
 	}
 }
@@ -118,12 +157,88 @@ func (s *Store) Add(ff ...Fact) {
 			s.byFile[f.File] = append(s.byFile[f.File], idx)
 		}
 		if f.Name != "" {
-			s.byName[f.Name] = append(s.byName[f.Name], idx)
+			s.indexName(f.Name, idx)
 		}
 		if f.Repo != "" {
 			s.byRepo[f.Repo] = append(s.byRepo[f.Repo], idx)
 		}
 	}
+}
+
+// indexName records that facts[idx] carries name. The caller must hold s.mu.
+func (s *Store) indexName(name string, idx int) {
+	v, seen := s.byName[name]
+	switch {
+	case !seen:
+		s.byName[name] = int32(idx)
+	case v >= 0:
+		s.byNameDup = append(s.byNameDup, []int32{v, int32(idx)})
+		s.byName[name] = ^int32(len(s.byNameDup) - 1)
+	default:
+		d := ^v
+		s.byNameDup[d] = append(s.byNameDup[d], int32(idx))
+	}
+}
+
+// namedIdxs returns the indices of every fact carrying name. The single-fact case,
+// which is the overwhelming majority, comes back as (idx, nil, true) and touches no
+// slice at all; a shared name comes back as (first, rest, true). Callers iterate
+// first and then rest. The caller must hold s.mu, and must not retain rest.
+func (s *Store) namedIdxs(name string) (first int, rest []int32, ok bool) {
+	v, seen := s.byName[name]
+	if !seen {
+		return 0, nil, false
+	}
+	if v >= 0 {
+		return int(v), nil, true
+	}
+	all := s.byNameDup[^v]
+	return int(all[0]), all[1:], true
+}
+
+// appendNamedIdxs appends every index carrying name to dst.
+// The caller must hold s.mu.
+func (s *Store) appendNamedIdxs(dst []int, name string) []int {
+	first, rest, ok := s.namedIdxs(name)
+	if !ok {
+		return dst
+	}
+	dst = append(dst, first)
+	for _, i := range rest {
+		dst = append(dst, int(i))
+	}
+	return dst
+}
+
+// namedCount returns how many facts carry name. The caller must hold s.mu.
+func (s *Store) namedCount(name string) int {
+	v, seen := s.byName[name]
+	switch {
+	case !seen:
+		return 0
+	case v >= 0:
+		return 1
+	default:
+		return len(s.byNameDup[^v])
+	}
+}
+
+// collectByName returns the facts carrying name. The caller must hold s.mu.
+func (s *Store) collectByName(name string) []Fact {
+	first, rest, ok := s.namedIdxs(name)
+	if !ok {
+		return nil
+	}
+	out := make([]Fact, 0, 1+len(rest))
+	if first < len(s.facts) {
+		out = append(out, s.facts[first])
+	}
+	for _, i := range rest {
+		if int(i) < len(s.facts) {
+			out = append(out, s.facts[i])
+		}
+	}
+	return out
 }
 
 // All returns an independent copy of every fact in the store — including each fact's
@@ -136,7 +251,7 @@ func (s *Store) Add(ff ...Fact) {
 // often the published snapshot bundle, which concurrent MCP readers are traversing.
 // The append-mode path in engine.GenerateSnapshot copies the previous bundle precisely
 // so it can mutate the result safely — binders delete props (unmatchedroutes) and
-// annotators add them (the enterprise metrics/orphans passes) — and it was relying on
+// annotators add them (the metrics/orphans passes) — and it was relying on
 // a guarantee this method did not provide.
 //
 // Freeze makes that guarantee load-bearing rather than merely correct: once a store is
@@ -156,7 +271,7 @@ func (s *Store) All() []Fact {
 			copy(rels, result[i].Relations)
 			result[i].Relations = rels
 		}
-		if len(result[i].Props) > 0 {
+		if result[i].PropCount() > 0 {
 			result[i].Props = result[i].CloneProps()
 		}
 	}
@@ -282,7 +397,7 @@ func (s *Store) ByFile(file string) []Fact {
 func (s *Store) ByName(name string) []Fact {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.collectByIndex(s.byName[name])
+	return s.collectByName(name)
 }
 
 // ByRepo returns all facts for the given repo label.
@@ -298,6 +413,21 @@ func (s *Store) CountByRepo(repo string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.byRepo[repo])
+}
+
+// HasFileOutside reports whether any fact of the given kind labelled repo names a
+// file that is not under prefix, stopping at the first one. It reads the byRepo
+// index, so it costs nothing for a repo the store does not hold.
+func (s *Store) HasFileOutside(repo, kind, prefix string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, i := range s.byRepo[repo] {
+		f := &s.facts[i]
+		if f.Kind == kind && f.File != "" && !strings.HasPrefix(f.File, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // ByRelation returns all facts that have a relation of the given kind.
@@ -407,11 +537,16 @@ type QueryOpts struct {
 	PropValue  string   // property value filter (requires Prop)
 	Offset     int      // number of results to skip
 	Limit      int      // max results to return (0 = default 100, max 500)
+
+	// ExcludeKinds drops facts of these kinds before offset and limit apply, so a
+	// capped query answers exactly as it would over a store without them.
+	ExcludeKinds []string
 }
 
-// QueryAdvanced returns facts matching the provided filter options along with
-// the total count of matches before offset/limit are applied.
-func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
+// eachMatch calls visit for every fact matching opts, in store order, ignoring
+// Offset and Limit. It holds the read lock throughout: visit must not call back into
+// the store, and must neither keep nor modify the fact it is handed.
+func (s *Store) eachMatch(opts QueryOpts, visit func(*Fact)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -453,7 +588,7 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 				mode = iterKindIndex
 			} else {
 				// Kind filter specified but no facts of that kind — fast exit.
-				return nil, 0
+				return
 			}
 		}
 	} else if len(fileSet) == 1 && opts.FilePrefix == "" {
@@ -462,7 +597,7 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 				indexSlice = idxs
 				mode = iterFileIndex
 			} else {
-				return nil, 0
+				return
 			}
 		}
 	} else if len(nameSet) > 0 && opts.Name == "" {
@@ -471,13 +606,17 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 		// to keep the logic simple.
 		total := 0
 		for n := range nameSet {
-			total += len(s.byName[n])
+			total += s.namedCount(n)
 		}
 		if total < len(s.facts) {
 			union := make([]int, 0, total)
 			for n := range nameSet {
-				union = append(union, s.byName[n]...)
+				union = s.appendNamedIdxs(union, n)
 			}
+			// nameSet is a map, so the union came out in a different order on every
+			// call: offset paging over a names= query could skip or repeat facts. Store
+			// order, as every other mode yields.
+			sort.Ints(union)
 			indexSlice = union
 			mode = iterNameUnion
 		}
@@ -490,6 +629,9 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 			if _, ok := kindSet[f.Kind]; !ok {
 				return false
 			}
+		}
+		if slices.Contains(opts.ExcludeKinds, f.Kind) {
+			return false
 		}
 
 		// Repo filter
@@ -541,7 +683,7 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 
 		// Property filter
 		if opts.Prop != "" {
-			v, ok := f.Props[opts.Prop]
+			v, ok := f.Prop(opts.Prop)
 			if !ok {
 				return false
 			}
@@ -553,8 +695,6 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 		return true
 	}
 
-	var matched []Fact
-
 	switch mode {
 	case iterKindIndex, iterFileIndex, iterNameUnion:
 		for _, idx := range indexSlice {
@@ -562,16 +702,23 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 				continue
 			}
 			if filterFact(s.facts[idx]) {
-				matched = append(matched, s.facts[idx])
+				visit(&s.facts[idx])
 			}
 		}
 	default:
-		for _, f := range s.facts {
-			if filterFact(f) {
-				matched = append(matched, f)
+		for i := range s.facts {
+			if filterFact(s.facts[i]) {
+				visit(&s.facts[i])
 			}
 		}
 	}
+}
+
+// QueryAdvanced returns facts matching the provided filter options along with
+// the total count of matches before offset/limit are applied.
+func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
+	var matched []Fact
+	s.eachMatch(opts, func(f *Fact) { matched = append(matched, *f) })
 
 	total := len(matched)
 
@@ -598,11 +745,27 @@ func (s *Store) QueryAdvanced(opts QueryOpts) ([]Fact, int) {
 	return matched, total
 }
 
+// QueryEach calls visit for every fact matching opts from Offset on, with no Limit,
+// and returns the total number of matches, as QueryAdvanced counts them. It copies
+// nothing, so a caller that only aggregates does not pay for a slice of every match.
+// visit runs under the store's read lock: it must not call back into the store, and
+// must neither keep nor modify the fact it is handed.
+func (s *Store) QueryEach(opts QueryOpts, visit func(*Fact)) int {
+	total := 0
+	s.eachMatch(opts, func(f *Fact) {
+		total++
+		if total > opts.Offset {
+			visit(f)
+		}
+	})
+	return total
+}
+
 // LookupByExactName returns all facts with the given exact name using the index.
 func (s *Store) LookupByExactName(name string) []Fact {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.collectByIndex(s.byName[name])
+	return s.collectByName(name)
 }
 
 // ReverseLookup returns all facts that have a relation targeting the given name.
@@ -624,6 +787,9 @@ func (s *Store) ReverseLookup(targetName, relKind string) []Fact {
 	var result []Fact
 	for _, f := range s.facts {
 		for _, r := range f.Relations {
+			if relKind == "" && IsStorageAccess(r.Kind) {
+				continue // the graph this stands in for holds no access edge
+			}
 			if r.Target == targetName && (relKind == "" || r.Kind == relKind) {
 				result = append(result, f)
 				break
@@ -712,7 +878,7 @@ func (s *Store) SetPropRange(startIdx int, key string, value any, match func(fil
 		if f.Props == nil {
 			f.Props = map[string]any{}
 		}
-		f.Props[key] = value
+		f.SetProp(key, value)
 		n++
 	}
 	return n
@@ -776,24 +942,38 @@ func (s *Store) RemoveWhere(pred func(Fact) bool) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	kept := s.facts[:0:0]
-	removed := 0
-	for _, f := range s.facts {
+	// Find the first match before copying anything. Binders and the cross-repo
+	// linker call this at the start of every snapshot to drop output from a previous
+	// pass, and on a single-repository snapshot there usually is none: copying the
+	// whole store to learn that cost four full copies per snapshot, which put about
+	// 650 MiB on gitlab's peak heap.
+	first := -1
+	for i := range s.facts {
+		if pred(s.facts[i]) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return 0
+	}
+	kept := make([]Fact, first, len(s.facts)-1)
+	copy(kept, s.facts[:first])
+	removed := 1
+	for _, f := range s.facts[first+1:] {
 		if pred(f) {
 			removed++
 			continue
 		}
 		kept = append(kept, f)
 	}
-	if removed == 0 {
-		return 0
-	}
 
 	// Rebuild facts slice and all indices from scratch.
 	s.facts = kept
 	s.byKind = make(map[string][]int)
 	s.byFile = make(map[string][]int)
-	s.byName = make(map[string][]int)
+	s.byName = make(map[string]int32)
+	s.byNameDup = nil
 	s.byRepo = make(map[string][]int)
 	for idx, f := range s.facts {
 		s.byKind[f.Kind] = append(s.byKind[f.Kind], idx)
@@ -801,7 +981,7 @@ func (s *Store) RemoveWhere(pred func(Fact) bool) int {
 			s.byFile[f.File] = append(s.byFile[f.File], idx)
 		}
 		if f.Name != "" {
-			s.byName[f.Name] = append(s.byName[f.Name], idx)
+			s.indexName(f.Name, idx)
 		}
 		if f.Repo != "" {
 			s.byRepo[f.Repo] = append(s.byRepo[f.Repo], idx)
@@ -849,11 +1029,14 @@ func (s *Store) Clear() {
 	s.facts = nil
 	s.byKind = make(map[string][]int)
 	s.byFile = make(map[string][]int)
-	s.byName = make(map[string][]int)
+	s.byName = make(map[string]int32)
+	s.byNameDup = nil
 	s.byRepo = make(map[string][]int)
 	s.graph = nil
 	s.intern = nil
 	s.frozen = false
+	s.targetAliases = nil
+	s.docTexts = nil
 }
 
 // BuildGraph constructs the adjacency-list graph index from the current facts.
@@ -861,7 +1044,7 @@ func (s *Store) Clear() {
 func (s *Store) BuildGraph() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.graph = NewGraph(s.facts)
+	s.graph = NewGraphWithAliases(s.facts, s.targetAliases)
 	// The interning table has done its job: the strings it canonicalized are held by
 	// the facts themselves now, and the map is pure overhead (1.3M entries on the
 	// kernel) for the rest of the store's life. Add recreates it if more facts
@@ -962,9 +1145,16 @@ func (s *Store) WriteJSONL(w io.Writer) error {
 		rels = rels[:0]
 		for _, r := range f.Relations {
 			wr := wireRelation{Relation: r}
+			// A name the lookup answered is never handed to the aliases when a
+			// rule refuses its fact: the rules only remove an id. An alias is
+			// the spelling the consumer's own import wrote, so only the Ruby
+			// rule asks about it, never where its fact lives.
 			if t := s.targetFactFor(r.Target, f.Repo); t >= 0 {
-				tf := s.facts[t]
-				wr.TargetID, idScratch = factIDInto(idScratch, tf.Repo, tf.Kind, tf.Name, tf.File)
+				if tf := s.facts[t]; keepsTargetID(f, r, tf) && LandsByName(f, r, tf) {
+					wr.TargetID, idScratch = factIDInto(idScratch, tf.Repo, tf.Kind, tf.Name, tf.File)
+				}
+			} else if k, ok := s.targetAliases[r.Target]; ok && keepsTargetID(f, r, Fact{Kind: k.Kind}) {
+				wr.TargetID, idScratch = factIDInto(idScratch, k.Repo, k.Kind, k.Name, k.File)
 			}
 			rels = append(rels, wr)
 		}
@@ -979,6 +1169,11 @@ func (s *Store) WriteJSONL(w io.Writer) error {
 		// f is a copy, and its own Relations field is shadowed by the one below,
 		// so neither the store's facts nor their relation slices are touched.
 		factID, idScratch = factIDInto(idScratch, f.Repo, f.Kind, f.Name, f.File)
+		if f.Kind == KindRoute {
+			// f is a copy, and withFactRefIDs copies before widening, so the
+			// store's shared Props map is never written.
+			f.Props, idScratch = withFactRefIDs(f.Props, f.Repo, f.File, idScratch)
+		}
 		b, err := json.Marshal(wireFact{Fact: f, Relations: rels, ID: factID})
 		if err != nil {
 			s.mu.RUnlock()
@@ -1042,6 +1237,7 @@ func (s *Store) ReadJSONL(r io.Reader) error {
 		if err := json.Unmarshal(line, &f); err != nil {
 			return fmt.Errorf("decoding fact: %w", err)
 		}
+		dropWireIDs(&f)
 		s.Add(f)
 	}
 	return scanner.Err()
@@ -1065,4 +1261,58 @@ func (s *Store) collectByIndex(indices []int) []Fact {
 		}
 	}
 	return result
+}
+
+// TakeDocTexts moves PropDocText off every fact from startIdx on into the store's
+// side table, keyed by the fact's identity, and returns how many it moved. Call it
+// once the facts carry their final repo label and file path, since those are part
+// of the key.
+//
+// It records every text before it deletes any, because an extractor may hand two
+// facts the same Props map, and deleting from the first would hide the text from
+// the second.
+func (s *Store) TakeDocTexts(startIdx int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for i := startIdx; i < len(s.facts); i++ {
+		f := &s.facts[i]
+		if text, _ := f.Props[PropDocText].(string); text != "" {
+			if s.docTexts == nil {
+				s.docTexts = make(map[FactKey]string)
+			}
+			s.docTexts[FactKey{Repo: f.Repo, Kind: f.Kind, Name: f.Name, File: f.File}] = text
+			n++
+		}
+	}
+	for i := startIdx; i < len(s.facts); i++ {
+		delete(s.facts[i].Props, PropDocText)
+	}
+	return n
+}
+
+// DocText returns the whole comment of the fact with key k, or "" when its PropDoc
+// is all there is.
+func (s *Store) DocText(k FactKey) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.docTexts[k]
+}
+
+// CarryDocTexts copies into s the doc texts held by from whose key keep accepts.
+// Append mode uses it to carry the other repositories' texts forward with their facts.
+func (s *Store) CarryDocTexts(from *Store, keep func(FactKey) bool) {
+	from.mu.RLock()
+	defer from.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, text := range from.docTexts {
+		if !keep(k) {
+			continue
+		}
+		if s.docTexts == nil {
+			s.docTexts = make(map[FactKey]string, len(from.docTexts))
+		}
+		s.docTexts[k] = text
+	}
 }

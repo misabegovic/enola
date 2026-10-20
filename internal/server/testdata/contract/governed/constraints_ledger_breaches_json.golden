@@ -1,0 +1,35 @@
+{
+  "summary": {
+    "rules": 1,
+    "by_mode": {
+      "ratchet": 1
+    },
+    "breaches": 1,
+    "suppressed": 0,
+    "exempted": 0,
+    "excused": 0
+  },
+  "rules": [
+    {
+      "id": "a-avoids-b",
+      "mode": "ratchet",
+      "source": "enola-intent.yaml",
+      "repo": "go_sample",
+      "because": "a must stay deliverable without b",
+      "verdicted": true,
+      "breaches": 1,
+      "suppressed": 0,
+      "exempted": 0,
+      "breach_list": [
+        {
+          "identity": "8bbc86575610ccb5",
+          "title": "Constraint a-avoids-b violated: pkg/a -\u003e example.com/gosample/pkg/b -\u003e pkg/b via imports",
+          "file": "pkg/a/a.go",
+          "symbol": "pkg/a -\u003e example.com/gosample/pkg/b",
+          "suppressed": false
+        }
+      ]
+    }
+  ],
+  "generated_at": "<TIME>"
+}

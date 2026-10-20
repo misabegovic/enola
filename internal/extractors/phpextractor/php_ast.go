@@ -3,6 +3,7 @@ package phpextractor
 import (
 	"strings"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -16,10 +17,17 @@ import (
 // extractHooks. LanguagePHP (not LanguagePHPOnly) is used so template files that
 // interleave HTML with <?php blocks parse correctly.
 func extractFileAST(src []byte, relFile string) []facts.Fact {
+	ff, _ := extractFileCountingTests(src, relFile)
+	return ff
+}
+
+// extractFileCountingTests is extractFileAST that also counts the Pest tests
+// whose label is not a literal.
+func extractFileCountingTests(src []byte, relFile string) ([]facts.Fact, int) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(php.LanguagePHP())); err != nil {
-		return nil
+		return nil, 0
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
@@ -31,7 +39,10 @@ func extractFileAST(src []byte, relFile string) []facts.Fact {
 		importMap: map[string]string{},
 	}
 	w.walkProgram(tree.RootNode())
-	return w.out
+	w.emitFileScopeNames(tree.RootNode())
+	pest, unlabelled := pestCases(tree.RootNode(), src, relFile)
+	w.testCases = append(w.testCases, pest...)
+	return append(w.out, w.testCases...), unlabelled
 }
 
 type phpWalker struct {
@@ -49,6 +60,10 @@ type phpWalker struct {
 	importMap map[string]string
 
 	out []facts.Fact
+	// testCases are appended after the walk (finding 0034), and testCaseStack is
+	// parallel to typeStack: whether each enclosing class extends a TestCase.
+	testCases     []facts.Fact
+	testCaseStack []bool
 
 	// Per-function complexity state, set up by handleCallable around walkForCalls.
 	// metrics is nil outside a function/method body walk.
@@ -60,8 +75,14 @@ type phpWalker struct {
 	// still runs many times, so a query inside stays an N+1 candidate.
 	scalingDepth int
 	repeatDepth  int
-	selfName     string // enclosing callable's qualified name (for recursion detection)
-	selfShort    string // enclosing callable's short name
+	// loopScopes are the enclosing loops' variables, for the rule in hierarchy.go.
+	loopScopes []phpLoopScope
+	// propTypes is the declared class of each property of the enclosing class, and
+	// paramTypes of each parameter of the enclosing callable (receivers.go).
+	propTypes  map[string]string
+	paramTypes map[string]string
+	selfName   string // enclosing callable's qualified name (for recursion detection)
+	selfShort  string // enclosing callable's short name
 }
 
 // phpBodyMetrics accumulates per-function complexity signals during the single
@@ -75,6 +96,7 @@ type phpBodyMetrics struct {
 	scalingLoopDepth   int             // max nesting counting only unbounded (input-scaling) loops
 	callsInScalingLoop []string        // distinct targets invoked inside a repeating loop (N+1 candidates)
 	inScalingSeen      map[string]bool // dedup set for callsInScalingLoop
+	scalingCallDepth   map[string]int  // deepest scaling nesting each of those is called at (calldepth.go)
 	recursive          bool            // body directly calls the enclosing callable
 	ioDirect           bool            // body makes a direct filesystem/DB/HTTP call
 }
@@ -180,10 +202,11 @@ func (w *phpWalker) handleUse(node *sitter.Node) {
 		w.importMap[short] = fqn
 
 		w.out = append(w.out, facts.Fact{
-			Kind:      facts.KindDependency,
-			Name:      w.dir + " -> " + fqn,
-			File:      w.relFile,
-			Line:      line(node),
+			Kind:    facts.KindDependency,
+			Name:    w.dir + " -> " + fqn,
+			File:    w.relFile,
+			Line:    line(node),
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props:     map[string]any{"language": "php"},
 			Relations: []facts.Relation{{Kind: facts.RelImports, Target: fqn}},
 		})
@@ -204,6 +227,9 @@ func (w *phpWalker) handleClassLike(node *sitter.Node, kind string) {
 		"exported":    true,
 		"language":    "php",
 	}
+	if doc := phpDoc(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if kindOf(node) == "trait_declaration" {
 		props["trait"] = true
 	}
@@ -222,17 +248,33 @@ func (w *phpWalker) handleClassLike(node *sitter.Node, kind string) {
 	}
 
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      fqn,
-		File:      w.relFile,
-		Line:      line(node),
+		Kind:    facts.KindSymbol,
+		Name:    fqn,
+		File:    w.relFile,
+		Line:    line(node),
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props:     props,
 		Relations: rels,
 	})
 
+	classIdx := len(w.out) - 1
 	w.typeStack = append(w.typeStack, fqn)
+	w.testCaseStack = append(w.testCaseStack, extendsTestCase(w.parentRefs(node)))
+	// A class-typed constructor parameter is how PHP states a dependency: the
+	// container, or the caller, hands the class an instance of that type.
+	for _, typ := range w.constructorTypes(node.ChildByFieldName("body")) {
+		if typ != fqn {
+			owner := &w.out[len(w.out)-1]
+			owner.Relations = append(owner.Relations, facts.Relation{Kind: facts.RelInjects, Target: typ})
+		}
+	}
+	outer := w.propTypes
+	w.propTypes = w.classPropertyTypes(node.ChildByFieldName("body"))
 	w.walkProgram(node.ChildByFieldName("body"))
+	w.nameClassesInBody(classIdx, node.ChildByFieldName("body"))
+	w.propTypes = outer
 	w.typeStack = w.typeStack[:len(w.typeStack)-1]
+	w.testCaseStack = w.testCaseStack[:len(w.testCaseStack)-1]
 }
 
 // parentRefs returns the resolved FQNs of every base class / implemented interface
@@ -248,7 +290,7 @@ func (w *phpWalker) parentRefs(node *sitter.Node) []string {
 			gc := c.Child(j)
 			switch kindOf(gc) {
 			case "name", "qualified_name":
-				if ref := w.resolveRef(phpText(gc, w.src)); ref != "" {
+				if ref := w.classRef(phpText(gc, w.src)); ref != "" {
 					out = append(out, ref)
 				}
 			}
@@ -271,7 +313,7 @@ func (w *phpWalker) handleTraitUse(node *sitter.Node) {
 		c := node.Child(i)
 		switch kindOf(c) {
 		case "name", "qualified_name":
-			if ref := w.resolveRef(phpText(c, w.src)); ref != "" {
+			if ref := w.classRef(phpText(c, w.src)); ref != "" {
 				w.out[ownerIdx].Relations = append(w.out[ownerIdx].Relations,
 					facts.Relation{Kind: facts.RelImplements, Target: ref})
 			}
@@ -309,6 +351,9 @@ func (w *phpWalker) handleCallable(node *sitter.Node, isMethod bool) {
 		"exported":    exported,
 		"language":    "php",
 	}
+	if doc := phpDoc(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if isMethod {
 		props["visibility"] = methodVisibility(node, w.src)
 		if hasModifier(node, "static_modifier") {
@@ -319,11 +364,20 @@ func (w *phpWalker) handleCallable(node *sitter.Node, isMethod bool) {
 		}
 	}
 
+	if isMethod && w.phpunitTest(node, name) {
+		endLine, col, endCol := tsutil.Span(node, w.src)
+		short := w.typeStack[len(w.typeStack)-1]
+		short = short[strings.LastIndex(short, `\`)+1:]
+		w.testCases = append(w.testCases, facts.NewTestCase("php", w.relFile, []string{short}, name, fullName,
+			line(node), endLine, col, endCol))
+	}
+
 	w.out = append(w.out, facts.Fact{
-		Kind:      facts.KindSymbol,
-		Name:      fullName,
-		File:      w.relFile,
-		Line:      line(node),
+		Kind:    facts.KindSymbol,
+		Name:    fullName,
+		File:    w.relFile,
+		Line:    line(node),
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props:     props,
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
@@ -337,9 +391,12 @@ func (w *phpWalker) handleCallable(node *sitter.Node, isMethod bool) {
 	w.loopDepth = 0
 	w.scalingDepth = 0
 	w.repeatDepth = 0
+	w.loopScopes = nil
 	w.selfName = fullName
 	w.selfShort = name
+	w.paramTypes = w.parameterTypes(node.ChildByFieldName("parameters"), nil)
 	w.walkForCalls(node.ChildByFieldName("body"), ownerIdx, seen)
+	w.paramTypes = nil
 	props["cyclomatic"] = 1 + w.metrics.decisions
 	if w.metrics.loopDepth > 0 {
 		props["loop_depth"] = w.metrics.loopDepth
@@ -358,6 +415,7 @@ func (w *phpWalker) handleCallable(node *sitter.Node, isMethod bool) {
 			w.metrics.callsInScalingLoop = []string{}
 		}
 		props["calls_in_scaling_loop"] = w.metrics.callsInScalingLoop
+		props["calls_in_scaling_loop_depth"] = callDepths(w.metrics.callsInScalingLoop, w.metrics.scalingCallDepth)
 	}
 	if w.metrics.recursive {
 		props["recursive_self"] = true
@@ -393,10 +451,28 @@ func (w *phpWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen map[strin
 	case "function_definition", "method_declaration", "class_declaration",
 		"interface_declaration", "trait_declaration", "enum_declaration":
 		return
+	case "assignment_expression":
+		// A local assigned from the current element is still the current element:
+		// `$models = $driver->models ?? [];` puts `$models` one step from `$driver`.
+		if len(w.loopScopes) > 0 {
+			if left := node.ChildByFieldName("left"); left != nil && kindOf(left) == "variable_name" &&
+				phpReachedThroughElement(node.ChildByFieldName("right"), w.src, w.loopScopes) {
+				w.loopScopes[len(w.loopScopes)-1].add(phpText(left, w.src))
+			}
+		}
 	case "for_statement", "foreach_statement", "while_statement", "do_statement":
 		// A constant-count loop raises loop_depth but not scaling_loop_depth (the Big-O
 		// exponent); an infinite loop is discounted from the exponent but still repeats.
 		class := phpSyntacticLoopClass(node, w.src)
+		scope := phpLoopScope{amortizes: class.repeats()}
+		if kindOf(node) == "foreach_statement" {
+			// A foreach over what belongs to an enclosing loop's element repeats
+			// without scaling (hierarchy.go).
+			if class.scales() && phpReachedThroughElement(phpForeachIterable(node), w.src, w.loopScopes) {
+				class = phpLoopInfinite
+			}
+			scope = phpForeachScope(node, w.src, class.repeats())
+		}
 		if w.metrics != nil {
 			w.metrics.loopCount++
 			w.metrics.decisions++
@@ -407,6 +483,15 @@ func (w *phpWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen map[strin
 				w.metrics.scalingLoopDepth = w.scalingDepth + 1
 			}
 		}
+		// A foreach evaluates its collection once, before the first iteration.
+		// Walking it with the body read `foreach (array_merge($a, $b) as $x)` as a
+		// merge per element.
+		var once *sitter.Node
+		if kindOf(node) == "foreach_statement" {
+			if once = phpForeachIterable(node); once != nil {
+				w.walkForCalls(once, ownerIdx, seen)
+			}
+		}
 		w.loopDepth++
 		if class.scales() {
 			w.scalingDepth++
@@ -414,9 +499,13 @@ func (w *phpWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen map[strin
 		if class.repeats() {
 			w.repeatDepth++
 		}
+		w.loopScopes = append(w.loopScopes, scope)
 		for i := uint(0); i < node.ChildCount(); i++ {
-			w.walkForCalls(node.Child(i), ownerIdx, seen)
+			if c := node.Child(i); once == nil || c.StartByte() != once.StartByte() || c.EndByte() != once.EndByte() {
+				w.walkForCalls(c, ownerIdx, seen)
+			}
 		}
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		w.loopDepth--
 		if class.scales() {
 			w.scalingDepth--
@@ -439,9 +528,16 @@ func (w *phpWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen map[strin
 		scope := node.ChildByFieldName("scope")
 		method := node.ChildByFieldName("name")
 		if scope != nil && method != nil {
-			target := w.resolveRef(phpText(scope, w.src)) + "::" + phpText(method, w.src)
+			target := w.scopeRef(scope) + "::" + phpText(method, w.src)
 			w.addCall(ownerIdx, seen, target)
-			w.recordCallMetrics(target)
+			// resolveRef folds `parent` into the current class, so `parent::m()` in
+			// an override of m, every constructor that calls its parent's included,
+			// carries this method's own name.
+			if phpText(scope, w.src) == "parent" {
+				w.recordInLoopCall(target)
+			} else {
+				w.recordCallMetrics(target)
+			}
 			w.recordIODirect(phpText(method, w.src), phpIOMethods)
 		}
 		w.walkChildrenExcept(node, ownerIdx, seen, method)
@@ -454,16 +550,32 @@ func (w *phpWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen map[strin
 		if method != nil && kindOf(method) == "name" {
 			target := phpText(method, w.src)
 			w.addCall(ownerIdx, seen, target)
-			w.recordCallMetrics(target)
+			w.recordEloquentRelation(node, ownerIdx, target)
+			w.recordReceiverCall(node, ownerIdx, target)
+			// The edge is the bare method name, because the receiver's type is
+			// unknown. Only `$this->m()` is known to be this class's m: a
+			// decorator's `$this->inner->handle()` or `$container->extend()` inside
+			// an `extend` shares the name and nothing else. A walk that recurses
+			// through another instance (`$child->render()`) is given up with it.
+			if obj := node.ChildByFieldName("object"); obj != nil && phpText(obj, w.src) == "$this" {
+				w.recordCallMetrics(target)
+			} else {
+				w.recordInLoopCall(target)
+			}
 			// $wpdb->get_results(...) / PDO->fetchAll() — the receiver type is unknown,
 			// so a distinctive DB round-trip method name is our only I/O signal.
 			w.recordIODirect(target, phpIOMethods)
 		}
 		w.walkChildrenExcept(node, ownerIdx, seen, method)
 		return
+	case "class_constant_access_expression", "scoped_property_access_expression":
+		// A class naming its own constant is not a use of the class.
+		if class := w.namedClass(node); class != "" && ownerIdx >= 0 && !w.isEnclosingType(class) {
+			w.addRel(ownerIdx, seen, facts.RelNames, class)
+		}
 	case "object_creation_expression":
 		if cls := w.creationClass(node); cls != "" {
-			target := w.resolveRef(cls)
+			target := w.classRef(cls)
 			w.addRel(ownerIdx, seen, facts.RelInstantiates, target)
 			w.recordCallMetrics(target)
 		}
@@ -530,6 +642,15 @@ func (w *phpWalker) recordCallMetrics(target string) {
 	if target == w.selfShort || target == w.selfName {
 		w.metrics.recursive = true
 	}
+	w.recordInLoopCall(target)
+}
+
+// recordInLoopCall is recordCallMetrics without the recursion check, for a call
+// that shares the enclosing method's name and cannot be that method.
+func (w *phpWalker) recordInLoopCall(target string) {
+	if w.metrics == nil || target == "" {
+		return
+	}
 	if w.loopDepth == 0 {
 		return
 	}
@@ -548,6 +669,7 @@ func (w *phpWalker) recordCallMetrics(target string) {
 		if w.metrics.inScalingSeen == nil {
 			w.metrics.inScalingSeen = make(map[string]bool)
 		}
+		w.metrics.scalingCallDepth = noteCallDepth(w.metrics.scalingCallDepth, target, w.scalingDepth)
 		if !w.metrics.inScalingSeen[target] {
 			w.metrics.inScalingSeen[target] = true
 			w.metrics.callsInScalingLoop = append(w.metrics.callsInScalingLoop, target)
@@ -611,7 +733,11 @@ func phpSyntacticLoopClass(node *sitter.Node, src []byte) phpLoopClass {
 		if cond == nil {
 			return phpLoopInfinite // for (;;)
 		}
-		if phpConstantForCondition(cond, src) {
+		// Both ends have to be constant. `for (i = n - 1; i >= 0; i--)` compares against a
+		// literal and walks all n: the bound that scales is where it starts. The
+		// condition alone used to decide, which read every descending loop as a
+		// fixed-count one and dropped it, and the calls inside it, from the analysis.
+		if phpConstantForCondition(cond, src) && phpForStartsAtConstant(node, src) {
 			return phpLoopConstant
 		}
 	case "foreach_statement":
@@ -640,6 +766,27 @@ func phpForeachIterable(node *sitter.Node) *sitter.Node {
 // against an integer literal (`$i < 3`), so the loop runs a statically fixed number of
 // times. A data-derived bound (`$i < $n`, `$i < count($xs)`) is conservatively treated
 // as scaling — no genuine O(n) finding is deleted.
+// phpForStartsAtConstant reports whether a for statement initialises its counter to
+// an integer literal or an ALL_CAPS constant. No initialiser, or one computed from
+// anything else (`count($xs) - 1`), does not qualify.
+func phpForStartsAtConstant(node *sitter.Node, src []byte) bool {
+	init := node.ChildByFieldName("initialize")
+	if init == nil || kindOf(init) != "assignment_expression" {
+		return false
+	}
+	right := init.ChildByFieldName("right")
+	if right == nil {
+		return false
+	}
+	switch kindOf(right) {
+	case "integer":
+		return true
+	case "name":
+		return phpIsScreamingConst(phpText(right, src))
+	}
+	return false
+}
+
 func phpConstantForCondition(cond *sitter.Node, src []byte) bool {
 	if cond == nil || kindOf(cond) != "binary_expression" {
 		return false
@@ -734,10 +881,11 @@ func (w *phpWalker) handleConst(node *sitter.Node) {
 			full = owner + "::" + name
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: full,
-			File: w.relFile,
-			Line: line(el),
+			Kind:    facts.KindSymbol,
+			Name:    full,
+			File:    w.relFile,
+			Line:    line(el),
+			EndLine: tsutil.EndLine(el, w.src), Column: tsutil.Column(el), EndColumn: tsutil.EndColumn(el, w.src),
 			Props: map[string]any{
 				"symbol_kind": facts.SymbolConstant,
 				"exported":    exported,
@@ -758,10 +906,11 @@ func (w *phpWalker) handleEnumCase(node *sitter.Node) {
 	}
 	owner := w.typeStack[len(w.typeStack)-1]
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: owner + "::" + name,
-		File: w.relFile,
-		Line: line(node),
+		Kind:    facts.KindSymbol,
+		Name:    owner + "::" + name,
+		File:    w.relFile,
+		Line:    line(node),
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolConstant,
 			"exported":    true,
@@ -791,11 +940,15 @@ func (w *phpWalker) handleProperty(node *sitter.Node) {
 		if name == "" {
 			continue
 		}
+		if name == "table" {
+			w.recordEloquentTable(el)
+		}
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: owner + "::$" + name,
-			File: w.relFile,
-			Line: line(el),
+			Kind:    facts.KindSymbol,
+			Name:    owner + "::$" + name,
+			File:    w.relFile,
+			Line:    line(el),
+			EndLine: tsutil.EndLine(el, w.src), Column: tsutil.Column(el), EndColumn: tsutil.EndColumn(el, w.src),
 			Props: map[string]any{
 				"symbol_kind": facts.SymbolVariable,
 				"exported":    exported,
@@ -845,6 +998,32 @@ func (w *phpWalker) resolveRef(raw string) string {
 		return fqn + rest
 	}
 	return raw
+}
+
+// classRef resolves a class name written in this file the way PHP does: through the
+// imports, else relative to the current namespace. self, static and parent keep
+// resolveRef's reading of them.
+func (w *phpWalker) classRef(raw string) string {
+	switch strings.TrimSpace(raw) {
+	case "self", "static", "parent":
+		return w.resolveRef(raw)
+	}
+	return w.className(raw)
+}
+
+// scopeRef resolves the scope of a static call. A scope that is not a class name
+// (`$class::make()`) is kept as written.
+func (w *phpWalker) scopeRef(scope *sitter.Node) string {
+	switch kindOf(scope) {
+	case "name", "qualified_name":
+		return w.classRef(phpText(scope, w.src))
+	}
+	return w.resolveRef(phpText(scope, w.src))
+}
+
+// isEnclosingType reports whether class is the type whose body is being walked.
+func (w *phpWalker) isEnclosingType(class string) bool {
+	return len(w.typeStack) > 0 && w.typeStack[len(w.typeStack)-1] == class
 }
 
 // typeFactIndex returns the index into w.out of the innermost enclosing type's
@@ -921,9 +1100,4 @@ func line(node *sitter.Node) int {
 }
 
 // phpText returns the source text covered by a node (nil-safe).
-func phpText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func phpText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }

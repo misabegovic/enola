@@ -1,0 +1,39 @@
+
+## Scope
+
+Stayed within the declared scope. 2 of 2 package(s) touched were predicted or declared, match ratio 1.
+
+Predicted but not touched (usually fine — the change was narrower than its blast radius):
+  - pkg/b
+PASS — no structural regression.
+could not see: 2 files and 0 directories excluded by ignore globs
+
+New findings (advisory — below the failure policy):
+  - [dead-code] 0.80 — Dead code candidate: function pkg/a.UsesGamma
+      function · unreferenced · pkg/a/gamma.go:6
+      pkg/a/gamma.go:6
+      func UsesGamma() string { return c.Gamma() }
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Confidence < 1.00 is a candidate to verify, not a verdict.
+
+What changed
+  modules      +1
+  symbols      +2
+  dependencies +1
+  edges        +4  (imports +1, calls +1, declares +2)
+
+Added (4):
+  module     pkg/c                                        pkg/c
+  symbol     pkg/a.UsesGamma                              pkg/a/gamma.go:6
+  symbol     pkg/c.Gamma                                  pkg/c/c.go:4
+  dependency pkg/a -> example.com/gosample/pkg/c          pkg/a/gamma.go:3
+
+New coupling (4):
+  pkg/a                                        --imports--> pkg/c
+  pkg/a.UsesGamma                              --calls--> pkg/c.Gamma
+  pkg/a.UsesGamma                              --declares--> pkg/a
+  pkg/c.Gamma                                  --declares--> pkg/c
+
+New coupling is reported, not failed: an added call edge is what ordinary work
+looks like. Inspect the list above if it is more than you expected.

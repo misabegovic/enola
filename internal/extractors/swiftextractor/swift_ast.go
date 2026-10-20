@@ -5,38 +5,22 @@ import (
 	"unicode"
 
 	swift "github.com/enola-labs/enola/internal/extractors/swiftextractor/grammar"
-	"github.com/enola-labs/enola/internal/factpath"
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
-// extractFileAST parses a Swift file with tree-sitter and emits architectural
-// facts. It is a superset of the legacy regex extractor: every declaration /
-// import / iOS-classification fact is preserved, and call-graph relations
-// (RelCalls / RelInstantiates / RelInjects) plus View->ViewModel RelDependsOn
-// edges are attached to symbol facts when call sites, initializer parameters or
-// dependency-injection property wrappers are observed.
-//
-// Edge targets are emitted as bare simple type names here (e.g. "AppComposition")
-// and canonicalised to "<dir>.<Type>" by the post-pass in Extract, which has the
-// project-wide type index needed to resolve them.
-func extractFileAST(src []byte, relFile string, isiOS bool) []facts.Fact {
-	return extractFileASTWithDir(src, relFile, isiOS, factpath.Dir(relFile))
-}
-
-// extractFileASTWithDir is extractFileAST with an explicit module identity dir.
-// Extract passes the file's resolved target module (from moduleResolver) so
-// symbols are named "<targetDir>.<Type>" and declare into the target module
-// rather than the file's leaf directory.
-func extractFileASTWithDir(src []byte, relFile string, isiOS bool, dir string) []facts.Fact {
+// withTree parses and walks one file and hands the walk's facts to use while the
+// tree is still open. use is not called when the file cannot be parsed.
+func withTree(src []byte, relFile string, isiOS bool, dir string, use func(root *sitter.Node, walked []facts.Fact)) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(swift.Language())); err != nil {
-		return nil
+		return
 	}
 	tree := parser.Parse(src, nil)
 	if tree == nil {
-		return nil
+		return
 	}
 	defer tree.Close()
 
@@ -48,7 +32,7 @@ func extractFileASTWithDir(src []byte, relFile string, isiOS bool, dir string) [
 		fileRefIdx: -1,
 	}
 	w.walkSourceFile(tree.RootNode())
-	return w.out
+	use(tree.RootNode(), append(w.out, w.testCases...))
 }
 
 type astWalker struct {
@@ -59,6 +43,10 @@ type astWalker struct {
 
 	// out is the accumulating fact list.
 	out []facts.Fact
+	// testCases are appended after the walk, and xctestStack is parallel to
+	// typeStack: whether each enclosing type inherits from an XCTestCase.
+	testCases   []facts.Fact
+	xctestStack []bool
 
 	// ownerStack holds INDICES into out (not pointers) of the symbol fact whose
 	// body is currently being walked. Indices stay valid across append/realloc,
@@ -131,7 +119,7 @@ var swiftIterators = map[string]bool{
 
 // swiftCheapMethods are obviously-cheap methods that are not I/O. No-arg-ish
 // instance calls to these inside loops are not recorded in calls_in_loop, keeping
-// it focused (the enterprise keyword gate is the real precision filter).
+// it focused (the analyzer's keyword gate is the real precision filter).
 var swiftCheapMethods = map[string]bool{
 	"append": true, "count": true, "isEmpty": true, "first": true, "last": true,
 	"contains": true, "map": true, "filter": true, "forEach": true, "compactMap": true,
@@ -427,11 +415,13 @@ func (w *astWalker) recordInLoopCall(target string) {
 func (w *astWalker) pushType(name string, methods map[string]bool) {
 	w.typeStack = append(w.typeStack, name)
 	w.methodStack = append(w.methodStack, methods)
+	w.xctestStack = append(w.xctestStack, false)
 }
 
 func (w *astWalker) popType() {
 	w.typeStack = w.typeStack[:len(w.typeStack)-1]
 	w.methodStack = w.methodStack[:len(w.methodStack)-1]
+	w.xctestStack = w.xctestStack[:len(w.xctestStack)-1]
 }
 
 func (w *astWalker) enclosingType() string { return strings.Join(w.typeStack, ".") }
@@ -535,7 +525,7 @@ func (w *astWalker) stampConditional(from int) {
 		if w.out[i].Props == nil {
 			w.out[i].Props = map[string]any{}
 		}
-		w.out[i].Props["conditional"] = true
+		w.out[i].SetProp("conditional", true)
 	}
 }
 
@@ -634,10 +624,11 @@ func (w *astWalker) handleImport(node *sitter.Node) {
 	if m := importRe.FindStringSubmatch(nodeText(node, w.src)); m != nil {
 		name := m[1]
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindDependency,
-			Name: w.dir + " -> " + name,
-			File: w.relFile,
-			Line: int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindDependency,
+			Name:    w.dir + " -> " + name,
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: map[string]any{
 				"language": "swift",
 			},
@@ -681,10 +672,11 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 	}
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    !isPrivateAccess(modifierText),
@@ -694,17 +686,20 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := swiftDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if keyword == "enum" {
-		f.Props["enum"] = true
+		f.SetProp("enum", true)
 	}
 	if keyword == "actor" {
-		f.Props["concurrency"] = "actor"
+		f.SetProp("concurrency", "actor")
 	}
 	if strings.Contains(modifierText, "final") {
-		f.Props["final"] = true
+		f.SetProp("final", true)
 	}
 	if containsAnnotation(attrs, "MainActor") {
-		f.Props["main_actor"] = true
+		f.SetProp("main_actor", true)
 	}
 	for _, st := range supertypes {
 		f.Relations = append(f.Relations, facts.Relation{Kind: facts.RelImplements, Target: st})
@@ -713,24 +708,25 @@ func (w *astWalker) handleClassDeclaration(node *sitter.Node) {
 	body := typeBody(node)
 	if sig, published := computeSignature(body, w.src); sig != "" || len(published) > 0 {
 		if sig != "" {
-			f.Props["signature"] = sig
+			f.SetProp("signature", sig)
 		}
 		if len(published) > 0 {
-			f.Props["reactive"] = true
-			f.Props["published_properties"] = strings.Join(published, ",")
+			f.SetProp("reactive", true)
+			f.SetProp("published_properties", strings.Join(published, ","))
 		}
 	}
 
 	if w.isiOS {
 		addIOSProps(&f, name, attrs, strings.Join(supertypes, ", "))
 	}
-	iosComponent, _ := f.Props["ios_component"].(string)
+	iosComponent, _ := f.PropAny("ios_component").(string)
 
 	w.out = append(w.out, f)
 	ownerIdx := len(w.out) - 1
 
 	w.pushOwner(ownerIdx)
 	w.pushType(name, collectMethodNames(body, w.src))
+	w.xctestStack[len(w.xctestStack)-1] = inheritsXCTestCase(supertypes)
 	w.walkTypeBody(body, iosComponent)
 	w.popType()
 	w.popOwner()
@@ -751,10 +747,11 @@ func (w *astWalker) handleProtocol(node *sitter.Node) {
 	supertypes := inheritanceNames(node, w.src)
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolInterface,
 			"exported":    !isPrivateAccess(modifierText),
@@ -764,12 +761,15 @@ func (w *astWalker) handleProtocol(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := swiftDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	for _, st := range supertypes {
 		f.Relations = append(f.Relations, facts.Relation{Kind: facts.RelImplements, Target: st})
 	}
 	body := findChildByKind(node, "protocol_body")
 	if sig, _ := computeSignature(body, w.src); sig != "" {
-		f.Props["signature"] = sig
+		f.SetProp("signature", sig)
 	}
 	if w.isiOS {
 		addIOSProps(&f, name, attrs, strings.Join(supertypes, ", "))
@@ -792,10 +792,11 @@ func (w *astWalker) handleExtension(node *sitter.Node) {
 	}
 	for _, proto := range inheritanceNames(node, w.src) {
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: w.dir + "." + base + "+" + proto,
-			File: w.relFile,
-			Line: int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.dir + "." + base + "+" + proto,
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: map[string]any{
 				"symbol_kind": "extension",
 				"exported":    true,
@@ -864,7 +865,7 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 
 	// A function declared inside a type is a method (dispatch/reflection usage is
 	// not edge-tracked), so it must be classified SymbolMethod — not SymbolFunc —
-	// or the dead-code detector mislabels it high-confidence "safest to remove".
+	// or the dead-code detector mislabels it high-confidence.
 	// This matches the Python/Java extractors. Free functions stay SymbolFunc.
 	enclosing := w.enclosingType()
 	symbolKind := facts.SymbolFunc
@@ -872,11 +873,16 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 		symbolKind = facts.SymbolMethod
 	}
 
+	if style := w.swiftTestStyle(name, attrs, header); style != "" {
+		w.emitSwiftTest(node, name, style)
+	}
+
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    !isPrivateAccess(modifierText),
@@ -886,27 +892,30 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := swiftDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if enclosing != "" {
-		f.Props["receiver"] = enclosing
+		f.SetProp("receiver", enclosing)
 	}
 	// An `override` is dispatched polymorphically through its supertype — UIKit /
 	// SwiftUI lifecycle callbacks (viewDidLoad, viewWillAppear, …) are invoked by
 	// the framework, never by the override's own literal name, so the dead-code
 	// detector must not report them as orphans. Mirrors kotlin_ast.go.
 	if strings.Contains(modifierText, "override") {
-		f.Props["override"] = true
+		f.SetProp("override", true)
 	}
 	if strings.Contains(header, " async") {
-		f.Props["async"] = true
+		f.SetProp("async", true)
 	}
 	if strings.Contains(header, " throws") {
-		f.Props["throws"] = true
+		f.SetProp("throws", true)
 	}
 	if strings.Contains(header, "nonisolated") {
-		f.Props["nonisolated"] = true
+		f.SetProp("nonisolated", true)
 	}
 	if strings.Contains(header, "@MainActor") || containsAnnotation(attrs, "MainActor") {
-		f.Props["main_actor"] = true
+		f.SetProp("main_actor", true)
 	}
 
 	w.out = append(w.out, f)
@@ -970,10 +979,11 @@ func (w *astWalker) handleProperty(node *sitter.Node) {
 	}
 
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": symbolKind,
 			"exported":    !isPrivateAccess(modifierText),
@@ -984,6 +994,9 @@ func (w *astWalker) handleProperty(node *sitter.Node) {
 		},
 	})
 	propIdx := len(w.out) - 1
+	if doc := swiftDoc(node, w.src); doc != "" {
+		facts.SetDoc(&w.out[propIdx], doc)
+	}
 
 	// A computed getter or a willSet/didSet observer has a real body that can hold a
 	// loop or per-iteration I/O, so measure its complexity like a function's — a
@@ -1101,10 +1114,11 @@ func (w *astWalker) handleTypeAlias(node *sitter.Node) {
 		}
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.dir + "." + w.qualify(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.dir + "." + w.qualify(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolType,
 			"exported":    !isPrivateAccess(nodeText(modifiers, w.src)),
@@ -1112,6 +1126,9 @@ func (w *astWalker) handleTypeAlias(node *sitter.Node) {
 		},
 		Relations: relations,
 	})
+	if doc := swiftDoc(node, w.src); doc != "" {
+		facts.SetDoc(&w.out[len(w.out)-1], doc)
+	}
 }
 
 // walkForCalls recursively scans an expression subtree for call_expression nodes
@@ -1756,9 +1773,4 @@ func findFirstIdentifier(node *sitter.Node, src []byte) *sitter.Node {
 	return nil
 }
 
-func nodeText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }

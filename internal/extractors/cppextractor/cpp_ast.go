@@ -31,6 +31,13 @@ import (
 // kinds (class_specifier, namespace_definition, template_declaration,
 // qualified_identifier, alias_declaration) simply never appear in C trees.
 func extractFileAST(src []byte, relFile, lang string, macros macroTable) []facts.Fact {
+	ff, _ := extractFileWithTests(src, relFile, lang, macros)
+	return ff
+}
+
+// extractFileWithTests is extractFileAST that also reads the file's test macros,
+// held apart from its facts until the project's includes decide which stand.
+func extractFileWithTests(src []byte, relFile, lang string, macros macroTable) ([]facts.Fact, testCandidates) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	grammar := cpp.Language()
@@ -38,12 +45,12 @@ func extractFileAST(src []byte, relFile, lang string, macros macroTable) []facts
 		grammar = c.Language()
 	}
 	if err := parser.SetLanguage(sitter.NewLanguage(grammar)); err != nil {
-		return nil
+		return nil, testCandidates{}
 	}
 	kinds := kindsFor(lang)
 	tree := parser.Parse(src, nil)
 	if tree == nil {
-		return nil
+		return nil, testCandidates{}
 	}
 	defer tree.Close()
 
@@ -61,7 +68,7 @@ func extractFileAST(src []byte, relFile, lang string, macros macroTable) []facts
 	// Recover callbacks from macro-opened struct initializers (machine_desc), which
 	// tree-sitter can't parse and scatters as `.field = fn` assignment debris.
 	w.salvageMacroStructAssigns(tree.RootNode())
-	return w.out
+	return w.out, cppTestCases(kinds, tree.RootNode(), src, relFile, lang)
 }
 
 // buildFileMethodIndex collects, per simple class name, the set of method names
@@ -169,6 +176,16 @@ type astWalker struct {
 	// receiverTypes maps explicit parameter/local names in the current function
 	// body to their simple project type. Empty values mark conflicting declarations.
 	receiverTypes map[string]string
+	// swallowed collects the function definitions found inside the body being
+	// walked. C and C++ have no nested functions, so one there is a later
+	// definition that parse-error recovery attached to a function it could not
+	// close. localClassDepth is non-zero inside a local class, whose inline methods
+	// are legitimately inside the body.
+	swallowed       []*sitter.Node
+	localClassDepth int
+	// errorGuardDepth is non-zero while walking a preprocessor guard reached
+	// through an ERROR node, where only definitions are trusted.
+	errorGuardDepth int
 }
 
 // cppBodyMetrics accumulates per-function complexity signals during the single
@@ -182,6 +199,7 @@ type cppBodyMetrics struct {
 	scalingLoopDepth   int             // max nesting counting only unbounded (input-scaling) loops
 	callsInScalingLoop []string        // distinct targets invoked inside a repeating loop (N+1 candidates)
 	inScalingSeen      map[string]bool // dedup set for callsInScalingLoop
+	scalingCallDepth   map[string]int  // deepest scaling nesting each of those is called at (calldepth.go)
 	recursive          bool            // body directly calls the enclosing function
 	ioDirect           bool            // body makes a direct file/socket I/O call
 }
@@ -232,6 +250,7 @@ func (w *astWalker) recordInLoop(target string) {
 		if w.metrics.inScalingSeen == nil {
 			w.metrics.inScalingSeen = make(map[string]bool)
 		}
+		w.metrics.scalingCallDepth = noteCallDepth(w.metrics.scalingCallDepth, target, w.scalingDepth)
 		if !w.metrics.inScalingSeen[target] {
 			w.metrics.inScalingSeen[target] = true
 			w.metrics.callsInScalingLoop = append(w.metrics.callsInScalingLoop, target)
@@ -263,7 +282,11 @@ func cppSyntacticLoopClass(kinds *tsutil.KindTable, node *sitter.Node, src []byt
 		if cond == nil {
 			return cppLoopInfinite // for (;;)
 		}
-		if cppConstantForCondition(kinds, cond) {
+		// Both ends have to be constant. `for (i = n - 1; i >= 0; i--)` compares against a
+		// literal and walks all n: the bound that scales is where it starts. The
+		// condition alone used to decide, which read every descending loop as a
+		// fixed-count one and dropped it, and the calls inside it, from the analysis.
+		if cppConstantForCondition(kinds, cond) && cppForStartsAtConstant(kinds, node, src) {
 			return cppLoopConstant
 		}
 	case "for_range_loop":
@@ -284,6 +307,66 @@ func cppSyntacticLoopClass(kinds *tsutil.KindTable, node *sitter.Node, src []byt
 // loop variable against a numeric literal (`i < 3`), so the loop runs a statically fixed
 // number of times. A data-derived bound (`i < n`, `i < v.size()`) or a compound
 // condition is conservatively treated as scaling — no genuine O(n) finding is deleted.
+// cppForStartsAtConstant reports whether a for statement initialises its counter
+// (every counter, if it declares several) to a number literal or an ALL_CAPS
+// macro or constant. No initialiser, or one computed from anything else, does not
+// qualify.
+func cppForStartsAtConstant(kinds *tsutil.KindTable, node *sitter.Node, src []byte) bool {
+	init := node.ChildByFieldName("initializer")
+	if init == nil {
+		return false
+	}
+	constant := func(v *sitter.Node) bool {
+		if v == nil {
+			return false
+		}
+		switch kindOf(kinds, v) {
+		case "number_literal":
+			return true
+		case "identifier":
+			return cppScreaming(string(src[v.StartByte():v.EndByte()]))
+		}
+		return false
+	}
+	switch kindOf(kinds, init) {
+	case "assignment_expression":
+		return constant(init.ChildByFieldName("right"))
+	case "declaration":
+		seen := false
+		for i := uint(0); i < init.NamedChildCount(); i++ {
+			d := init.NamedChild(i)
+			if kindOf(kinds, d) != "init_declarator" {
+				continue
+			}
+			if !constant(d.ChildByFieldName("value")) {
+				return false
+			}
+			seen = true
+		}
+		return seen
+	}
+	return false
+}
+
+// cppScreaming reports whether name is ALL_CAPS with at least two characters, the
+// convention for a macro or a constant.
+func cppScreaming(name string) bool {
+	if len(name) < 2 {
+		return false
+	}
+	hasLetter := false
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
+	}
+	return hasLetter
+}
+
 func cppConstantForCondition(kinds *tsutil.KindTable, cond *sitter.Node) bool {
 	if cond == nil || kindOf(kinds, cond) != "binary_expression" {
 		return false
@@ -318,7 +401,7 @@ func cppIsTrueCondition(cond *sitter.Node, src []byte) bool {
 // cppCheapMethods are obviously-cheap STL container / iterator / accessor methods.
 // A call to one of these on an unknown receiver inside a loop is NOT recorded in
 // calls_in_loop, keeping the metric focused on potential per-iteration work (the
-// enterprise keyword gate is the real precision filter, but suppressing these at the
+// analyzer's keyword gate is the real precision filter, but suppressing these at the
 // source avoids false positives like a JSON `db.begin()`/`db.end()` matching the
 // generic `db.` I/O prefix).
 var cppCheapMethods = map[string]bool{
@@ -447,6 +530,26 @@ func (w *astWalker) walkDecl(node *sitter.Node) {
 	if node == nil {
 		return
 	}
+	if w.errorGuardDepth > 0 {
+		// Inside an ERROR region the loose declarations and statements are the
+		// unparsed construct's debris. A definition is trusted, and what it
+		// contains is walked normally.
+		switch kindOf(w.kinds, node) {
+		case "declaration", "expression_statement", "compound_statement",
+			"static_assert_declaration", "type_definition", "alias_declaration":
+			return
+		case "function_definition":
+			if w.isMisreadStatement(node, false) {
+				return
+			}
+			fallthrough
+		case "namespace_definition", "class_specifier", "struct_specifier", "union_specifier",
+			"enum_specifier", "template_declaration", "linkage_specification":
+			saved := w.errorGuardDepth
+			w.errorGuardDepth = 0
+			defer func() { w.errorGuardDepth = saved }()
+		}
+	}
 	switch kindOf(w.kinds, node) {
 	case "preproc_include":
 		w.handleInclude(node)
@@ -480,6 +583,13 @@ func (w *astWalker) walkDecl(node *sitter.Node) {
 		// Macros are not expanded, so the function-name arguments would otherwise be
 		// invisible and the referenced entry points mis-reported as dead.
 		w.handleFileScopeMacroCall(node)
+	case "static_assert_declaration":
+		// File-scope constexpr calls are real uses even though they have no
+		// enclosing function owner: `static_assert(encodedWords(N) < Limit)`.
+		// Credit them to the module so dead-code analysis sees the inbound edge.
+		w.pushOwner(w.moduleOwner())
+		w.walkForCalls(node)
+		w.popOwner()
 	case "preproc_def", "preproc_function_def":
 		// A function called inside a #define body (e.g. `#define ____cmpxchg(...) (
 		// size == 2 ? ____cmpxchg_u16(p,o,n) : ...)`) is invisible to the AST — the
@@ -502,6 +612,105 @@ func (w *astWalker) walkDecl(node *sitter.Node) {
 		// children (after the condition/name field). gmsh wraps large amounts of
 		// code in #if defined(HAVE_*); headers wrap everything in #ifndef guards.
 		w.walkGuardChildren(node)
+	case "ERROR":
+		w.walkErrorRegion(node)
+	}
+}
+
+// isMisreadStatement reports whether a function_definition found where no
+// definition can be (inside a body, or under an ERROR node) is a statement in a
+// definition's clothes, not a definition recovery displaced:
+//
+//   - `if (x) { ... }` after unparseable text reads as a function named "if";
+//   - `for_each_net(net) for_each_netdev(net, dev) { ... }` reads as a function
+//     whose return type is the first macro;
+//   - `CRITFLAGS DBG(__func__) ...` reads as one returning CRITFLAGS.
+//
+// A real definition has a return type that is not a macro call (or, with none, a
+// qualified name: an out-of-line constructor or destructor), and its parameter
+// list holds parameter declarations only, not all of them bare names.
+//
+// With no function declarator at all the node is a macro followed by a block. At
+// file scope that is a name-carrying macro such as SYSCALL_DEFINE0(name) { ... },
+// which handleFunctionDefinition knows; inside a body it is a loop macro,
+// `for_each_possible_cpu(i) { ... }`, and is the body's own code.
+func (w *astWalker) isMisreadStatement(node *sitter.Node, inBody bool) bool {
+	fdecl := findFunctionDeclarator(w.kinds, node.ChildByFieldName("declarator"))
+	if fdecl == nil {
+		return inBody
+	}
+	name := declaratorLeafName(w.kinds, fdecl.ChildByFieldName("declarator"), w.src)
+	if cppStatementKeywords[name] {
+		return true
+	}
+	typ := node.ChildByFieldName("type")
+	if typ == nil {
+		return !strings.Contains(name, "::")
+	}
+	if kindOf(w.kinds, typ) == "macro_type_specifier" {
+		return true
+	}
+	params := fdecl.ChildByFieldName("parameters")
+	if params == nil {
+		return false
+	}
+	named, bare := 0, 0
+	for i := uint(0); i < params.ChildCount(); i++ {
+		p := params.Child(i)
+		switch kindOf(w.kinds, p) {
+		case "parameter_declaration":
+		case "optional_parameter_declaration", "variadic_parameter", "variadic_parameter_declaration", "comment":
+			named++
+			continue
+		case "identifier":
+			// A K&R identifier list, `int gcd(a, b) int a; int b; { ... }`, which
+			// is a definition only with the declarations that type its names.
+			if findChildByKind(w.kinds, node, "declaration") == nil {
+				return true
+			}
+			named++
+			continue
+		default:
+			if p.IsNamed() {
+				// A literal or an expression: these are a macro call's arguments.
+				return true
+			}
+			continue
+		}
+		t := p.ChildByFieldName("type")
+		if p.ChildByFieldName("declarator") == nil && t != nil && kindOf(w.kinds, t) == "type_identifier" {
+			bare++
+		} else {
+			named++
+		}
+	}
+	return bare > 0 && named == 0
+}
+
+var cppStatementKeywords = map[string]bool{
+	"if": true, "else": true, "for": true, "while": true, "do": true, "switch": true,
+	"case": true, "return": true, "catch": true, "sizeof": true, "defined": true,
+}
+
+// walkErrorRegion extracts the definitions inside an ERROR node. When a construct
+// cannot be parsed (a brace opened in both branches of an #if, a macro standing in
+// for syntax), recovery wraps it and often everything after it in ERROR, with the
+// later definitions intact underneath. Only nodes that are definitions in their own
+// right are walked; loose declarations and expression fragments in the region are
+// the unparsed construct's debris and are left alone.
+func (w *astWalker) walkErrorRegion(node *sitter.Node) {
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		switch kindOf(w.kinds, child) {
+		case "function_definition", "template_declaration", "namespace_definition",
+			"class_specifier", "struct_specifier", "union_specifier", "enum_specifier",
+			"linkage_specification", "preproc_include",
+			"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef",
+			"ERROR":
+			w.errorGuardDepth++
+			w.walkDecl(child)
+			w.errorGuardDepth--
+		}
 	}
 }
 
@@ -553,10 +762,11 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 	}
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.factName(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.factName(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": kind,
 			"exported":    true, // C++ has no file-private types; visibility is via access specifiers
@@ -564,8 +774,11 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := cppDoc(w.kinds, node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if kindOf(w.kinds, node) == "union_specifier" {
-		f.Props["union"] = true
+		f.SetProp("union", true)
 	}
 	for _, base := range baseClassNames(w.kinds, node, w.src) {
 		f.Relations = append(f.Relations, facts.Relation{Kind: facts.RelImplements, Target: base})
@@ -624,10 +837,11 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 		return
 	}
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.factName(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.factName(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolEnum,
 			"exported":    true,
@@ -635,8 +849,11 @@ func (w *astWalker) handleEnum(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := cppDoc(w.kinds, node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if isScopedEnum(node, w.src) {
-		f.Props["scoped"] = true
+		f.SetProp("scoped", true)
 	}
 	w.out = append(w.out, f)
 }
@@ -700,10 +917,11 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 		sk = facts.SymbolMethod
 	}
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: symbolName,
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    symbolName,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": sk,
 			"exported":    true,
@@ -712,8 +930,11 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := cppDoc(w.kinds, node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if receiver != "" {
-		f.Props["receiver"] = receiver
+		f.SetProp("receiver", receiver)
 	}
 	w.applyFuncQualifiers(&f, node, fdecl)
 
@@ -743,10 +964,14 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 	w.repeatDepth = 0
 	w.selfName = symbolName
 	w.selfShort = shortName
+	savedSwallowed, savedClassDepth := w.swallowed, w.localClassDepth
+	w.swallowed, w.localClassDepth = nil, 0
 	if body := node.ChildByFieldName("body"); body != nil {
 		w.receiverTypes = collectExplicitReceiverTypes(w.kinds, w.lang, fdecl, body, w.src)
 		w.walkForCalls(body)
 	}
+	swallowed := w.swallowed
+	w.swallowed, w.localClassDepth = savedSwallowed, savedClassDepth
 	m := w.metrics
 	props := w.out[idx].Props
 	props["cyclomatic"] = 1 + m.decisions
@@ -767,6 +992,7 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 			m.callsInScalingLoop = []string{}
 		}
 		props["calls_in_scaling_loop"] = m.callsInScalingLoop
+		props["calls_in_scaling_loop_depth"] = callDepths(m.callsInScalingLoop, m.scalingCallDepth)
 	}
 	if m.recursive {
 		props["recursive_self"] = true
@@ -782,6 +1008,11 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 		w.popType()
 	}
 	w.popOwner()
+	// The definitions recovery nested in this body belong to the scope this
+	// function was declared in. Extract them now that its own state is unwound.
+	for _, def := range swallowed {
+		w.walkDecl(def)
+	}
 }
 
 // handleFieldDeclaration handles a member of a class body: either a member
@@ -795,10 +1026,11 @@ func (w *astWalker) handleFieldDeclaration(node *sitter.Node) {
 			return
 		}
 		f := facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: w.factName(leaf),
-			File: w.relFile,
-			Line: int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.factName(leaf),
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: map[string]any{
 				"symbol_kind": facts.SymbolMethod,
 				"exported":    true,
@@ -806,6 +1038,9 @@ func (w *astWalker) handleFieldDeclaration(node *sitter.Node) {
 				"receiver":    w.enclosingTypeReceiver(),
 			},
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
+		}
+		if doc := cppDoc(w.kinds, node, w.src); doc != "" {
+			facts.SetDoc(&f, doc)
 		}
 		w.applyFuncQualifiers(&f, node, fdecl)
 		w.out = append(w.out, f)
@@ -827,10 +1062,11 @@ func (w *astWalker) handleFieldDeclaration(node *sitter.Node) {
 			kind = facts.SymbolConstant
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: w.factName(leaf),
-			File: w.relFile,
-			Line: int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.factName(leaf),
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: map[string]any{
 				"symbol_kind": kind,
 				"exported":    true,
@@ -839,6 +1075,7 @@ func (w *astWalker) handleFieldDeclaration(node *sitter.Node) {
 			},
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 		})
+		w.setDoc(node)
 	}
 }
 
@@ -848,7 +1085,11 @@ func (w *astWalker) handleTemplate(node *sitter.Node) {
 	var inner *sitter.Node
 	for i := uint(0); i < node.ChildCount(); i++ {
 		c := node.Child(i)
-		if kindOf(w.kinds, c) == "template_parameter_list" || !c.IsNamed() {
+		if kindOf(w.kinds, c) == "template_parameter_list" {
+			w.emitTemplateDefaultRefs(c)
+			continue
+		}
+		if !c.IsNamed() {
 			continue
 		}
 		inner = c
@@ -860,9 +1101,44 @@ func (w *astWalker) handleTemplate(node *sitter.Node) {
 	w.walkDecl(inner)
 	for i := before; i < len(w.out); i++ {
 		if w.out[i].Props != nil {
-			w.out[i].Props["templated"] = true
+			w.out[i].SetProp("templated", true)
 		}
 	}
+}
+
+// emitTemplateDefaultRefs records functions installed as non-type template
+// defaults, e.g. `template <typename T, auto Make = defaultMake<T>>`. There is
+// no call_expression in that syntax, but instantiating the template uses the
+// function value. Candidates are filtered against the project function index
+// later, so type names, constants and template parameters do not become edges.
+func (w *astWalker) emitTemplateDefaultRefs(params *sitter.Node) {
+	w.pushOwner(w.moduleOwner())
+	defer w.popOwner()
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node == nil {
+			return
+		}
+		if kindOf(w.kinds, node) == "optional_parameter_declaration" {
+			if value := node.ChildByFieldName("default_value"); value != nil {
+				var values func(*sitter.Node)
+				values = func(v *sitter.Node) {
+					if kindOf(w.kinds, v) == "identifier" {
+						w.emitFuncPtrRef(nodeText(v, w.src))
+					}
+					for i := uint(0); i < v.ChildCount(); i++ {
+						values(v.Child(i))
+					}
+				}
+				values(value)
+			}
+			return
+		}
+		for i := uint(0); i < node.ChildCount(); i++ {
+			walk(node.Child(i))
+		}
+	}
+	walk(params)
 }
 
 // handleDeclaration handles a translation-unit / namespace-level declaration:
@@ -943,10 +1219,11 @@ func (w *astWalker) handleDeclaration(node *sitter.Node) {
 		sk = facts.SymbolMethod
 	}
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: symbolName,
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    symbolName,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": sk,
 			"exported":    true,
@@ -954,8 +1231,11 @@ func (w *astWalker) handleDeclaration(node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	}
+	if doc := cppDoc(w.kinds, node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if receiver != "" {
-		f.Props["receiver"] = receiver
+		f.SetProp("receiver", receiver)
 	}
 	w.applyFuncQualifiers(&f, node, fdecl)
 	w.out = append(w.out, f)
@@ -993,10 +1273,11 @@ func (w *astWalker) handleVarInitializers(node *sitter.Node) bool {
 			kind = facts.SymbolConstant
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind: facts.KindSymbol,
-			Name: w.factName(leaf),
-			File: w.relFile,
-			Line: int(node.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.factName(leaf),
+			File:    w.relFile,
+			Line:    int(node.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 			Props: map[string]any{
 				"symbol_kind": kind,
 				"exported":    true,
@@ -1004,6 +1285,7 @@ func (w *astWalker) handleVarInitializers(node *sitter.Node) bool {
 			},
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 		})
+		w.setDoc(node)
 		w.pushOwner(len(w.out) - 1)
 		w.walkInitializerRefs(value)
 		w.popOwner()
@@ -1427,10 +1709,11 @@ func (w *astWalker) handleUsing(node *sitter.Node) {
 
 func (w *astWalker) emitTypeAlias(name string, node *sitter.Node) {
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.factName(name),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.factName(name),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolType,
 			"exported":    true,
@@ -1438,6 +1721,7 @@ func (w *astWalker) emitTypeAlias(name string, node *sitter.Node) {
 		},
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
+	w.setDoc(node)
 }
 
 func (w *astWalker) handleInclude(node *sitter.Node) {
@@ -1462,10 +1746,11 @@ func (w *astWalker) handleInclude(node *sitter.Node) {
 		return
 	}
 	w.out = append(w.out, facts.Fact{
-		Kind: facts.KindDependency,
-		Name: w.dir + " -> " + inc,
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindDependency,
+		Name:    w.dir + " -> " + inc,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"language":      w.lang,
 			"include":       inc,
@@ -1481,16 +1766,16 @@ func (w *astWalker) handleInclude(node *sitter.Node) {
 func (w *astWalker) applyFuncQualifiers(f *facts.Fact, node, fdecl *sitter.Node) {
 	header := w.signatureText(node)
 	if strings.Contains(header, "static") {
-		f.Props["static"] = true
+		f.SetProp("static", true)
 		// In C a `static` function has internal linkage — it is file-private, not
 		// externally visible. (C++ keeps exported=true: file scope there is rare and
 		// visibility is expressed via access specifiers / anonymous namespaces.)
 		if w.lang == langC {
-			f.Props["exported"] = false
+			f.SetProp("exported", false)
 		}
 	}
 	if strings.Contains(header, "virtual") {
-		f.Props["virtual"] = true
+		f.SetProp("virtual", true)
 	}
 	// Trailing const: a type_qualifier child after the parameter_list.
 	if fdecl != nil {
@@ -1499,7 +1784,7 @@ func (w *astWalker) applyFuncQualifiers(f *facts.Fact, node, fdecl *sitter.Node)
 			c := fdecl.Child(i)
 			if kindOf(w.kinds, c) == "type_qualifier" && params != nil && c.StartByte() >= params.EndByte() {
 				if nodeText(c, w.src) == "const" {
-					f.Props["const"] = true
+					f.SetProp("const", true)
 				}
 			}
 		}
@@ -1529,6 +1814,21 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	}
 	kind := kindOf(w.kinds, node)
+
+	// A function definition inside a function body is not this function's code.
+	// Set it aside (handleFunctionDefinition extracts it afterwards) so its calls
+	// and decision points are not credited here. A local class's inline methods
+	// are the exception and stay part of the enclosing body.
+	switch kind {
+	case "function_definition":
+		if w.metrics != nil && w.localClassDepth == 0 && !w.isMisreadStatement(node, true) {
+			w.swallowed = append(w.swallowed, node)
+			return
+		}
+	case "class_specifier", "struct_specifier", "union_specifier":
+		w.localClassDepth++
+		defer func() { w.localClassDepth-- }()
+	}
 
 	// A lambda is a deferred scope: its body runs when invoked, NOT per-iteration of
 	// the enclosing loops — so reset the loop depth for its subtree (e.g. a callback
@@ -1746,7 +2046,7 @@ func collectExplicitReceiverTypes(kinds *tsutil.KindTable, lang string, fdecl, b
 			if node.FieldNameForChild(uint32(i)) != "declarator" {
 				continue
 			}
-			name := declaratorLeafName(kinds, node.Child(i), src)
+			name := declaratorLeafName(kinds, referencedDeclarator(kinds, node.Child(i)), src)
 			if name == "" {
 				continue
 			}
@@ -1780,13 +2080,32 @@ func collectExplicitReceiverTypes(kinds *tsutil.KindTable, lang string, fdecl, b
 	return out
 }
 
+// referencedDeclarator steps through the reference in `T &name` and
+// `T &name = init`. The grammar gives a reference_declarator's operand no field
+// name, so declaratorLeafName, which descends by the declarator field, stops there.
+func referencedDeclarator(kinds *tsutil.KindTable, node *sitter.Node) *sitter.Node {
+	if kindOf(kinds, node) == "init_declarator" {
+		if inner := node.ChildByFieldName("declarator"); inner != nil {
+			node = inner
+		}
+	}
+	if kindOf(kinds, node) == "reference_declarator" && node.ChildByFieldName("declarator") == nil {
+		if inner := firstNamedChild(node); inner != nil {
+			return inner
+		}
+	}
+	return node
+}
+
 // declaredInsideLambda reports whether node sits under a lambda between it and
 // stop. The query cannot express "not under a lambda", so the exclusion the walk
 // made by refusing to descend is made here instead — over matches rather than over
 // every node, which is why it stays cheap.
 func declaredInsideLambda(kinds *tsutil.KindTable, node, stop *sitter.Node) bool {
 	for p := node.Parent(); p != nil && p.Id() != stop.Id(); p = p.Parent() {
-		if kindOf(kinds, p) == "lambda_expression" {
+		// A function definition here is one that recovery nested in this body. Its
+		// locals are its own, like a lambda's.
+		if k := kindOf(kinds, p); k == "lambda_expression" || k == "function_definition" {
 			return true
 		}
 	}
@@ -2140,12 +2459,7 @@ func findFirstIdentifier(kinds *tsutil.KindTable, node *sitter.Node, src []byte)
 	return nil
 }
 
-func nodeText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
 
 func isCapitalized(s string) bool {
 	if s == "" {
@@ -2193,4 +2507,11 @@ var cppBuiltins = map[string]bool{
 // builtins/macros, so they should not become RelInstantiates edges.
 var cppBuiltinTypes = map[string]bool{
 	"T": true, "U": true, "K": true, "V": true,
+}
+
+// setDoc sets the doc prop of the declaration node on the fact just appended for it.
+func (w *astWalker) setDoc(node *sitter.Node) {
+	if doc := cppDoc(w.kinds, node, w.src); doc != "" {
+		facts.SetDoc(&w.out[len(w.out)-1], doc)
+	}
 }

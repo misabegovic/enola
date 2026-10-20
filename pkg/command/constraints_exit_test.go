@@ -67,6 +67,8 @@ func TestConstraintsSubcommandsExitAsThemselves(t *testing.T) {
 		{"lint", []string{"constraints", "lint", "."}, 0},
 		{"mine", []string{"constraints", "mine", "."}, 0},
 		{"explain", []string{"constraints", "explain", "app/models/user.rb", "."}, 0},
+		{"ledger --json --breaches", []string{"constraints", "ledger", "--json", "--breaches", "."}, 0},
+		{"ledger --breaches without --json", []string{"constraints", "ledger", "--breaches", "."}, 2},
 	}
 	for _, tc := range cases {
 		code, out := run(tc.args...)

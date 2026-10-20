@@ -68,7 +68,9 @@ the last published graph rather than re-extracting, but nothing recomputes it un
 
 ## A baseline is a value you keep, not a state you are in
 
-`enola baseline pin` copies the current artifact set into `.enola/baseline/`, and it stays there
+`enola baseline pin` puts the current artifact set into `.enola/baseline/` (as hard links where the
+filesystem allows, copies where it does not; no artifact is ever written into, so either holds its
+bytes), and it stays there
 across as many `generate_snapshot` runs as you like — which is the point, since a task is usually
 several rounds of edits and the *before* has to outlive all of them. `.enola/previous/` is the other
 one: rotated automatically on every write, always exactly one step back, no pin required.
@@ -185,11 +187,13 @@ corpus is comfortable for a gate that runs twice a task and impossible for one t
 What it buys is that every snapshot is a complete value rather than an accumulation of edits, which
 is what makes any two of them comparable at all.
 
-**Retrieval is not the axis this is tuned for.**
-[BENCHMARKS.md § What this does not measure](BENCHMARKS.md#what-this-does-not-measure) says so
-directly: retrieval speed, token counts and cost per query are deliberately absent from the evidence
-here. If what you want is the shortest path from a question to the right file, a design built to
-answer *now* will beat this one, and it should.
+**Retrieval cost shows up in real use.** Across
+[238 Claude Code and OpenCode sessions](BENCHMARKS.md#real-session-usage),
+4,375 enola calls put 4.1 million tokens into context; the median call was about 220 to 250 tokens,
+and most graph lookups completed in tens of milliseconds. In 205 of 210 sessions that took a snapshot,
+the source represented by it was larger than the agent's median active context. Those are field
+measurements from ordinary development. The fixed-corpus [benchmarks](BENCHMARKS.md) answer a different
+question: whether the complete snapshots and the structural verdicts drawn from them are reproducible.
 
 One number in that benchmark is easy to misread as enola's price, and is not it. The A/B's cost
 column — a median \$0.31 for the bare agent against $1.12 with the loop installed — compares an agent

@@ -5,16 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"github.com/enola-labs/enola/internal/clientspec"
 	"github.com/enola-labs/enola/internal/config"
-	"github.com/enola-labs/enola/internal/diff"
-	"github.com/enola-labs/enola/internal/drift"
 	"github.com/enola-labs/enola/internal/engine"
 	"github.com/enola-labs/enola/internal/explainers/complexity"
 	"github.com/enola-labs/enola/internal/explainers/constraints"
@@ -44,6 +45,7 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/grpcextractor"
 	"github.com/enola-labs/enola/internal/extractors/hclextractor"
 	"github.com/enola-labs/enola/internal/extractors/javaextractor"
+	"github.com/enola-labs/enola/internal/extractors/kicadextractor"
 	"github.com/enola-labs/enola/internal/extractors/kotlinextractor"
 	"github.com/enola-labs/enola/internal/extractors/manifestextractor"
 	"github.com/enola-labs/enola/internal/extractors/mdintent"
@@ -56,15 +58,18 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/swiftextractor"
 	"github.com/enola-labs/enola/internal/extractors/tsextractor"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/history"
 	"github.com/enola-labs/enola/internal/linkers/binders/clientseam"
 	"github.com/enola-labs/enola/internal/linkers/binders/emberresolver"
 	"github.com/enola-labs/enola/internal/linkers/binders/frameworkroots"
 	"github.com/enola-labs/enola/internal/linkers/binders/grpcclientfqn"
 	"github.com/enola-labs/enola/internal/linkers/binders/grpcimpl"
 	"github.com/enola-labs/enola/internal/linkers/binders/httphandler"
+	"github.com/enola-labs/enola/internal/linkers/binders/importaliases"
 	"github.com/enola-labs/enola/internal/linkers/binders/messagingcontract"
 	"github.com/enola-labs/enola/internal/linkers/binders/mixinowner"
 	"github.com/enola-labs/enola/internal/linkers/binders/moduleedges"
+	"github.com/enola-labs/enola/internal/linkers/binders/rubyenqueue"
 	"github.com/enola-labs/enola/internal/linkers/binders/stimulusresolver"
 	"github.com/enola-labs/enola/internal/linkers/binders/unmatchedroutes"
 	"github.com/enola-labs/enola/internal/linkers/binders/vendoredspecs"
@@ -74,16 +79,24 @@ import (
 	kafkasignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/kafka"
 	sharedcodesignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/sharedcode"
 	"github.com/enola-labs/enola/internal/linkers/vocab"
+	"github.com/enola-labs/enola/internal/metrics"
+	"github.com/enola-labs/enola/internal/orphans"
+	"github.com/enola-labs/enola/internal/perf"
+	"github.com/enola-labs/enola/internal/renderers/docsjsonl"
+	"github.com/enola-labs/enola/internal/renderers/flowsjson"
 	"github.com/enola-labs/enola/internal/renderers/llmcontext"
+	"github.com/enola-labs/enola/internal/resolve"
 	"github.com/enola-labs/enola/internal/server"
+	"github.com/enola-labs/enola/internal/workspace"
 	"github.com/enola-labs/enola/pkg/plan"
+
+	pkghistory "github.com/enola-labs/enola/pkg/history"
 	"github.com/enola-labs/enola/pkg/plugin"
 	"github.com/enola-labs/enola/pkg/status"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Engine wraps the internal engine with a public interface for
-// extension by enterprise or third-party code.
+// Engine wraps the internal engine with a public interface.
 type Engine struct {
 	eng *engine.Engine
 }
@@ -118,6 +131,12 @@ func (e *Engine) MetaFor(repoPath string) facts.SnapshotMeta {
 	return e.eng.MetaFor(repoPath)
 }
 
+// WriteProviderSummary writes the block that ends a generate, a pin and a
+// check; see engine.Engine.WriteProviderSummary.
+func (e *Engine) WriteProviderSummary(w io.Writer, repoPaths []string) {
+	e.eng.WriteProviderSummary(w, repoPaths)
+}
+
 // ActiveRepo returns the absolute repo path of the currently loaded snapshot,
 // or "" if none is loaded. Used to attribute tool usage to the repo a call
 // actually operated on.
@@ -136,6 +155,12 @@ func (e *Engine) SetSnapshot(snap *facts.Snapshot) {
 // RestoreFromDir restores a persisted snapshot into the engine (see engine.RestoreFromDir).
 func (e *Engine) RestoreFromDir(dir string, repoPaths map[string]string, singleRepoLabel string) error {
 	return e.eng.RestoreFromDir(dir, repoPaths, singleRepoLabel)
+}
+
+// RestoreMembers publishes each member's own meta beside a restored union (see
+// engine.RestoreMembers).
+func (e *Engine) RestoreMembers(members map[string]facts.SnapshotMeta) {
+	e.eng.RestoreMembers(members)
 }
 
 // SetPersistCache controls whether the per-extractor cache is written to disk.
@@ -158,10 +183,23 @@ func (e *Engine) Config() *config.Config {
 	return e.eng.Config()
 }
 
+// Resolver returns the name resolver over the engine's loaded graph.
+func (e *Engine) Resolver() resolve.Resolver {
+	r := resolve.Resolver{Store: e.eng.Store(), RepoPaths: e.eng.RepoPaths()}
+	if snap := e.eng.Snapshot(); snap != nil {
+		r.RepoPath = snap.Meta.RepoPath
+	}
+	return r
+}
+
 // GenerateSnapshot runs the full pipeline: walk -> extract -> explain -> render.
 // SetDeferLinking is engine.Engine.SetDeferLinking: a cluster walked repo by
 // repo sets it for every turn but the last.
 func (e *Engine) SetDeferLinking(defer_ bool) { e.eng.SetDeferLinking(defer_) }
+
+// SetWritesArtifacts is engine.Engine.SetWritesArtifacts: a caller that writes
+// the snapshot right after generating it sets it, so the facts are serialized once.
+func (e *Engine) SetWritesArtifacts(writes bool) { e.eng.SetWritesArtifacts(writes) }
 
 func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMode bool) (*facts.Snapshot, error) {
 	return e.eng.GenerateSnapshot(ctx, repoPath, appendMode)
@@ -176,6 +214,13 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 // and this workspace's own copy under ~/.enola/graphs/.
 func (e *Engine) WriteGlobalReceipt() error {
 	return e.eng.WriteGlobalReceipt()
+}
+
+// SetSessionClient records the PID of the agent session this engine serves, which
+// keys the session receipt a restart restores from. NewServer sets it to the
+// server's parent process.
+func (e *Engine) SetSessionClient(pid int) {
+	e.eng.SetSessionClient(pid)
 }
 
 // GraphReceipt returns the receipt for the graph THIS engine currently holds,
@@ -213,29 +258,6 @@ func LoadSnapshotDir(dir string) (*facts.Snapshot, error) {
 	return engine.LoadSnapshotDir(dir)
 }
 
-// AddDriftWarning appends a comparability caveat to d when repoPath's working tree no
-// longer matches the snapshot eng holds. rerunTool names the tool to call again.
-//
-// Exported because every tool that computes its OWN delta needs this caveat, and they do
-// not all live in this module. A consumer that builds a diff the server never sees is not
-// covered by the server's own call, so the check has to be reachable from outside. See
-// internal/drift for why the implementation lives a layer down.
-func AddDriftWarning(d *diff.SnapshotDiff, eng *Engine, repoPath, rerunTool string) {
-	drift.AddWarning(d, eng, repoPath, rerunTool)
-}
-
-// ResolveBaselineDir maps a baseline selector to the directory holding that snapshot's
-// artifacts: "" / "pinned" → the explicit SetBaseline pin, "previous" → the
-// automatically-rotated preceding run, anything else → an explicit path.
-//
-// Re-exported so out-of-module callers resolve a selector the same way the MCP tools
-// and the `check` gate do. What `previous` means is a contract, not a path convention:
-// a consumer that spelled it out locally would keep working right up until the rotation
-// changed, and then disagree with every other surface about which snapshot it named.
-func ResolveBaselineDir(outDir, selector string) string {
-	return engine.ResolveBaselineDir(outDir, selector)
-}
-
 // GetArtifact returns the content of a named artifact.
 func (e *Engine) GetArtifact(name string) ([]byte, error) {
 	return e.eng.GetArtifact(name)
@@ -270,11 +292,22 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.srv.Run(ctx)
 }
 
-// SeedCorpus publishes the corpus of a graph restored from disk, so queries are
-// priced against it before this process takes a snapshot of its own. Pass the map
-// returned by AutoLoadSnapshot, and call it before Run.
-func (s *Server) SeedCorpus(byRepo map[string]int) {
-	s.srv.SeedCorpus(byRepo)
+// Serve runs the MCP server on stdio and accepts sessions on ln as well, each
+// a session over the same engine, until the caller on stdio leaves or, when
+// stdio carries no session, until ctx ends. It closes ln on return.
+func (s *Server) Serve(ctx context.Context, stdio mcp.Transport, ln net.Listener) error {
+	return s.srv.Serve(ctx, stdio, ln)
+}
+
+// RestoreInBackground restores this workspace's graph with AutoLoadSnapshot while the
+// server is already serving, so the handshake is immediate and a closed stdin ends the
+// process mid-restore. Tool calls wait for it. Call it once, before Run.
+func (s *Server) RestoreInBackground(eng *Engine, cfg *config.Config) {
+	s.srv.RestoreInBackground(func() map[string]int {
+		corpus, notice := autoLoad(eng, cfg)
+		s.srv.AddNotice(notice)
+		return corpus
+	})
 }
 
 // SetToolCallback sets a callback invoked once per completed tool call, with the
@@ -282,25 +315,38 @@ func (s *Server) SeedCorpus(byRepo map[string]int) {
 // its response size and any snapshot detail — everything the value model needs
 // that cannot be recovered from a call count afterwards.
 //
-// It fires for every tool on the server, including those a wrapper binary
-// registers, so a wrapper does not report its own calls.
+// It fires for every tool registered on the server, including any added after
+// construction.
 func (s *Server) SetToolCallback(cb func(status.ToolCall)) {
 	s.srv.SetToolCallback(cb)
 }
 
-// StartTime returns the time the server started (zero value if Run() hasn't been called).
-func (s *Server) StartTime() time.Time {
-	return s.srv.GetStartTime()
+// SeedCorpus publishes the corpus of a graph restored from disk, so queries are
+// priced against it before this process takes a snapshot of its own. Pass the map
+// returned by AutoLoadSnapshot, and call it before Run.
+func (s *Server) SeedCorpus(byRepo map[string]int) {
+	s.srv.SeedCorpus(byRepo)
 }
 
-// MCP returns the underlying MCP server so enterprise code can register
-// additional (license-gated) tools before calling Run.
+// MCP returns the underlying MCP server. It is the handle the end-to-end tests use
+// to connect an in-memory transport and drive this server as a real client would,
+// and to register a test-only tool against the same server and engine.
 func (s *Server) MCP() *mcp.Server {
 	return s.srv.MCPServer()
 }
 
-func (s *Server) SetPlanEngineFactory(factory plan.EngineFactory) {
-	s.srv.SetPlanEngineFactory(factory)
+// gradeEngineFactory makes the engine a kept-up server's grade tool publishes
+// a regenerate or a restore into: built as this one was, persisting nothing.
+func gradeEngineFactory(cfg *config.Config) func() (*engine.Engine, error) {
+	return func() (*engine.Engine, error) {
+		eng, err := engine.New(cfg)
+		if err != nil {
+			return nil, err
+		}
+		registerOSSPlugins(eng, cfg)
+		eng.SetPersistCache(false)
+		return eng, nil
+	}
 }
 
 func PlanEngineFactory(cfg *config.Config) plan.EngineFactory {
@@ -417,25 +463,80 @@ func bundledConfigDir() (string, bool) {
 	return exeDir, true
 }
 
-// NewEngine creates an Engine with all OSS plugins registered.
-// Use the returned Engine's methods to add additional (enterprise) plugins
-// before starting the server or generating snapshots.
+// NewEngine creates an Engine with every built-in plugin registered. Use the
+// returned Engine's methods to add further plugins before starting the server or
+// generating snapshots.
 func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	cfg, note, err := ResolveConfig(opts.ConfigPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	fmt.Fprintln(os.Stderr, note)
+	if notice := clientspec.UnsupportedNotice(cfg.Clients); notice != "" {
+		fmt.Fprint(os.Stderr, "warning: "+notice)
+	}
 
+	eng, err := NewEngineFromConfig(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return eng, cfg, nil
+}
+
+// NewEngineFromConfig creates an Engine with all OSS plugins registered from a config
+// already resolved, for a caller that adjusts one (a folder of repositories indexed as a
+// cluster keeps every other setting in force).
+func NewEngineFromConfig(cfg *config.Config) (*Engine, error) {
 	eng, err := engine.New(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create engine: %w", err)
+		return nil, fmt.Errorf("failed to create engine: %w", err)
 	}
 	registerOSSPlugins(eng, cfg)
-	return &Engine{eng: eng}, cfg, nil
+	return &Engine{eng: eng}, nil
+}
+
+// RecordHistory wires the architecture history to an engine: every snapshot the engine
+// writes is appended as a revision, unless the config turns recording off. The engine
+// knows nothing about the history; this adapter is the whole connection, which is why
+// it sits in the composition root. Exported for the tests that build a bare engine and
+// still need a history to assert on.
+func RecordHistory(eng *engine.Engine, cfg *config.Config) {
+	if !cfg.HistoryEnabled() {
+		return
+	}
+	recorder := history.NewRecorder(history.RecorderOptions{
+		Dir:          cfg.History.Dir,
+		Blobs:        cfg.HistoryBlobsEnabled(),
+		WorkingKeep:  cfg.History.WorkingKeep,
+		RevisionKeep: cfg.History.RevisionKeep,
+		BlobKeep:     cfg.History.BlobKeep,
+	})
+	eng.SetSnapshotRecorder(func(rec engine.SnapshotRecord) {
+		recorder.Record(history.Record{
+			RepoPath:    rec.RepoPath,
+			Meta:        rec.Meta,
+			Snapshot:    rec.Snapshot,
+			FactsPath:   rec.FactsPath,
+			PreviousDir: rec.PreviousDir,
+			Parents:     rec.Parents,
+			Repos: func() []pkghistory.RepoRef {
+				states := rec.Repos()
+				if len(states) == 0 {
+					return nil
+				}
+				refs := make([]pkghistory.RepoRef, 0, len(states))
+				for _, st := range states {
+					refs = append(refs, pkghistory.RepoRef{Label: st.Label, Commit: st.Commit, Dirty: st.Dirty})
+				}
+				return refs
+			},
+		})
+	})
 }
 
 func registerOSSPlugins(eng *engine.Engine, cfg *config.Config) {
+	RecordHistory(eng, cfg)
+
 	// Register all OSS extractors
 	eng.RegisterExtractor(cppextractor.New())
 	eng.RegisterExtractor(asyncapiextractor.New())
@@ -445,6 +546,7 @@ func registerOSSPlugins(eng *engine.Engine, cfg *config.Config) {
 	eng.RegisterExtractor(mdintent.New())
 	eng.RegisterExtractor(grpcextractor.New())
 	eng.RegisterExtractor(hclextractor.New())
+	eng.RegisterExtractor(kicadextractor.New())
 	eng.RegisterExtractor(ansibleextractor.New())
 	eng.RegisterExtractor(javaextractor.New())
 	eng.RegisterExtractor(kotlinextractor.New())
@@ -481,7 +583,9 @@ func registerOSSPlugins(eng *engine.Engine, cfg *config.Config) {
 	eng.RegisterBinder(stimulusresolver.New())
 	eng.RegisterBinder(vendoredspecs.New())
 	eng.RegisterBinder(messagingcontract.New())
+	eng.RegisterBinder(rubyenqueue.New())
 	eng.RegisterBinder(unmatchedroutes.New(linkVocab))
+	eng.RegisterBinder(importaliases.New())
 
 	// Register all OSS cross-repo signals. Phase() decides when each runs, so the
 	// order here is presentation only — see plugin.CrossRepoSignal.
@@ -511,19 +615,32 @@ func registerOSSPlugins(eng *engine.Engine, cfg *config.Config) {
 	eng.RegisterExplainer(constraints.New())
 	eng.RegisterExplainer(vendoredcandidates.New())
 	eng.RegisterExplainer(importclosure.New())
+	eng.RegisterExplainer(metrics.NewExplainer())
+	eng.RegisterExplainer(orphans.NewExplainer())
+	eng.RegisterExplainer(perf.NewExplainer())
 
 	// Register all OSS renderers
 	eng.RegisterRenderer(llmcontext.New(cfg.Output.MaxContextTokens))
+	eng.RegisterRenderer(flowsjson.New())
+	eng.RegisterRenderer(docsjsonl.New())
 }
 
 // NewServer creates an MCP server wired to the given Engine.
-func NewServer(eng *Engine, cfg *config.Config) (*Server, error) {
-	srv, err := server.New(eng.eng, cfg)
+func NewServer(eng *Engine, cfg *config.Config, opts ...ServerOption) (*Server, error) {
+	srv, err := server.New(eng.eng, cfg, opts...)
 	if err != nil {
 		return nil, err
 	}
 	srv.SetPlanEngineFactory(PlanEngineFactory(cfg))
-	srv.SetReloader(func() map[string]int { return AutoLoadSnapshot(eng, cfg) })
+	srv.SetGradeEngineFactory(gradeEngineFactory(cfg))
+	// A server's parent is the agent session it serves, and it outlives an MCP
+	// restart; its receipts are keyed by it so a restart restores this session's graph.
+	eng.eng.SetSessionClient(os.Getppid())
+	srv.SetReloader(func() map[string]int {
+		corpus, notice := autoLoad(eng, cfg)
+		srv.AddNotice(notice)
+		return corpus
+	})
 	// The one place the soft memory limit is worth announcing. ConfigureRuntime is
 	// silent (see its doc) because a working default is not news on every CLI
 	// invocation — but a server is long-lived, holds whole graphs in memory, and its
@@ -531,6 +648,39 @@ func NewServer(eng *Engine, cfg *config.Config) (*Server, error) {
 	// internal/server so it cannot depend on which binary started the server, and
 	// because internal/server cannot reach this package.
 	log.Printf("[runtime] %s", MemoryLimitLine())
+	return &Server{srv: srv}, nil
+}
+
+// ServerOption configures the MCP server NewServer builds.
+type ServerOption = server.Option
+
+// Binary names the command a server's tools suggest in their remedies and
+// attribute a SARIF verdict to; see server.Binary.
+func Binary(name, version string) ServerOption { return server.Binary(name, version) }
+
+// Executable names the file the server was started from, as it was then, so
+// its handshake and answers can say when an install replaced it. Without it
+// the server reads its own binary.
+func Executable(exe status.Executable) ServerOption { return server.Executable(exe) }
+
+// SmallProfile serves the tool profile for a client with a small context window:
+// a short list of read tools described in one line each, short instructions,
+// compact JSON results, and a smaller default cap on every result.
+func SmallProfile() ServerOption { return server.SmallProfile() }
+
+// NewServerOverRestored creates an MCP server over a graph the caller restored
+// itself, to ask it one question. It sets no reloader: NewServer's reloads
+// whatever graph this workspace's receipt under ~/.enola names, which is right
+// for a long-lived session and wrong for a command that restored a named
+// repository's snapshot on purpose, since the answer would silently come from
+// another graph. It sets no plan factory and no tool callback either, and no
+// grade engine: its grade publishes into the engine the command gave it, as
+// check always did, since nothing else is served from it.
+func NewServerOverRestored(eng *Engine, cfg *config.Config, opts ...ServerOption) (*Server, error) {
+	srv, err := server.New(eng.eng, cfg, opts...)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{srv: srv}, nil
 }
 
@@ -574,22 +724,26 @@ func GraphStateFunc(eng *Engine) status.GraphFunc {
 }
 
 // AutoLoadSnapshot restores an existing snapshot from disk if available, so queries
-// (and the enterprise tools) work immediately after a restart WITHOUT a
+// (and the analyzers) work immediately after a restart WITHOUT a
 // generate_snapshot call.
 //
 // It prefers a graph registry listing every repo in the graph and their paths, so
 // a restart restores the WHOLE multi-repo graph — not just cfg.Repo — with no
-// extractor runs. Two registries exist and are tried in order:
+// extractor runs. Three registries exist and are tried in order:
 //
-//  1. ~/.enola/graphs/<workspace>.json — the receipt for THIS workspace (cfg.Repo).
-//  2. ~/.enola/receipt.json — the machine-wide receipt, describing whichever
+//  1. ~/.enola/graphs/sessions/<workspace>.<client>.json — the receipt of the graph
+//     THIS agent session held, when the engine knows its session (SetSessionClient).
+//  2. ~/.enola/graphs/<workspace>.json — the receipt for THIS workspace (cfg.Repo).
+//  3. ~/.enola/receipt.json — the machine-wide receipt, describing whichever
 //     server generated a snapshot last.
 //
-// The workspace file comes first because a user typically runs several servers at
-// once, one per agent terminal: reading the shared file would restore a sibling
-// terminal's repo set into this process. The shared file remains the fallback for
-// graphs snapshotted before the workspace receipt existed. Failing both, it falls
-// back to a single-repo restore of cfg.Repo. Either way it restores facts +
+// The session file comes first because several agent sessions started in one
+// directory share a workspace, and the workspace file holds whichever of them
+// snapshotted last. The workspace file comes before the shared one because a user
+// typically runs several servers at once, one per agent terminal: reading the shared
+// file would restore a sibling terminal's repo set into this process. The shared file
+// remains the fallback for graphs snapshotted before the workspace receipt existed.
+// Failing all three, it falls back to a single-repo restore of cfg.Repo. Either way it restores facts +
 // insights + the snapshot meta (incl. generated_at, which the freshness check
 // needs), unlike the old facts-only load.
 //
@@ -605,10 +759,32 @@ func GraphStateFunc(eng *Engine) status.GraphFunc {
 // to Server.SeedCorpus so queries are priced against the restored graph without
 // waiting for a snapshot this process did not need to take.
 func AutoLoadSnapshot(eng *Engine, cfg *config.Config) map[string]int {
-	// Preferred path: this workspace's own graph.
+	corpus, _ := autoLoad(eng, cfg)
+	return corpus
+}
+
+// autoLoad is AutoLoadSnapshot plus the notice a server owes its agent when the
+// graph it restored belongs to another agent session that is still running: that
+// graph was chosen for a different conversation, and nothing else would tell this
+// one. Empty when the graph is this session's own, or its writer has ended.
+func autoLoad(eng *Engine, cfg *config.Config) (map[string]int, string) {
+	client := eng.eng.SessionClient()
+	pruneEndedSessions(cfg.Repo, client)
+
+	// Preferred path: the graph this session itself held before a restart.
+	if client > 0 {
+		if gr, err := engine.LoadSessionReceipt(cfg.Repo, client); err == nil && len(gr.Repos) > 0 {
+			if restoreFromGlobalReceipt(eng, cfg, gr) {
+				return corpusFromReceipt(gr), ""
+			}
+			log.Printf("[bootstrap] session receipt present but multi-repo restore incomplete; trying the workspace receipt")
+		}
+	}
+
+	// Next: this workspace's own graph.
 	if gr, err := engine.LoadWorkspaceReceipt(cfg.Repo); err == nil && len(gr.Repos) > 0 {
 		if restoreFromGlobalReceipt(eng, cfg, gr) {
-			return corpusFromReceipt(gr)
+			return corpusFromReceipt(gr), siblingNotice(gr, client)
 		}
 		log.Printf("[bootstrap] workspace receipt present but multi-repo restore incomplete; trying the machine-wide receipt")
 	}
@@ -619,7 +795,7 @@ func AutoLoadSnapshot(eng *Engine, cfg *config.Config) map[string]int {
 	// the cross-talk the workspace receipt above exists to prevent.
 	if gr, err := engine.LoadGlobalReceipt(); err == nil && len(gr.Repos) > 0 && receiptCovers(gr, cfg.Repo) {
 		if restoreFromGlobalReceipt(eng, cfg, gr) {
-			return corpusFromReceipt(gr)
+			return corpusFromReceipt(gr), siblingNotice(gr, client)
 		}
 		log.Printf("[bootstrap] global receipt present but multi-repo restore incomplete; falling back to single-repo")
 	}
@@ -627,11 +803,19 @@ func AutoLoadSnapshot(eng *Engine, cfg *config.Config) map[string]int {
 	// Fallback: single-repo restore of cfg.Repo.
 	repoPath, err := filepath.Abs(cfg.Repo)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	dir := filepath.Join(repoPath, cfg.Output.Dir)
 	if _, err := os.Stat(filepath.Join(dir, "facts.jsonl")); err != nil {
-		return nil // nothing on disk; start empty
+		return nil, "" // nothing on disk; start empty
+	}
+	// A folder of repositories restores through its workspace receipt above, as the
+	// multi-repo graph it is. A snapshot of it as ONE repository is what the session
+	// hooks once left there by accident: every repository the user has, 9M facts and a
+	// 6 GB facts.jsonl, loaded before the server read stdin, so a quit did not end it.
+	if workspace.IsFolderOfRepos(repoPath) {
+		log.Printf("[bootstrap] not restoring %s: it is a folder of repositories, and its snapshot there indexes them all as one", dir)
+		return nil, ""
 	}
 	// The label from the snapshot on disk, not from the directory it sits in. The map
 	// below is what repo-scoped queries and fact counts are keyed by, so guessing it
@@ -640,16 +824,42 @@ func AutoLoadSnapshot(eng *Engine, cfg *config.Config) map[string]int {
 	label := restoredLabel(dir, repoPath)
 	if err := eng.RestoreFromDir(dir, map[string]string{label: repoPath}, label); err != nil {
 		log.Printf("[bootstrap] warning: failed to restore snapshot from %s: %v", dir, err)
-		return nil
+		return nil, ""
 	}
 	log.Printf("[bootstrap] restored single-repo snapshot for %s", label)
 
 	// No graph receipt on this path, so read the size from the snapshot we just
 	// restored — it carries the same measurement.
 	if snap := eng.Snapshot(); snap != nil && snap.Meta.SourceBytes > 0 {
-		return map[string]int{repoPath: int(snap.Meta.SourceBytes / charsPerToken)}
+		return map[string]int{repoPath: int(snap.Meta.SourceBytes / charsPerToken)}, ""
 	}
-	return nil
+	return nil, ""
+}
+
+// siblingNotice says, once, that the restored graph is another running session's.
+// Empty when this session wrote it, when its writer is unknown (a receipt from before
+// writers were recorded) or was a CLI run, or when that session has ended: adopting
+// the graph of a finished session is resuming the workspace, not cross-talk.
+func siblingNotice(gr *facts.GraphReceipt, client int) string {
+	if gr.Writer == nil || gr.Writer.ClientPID <= 0 || gr.Writer.ClientPID == client || !status.ProcessAlive(gr.Writer.ClientPID) {
+		return ""
+	}
+	return fmt.Sprintf("Restored the latest graph for this workspace (%s), snapshotted by another running agent session at %s. "+
+		"If this session works on different code, call generate_snapshot to load it.", gr.RepoLabels(6), gr.GeneratedAt)
+}
+
+// pruneEndedSessions removes the session receipts of agent sessions that are no longer
+// running, keeping this one's. They only ever answer a restart of their own session.
+func pruneEndedSessions(repo string, client int) {
+	receipts, err := engine.SessionReceipts(repo)
+	if err != nil {
+		return
+	}
+	for pid, path := range receipts {
+		if pid != client && !status.ProcessAlive(pid) {
+			_ = os.Remove(path)
+		}
+	}
 }
 
 // LoadDashboardSnapshot restores exactly the scope selected by the dashboard
@@ -667,7 +877,11 @@ func LoadDashboardSnapshot(eng *Engine, cfg *config.Config) bool {
 			paths[filepath.Base(repo)] = repo
 		}
 		dir := filepath.Join(repos[0], cfg.Output.Dir)
-		return eng.RestoreFromDir(dir, paths, "") == nil
+		if eng.RestoreFromDir(dir, paths, "") != nil {
+			return false
+		}
+		restoreMemberMetas(eng, cfg, paths)
+		return true
 	}
 	repoPath, err := filepath.Abs(cfg.Repo)
 	if err != nil {
@@ -679,6 +893,74 @@ func LoadDashboardSnapshot(eng *Engine, cfg *config.Config) bool {
 		return false
 	}
 	return true
+}
+
+// restoreMemberMetas publishes each member's own meta beside a union restored
+// from one member's dir, read from every member's snapshot.meta.json that
+// belongs to the same union. That dir's meta carries its own member's
+// provenance only; without the others a tool answering for another member
+// would read the restored one's repository, file hashes and time as its own.
+// A member whose dir holds another snapshot, or a meta describing another
+// checkout, is left out, and MetaFor answers it with the union's meta as
+// before.
+func restoreMemberMetas(eng *Engine, cfg *config.Config, repoPaths map[string]string) {
+	snap := eng.Snapshot()
+	if snap == nil || snap.Meta.SnapshotID == "" || len(repoPaths) < 2 {
+		return
+	}
+	members := make(map[string]facts.SnapshotMeta, len(repoPaths))
+	for _, path := range repoPaths {
+		data, err := os.ReadFile(filepath.Join(path, cfg.Output.Dir, "snapshot.meta.json"))
+		if err != nil {
+			continue
+		}
+		var meta facts.SnapshotMeta
+		if json.Unmarshal(data, &meta) != nil || meta.SnapshotID != snap.Meta.SnapshotID {
+			continue
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil || filepath.Clean(meta.RepoPath) != abs {
+			continue
+		}
+		members[abs] = meta
+	}
+	if len(members) > 0 {
+		eng.RestoreMembers(members)
+	}
+}
+
+// RestoreSnapshot loads the on-disk snapshot under its recorded labels, refusing one without readable insights.
+func RestoreSnapshot(eng *Engine, repoPaths []string) error {
+	if len(repoPaths) == 0 {
+		return errors.New("no repository to restore")
+	}
+	dir := eng.OutputDir(repoPaths[0])
+	raw, err := os.ReadFile(filepath.Join(dir, "insights.json"))
+	if err != nil {
+		return fmt.Errorf("reading insights from %s: %w", dir, err)
+	}
+	var insights []facts.Insight
+	if err := json.Unmarshal(raw, &insights); err != nil {
+		return fmt.Errorf("reading insights from %s: %w", dir, err)
+	}
+
+	paths := make(map[string]string, len(repoPaths))
+	for _, repoPath := range repoPaths {
+		label := restoredLabel(eng.OutputDir(repoPath), repoPath)
+		if other, taken := paths[label]; taken {
+			return fmt.Errorf("%s and %s are both labelled %q", other, repoPath, label)
+		}
+		paths[label] = repoPath
+	}
+	single := ""
+	if len(repoPaths) == 1 {
+		single = restoredLabel(dir, repoPaths[0])
+	}
+	if err := eng.RestoreFromDir(dir, paths, single); err != nil {
+		return err
+	}
+	restoreMemberMetas(eng, eng.Config(), paths)
+	return nil
 }
 
 // restoredLabel reads the repo label recorded in a snapshot directory, falling back to
@@ -777,6 +1059,7 @@ func restoreFromGlobalReceipt(eng *Engine, cfg *config.Config, gr *facts.GraphRe
 		log.Printf("[bootstrap] warning: multi-repo restore from %s failed: %v", completeDir, err)
 		return false
 	}
+	restoreMemberMetas(eng, cfg, repoPaths)
 	if got := eng.Store().Count(); gr.FactCount > 0 && got != gr.FactCount {
 		log.Printf("[bootstrap] note: restored %d facts but global receipt records %d (partial restore from %s)", got, gr.FactCount, completeDir)
 	}

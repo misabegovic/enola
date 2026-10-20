@@ -13,8 +13,9 @@
 //   3. ENOLA_ESLINT_RUN=1            run `npx eslint -f json .` in every
 //                                    package under the repo that lists eslint
 //                                    (a second lint run; opt in)
-// With none of those it emits nothing and says so on stderr: a missing linter
-// is a named skip in the census, never an error.
+// With none of those it emits nothing and says on stderr that it does not
+// apply: the receipt records it as not applicable, with the reason, which is
+// neither an error nor a clean lint.
 //
 // Each fact: kind "lint", name "eslint: <rule> <file>:<line>:<col>", file
 // relative to the repository root, line, and props lint_engine, lint_rule,
@@ -91,7 +92,7 @@ import { readdirSync } from "node:fs";
 
 const loaded = loadResults();
 if (!loaded) {
-  process.stderr.write("enola eslint provider: no results (set ENOLA_ESLINT_RESULTS, write tmp/eslint-results.json, or ENOLA_ESLINT_RUN=1); emitting nothing\n");
+  process.stderr.write("enola-provider-not-applicable: no ESLint results file (ENOLA_ESLINT_RESULTS, or tmp/eslint-results.json)\n");
   process.exit(0);
 }
 

@@ -1,9 +1,7 @@
 package swiftextractor
 
 import (
-	"bufio"
 	"context"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,6 +11,7 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/linescan"
 	"github.com/enola-labs/enola/internal/parallel"
 )
 
@@ -147,9 +146,8 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 			return nil
 		}
 		dir := moduleForFile(relFile)
-		ff := extractFileASTWithDir(src, relFile, isiOS, dir)
-		ff = append(ff, extractURLSessionFactsWithDir(src, relFile, dir)...)
-		return append(ff, extractEndpointFacts(src, relFile, dir, defaultURLPrefix)...)
+		clients := append(extractURLSessionFactsWithDir(src, relFile, dir), extractEndpointFacts(src, relFile, dir, defaultURLPrefix)...)
+		return extractFileWithClients(src, relFile, isiOS, dir, clients)
 	})
 
 	for i, fileFacts := range perFileFacts {
@@ -167,7 +165,7 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 			if fact.Kind != facts.KindSymbol {
 				continue
 			}
-			sk, _ := fact.Props["symbol_kind"].(string)
+			sk, _ := fact.PropAny("symbol_kind").(string)
 			switch sk {
 			case facts.SymbolStruct, facts.SymbolClass, facts.SymbolInterface:
 				if simpleName := lastDotComponent(fact.Name); simpleName != "" {
@@ -463,7 +461,7 @@ func resolveInheritedCalls(allFacts []facts.Fact) {
 			continue
 		}
 		factNames[f.Name] = true
-		sk, _ := f.Props["symbol_kind"].(string)
+		sk, _ := f.PropAny("symbol_kind").(string)
 		switch sk {
 		case facts.SymbolClass, facts.SymbolStruct, facts.SymbolInterface:
 			simple := lastDotComponent(f.Name)
@@ -473,7 +471,7 @@ func resolveInheritedCalls(allFacts []facts.Fact) {
 				}
 			}
 		case facts.SymbolMethod:
-			recv, _ := f.Props["receiver"].(string)
+			recv, _ := f.PropAny("receiver").(string)
 			if recv == "" {
 				continue
 			}
@@ -513,10 +511,10 @@ func resolveInheritedCalls(allFacts []facts.Fact) {
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		if sk, _ := f.Props["symbol_kind"].(string); sk != facts.SymbolMethod {
+		if sk, _ := f.PropAny("symbol_kind").(string); sk != facts.SymbolMethod {
 			continue
 		}
-		recv, _ := f.Props["receiver"].(string)
+		recv, _ := f.PropAny("receiver").(string)
 		callerType := lastDotComponent(recv)
 		if callerType == "" || len(typeSupers[callerType]) == 0 {
 			continue // no supertypes → nothing to inherit; skip the common leaf case
@@ -558,7 +556,7 @@ func computePerformsIO(allFacts []facts.Fact, methodIndex, funcIndex map[string]
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		if sk, _ := f.Props["symbol_kind"].(string); sk == facts.SymbolMethod || sk == facts.SymbolFunc {
+		if sk, _ := f.PropAny("symbol_kind").(string); sk == facts.SymbolMethod || sk == facts.SymbolFunc {
 			byName[f.Name] = append(byName[f.Name], i)
 		}
 	}
@@ -586,7 +584,7 @@ func computePerformsIO(allFacts []facts.Fact, methodIndex, funcIndex map[string]
 	for name, idxs := range byName {
 		seen := make(map[string]bool)
 		for _, i := range idxs {
-			if b, _ := allFacts[i].Props["io_direct"].(bool); b {
+			if b, _ := allFacts[i].PropAny("io_direct").(bool); b {
 				io[name] = true
 			}
 			for _, r := range allFacts[i].Relations {
@@ -627,24 +625,14 @@ func computePerformsIO(allFacts []facts.Fact, methodIndex, funcIndex map[string]
 		if f.Kind != facts.KindSymbol {
 			continue
 		}
-		direct, _ := f.Props["io_direct"].(bool)
+		direct, _ := f.PropAny("io_direct").(bool)
 		if io[f.Name] || direct {
 			if f.Props == nil {
 				f.Props = map[string]any{}
 			}
-			f.Props["performs_io"] = true
+			f.SetProp("performs_io", true)
 		}
 	}
-}
-
-// extractFile reads a Swift file and delegates to the tree-sitter walker. It
-// preserves the legacy signature used by the test helper extractFromString.
-func extractFile(f *os.File, relFile string, isiOS bool) []facts.Fact {
-	src, err := io.ReadAll(f)
-	if err != nil {
-		return nil
-	}
-	return extractFileAST(src, relFile, isiOS)
 }
 
 // importRe matches a Swift import statement and captures the module name. Used by
@@ -665,8 +653,7 @@ func extractTypeReferences(absFile string) []string {
 	seen := make(map[string]bool)
 	var refs []string
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
+	scanner := linescan.New(f)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -689,6 +676,9 @@ func extractTypeReferences(absFile string) []string {
 				refs = append(refs, typeName)
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[swift-extractor] error reading %s: %v", absFile, err)
 	}
 
 	return refs
@@ -729,36 +719,6 @@ func lastDotComponent(name string) string {
 	return name
 }
 
-// extractSupertypesFromText finds the supertype clause after ":" in text that may
-// contain generic parameters. It skips content inside balanced parentheses and angle brackets.
-//
-// It is retained for direct unit testing of the supertype-clause parsing logic;
-// the AST walker reads supertypes structurally from inheritance_specifier nodes.
-func extractSupertypesFromText(text string) string {
-	depth := 0
-	for i, ch := range text {
-		switch ch {
-		case '(', '<':
-			depth++
-		case ')', '>':
-			depth--
-		case ':':
-			if depth <= 0 {
-				rest := text[i+1:]
-				if braceIdx := strings.Index(rest, "{"); braceIdx >= 0 {
-					rest = rest[:braceIdx]
-				}
-				// Stop at "where" clause.
-				if whereIdx := strings.Index(rest, " where "); whereIdx >= 0 {
-					rest = rest[:whereIdx]
-				}
-				return strings.TrimSpace(rest)
-			}
-		}
-	}
-	return ""
-}
-
 // --- iOS detection helpers ---
 
 // detectiOSProject checks for Info.plist or other iOS markers.
@@ -796,36 +756,36 @@ func detectiOSProject(repoPath string) bool {
 func addIOSProps(f *facts.Fact, name string, annotations []string, supertypes string) {
 	// SwiftUI App entry point.
 	if containsAnnotation(annotations, "main") && supertypeMatches(supertypes, "App") {
-		f.Props["ios_component"] = "swiftui_app"
-		f.Props["framework"] = "swiftui"
+		f.SetProp("ios_component", "swiftui_app")
+		f.SetProp("framework", "swiftui")
 		return
 	}
 
 	// SwiftUI Views.
 	if supertypeMatches(supertypes, "View") {
-		f.Props["ios_component"] = "swiftui_view"
-		f.Props["framework"] = "swiftui"
+		f.SetProp("ios_component", "swiftui_view")
+		f.SetProp("framework", "swiftui")
 		return
 	}
 
 	// SwiftUI Scene.
 	if supertypeMatches(supertypes, "Scene") {
-		f.Props["ios_component"] = "swiftui_scene"
-		f.Props["framework"] = "swiftui"
+		f.SetProp("ios_component", "swiftui_scene")
+		f.SetProp("framework", "swiftui")
 		return
 	}
 
 	// Combine ViewModels (ObservableObject conformance).
 	if supertypeMatches(supertypes, "ObservableObject") {
-		f.Props["ios_component"] = "viewmodel"
-		f.Props["framework"] = "combine"
+		f.SetProp("ios_component", "viewmodel")
+		f.SetProp("framework", "combine")
 		return
 	}
 
 	// Swift 5.9+ Observable ViewModels.
 	if containsAnnotation(annotations, "Observable") {
-		f.Props["ios_component"] = "viewmodel"
-		f.Props["framework"] = "observation"
+		f.SetProp("ios_component", "viewmodel")
+		f.SetProp("framework", "observation")
 		return
 	}
 
@@ -833,47 +793,47 @@ func addIOSProps(f *facts.Fact, name string, annotations []string, supertypes st
 	if supertypeMatches(supertypes, "UIViewController", "UITableViewController",
 		"UICollectionViewController", "UINavigationController", "UITabBarController",
 		"UIPageViewController") {
-		f.Props["ios_component"] = "viewcontroller"
-		f.Props["framework"] = "uikit"
+		f.SetProp("ios_component", "viewcontroller")
+		f.SetProp("framework", "uikit")
 		return
 	}
 
 	// UIKit Views.
 	if supertypeMatches(supertypes, "UIView", "UITableViewCell", "UICollectionViewCell",
 		"UIStackView", "UIScrollView") {
-		f.Props["ios_component"] = "uiview"
-		f.Props["framework"] = "uikit"
+		f.SetProp("ios_component", "uiview")
+		f.SetProp("framework", "uikit")
 		return
 	}
 
 	// NSObject subclasses acting as delegates.
 	if supertypeMatches(supertypes, "NSObject") {
-		f.Props["framework"] = "foundation"
+		f.SetProp("framework", "foundation")
 	}
 
 	// Name-based architectural classification.
 	if strings.HasSuffix(name, "ViewModel") {
-		f.Props["ios_component"] = "viewmodel"
+		f.SetProp("ios_component", "viewmodel")
 		return
 	}
 	if strings.HasSuffix(name, "Repository") || strings.HasSuffix(name, "RepositoryImpl") {
-		f.Props["ios_component"] = "repository"
+		f.SetProp("ios_component", "repository")
 		return
 	}
 	if strings.HasSuffix(name, "UseCase") {
-		f.Props["ios_component"] = "usecase"
+		f.SetProp("ios_component", "usecase")
 		return
 	}
 	if strings.HasSuffix(name, "Coordinator") {
-		f.Props["ios_component"] = "coordinator"
+		f.SetProp("ios_component", "coordinator")
 		return
 	}
 	if strings.HasSuffix(name, "APIService") || (strings.HasSuffix(name, "Service") && !strings.HasSuffix(name, "ServiceInterface")) {
-		f.Props["ios_component"] = "service"
+		f.SetProp("ios_component", "service")
 		return
 	}
 	if name == "DIContainer" || strings.HasSuffix(name, "Container") {
-		f.Props["ios_component"] = "di_container"
+		f.SetProp("ios_component", "di_container")
 		return
 	}
 }

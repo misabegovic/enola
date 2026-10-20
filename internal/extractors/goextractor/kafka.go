@@ -28,17 +28,17 @@ func extractKafkaFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir string)
 	var out []facts.Fact
 	seen := map[string]bool{}
 
-	emit := func(topic string, line int, source string) {
+	emit := func(topic string, node ast.Node, source string) {
 		topic = strings.TrimSpace(topic)
 		if topic == "" || seen[topic] {
 			return
 		}
 		seen[topic] = true
-		out = append(out, facts.Fact{
+		fact := facts.Fact{
 			Kind: facts.KindStorage,
 			Name: topic,
 			File: relFile,
-			Line: line,
+			Line: fset.Position(node.Pos()).Line,
 			Props: map[string]any{
 				"storage_kind":      facts.StorageKindTopic,
 				facts.PropMessaging: "kafka",
@@ -46,7 +46,9 @@ func extractKafkaFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir string)
 				"source":            source,
 			},
 			Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: pkgDir}},
-		})
+		}
+		spanOf(fset, node).set(&fact)
+		out = append(out, fact)
 	}
 
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -62,12 +64,12 @@ func extractKafkaFacts(fset *token.FileSet, f *ast.File, relFile, pkgDir string)
 				return true
 			}
 			if def := reflect.StructTag(tag).Get("default"); def != "" {
-				emit(def, fset.Position(node.Pos()).Line, "config_default")
+				emit(def, node, "config_default")
 			}
 		case *ast.CallExpr:
 			// env.Get("<...>_TOPIC", "<default topic>")
 			if topic, ok := envGetTopicDefault(node); ok {
-				emit(topic, fset.Position(node.Pos()).Line, "env_default")
+				emit(topic, node, "env_default")
 			}
 		}
 		return true
@@ -137,7 +139,7 @@ func extractKafkaOperationFacts(fset *token.FileSet, f *ast.File, relFile, pkgDi
 				return true
 			}
 			seen[key] = true
-			out = append(out, facts.Fact{
+			fact := facts.Fact{
 				Kind: facts.KindStorage, Name: topic, File: relFile, Line: line,
 				Props: map[string]any{
 					"storage_kind": facts.StorageKindTopic, facts.PropMessaging: "kafka",
@@ -146,7 +148,9 @@ func extractKafkaOperationFacts(fset *token.FileSet, f *ast.File, relFile, pkgDi
 					"language":       "go", "code_symbol": symbol, "call": sel.Sel.Name,
 				},
 				Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: pkgDir}},
-			})
+			}
+			spanOf(fset, call).set(&fact)
+			out = append(out, fact)
 			return true
 		})
 	}

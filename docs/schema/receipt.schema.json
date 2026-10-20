@@ -1,0 +1,473 @@
+{
+  "$defs": {
+    "facts.CensusCause": {
+      "properties": {
+        "cause": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cause",
+        "count"
+      ],
+      "type": "object"
+    },
+    "facts.CoverageSummary": {
+      "properties": {
+        "coverage_gaps": {
+          "type": "integer"
+        },
+        "external_edges": {
+          "type": "integer"
+        },
+        "extraction_unresolved": {
+          "type": "integer"
+        },
+        "extractors_reporting": {
+          "type": "integer"
+        },
+        "services_total": {
+          "type": "integer"
+        },
+        "unresolved_edges": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "coverage_gaps",
+        "services_total",
+        "unresolved_edges"
+      ],
+      "type": "object"
+    },
+    "facts.FileCensus": {
+      "properties": {
+        "excluded_by_ignore": {
+          "type": "integer"
+        },
+        "excluded_by_kind": {
+          "type": "integer"
+        },
+        "excluded_kinds": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "files_walked": {
+          "type": "integer"
+        },
+        "parsed": {
+          "type": "integer"
+        },
+        "skipped_with_cause": {
+          "type": "integer"
+        },
+        "top_skip_causes": {
+          "items": {
+            "$ref": "#/$defs/facts.CensusCause"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "excluded_by_ignore",
+        "excluded_by_kind",
+        "files_walked",
+        "parsed",
+        "skipped_with_cause"
+      ],
+      "type": "object"
+    },
+    "facts.GitInfo": {
+      "properties": {
+        "commit": {
+          "type": "string"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "remote": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "dirty"
+      ],
+      "type": "object"
+    },
+    "facts.ParseError": {
+      "properties": {
+        "extractor": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "msg": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "extractor",
+        "msg"
+      ],
+      "type": "object"
+    },
+    "facts.ProviderCensus": {
+      "properties": {
+        "constructs_skipped": {
+          "type": "integer"
+        },
+        "declarations_parsed": {
+          "type": "integer"
+        },
+        "files_seen": {
+          "type": "integer"
+        },
+        "skip_causes": {
+          "items": {
+            "$ref": "#/$defs/facts.CensusCause"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "constructs_skipped",
+        "declarations_parsed",
+        "files_seen"
+      ],
+      "type": "object"
+    },
+    "facts.ProviderDifference": {
+      "properties": {
+        "cause": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        },
+        "examples": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cause",
+        "count"
+      ],
+      "type": "object"
+    },
+    "facts.ProviderRecord": {
+      "properties": {
+        "agreed": {
+          "type": "integer"
+        },
+        "applicable": {
+          "type": "boolean"
+        },
+        "census": {
+          "$ref": "#/$defs/facts.ProviderCensus"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "commit_source": {
+          "type": "string"
+        },
+        "differences": {
+          "items": {
+            "$ref": "#/$defs/facts.ProviderDifference"
+          },
+          "type": "array"
+        },
+        "differing": {
+          "type": "integer"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "excluded_by_ignore": {
+          "type": "integer"
+        },
+        "fact_count": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "one_sided": {
+          "type": "integer"
+        },
+        "overlap": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/facts.RelationOverlap"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "reuse": {
+          "$ref": "#/$defs/facts.ProviderReuse"
+        },
+        "skipped": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fact_count",
+        "name"
+      ],
+      "type": "object"
+    },
+    "facts.ProviderReuse": {
+      "properties": {
+        "cache": {
+          "type": "string"
+        },
+        "computed": {
+          "type": "integer"
+        },
+        "files_computed": {
+          "type": "integer"
+        },
+        "files_reused": {
+          "type": "integer"
+        },
+        "miss": {
+          "type": "string"
+        },
+        "outside_scope": {
+          "type": "integer"
+        },
+        "reused": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "computed",
+        "reused"
+      ],
+      "type": "object"
+    },
+    "facts.ReceiptQuality": {
+      "properties": {
+        "census": {
+          "$ref": "#/$defs/facts.FileCensus"
+        },
+        "coverage": {
+          "$ref": "#/$defs/facts.CoverageSummary"
+        },
+        "dirs_skipped": {
+          "type": "integer"
+        },
+        "files_parsed": {
+          "type": "integer"
+        },
+        "files_seen": {
+          "type": "integer"
+        },
+        "files_skipped": {
+          "type": "integer"
+        },
+        "heuristic_insights": {
+          "type": "integer"
+        },
+        "parse_error_sample": {
+          "items": {
+            "$ref": "#/$defs/facts.ParseError"
+          },
+          "type": "array"
+        },
+        "parse_errors": {
+          "type": "integer"
+        },
+        "skipped_sample": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dirs_skipped",
+        "files_parsed",
+        "files_seen",
+        "files_skipped",
+        "heuristic_insights",
+        "parse_errors"
+      ],
+      "type": "object"
+    },
+    "facts.RelationOverlap": {
+      "properties": {
+        "already_resolved": {
+          "type": "integer"
+        },
+        "conflict": {
+          "type": "integer"
+        },
+        "conflicts": {
+          "items": {
+            "$ref": "#/$defs/facts.TargetPair"
+          },
+          "type": "array"
+        },
+        "no_extractor_symbol": {
+          "type": "integer"
+        },
+        "provider_only": {
+          "type": "integer"
+        },
+        "respelled": {
+          "type": "integer"
+        },
+        "respellings": {
+          "items": {
+            "$ref": "#/$defs/facts.TargetPair"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "already_resolved",
+        "conflict",
+        "no_extractor_symbol",
+        "provider_only",
+        "respelled"
+      ],
+      "type": "object"
+    },
+    "facts.TargetPair": {
+      "properties": {
+        "extractor": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "extractor",
+        "provider",
+        "source"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "config_hash": {
+      "type": "string"
+    },
+    "duration": {
+      "type": "string"
+    },
+    "enola_version": {
+      "type": "string"
+    },
+    "explainers": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "extractor_version": {
+      "type": "string"
+    },
+    "extractors": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "fact_count": {
+      "type": "integer"
+    },
+    "format_version": {
+      "type": "integer"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "git": {
+      "$ref": "#/$defs/facts.GitInfo"
+    },
+    "ignore_glob_hash": {
+      "type": "string"
+    },
+    "insight_count": {
+      "type": "integer"
+    },
+    "output_hashes": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "providers": {
+      "items": {
+        "$ref": "#/$defs/facts.ProviderRecord"
+      },
+      "type": "array"
+    },
+    "quality": {
+      "$ref": "#/$defs/facts.ReceiptQuality"
+    },
+    "renderers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "repo_path": {
+      "type": "string"
+    },
+    "snapshot_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "duration",
+    "enola_version",
+    "explainers",
+    "extractors",
+    "fact_count",
+    "format_version",
+    "generated_at",
+    "insight_count",
+    "quality",
+    "repo_path",
+    "snapshot_id"
+  ],
+  "title": "receipt.json",
+  "type": "object"
+}

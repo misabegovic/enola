@@ -1,18 +1,10 @@
 package diff
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
+import "github.com/enola-labs/enola/internal/facts"
 
-	"github.com/enola-labs/enola/internal/facts"
-)
+// FindingIdentity is facts.FindingIdentity, the identity the diff pairs a
+// finding on; it lives beside the type so the engine stamps it without
+// importing the diff.
+func FindingIdentity(in facts.Insight) string { return facts.FindingIdentity(in) }
 
-// FindingIdentity is the stable identity of a finding across snapshots, as a
-// short hex digest of the same key the diff pairs findings on. It is what a
-// writer that leaves the binary (a SARIF fingerprint, an annotation a host
-// deduplicates between builds) carries, so the identity CI sees is the one
-// the verdict was computed with and never a second derivation.
-func FindingIdentity(in facts.Insight) string {
-	sum := sha256.Sum256([]byte(findingKey(in)))
-	return hex.EncodeToString(sum[:8])
-}
+func WithIdentities[T any](v T) T { return facts.WithIdentities(v) }

@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/enola-labs/enola/internal/config"
+	"github.com/enola-labs/enola/internal/impact"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/cli"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -38,7 +39,11 @@ var expectedTools = []string{
 	"governing_intent",
 	"constraints_for",
 	"plan_check",
+	"context_pack",
 	"coverage_report",
+	"constraints_ledger",
+	"constraints_lint",
+	"grade",
 }
 
 // session bundles a connected client and the temp repo the server was pointed at.
@@ -280,6 +285,48 @@ func TestE2E_ImpactAnalysis(t *testing.T) {
 	}
 }
 
+// The command and the tool must produce one document for the same query.
+func TestE2E_ImpactReportMatchesTool(t *testing.T) {
+	eng, cfg := newTestEngine(t)
+	s := connect(t, eng, cfg)
+	s.repo = copyTree(t, filepath.Join("..", "engine", "testdata", "repos", "go_sample"), t.TempDir())
+	s.snapshot(t)
+
+	// "a" matches too many nodes to pick from.
+	// "pkg/a/a.go" is a file, answered from the symbols it declares.
+	for _, target := range []string{"pkg/a.Alpha", "a", "pkg/a/a.go"} {
+		report, err := impact.Analyze(eng.Resolver(), impact.Request{Target: target, IncludeForward: true})
+		if err != nil {
+			t.Fatalf("Impact(%q): %v", target, err)
+		}
+		doc, err := report.JSON()
+		if err != nil {
+			t.Fatalf("JSON(%q): %v", target, err)
+		}
+		tool := text(s.call(t, "impact_analysis", map[string]any{
+			"target": target, "include_forward": true, "output_mode": "full",
+		}))
+		if string(doc) != tool {
+			t.Errorf("target %q: --json and output_mode=full differ.\ncommand:\n%s\ntool:\n%s", target, doc, tool)
+		}
+		if got, want := report.Resolved(), target != "a"; got != want {
+			t.Errorf("target %q: Resolved() = %v, want %v", target, got, want)
+		}
+	}
+
+	// The readable modes say a file was asked about, and how it was answered.
+	for _, mode := range []string{"summary", "compact"} {
+		got := text(s.call(t, "impact_analysis", map[string]any{"target": "pkg/a/a.go", "output_mode": mode}))
+		if !strings.Contains(got, "pkg/a/a.go is a file, not a node") || !strings.Contains(got, "4 total dependents") {
+			t.Errorf("output_mode=%s on a file should name it and count its dependents; got:\n%s", mode, got)
+		}
+	}
+
+	if _, err := impact.Analyze(eng.Resolver(), impact.Request{Target: "NoSuchSymbolAnywhere"}); err == nil {
+		t.Error("a target matching nothing must be an error, as it is on the tool")
+	}
+}
+
 // TestE2E_GoverningIntent drives the reverse query through the wire in both
 // directions, plus its two distinct empty states: a snapshot with no compiled
 // pages answers "not asked", and a governed snapshot answers per target.
@@ -341,6 +388,53 @@ func TestE2E_GoverningIntent(t *testing.T) {
 	out = text(s.call(t, "show_symbol", map[string]any{"name": "Alpha"}))
 	if !strings.Contains(out, "Governed by: decision.md (decision, accepted)") {
 		t.Errorf("show_symbol must surface the governing pages beside the source; got:\n%s", out)
+	}
+}
+
+// TestE2E_GoverningIntentNarrowsForASymbol asks the reverse query by a fact
+// name and by a file path over a page narrowed to one function: by name, the
+// page governs that function and not its sibling in the same file; by path, it
+// governs the file and names the symbol.
+func TestE2E_GoverningIntentNarrowsForASymbol(t *testing.T) {
+	s := startInMemory(t)
+	repo := filepath.Join(t.TempDir(), "backend")
+	for path, body := range map[string]string{
+		"go.mod":      "module example.com/backend\n\ngo 1.21\n",
+		"main.go":     "package main\n\nfunc main() {}\n",
+		"pkg/a/a.go":  "package a\n\nfunc Alpha() {}\n\nfunc Beta() {}\n",
+		"decision.md": "---\nenola_intent:\n  page:\n    type: decision\n    status: accepted\n    anchors:\n      - {repo: backend, path: pkg/a/a.go, symbol: pkg/a.Alpha}\n---\nbody\n",
+	} {
+		full := filepath.Join(repo, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if res := s.call(t, "generate_snapshot", map[string]any{"repo_path": repo, "fresh": true}); res.IsError {
+		t.Fatalf("generate_snapshot(backend) returned error: %s", text(res))
+	}
+
+	out := text(s.call(t, "governing_intent", map[string]any{"target": "pkg/a.Alpha"}))
+	if !strings.Contains(out, "decision.md (decision, accepted) [symbol pkg/a.Alpha]") {
+		t.Errorf("the page narrowed to Alpha governs Alpha and says so; got:\n%s", out)
+	}
+	out = text(s.call(t, "governing_intent", map[string]any{"target": "pkg/a.Beta"}))
+	if strings.Contains(out, "decision.md") || !strings.Contains(out, "narrowed to another symbol") {
+		t.Errorf("the page narrowed to Alpha does not govern Beta, and the answer says why; got:\n%s", out)
+	}
+	out = text(s.call(t, "governing_intent", map[string]any{"target": "pkg/a/a.go"}))
+	if !strings.Contains(out, "decision.md (decision, accepted) [symbol pkg/a.Alpha]") {
+		t.Errorf("by path the file is governed and the symbol named; got:\n%s", out)
+	}
+	out = text(s.call(t, "governing_intent", map[string]any{"target": "decision.md"}))
+	if !strings.Contains(out, "backend pkg/a/a.go") || !strings.Contains(out, "narrowed to symbol pkg/a.Alpha") {
+		t.Errorf("the forward half names the symbol beside the path; got:\n%s", out)
+	}
+	out = text(s.call(t, "show_symbol", map[string]any{"name": "pkg/a.Beta"}))
+	if strings.Contains(out, "Governed by: decision.md") {
+		t.Errorf("show_symbol on Beta must not list the page narrowed to Alpha; got:\n%s", out)
 	}
 }
 
@@ -568,6 +662,55 @@ func TestE2E_AutoLoadedSnapshotResetOnFreshGenerate(t *testing.T) {
 	}
 }
 
+// TestE2E_LabelShorthandResolvesHoweverTheGraphWasLoaded: "<label> <term>" must mean the
+// same node after generate_snapshot and after a restore from disk. A restore carries a
+// label-to-path map and a single-repo generate does not, and the shorthand once read
+// only that map.
+func TestE2E_LabelShorthandResolvesHoweverTheGraphWasLoaded(t *testing.T) {
+	sameAnswerOnBothLoadPaths(t, "impact_analysis", func(repo string) map[string]any {
+		return map[string]any{"target": filepath.Base(repo) + " Alpha", "output_mode": "compact"}
+	})
+}
+
+// TestE2E_AbsolutePathResolvesHoweverTheGraphWasLoaded is the same split read the other
+// way. The map a restore carries made an absolute path gain the repo label, which only
+// an appended repository's files have, so a path that resolved after generate_snapshot
+// matched nothing in a session that restored the graph.
+func TestE2E_AbsolutePathResolvesHoweverTheGraphWasLoaded(t *testing.T) {
+	sameAnswerOnBothLoadPaths(t, "explore", func(repo string) map[string]any {
+		return map[string]any{"focus": filepath.Join(repo, "pkg", "a", "a.go")}
+	})
+}
+
+// sameAnswerOnBothLoadPaths asks one question of go_sample straight after
+// generate_snapshot and again in a server that restored that snapshot from disk, and
+// expects pkg/a.Alpha in both answers.
+func sameAnswerOnBothLoadPaths(t *testing.T, tool string, args func(repo string) map[string]any) {
+	t.Helper()
+	repo := copyTree(t, filepath.Join("..", "engine", "testdata", "repos", "go_sample"), t.TempDir())
+	target := args(repo)
+
+	generated := startInMemory(t)
+	generated.repo = repo
+	generated.snapshot(t)
+	afterGenerate := generated.call(t, tool, target)
+
+	writeSnapshotToDisk(t, repo)
+	eng, cfg := newTestEngine(t)
+	cfg.Repo = repo
+	bootstrap.AutoLoadSnapshot(eng, cfg)
+	if eng.Store().Count() == 0 {
+		t.Fatalf("expected AutoLoadSnapshot to populate the store from %s", repo)
+	}
+	afterRestore := connect(t, eng, cfg).call(t, tool, target)
+
+	for name, res := range map[string]*mcp.CallToolResult{"generate": afterGenerate, "restore": afterRestore} {
+		if res.IsError || !strings.Contains(text(res), "pkg/a.Alpha") {
+			t.Errorf("after %s: %s %v should reach pkg/a.Alpha; got:\n%s", name, tool, target, text(res))
+		}
+	}
+}
+
 // TestE2E_MultiRepoAppendStillAccumulates guards against the session-flag gate
 // over-resetting: a genuine multi-repo flow (first snapshot resets, then
 // append=true) must still accumulate both repos as service nodes.
@@ -589,6 +732,24 @@ func TestE2E_MultiRepoAppendStillAccumulates(t *testing.T) {
 		if !strings.Contains(cov, label) {
 			t.Errorf("coverage_report should list service %q after append; got:\n%s", label, cov)
 		}
+	}
+}
+
+// TestE2E_AppendWithoutRepoPathIsRefused: append names one repository to add. Without
+// repo_path it used to fall back to the configured repo, the directory the agent was
+// started in, which can be a folder of every repository the user has. It must fail at
+// once, with the store untouched, instead of indexing that.
+func TestE2E_AppendWithoutRepoPathIsRefused(t *testing.T) {
+	s := startInMemory(t)
+	s.snapshot(t)
+	before := text(s.call(t, "coverage_report", map[string]any{}))
+
+	res := s.call(t, "generate_snapshot", map[string]any{"append": true, "no_cluster": true})
+	if !res.IsError || !strings.Contains(text(res), "needs repo_path") {
+		t.Fatalf("append without repo_path must be refused naming repo_path; got error=%v:\n%s", res.IsError, text(res))
+	}
+	if after := text(s.call(t, "coverage_report", map[string]any{})); after != before {
+		t.Errorf("a refused append changed the store:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
 

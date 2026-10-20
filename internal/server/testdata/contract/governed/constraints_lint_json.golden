@@ -1,0 +1,22 @@
+{
+  "valid": true,
+  "resolution": "snapshot",
+  "snapshot": "<TMP>/go_sample/.enola",
+  "problems": [],
+  "unknown_keys": [],
+  "notes": [],
+  "components": [
+    {
+      "name": "pkg-a",
+      "selector": "match pkg/a/**",
+      "members": 8,
+      "state": "resolved"
+    },
+    {
+      "name": "pkg-b",
+      "selector": "match pkg/b/**",
+      "members": 2,
+      "state": "resolved"
+    }
+  ]
+}

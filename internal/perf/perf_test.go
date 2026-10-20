@@ -1,0 +1,2625 @@
+package perf
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/enola-labs/enola/internal/facts"
+)
+
+func findFinding(fs []Finding, symbol, kind string) (Finding, bool) {
+	for _, f := range fs {
+		if f.Symbol == symbol && f.Kind == kind {
+			return f, true
+		}
+	}
+	return Finding{}, false
+}
+
+func TestBigOForDepth(t *testing.T) {
+	cases := map[int]string{0: "O(1)", 1: "O(n)", 2: "O(n²)", 3: "O(n³)", 4: "O(n^4)"}
+	for d, want := range cases {
+		if got := bigOForDepth(d); got != want {
+			t.Errorf("bigOForDepth(%d) = %q, want %q", d, got, want)
+		}
+	}
+}
+
+func TestIsExpensiveCall(t *testing.T) {
+	storage := map[string]bool{"app/data.users": true}
+	expensive := []string{
+		// storage fact + Go idioms
+		"app/data.users", "db.Query", "repo.FindByID", "client.Request", "http.Get",
+		// Python SQLAlchemy / DBAPI (resolve to <type>.method)
+		"sqlalchemy.orm.Session.execute", "models.DagRun.scalars", "conn.Connection.fetchall",
+		"orm.Session.commit", "models.Dag.bulk_create",
+		// Python HTTP (module-qualified)
+		"requests.get", "httpx.post",
+		// Ruby / ActiveRecord (resolve as Model.method / receiver.method)
+		"User.where", "Account.find_by", "posts.pluck", "User.find_each", "record.update",
+		// Swift (Core Data / network / file)
+		"context.fetch", "URLSession.shared.dataTask", "repo.save", "store.load(for",
+		// Kotlin (Room / Retrofit / coroutine)
+		"dao.insert", "api.enqueue", "userDao.getAll", "call.await",
+		// TypeScript (Prisma / TypeORM / network)
+		"prisma.user.findMany", "repo.findOne", "client.fetch(",
+		// Java (JPA / Spring Data / JDBC / RestTemplate)
+		"userRepo.findAll", "repo.findById", "jdbcTemplate.queryForObject", "restTemplate.getForObject",
+	}
+	for _, c := range expensive {
+		if !isExpensiveCall(c, storage, nil) {
+			t.Errorf("isExpensiveCall(%q) = false, want true", c)
+		}
+	}
+	cheap := []string{
+		"strings.ToLower", "math.Max", "pkg.helper", "module.compute_total", "utils.format_name",
+		// keywords must match the METHOD segment, not the receiver / path / argument:
+		"searchQuery.toLowerCase",                           // "Query" is the receiver, not the method
+		"src/components/GolfShop/RentalRequests.parseFloat", // "Request" is in the path
+		"new Date(ticket.updated_at).toLocaleDateString",    // ".update" is in the argument
+		"queryClient.invalidateQueries",                     // not a DB query method
+		// Whole-word matching: a keyword must not fire on a within-token infix —
+		// these are common C/C++ names that previously false-matched via substring.
+		"stream.fflush",   // "flush" is an infix of "fflush" (C stdlib), not a DB flush
+		"obj.preload",     // "load" is an infix of "preload"
+		"row.updatedAt",   // "update" is a prefix of the getter "updatedAt"
+		"node.insertedAt", // "insert" is a prefix of "insertedAt"
+	}
+	for _, c := range cheap {
+		if isExpensiveCall(c, storage, nil) {
+			t.Errorf("isExpensiveCall(%q) = true, want false", c)
+		}
+	}
+
+	// Ruby association reads: flagged only when the method name is a known association.
+	assoc := map[string]bool{"posts": true, "account": true}
+	for _, c := range []string{"posts", "u.posts", "account", "u.account"} {
+		if !isExpensiveCall(c, storage, assoc) {
+			t.Errorf("isExpensiveCall(%q, assoc) = false, want true (association read)", c)
+		}
+	}
+	for _, c := range []string{"name", "u.name", "title"} {
+		if isExpensiveCall(c, storage, assoc) {
+			t.Errorf("isExpensiveCall(%q, assoc) = true, want false (not an association)", c)
+		}
+	}
+}
+
+func TestAnalyze_NestedLoopSeverity(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "p.Quad", File: "p/q.go", Line: 3, LoopDepth: 2, LoopCount: 2, Cyclomatic: 3},
+		{Name: "p.Cubic", File: "p/c.go", Line: 9, LoopDepth: 3, LoopCount: 3, Cyclomatic: 4},
+	}
+	got := analyze(funcs, nil, nil, nil)
+
+	q, ok := findFinding(got, "p.Quad", "nested-loop")
+	if !ok {
+		t.Fatalf("no nested-loop finding for p.Quad; got %+v", got)
+	}
+	if q.Depth != 2 || q.BigO != "" || q.Severity != "medium" {
+		t.Errorf("p.Quad: got depth=%d BigO=%q sev=%q, want depth 2, no Big-O, medium", q.Depth, q.BigO, q.Severity)
+	}
+	c, ok := findFinding(got, "p.Cubic", "nested-loop")
+	if !ok {
+		t.Fatalf("no nested-loop finding for p.Cubic")
+	}
+	// A structural finding is medium at any depth; see structuralSeverity.
+	if c.Depth != 3 || c.BigO != "" || c.Severity != "medium" || c.Label() != "depth 3" {
+		t.Errorf("p.Cubic: got depth=%d BigO=%q sev=%q label=%q, want depth 3, no Big-O, medium", c.Depth, c.BigO, c.Severity, c.Label())
+	}
+	for _, f := range []Finding{q, c} {
+		if !strings.Contains(f.Why, depthIsNotComplexity) {
+			t.Errorf("%s: a nested-loop finding must say its depth is not a complexity; why = %q", f.Symbol, f.Why)
+		}
+	}
+}
+
+func TestAnalyze_CompoundedAcrossCallGraph(t *testing.T) {
+	// f loops once and, inside that loop, calls g which itself loops once.
+	// Effective worst-case nesting compounds to O(n²) across the call boundary.
+	funcs := []funcInfo{
+		{Name: "p.f", File: "p/f.go", Line: 1, LoopDepth: 1, LoopCount: 1, Calls: []string{"p.g"}, CallsInLoop: []string{"p.g"}},
+		{Name: "p.g", File: "p/g.go", Line: 1, LoopDepth: 1, LoopCount: 1},
+	}
+	got := analyze(funcs, nil, nil, nil)
+
+	c, ok := findFinding(got, "p.f", "compounded")
+	if !ok {
+		t.Fatalf("no compounded finding for p.f; got %+v", got)
+	}
+	if c.Depth != 2 || c.BigO != "" {
+		t.Errorf("p.f compounded depth = %d, BigO = %q; want depth 2 and no Big-O", c.Depth, c.BigO)
+	}
+	// p.f loops only once locally, so it must NOT produce a nested-loop finding.
+	if _, ok := findFinding(got, "p.f", "nested-loop"); ok {
+		t.Errorf("p.f should not have a nested-loop finding (loop_depth=1)")
+	}
+	// p.g loops once and calls nothing in a loop → no compounded finding.
+	if _, ok := findFinding(got, "p.g", "compounded"); ok {
+		t.Errorf("p.g should not have a compounded finding")
+	}
+}
+
+func TestAnalyze_DirectRecursion(t *testing.T) {
+	// Flagged via the extractor's recursive_self prop.
+	funcs := []funcInfo{{Name: "p.Fib", File: "p/f.go", Line: 1, Recursive: true, Calls: []string{"p.Fib"}}}
+	got := analyze(funcs, nil, nil, nil)
+	r, ok := findFinding(got, "p.Fib", "recursion")
+	if !ok {
+		t.Fatalf("no recursion finding for p.Fib; got %+v", got)
+	}
+	if r.Severity != "medium" {
+		t.Errorf("p.Fib recursion severity = %q, want medium (no loop)", r.Severity)
+	}
+}
+
+func TestAnalyze_RecursionWithLoopIsMediumNotExponential(t *testing.T) {
+	// Recursion combined with a loop is the common tree/divide-and-conquer shape
+	// (each level consumes a disjoint subset), NOT a combinatorial blow-up — so it
+	// is medium and must not claim "exponential".
+	funcs := []funcInfo{{Name: "p.Walk", File: "p/w.go", Line: 1, LoopDepth: 1, Recursive: true, Calls: []string{"p.Walk"}}}
+	got := analyze(funcs, nil, nil, nil)
+	r, ok := findFinding(got, "p.Walk", "recursion")
+	if !ok {
+		t.Fatalf("no recursion finding for p.Walk")
+	}
+	if r.Severity != "medium" {
+		t.Errorf("recursion+loop severity = %q, want medium", r.Severity)
+	}
+	if r.BigO != "O(?) — recursive (with loop)" {
+		t.Errorf("recursion+loop big_o = %q, want %q", r.BigO, "O(?) — recursive (with loop)")
+	}
+	if strings.Contains(r.BigO, "exponential") || strings.Contains(r.Why, "exponential") {
+		t.Errorf("recursion+loop must not claim exponential: big_o=%q why=%q", r.BigO, r.Why)
+	}
+}
+
+func TestAnalyze_OverloadDelegationNotRecursion(t *testing.T) {
+	// Two overloads share the name "p.M.f"; one delegates to the other (resolves to
+	// the shared name) and also loops. That must NOT be reported as recursion.
+	funcs := []funcInfo{
+		{Name: "p.M.f", File: "p/m.go", Line: 1, Recursive: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"p.M.f"}, CallsInLoop: []string{"p.M.g"}},
+		{Name: "p.M.f", File: "p/m.go", Line: 8},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "p.M.f", "recursion"); ok {
+		t.Errorf("overloaded p.M.f must not be reported as recursion")
+	}
+}
+
+func TestAnalyze_GenuineRecursionStillFlagged(t *testing.T) {
+	// A single (non-overloaded) self-recursive function is still flagged.
+	funcs := []funcInfo{{Name: "p.fib", File: "p/f.go", Line: 1, Recursive: true, Calls: []string{"p.fib"}}}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "p.fib", "recursion"); !ok {
+		t.Errorf("genuine direct recursion should still be flagged")
+	}
+}
+
+func TestAnalyze_NoCompoundedOnLoopFreeOverload(t *testing.T) {
+	// Two overloads named "p.M.toOffers": one is loop-free, the other loops and
+	// calls a looping helper. The loop-free overload must NOT get a compounded finding.
+	funcs := []funcInfo{
+		{Name: "p.M.toOffers", File: "p/m.go", Line: 1}, // loop-free
+		{Name: "p.M.toOffers", File: "p/m.go", Line: 9, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"p.M.helper"}},
+		{Name: "p.M.helper", File: "p/m.go", Line: 20, LoopDepth: 1, LoopCount: 1},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	// The loop-free overload (Line 1) must have no compounded finding; assert that
+	// NO compounded finding cites loop_depth=0 evidence and that a loop-free fact
+	// can't be compounded by checking the only compounded finding (if any) is high-depth.
+	for _, f := range got {
+		if f.Kind == "compounded" && f.Line == 1 {
+			t.Errorf("loop-free overload (line 1) must not get a compounded finding: %+v", f)
+		}
+	}
+}
+
+func TestAnalyze_MutualRecursionNotFlagged(t *testing.T) {
+	// A→B→A with no self-call. Mutual-recursion (SCC) detection was removed because
+	// in real call graphs it flags event-driven closure/delegate callback cycles as
+	// recursion (the dominant Swift false-positive source). This A→B→A pattern is a
+	// deliberate, accepted false negative — it must NOT produce a recursion finding.
+	funcs := []funcInfo{
+		{Name: "p.A", File: "p/a.go", Line: 1, Calls: []string{"p.B"}},
+		{Name: "p.B", File: "p/b.go", Line: 1, Calls: []string{"p.A"}},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if _, ok := findFinding(got, "p.A", "recursion"); ok {
+		t.Errorf("mutual recursion (SCC) must no longer be flagged for p.A")
+	}
+	if _, ok := findFinding(got, "p.B", "recursion"); ok {
+		t.Errorf("mutual recursion (SCC) must no longer be flagged for p.B")
+	}
+}
+
+func TestAnalyze_ExpensiveCallInLoop_N1(t *testing.T) {
+	storage := map[string]bool{"app/data.LoadUser": true}
+	funcs := []funcInfo{
+		// confirmed I/O (storage fact) → high, regardless of export status
+		{Name: "app.Handler", File: "app/h.go", Line: 5, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"app/data.LoadUser"}, CallsInLoop: []string{"app/data.LoadUser"}},
+		// heuristic-only match (generic verb name, no storage/prefix) → medium
+		{Name: "app.worker", File: "app/w.go", Line: 9, Exported: false, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"repo.FindByID"}, CallsInLoop: []string{"repo.FindByID"}},
+	}
+	got := analyze(funcs, storage, nil, nil)
+
+	h, ok := findFinding(got, "app.Handler", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop finding for app.Handler; got %+v", got)
+	}
+	if h.Severity != "high" {
+		t.Errorf("confirmed-I/O N+1 severity = %q, want high", h.Severity)
+	}
+	w, ok := findFinding(got, "app.worker", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop finding for app.worker")
+	}
+	if w.Severity != "medium" {
+		t.Errorf("heuristic-only N+1 severity = %q, want medium", w.Severity)
+	}
+}
+
+func TestAnalyze_CallInLoopAggregatesCallees(t *testing.T) {
+	// Multiple expensive callees in one function collapse to a SINGLE call-in-loop
+	// finding that enumerates each in its evidence, rather than one near-duplicate
+	// row per callee (same symbol/line/Big-O).
+	funcs := []funcInfo{{
+		Name: "app.Handler", File: "app/h.go", Line: 5, Exported: true, LoopDepth: 1, LoopCount: 1,
+		CallsInLoop: []string{"db.Query", "db.Exec"},
+	}}
+	got := analyze(funcs, nil, nil, nil)
+
+	var n int
+	var f Finding
+	for _, x := range got {
+		if x.Symbol == "app.Handler" && x.Kind == "call-in-loop" {
+			n++
+			f = x
+		}
+	}
+	if n != 1 {
+		t.Fatalf("call-in-loop findings for app.Handler = %d, want 1 (aggregated)", n)
+	}
+	for _, want := range []string{"call_in_loop=db.Query", "call_in_loop=db.Exec"} {
+		found := false
+		for _, e := range f.Evidence {
+			if e == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("aggregated evidence %v missing %q", f.Evidence, want)
+		}
+	}
+}
+
+func TestIsExpensiveTSCall(t *testing.T) {
+	storage := map[string]bool{"app/data.users": true}
+	byName := map[string]funcInfo{
+		"api.loadFeed": {Name: "api.loadFeed", PerformsIO: true},
+	}
+	// Short-name performs_io index (built by analyze from every performs_io func): a
+	// wrapper the extractor tagged performs_io whose method segment is "updateChannels".
+	ioMethods := map[string]bool{"updateChannels": true}
+	expensive := []string{
+		"app/data.users",       // storage fact
+		"api.loadFeed",         // resolved callee flagged performs_io (exact byName)
+		"svc.updateChannels",   // performs_io wrapper matched by short-name index
+		"fetch",                // global fetch
+		"prisma.user.findMany", // distinctive ORM method
+		"repo.findUnique",      // ORM method
+		"client.queryRaw",      // Prisma raw query
+		"axios.get",            // HTTP receiver token
+		"http.request",         // HTTP receiver token
+		"prisma.$queryRaw",     // prisma. prefix
+	}
+	for _, c := range expensive {
+		if !isExpensiveTSCall(c, storage, byName, ioMethods) {
+			t.Errorf("isExpensiveTSCall(%q) = false, want true", c)
+		}
+	}
+	cheap := []string{
+		// The camelCase-verb collisions this fix targets: pure in-memory helpers
+		// whose names merely contain a DB verb at a hump boundary.
+		"getFetchAllUpdate", "updateState", "findIndex", "getOtherListUpdates",
+		"scopeList.reduce", "collection.push", "items.flatMap",
+		// A locally-defined helper resolved to a non-IO fact.
+		"utils.formatName",
+	}
+	for _, c := range cheap {
+		if isExpensiveTSCall(c, storage, byName, ioMethods) {
+			t.Errorf("isExpensiveTSCall(%q) = true, want false", c)
+		}
+	}
+}
+
+func TestAnalyze_TSCallInLoop_LocalHelperNotExpensive(t *testing.T) {
+	// A frontend reducer that calls a pure in-memory helper (getFetchAllUpdate)
+	// inside a reduce must NOT produce a call-in-loop finding, even though the
+	// helper name contains the DB verbs "Fetch"/"Update" at camelCase humps and
+	// the reducer is exported (which would otherwise escalate to high).
+	funcs := []funcInfo{
+		{Name: "search/state.Reducer", File: "client/search/state/reducer.jsx", Line: 26,
+			Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"getFetchAllUpdate"}},
+		{Name: "getFetchAllUpdate", File: "client/search/state/utils.jsx", Line: 3},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if f, ok := findFinding(got, "search/state.Reducer", "call-in-loop"); ok {
+		t.Errorf("unexpected call-in-loop finding on in-memory helper: %+v", f)
+	}
+}
+
+func TestAnalyze_TSCallInLoop_RealN1Flagged(t *testing.T) {
+	// A genuine per-iteration network/DB call in TS/JS is still flagged. Both calls
+	// are known by their names only, so the finding is medium: a curated method name
+	// is a better reading than a verb, and still a reading.
+	funcs := []funcInfo{
+		{Name: "feed.load", File: "client/feed/api.ts", Line: 10,
+			Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"prisma.user.findMany", "fetch"}},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "feed.load", "call-in-loop")
+	if !ok {
+		t.Fatalf("expected a call-in-loop finding for a real TS N+1; got %+v", got)
+	}
+	if f.Severity != "medium" || f.Confidence != 0.6 {
+		t.Errorf("TS N+1 known by name = %q at %.1f, want medium at 0.6", f.Severity, f.Confidence)
+	}
+}
+
+func TestAnalyze_TSCallInLoop_PerformsIOWrapperFlagged(t *testing.T) {
+	// A loop calling a wrapper the extractor transitively tagged performs_io is a real
+	// per-iteration network call — flagged even though the wrapper's name matches no
+	// keyword. The in-loop callee is the receiver-qualified metric string; the match
+	// comes through the short-name ioMethods index built from the wrapper's own fact.
+	//
+	// That match is by method name, so it reports and does not confirm. The same
+	// call resolved to the wrapper's fact is confirmed, and high.
+	funcs := []funcInfo{
+		{Name: "notif.Subcategory", File: "client/notif/index.tsx", Line: 29,
+			Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"svc.updateChannels"}},
+		{Name: "notif.Resolved", File: "client/notif/index.tsx", Line: 60,
+			Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"client/notif/api.updateChannels"}},
+		// The wrapper fact carries performs_io (propagated by the TS extractor).
+		{Name: "client/notif/api.updateChannels", File: "client/notif/api.ts", Line: 4,
+			Exported: true, PerformsIO: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "notif.Subcategory", "call-in-loop")
+	if !ok {
+		t.Fatalf("expected a call-in-loop finding for a performs_io wrapper N+1; got %+v", got)
+	}
+	if f.Severity != "medium" {
+		t.Errorf("performs_io N+1 matched by method name = %q, want medium", f.Severity)
+	}
+	if r, ok := findFinding(got, "notif.Resolved", "call-in-loop"); !ok || r.Severity != "high" || r.Confidence != 0.9 {
+		t.Errorf("performs_io N+1 on a resolved callee = %q at %.1f (ok=%v), want high at 0.9", r.Severity, r.Confidence, ok)
+	}
+}
+
+func TestAnalyze_PyDottedLocalHelperNotN1(t *testing.T) {
+	// The Python extractor emits an in-loop call to an *unresolved* local function in
+	// dotted import-path form ("app.helpers.merge_config"), while byName is keyed by the
+	// slash-form canonical name ("app/helpers.merge_config"). The two never match, so the
+	// resolution-based downgrade could not see that the callee is a pure in-memory helper,
+	// and the "merge" keyword produced a false-positive call-in-loop N+1. A dotted callee
+	// that resolves to a known non-I/O local must NOT be flagged.
+	funcs := []funcInfo{
+		{Name: "app/svc.Processor.run", File: "app/svc.py", Line: 10,
+			LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"app.helpers.merge_config"}},
+		// The helper's canonical name is slash-form; its dotted form is the callee above.
+		{Name: "app/helpers.merge_config", File: "app/helpers.py", Line: 3},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if f, ok := findFinding(got, "app/svc.Processor.run", "call-in-loop"); ok {
+		t.Errorf("unexpected call-in-loop finding on a dotted-form in-memory helper: %+v", f)
+	}
+}
+
+func TestAnalyze_PyDottedPerformsIOStillN1(t *testing.T) {
+	// Guard against over-suppression: a dotted-form in-loop call that resolves to a local
+	// the extractor tagged performs_io is a genuine per-iteration I/O call and must stay
+	// flagged. The dotted-form resolution must downgrade only NON-I/O locals.
+	funcs := []funcInfo{
+		{Name: "app/svc.Processor.run", File: "app/svc.py", Line: 10,
+			LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"app.daos.user.UserDAO.save"}},
+		{Name: "app/daos/user.UserDAO.save", File: "app/daos/user.py", Line: 3,
+			PerformsIO: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if _, ok := findFinding(got, "app/svc.Processor.run", "call-in-loop"); !ok {
+		t.Fatalf("expected a call-in-loop finding for a dotted performs_io N+1; got %+v", got)
+	}
+}
+
+func TestAnalyze_AssociationReadIsNotACallInLoop(t *testing.T) {
+	// `record.posts` in a loop is left to the query-loops explainer, which reads
+	// the receiver's type. Here the name alone would have to do, and a string
+	// column called like some other model's association would do as well.
+	funcs := []funcInfo{
+		{Name: "Report#run", File: "app/report.rb", Line: 3, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"posts", "tag.tag", "block.account"}},
+		{Name: "Report#sync", File: "app/report.rb", Line: 20, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"post.save", "post.author"}},
+	}
+	assoc := map[string]bool{"posts": true, "tag": true, "account": true, "author": true}
+
+	got := analyze(funcs, nil, nil, assoc)
+	if f, ok := findFinding(got, "Report#run", "call-in-loop"); ok {
+		t.Errorf("association names alone produced a call-in-loop finding: %+v", f)
+	}
+	// A real write beside an association read is still reported, and names the write.
+	f, ok := findFinding(got, "Report#sync", "call-in-loop")
+	if !ok || len(f.Calls) != 1 || f.Calls[0].Callee != "post.save" {
+		t.Errorf("Report#sync = %+v (ok=%v), want one call, post.save", f, ok)
+	}
+}
+
+func TestAnalyze_RubyInMemoryNotN1(t *testing.T) {
+	// In-memory Hash/Array/dirty-tracking ops (merge/fetch/insert/will_save_change_*)
+	// collide with the cross-language DB/IO keywords but are not N+1 for a Ruby caller.
+	// cache.fetch and insert_all are real I/O and must still be flagged.
+	funcs := []funcInfo{
+		{Name: "P#render", File: "app/p.rb", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"hash.fetch", "params.merge", "will_save_change_to_name?", "results.insert"}},
+		{Name: "Q#run", File: "app/q.rb", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"cache.fetch", "Model.insert_all"}},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if _, ok := findFinding(got, "P#render", "call-in-loop"); ok {
+		t.Errorf("in-memory Hash/Array/dirty-tracking ops must not be flagged as N+1")
+	}
+	if _, ok := findFinding(got, "Q#run", "call-in-loop"); !ok {
+		t.Errorf("cache.fetch / insert_all are real I/O and must still be flagged")
+	}
+}
+
+func TestAnalyze_BoundedFanoutDoesNotCompound(t *testing.T) {
+	// Compounding through a bounded background-job fan-out (perform_later over a
+	// handler registry) must not produce O(n²).
+	funcs := []funcInfo{
+		{Name: "Caller#perform", File: "app/c.rb", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"SystemEventService.trigger"}},
+		{Name: "SystemEventService.trigger", File: "app/s.rb", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"inline", "klass.perform_now", "klass.perform_later"}},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "Caller#perform", "compounded"); ok {
+		t.Errorf("compounding through a bounded job fan-out must not produce O(n²)")
+	}
+
+	// Control: a genuinely-looping callee (real per-iteration I/O) still compounds.
+	funcs2 := []funcInfo{
+		{Name: "Caller2#perform", File: "app/c.rb", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"Looper#each_thing"}},
+		{Name: "Looper#each_thing", File: "app/l.rb", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"record.save"}},
+	}
+	if _, ok := findFinding(analyze(funcs2, nil, nil, nil), "Caller2#perform", "compounded"); !ok {
+		t.Errorf("compounding through a genuinely-looping function should still be flagged")
+	}
+}
+
+func TestSortFindings_SeverityFirst(t *testing.T) {
+	got := analyze([]funcInfo{
+		{Name: "p.Med", LoopDepth: 3},                                          // nested-loop, held at medium
+		{Name: "p.High", LoopDepth: 1, CallsInLoop: []string{"app/data.Load"}}, // confirmed I/O in a loop
+	}, map[string]bool{"app/data.Load": true}, nil, nil)
+	if len(got) < 2 {
+		t.Fatalf("expected >=2 findings, got %d", len(got))
+	}
+	if got[0].Severity != "high" {
+		t.Errorf("first finding severity = %q, want high (ranked first)", got[0].Severity)
+	}
+}
+
+func TestComputeEffectiveDepths_CycleTerminates(t *testing.T) {
+	// A and B call each other in loops; the DFS must not loop forever.
+	funcs := map[string]funcInfo{
+		"A": {Name: "A", LoopDepth: 1, CallsInLoop: []string{"B"}},
+		"B": {Name: "B", LoopDepth: 1, CallsInLoop: []string{"A"}},
+	}
+	eff := computeEffectiveDepths(funcs)
+	if eff["A"] < 1 || eff["B"] < 1 {
+		t.Errorf("effective depths should be >= local loop depth; got %v", eff)
+	}
+}
+
+func TestAnalyze_SwiftInMemoryCallInLoopNotFlagged(t *testing.T) {
+	// Swift callees whose names merely share the generic verbs (updateCenter,
+	// updateValue) are in-memory UI/state ops, not I/O — no call-in-loop finding.
+	funcs := []funcInfo{
+		{Name: "A.refresh", File: "a.swift", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"badge.updateCenter", "self.updateValue", "stack.insertArrangedSubview", "$0.refresh"}},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "A.refresh", "call-in-loop"); ok {
+		t.Errorf("Swift in-memory verb callees must not produce a call-in-loop finding")
+	}
+}
+
+func TestAnalyze_SwiftIOPrimitiveCallInLoop(t *testing.T) {
+	// A direct high-confidence I/O primitive in a Swift loop IS flagged.
+	funcs := []funcInfo{
+		{Name: "A.load", File: "a.swift", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"URLSession.shared.dataTask"}},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "A.load", "call-in-loop"); !ok {
+		t.Errorf("Swift URLSession.dataTask in a loop should be a call-in-loop finding")
+	}
+}
+
+func TestAnalyze_SwiftPerformsIOCallInLoop(t *testing.T) {
+	// A Swift in-loop call to a resolved method the extractor flagged performs_io is
+	// an N+1; an in-memory resolved callee (performs_io=false) is not. (The transitive
+	// I/O closure itself lives in the extractor; the analyzer just trusts the prop.)
+	ioFuncs := []funcInfo{
+		{Name: "A.foo", File: "a.swift", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"A.bar"}, Calls: []string{"A.bar"}},
+		{Name: "A.bar", File: "a.swift", PerformsIO: true},
+	}
+	if _, ok := findFinding(analyze(ioFuncs, nil, nil, nil), "A.foo", "call-in-loop"); !ok {
+		t.Errorf("in-loop call to a performs_io method should be flagged")
+	}
+
+	memFuncs := []funcInfo{
+		{Name: "A.foo", File: "a.swift", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"A.bar"}, Calls: []string{"A.bar"}},
+		{Name: "A.bar", File: "a.swift"}, // performs_io=false
+	}
+	if _, ok := findFinding(analyze(memFuncs, nil, nil, nil), "A.foo", "call-in-loop"); ok {
+		t.Errorf("in-loop call to a non-I/O resolved method must not be flagged")
+	}
+}
+
+func TestAnalyze_NonSwiftUpdateInLoopStillFlagged(t *testing.T) {
+	// The generic (non-Swift) path is unchanged: a Ruby ActiveRecord update in a loop
+	// is still an N+1.
+	funcs := []funcInfo{
+		{Name: "app.sync", File: "app/sync.rb", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"record.update"}},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "app.sync", "call-in-loop"); !ok {
+		t.Errorf("Ruby record.update in a loop should still be flagged (generic path unchanged)")
+	}
+}
+
+func TestAnalyze_RustCallInLoop_PerformsIOWrapperFlagged(t *testing.T) {
+	// A Rust for-loop over a variable calls a helper the extractor transitively
+	// tagged performs_io (it does a DB/HTTP round-trip). This is a real N+1 and
+	// must be flagged high, even though the helper's name matches no keyword —
+	// the .rs branch trusts the extractor's performs_io signal, not verbs. The
+	// in-loop callee sits in the scaling subset (data-dependent loop).
+	funcs := []funcInfo{
+		{Name: "svc/feed.load_all", File: "crates/feed/src/lib.rs", Line: 12,
+			Exported: true, LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			CallsInLoop: []string{"crates/feed/src/db.load_row"}, CallsInScalingLoop: []string{"crates/feed/src/db.load_row"}, HasScalingLoopCalls: true},
+		{Name: "crates/feed/src/db.load_row", File: "crates/feed/src/db.rs", Line: 4, PerformsIO: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "svc/feed.load_all", "call-in-loop")
+	if !ok {
+		t.Fatalf("expected a call-in-loop finding for a Rust performs_io wrapper N+1; got %+v", got)
+	}
+	if f.Severity != "high" {
+		t.Errorf("exported Rust performs_io N+1 severity = %q, want high", f.Severity)
+	}
+}
+
+func TestAnalyze_RustCallInLoop_InMemoryHelperNotFlagged(t *testing.T) {
+	// A Rust loop calling a pure in-memory helper (no performs_io, no storage,
+	// no DB/HTTP method) must NOT produce a call-in-loop finding — the .rs branch
+	// fires only on a confirmed-I/O callee, so ordinary per-element computation
+	// (the common case) is never a false N+1.
+	funcs := []funcInfo{
+		{Name: "svc/feed.total", File: "crates/feed/src/lib.rs", Line: 20,
+			Exported: true, LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			CallsInLoop: []string{"crates/feed/src/math.combine"}, CallsInScalingLoop: []string{"crates/feed/src/math.combine"}, HasScalingLoopCalls: true},
+		{Name: "crates/feed/src/math.combine", File: "crates/feed/src/math.rs", Line: 3}, // performs_io=false
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "svc/feed.total", "call-in-loop"); ok {
+		t.Errorf("Rust in-loop call to a non-I/O resolved helper must not be flagged")
+	}
+}
+
+func TestAnalyze_PhpCallInLoop_PerformsIOWrapperFlagged(t *testing.T) {
+	// A WordPress foreach calls a helper the extractor tagged performs_io (it does a
+	// $wpdb->get_results). This is a real N+1 and must be flagged high, even though
+	// the helper's name matches no expensive keyword — the .php branch trusts the
+	// extractor's performs_io signal.
+	funcs := []funcInfo{
+		{Name: "wp_render_all", File: "src/wp-includes/blocks/list.php", Line: 12,
+			Exported: true, LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			CallsInLoop: []string{"wp_stress_load_row"}, CallsInScalingLoop: []string{"wp_stress_load_row"}, HasScalingLoopCalls: true},
+		{Name: "wp_stress_load_row", File: "src/wp-includes/blocks/db.php", Line: 4, Exported: true, PerformsIO: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "wp_render_all", "call-in-loop")
+	if !ok {
+		t.Fatalf("expected a call-in-loop finding for a PHP performs_io wrapper N+1; got %+v", got)
+	}
+	if f.Severity != "high" {
+		t.Errorf("exported PHP performs_io N+1 severity = %q, want high", f.Severity)
+	}
+}
+
+func TestAnalyze_PhpCallInLoop_InMemoryGetHelperNotFlagged(t *testing.T) {
+	// WordPress is full of exported in-memory helpers named with DB verbs
+	// (wp_get_object_terms style). A resolved non-I/O local must NOT be flagged just
+	// because its name contains "get" — the .php branch downgrades resolved non-I/O locals.
+	funcs := []funcInfo{
+		{Name: "wp_build_list", File: "src/wp-includes/blocks/list.php", Line: 20,
+			Exported: true, LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			CallsInLoop: []string{"wp_get_cached_label"}, CallsInScalingLoop: []string{"wp_get_cached_label"}, HasScalingLoopCalls: true},
+		{Name: "wp_get_cached_label", File: "src/wp-includes/blocks/util.php", Line: 3, Exported: true}, // performs_io=false
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "wp_build_list", "call-in-loop"); ok {
+		t.Errorf("PHP in-loop call to a resolved non-I/O helper must not be flagged despite the get* name")
+	}
+}
+
+func TestAnalyze_CppCallInLoop_PerformsIOWrapperFlagged(t *testing.T) {
+	// A C++ for-loop calls a helper the extractor tagged performs_io (it does a
+	// fopen/fread). A real N+1 — flagged high even though the helper's name matches
+	// no keyword; the .cpp branch trusts the extractor's performs_io signal.
+	funcs := []funcInfo{
+		{Name: "Post.PViewFactory::buildAll", File: "Post/PViewFactory.cpp", Line: 30,
+			Exported: true, LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			CallsInLoop: []string{"Post.enola_load_row"}, CallsInScalingLoop: []string{"Post.enola_load_row"}, HasScalingLoopCalls: true},
+		{Name: "Post.enola_load_row", File: "Post/PViewFactory.cpp", Line: 8, Exported: true, PerformsIO: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "Post.PViewFactory::buildAll", "call-in-loop")
+	if !ok {
+		t.Fatalf("expected a call-in-loop finding for a C++ performs_io wrapper N+1; got %+v", got)
+	}
+	if f.Severity != "high" {
+		t.Errorf("exported C++ performs_io N+1 severity = %q, want high", f.Severity)
+	}
+}
+
+func TestAnalyze_CppCallInLoop_InMemoryHelperNotFlagged(t *testing.T) {
+	// A C++ loop calling a pure in-memory helper (no performs_io) must NOT fire — the
+	// .cpp branch fires only on a confirmed-I/O callee, so ordinary per-element compute
+	// (the overwhelmingly common case in a numeric codebase) is never a false N+1.
+	funcs := []funcInfo{
+		{Name: "Numeric.integrate", File: "Numeric/gauss.cpp", Line: 20,
+			Exported: true, LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			CallsInLoop: []string{"Numeric.evalBasis"}, CallsInScalingLoop: []string{"Numeric.evalBasis"}, HasScalingLoopCalls: true},
+		{Name: "Numeric.evalBasis", File: "Numeric/gauss.cpp", Line: 3, Exported: true}, // performs_io=false
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "Numeric.integrate", "call-in-loop"); ok {
+		t.Errorf("C++ in-loop call to a non-I/O resolved helper must not be flagged")
+	}
+}
+
+func TestIsTestPath(t *testing.T) {
+	tests := []string{
+		"Tests/Feed/BaseFeedTest.swift",
+		"internal/app/handler_test.go", "spec/models/user_spec.rb",
+		"src/__tests__/app.test.ts", "app/Mocks/MockRepo.swift", "tests/test_thing.py",
+	}
+	for _, p := range tests {
+		if !isTestPath(p) {
+			t.Errorf("isTestPath(%q) = false, want true", p)
+		}
+	}
+	production := []string{
+		"Sources/Core/POIDataModel.swift", "internal/app/handler.go",
+		"app/models/user.rb", "src/app/App.tsx", "Sources/Testable/Contest.swift",
+		// Deliberate change of behaviour: a Swift file is classified by its TARGET,
+		// not its name. `Sources/Foo/BarTests.swift` used to be treated as a test on
+		// the strength of the `Tests.swift` basename suffix — but neither SPM nor
+		// Xcode will compile a test from a `Sources/` target, so on a real repo that
+		// shape is always production. On nan/nebenan-iOS the suffix rule uniquely
+		// matched 9 files and every one was a production A/B-test feature, e.g.
+		// `Settings.ABUserTests.swift` below; the 393 genuine test files it also
+		// matched were already claimed by the `Tests/` segment. It had no true
+		// positives to contribute, so it is gone. (fixed/28 defect class.)
+		"Sources/Foo/BarTests.swift",
+		"Sources/NebenanFoundation/Components/Settings/Settings.ABUserTests.swift",
+	}
+	for _, p := range production {
+		if isTestPath(p) {
+			t.Errorf("isTestPath(%q) = true, want false", p)
+		}
+	}
+}
+
+// --- Kotlin/Java (JVM) precision: cross-language keyword bleed, severity, depth ---
+
+func TestIsExpensiveJvmCall(t *testing.T) {
+	storage := map[string]bool{"app/data.RoomDb.loadUser": true}
+	byName := map[string]funcInfo{}
+
+	// Genuine Room / Retrofit / JPA / JDBC calls — must stay expensive.
+	expensive := []string{
+		"app/data.RoomDb.loadUser",        // storage fact
+		"db.postCategoryDao().insert",     // Room insert (method + db. prefix)
+		"dao.upsert", "api.awaitResponse", // Room upsert / Retrofit coroutine adapter
+		"userRepo.findById", "userRepo.findAll", "repo.getAll",
+		"jdbcTemplate.queryForObject", "restTemplate.getForObject", "webClient.retrieve",
+		"cursor.query",
+	}
+	// Extractor-flagged I/O methods (Retrofit/Room) matched by short name — these are
+	// NOT in the keyword list and would otherwise be missed.
+	ioMethods := map[string]bool{"fetchFurly": true, "getNeighboursRx": true}
+	for _, c := range expensive {
+		if !isExpensiveJvmCall(c, storage, byName, ioMethods) {
+			t.Errorf("isExpensiveJvmCall(%q) = false, want true", c)
+		}
+	}
+	// A per-iteration call to a Retrofit/Room method is expensive via its I/O identity,
+	// even though its name is in no keyword list.
+	for _, c := range []string{"service.fetchFurly", "api.getNeighboursRx"} {
+		if !isExpensiveJvmCall(c, storage, byName, ioMethods) {
+			t.Errorf("isExpensiveJvmCall(%q) = false, want true (performs_io leaf)", c)
+		}
+	}
+
+	// The cross-language bleed that produced the Kotlin false positives — the generic
+	// verbs are in-memory here and must NOT be expensive.
+	cheap := []string{
+		"_basicState.update",                     // StateFlow.update, not a DB update
+		"adapter.updateItem",                     // "update" prefix on an in-memory op
+		"model.updateWith",                       // ditto
+		"avatarView.loadAvatar",                  // "load" prefix, image draw
+		"viewModel.loadFeed",                     // "load" prefix
+		"m.awaitPointerEvent",                    // Compose await, not I/O
+		"lastReplyDeferred.await",                // coroutine Deferred.await, dropped as too broad
+		"translator.translate(line).await",       // ditto
+		"request.getQuery",                       // "Query" is CamelCase-humped, but case-sensitive lowercase list won't fire
+		"presenter.save", "repo.find", "x.fetch", // bare verbs excluded
+	}
+	for _, c := range cheap {
+		if isExpensiveJvmCall(c, storage, byName, nil) {
+			t.Errorf("isExpensiveJvmCall(%q) = true, want false", c)
+		}
+	}
+}
+
+func TestAnalyze_JvmPerformsIOAccessorNameNoCollision(t *testing.T) {
+	// A Retrofit endpoint named `get` (e.g. Furly `@GET fun get(@Url …)`) puts "get" in
+	// the performs_io set. A per-iteration list/map `.get(...)` must NOT be flagged as an
+	// N+1 through that name collision.
+	funcs := []funcInfo{
+		{Name: "ui.View.draw", File: "ui/V.kt", Line: 1, Exported: true,
+			LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"participants.get"}},
+		{Name: "api.Furly.get", File: "api/F.kt", Line: 9, PerformsIO: true},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "ui.View.draw", "call-in-loop"); ok {
+		t.Errorf("a collection .get() must not be an N+1 via a Retrofit method named get")
+	}
+}
+
+func TestAnalyze_JvmPerformsIOLeafIsN1(t *testing.T) {
+	// A public Kotlin method looping over a call to a Retrofit endpoint (flagged
+	// performs_io by the extractor) is a genuine N+1, reported even though the callee
+	// name matches no keyword. `service.fetchFurly` reaches the endpoint by its
+	// method name, which reports it; resolved to the endpoint's fact it is high.
+	funcs := []funcInfo{
+		{Name: "biz.UseCase.getEmbeddedUrls", File: "biz/U.kt", Line: 31, Exported: true,
+			LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"service.fetchFurly"}},
+		{Name: "biz.UseCase.resolved", File: "biz/U.kt", Line: 50, Exported: true,
+			LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"api.Service.fetchFurly"}},
+		{Name: "api.Service.fetchFurly", File: "api/S.kt", Line: 9, PerformsIO: true, IODirect: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "biz.UseCase.getEmbeddedUrls", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop for a per-iteration Retrofit call; got %+v", got)
+	}
+	if f.Severity != "medium" {
+		t.Errorf("performs_io N+1 matched by method name = %q, want medium", f.Severity)
+	}
+	if r, ok := findFinding(got, "biz.UseCase.resolved", "call-in-loop"); !ok || r.Severity != "high" {
+		t.Errorf("performs_io N+1 on a resolved callee = %q (ok=%v), want high", r.Severity, ok)
+	}
+}
+
+func TestAnalyze_JvmKeywordBleedCleared(t *testing.T) {
+	// A public Kotlin method looping over image previews and calling _basicState.update
+	// must NOT produce a call-in-loop finding (update is in-memory StateFlow work).
+	funcs := []funcInfo{{
+		Name: "ui.VM.onRetryImageLoad", File: "ui/VM.kt", Line: 5, Exported: true,
+		LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"_basicState.update", "image.isError"},
+	}}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "ui.VM.onRetryImageLoad", "call-in-loop"); ok {
+		t.Errorf("Kotlin _basicState.update in a loop must not be an N+1 finding")
+	}
+}
+
+func TestAnalyze_JvmPublicNotHot(t *testing.T) {
+	storage := map[string]bool{"data.Db.loadUser": true}
+	funcs := []funcInfo{
+		// public Kotlin method, keyword-only expensive call → medium (public != hot on JVM)
+		{Name: "ui.A.f", File: "ui/A.kt", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"dao.insert"}},
+		// public Kotlin method, storage-backed call → high
+		{Name: "ui.B.g", File: "ui/B.kt", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"data.Db.loadUser"}},
+	}
+	got := analyze(funcs, storage, nil, nil)
+	a, ok := findFinding(got, "ui.A.f", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop for ui.A.f")
+	}
+	if a.Severity != "medium" {
+		t.Errorf("keyword-only JVM N+1 severity = %q, want medium", a.Severity)
+	}
+	b, ok := findFinding(got, "ui.B.g", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop for ui.B.g")
+	}
+	if b.Severity != "high" {
+		t.Errorf("storage-backed JVM N+1 severity = %q, want high", b.Severity)
+	}
+}
+
+func TestAnalyze_RecursiveNotCompoundedToN3(t *testing.T) {
+	// A directly-recursive tree walk (loop + self-call) must be reported as recursion
+	// only — NOT compounded to O(n³). Regression for the effectiveDepthOf self-cycle
+	// double-count (hideKeyboardOnTouch / BaseNeighbourListAdapter.updateItem).
+	funcs := []funcInfo{{
+		Name: "ui.hideKeyboardOnTouch", File: "ui/K.kt", Line: 38, Exported: true,
+		LoopDepth: 1, LoopCount: 1, Recursive: true,
+		Calls: []string{"ui.hideKeyboardOnTouch"}, CallsInLoop: []string{"ui.hideKeyboardOnTouch"},
+	}}
+	got := analyze(funcs, nil, nil, nil)
+	if _, ok := findFinding(got, "ui.hideKeyboardOnTouch", "recursion"); !ok {
+		t.Errorf("recursive tree walk should still be flagged as recursion")
+	}
+	if c, ok := findFinding(got, "ui.hideKeyboardOnTouch", "compounded"); ok {
+		t.Errorf("recursive function must not get a compounded finding: %+v", c)
+	}
+}
+
+func TestEffectiveDepthOf_SelfCycleNoDoubleCount(t *testing.T) {
+	f := funcInfo{Name: "p.walk", LoopDepth: 1, CallsInLoop: []string{"p.walk"}}
+	eff := computeEffectiveDepths(map[string]funcInfo{"p.walk": f})
+	if got := effectiveDepthOf(f, eff, map[string]funcInfo{f.Name: f}); got != 1 {
+		t.Errorf("effectiveDepthOf(self-recursive, loop_depth=1) = %d, want 1 (no double-count)", got)
+	}
+}
+
+func TestAnalyze_ComposeEventLoopSuppressed(t *testing.T) {
+	// A Compose while(true){ awaitPointerEvent() } gesture loop iterates on input, not a
+	// data size — no nested-loop / call-in-loop / compounded finding.
+	funcs := []funcInfo{{
+		Name: "ui.interceptGestures", File: "ui/R.kt", Line: 350, Exported: true,
+		LoopDepth: 2, LoopCount: 2,
+		CallsInLoop: []string{"m.awaitPointerEvent", "m.pressFunc"},
+	}}
+	got := analyze(funcs, nil, nil, nil)
+	for _, kind := range []string{"nested-loop", "call-in-loop", "compounded"} {
+		if f, ok := findFinding(got, "ui.interceptGestures", kind); ok {
+			t.Errorf("Compose event loop must not produce a %s finding: %+v", kind, f)
+		}
+	}
+}
+
+// --- False-positive reduction: scaling depth, cold paths, Python precision, confidence ---
+
+func TestAnalyze_ScalingDepthDeflatesBigO(t *testing.T) {
+	// A function with 3 lexical loops but only 1 that scales with input (the other two
+	// iterate literal/constant ranges) must read as O(n), not O(n³).
+	funcs := []funcInfo{
+		{Name: "p.merge", File: "p/m.ts", Line: 1, LoopDepth: 3, ScalingLoopDepth: 1, HasScalingDepth: true, LoopCount: 3, Cyclomatic: 4},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if f, ok := findFinding(got, "p.merge", "nested-loop"); ok {
+		t.Errorf("scaling depth 1 must not emit a nested-loop finding, got %+v", f)
+	}
+}
+
+func TestAnalyze_FullyBoundedLoopsNoFinding(t *testing.T) {
+	// All loops bounded (scaling 0) → no nested-loop finding at all.
+	funcs := []funcInfo{
+		{Name: "p.headers", File: "p/h.ts", Line: 1, LoopDepth: 3, ScalingLoopDepth: 0, HasScalingDepth: true, LoopCount: 3},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if f, ok := findFinding(got, "p.headers", "nested-loop"); ok {
+		t.Errorf("fully-bounded loops must not emit a finding, got %+v", f)
+	}
+}
+
+func TestAnalyze_ScalingDepthKeepsGenuineNesting(t *testing.T) {
+	// No scaling signal (older extractor) falls back to loop_depth: behavior unchanged.
+	funcs := []funcInfo{
+		{Name: "p.Cubic", File: "p/c.go", Line: 1, LoopDepth: 3, LoopCount: 3},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "p.Cubic", "nested-loop")
+	if !ok || f.Depth != 3 || f.Severity != "medium" {
+		t.Fatalf("fallback to loop_depth failed: ok=%v %+v", ok, f)
+	}
+}
+
+func TestAnalyze_ColdPathDownrankedToLow(t *testing.T) {
+	// A deeply-nested loop in an Alembic migration is real but one-shot: downranked to low.
+	funcs := []funcInfo{
+		{Name: "m.upgrade", File: "airflow/migrations/versions/0101_x.py", Line: 1, LoopDepth: 3, ScalingLoopDepth: 3, HasScalingDepth: true, LoopCount: 3},
+		{Name: "s.hot", File: "airflow/jobs/scheduler.py", Line: 1, LoopDepth: 3, ScalingLoopDepth: 3, HasScalingDepth: true, LoopCount: 3},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	m, ok := findFinding(got, "m.upgrade", "nested-loop")
+	if !ok || m.Severity != "low" {
+		t.Errorf("migration finding severity = %q (ok=%v), want low (cold path)", m.Severity, ok)
+	}
+	h, ok := findFinding(got, "s.hot", "nested-loop")
+	if !ok || h.Severity != "medium" {
+		t.Errorf("hot-path finding severity = %q (ok=%v), want medium (above the migration's low)", h.Severity, ok)
+	}
+}
+
+func TestAnalyze_PythonPureHelperNotExpensive(t *testing.T) {
+	// merge_dicts: the callee resolves to a known non-I/O local whose name ("merge")
+	// collides with SQLAlchemy Session.merge — it must NOT be flagged as an N+1.
+	funcs := []funcInfo{
+		{Name: "u.merge_dicts", File: "airflow/utils/helpers.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"u.merge_dicts"}, CallsInLoop: []string{"u.merge_dicts"}},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if f, ok := findFinding(got, "u.merge_dicts", "call-in-loop"); ok {
+		t.Errorf("pure recursive dict merge must not be an N+1: %+v", f)
+	}
+}
+
+func TestAnalyze_PythonExportedNotAutoHigh(t *testing.T) {
+	// An in-loop call that is only a name-heuristic match (not a confirmed I/O fact) stays
+	// medium, never high — exported is not a hotness signal.
+	funcs := []funcInfo{
+		{Name: "s.is_safe_url", File: "airflow/api/security.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"x.where"}, CallsInLoop: []string{"x.where"}},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "s.is_safe_url", "call-in-loop")
+	if !ok || f.Severity != "medium" {
+		t.Errorf("exported Python non-IO call-in-loop severity = %q (ok=%v), want medium", f.Severity, ok)
+	}
+}
+
+func TestAnalyze_PythonRealDBCallInLoopIsReported(t *testing.T) {
+	// A genuine DB round-trip (session.execute) inside a loop is reported. It is
+	// known by the method's name, on a receiver of unknown type, so it is medium.
+	funcs := []funcInfo{
+		{Name: "d.delete_dag", File: "airflow/api/delete_dag.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"session.execute"}, CallsInLoop: []string{"session.execute"}},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "d.delete_dag", "call-in-loop")
+	if !ok || f.Severity != "medium" {
+		t.Errorf("Python DB call-in-loop severity = %q (ok=%v), want medium", f.Severity, ok)
+	}
+}
+
+func TestAnalyze_PythonIOWrapperInLoopStaysExpensive(t *testing.T) {
+	// A local helper that the extractor flagged performs_io, called in a loop, is a real
+	// per-iteration I/O even though its name is generic.
+	funcs := []funcInfo{
+		{Name: "svc.run", File: "svc/run.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"svc.load_row"}, CallsInLoop: []string{"svc.load_row"}},
+		{Name: "svc.load_row", File: "svc/run.py", Line: 9, PerformsIO: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	f, ok := findFinding(got, "svc.run", "call-in-loop")
+	if !ok || f.Severity != "high" {
+		t.Errorf("Python performs_io wrapper in loop = %q (ok=%v), want high", f.Severity, ok)
+	}
+}
+
+func TestConfidenceFor_ByKindAndDecay(t *testing.T) {
+	// Base confidence is set by kind reliability.
+	if c := confidenceFor("call-in-loop", true, 1, false); c != 0.9 {
+		t.Errorf("confirmed call-in-loop = %v, want 0.9", c)
+	}
+	if c := confidenceFor("call-in-loop", false, 1, false); c != 0.6 {
+		t.Errorf("heuristic call-in-loop = %v, want 0.6", c)
+	}
+	if c := confidenceFor("nested-loop", false, 2, false); c != 0.8 {
+		t.Errorf("nested-loop = %v, want 0.8", c)
+	}
+	if c := confidenceFor("compounded", false, 2, false); c != 0.55 {
+		t.Errorf("compounded = %v, want 0.55 (least reliable kind)", c)
+	}
+	if c := confidenceFor("recursion", false, 0, false); c != 0.5 {
+		t.Errorf("recursion = %v, want 0.5", c)
+	}
+	// Depth decay and bounded-discount caps still apply on top of the base.
+	if c := confidenceFor("call-in-loop", true, 4, false); c > 0.5 {
+		t.Errorf("depth-4 confidence = %v, want <= 0.5", c)
+	}
+	if c := confidenceFor("call-in-loop", true, 6, false); c > 0.35 {
+		t.Errorf("depth-6 confidence = %v, want <= 0.35", c)
+	}
+	if c := confidenceFor("call-in-loop", true, 2, true); c > 0.6 {
+		t.Errorf("bounded-discounted confidence = %v, want <= 0.6", c)
+	}
+}
+
+func TestRiskRanking_WorstFirst(t *testing.T) {
+	// Within the high tier, the deeper/more-confident finding must sort first.
+	storage := map[string]bool{"s.exec": true}
+	funcs := []funcInfo{
+		{Name: "app.shallow", File: "app/a.py", Line: 1, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"s.exec"}}, // O(n) confirmed N+1
+		{Name: "app.deep", File: "app/z.py", Line: 1, LoopDepth: 2, LoopCount: 2,
+			CallsInLoop: []string{"s.exec"}}, // O(n²) confirmed N+1 — higher risk
+	}
+	got := analyze(funcs, storage, nil, nil)
+	// app.deep (later alphabetically) must come before app.shallow purely on risk.
+	var iDeep, iShallow = -1, -1
+	for i, f := range got {
+		if f.Symbol == "app.deep" && f.Kind == "call-in-loop" {
+			iDeep = i
+		}
+		if f.Symbol == "app.shallow" && f.Kind == "call-in-loop" {
+			iShallow = i
+		}
+	}
+	if iDeep < 0 || iShallow < 0 || iDeep >= iShallow {
+		t.Errorf("risk order wrong: deep=%d shallow=%d (deep must lead)", iDeep, iShallow)
+	}
+	if got[iDeep].RiskScore <= got[iShallow].RiskScore {
+		t.Errorf("deep risk %.2f must exceed shallow %.2f", got[iDeep].RiskScore, got[iShallow].RiskScore)
+	}
+}
+
+func TestRiskRanking_RouteHotPathBonus(t *testing.T) {
+	// Two equal-complexity confirmed N+1s; the route handler outranks the internal helper.
+	storage := map[string]bool{"s.exec": true}
+	routes := map[string]bool{"app.handler": true}
+	funcs := []funcInfo{
+		{Name: "app.internal", File: "app/a.py", Line: 1, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"s.exec"}},
+		{Name: "app.handler", File: "app/z.py", Line: 1, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"s.exec"}},
+	}
+	got := analyze(funcs, storage, routes, nil)
+	h, _ := findFinding(got, "app.handler", "call-in-loop")
+	in, _ := findFinding(got, "app.internal", "call-in-loop")
+	if h.RiskScore <= in.RiskScore {
+		t.Errorf("route handler risk %.2f must exceed internal %.2f (hot-path bonus)", h.RiskScore, in.RiskScore)
+	}
+}
+
+func TestRiskRanking_CompoundedDeemphasised(t *testing.T) {
+	// An O(n²) confirmed call-in-loop N+1 outranks an O(n²) compounded estimate.
+	storage := map[string]bool{"s.exec": true}
+	funcs := []funcInfo{
+		{Name: "p.n1", File: "p/a.py", Line: 1, LoopDepth: 2, LoopCount: 2, CallsInLoop: []string{"s.exec"}},
+		// compounded O(n²): loops once, calls a looping function.
+		{Name: "p.comp", File: "p/b.py", Line: 1, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"p.g"}},
+		{Name: "p.g", File: "p/g.py", Line: 1, LoopDepth: 1, LoopCount: 1},
+	}
+	got := analyze(funcs, storage, nil, nil)
+	n1, _ := findFinding(got, "p.n1", "call-in-loop")
+	comp, ok := findFinding(got, "p.comp", "compounded")
+	if !ok {
+		t.Fatalf("no compounded finding for p.comp; got %+v", got)
+	}
+	if comp.Confidence >= n1.Confidence {
+		t.Errorf("compounded confidence %.2f must be below confirmed N+1 %.2f", comp.Confidence, n1.Confidence)
+	}
+	if comp.RiskScore >= n1.RiskScore {
+		t.Errorf("compounded risk %.2f must be below equal-complexity N+1 %.2f", comp.RiskScore, n1.RiskScore)
+	}
+}
+
+func TestIsColdPath(t *testing.T) {
+	cold := []string{
+		"airflow/migrations/versions/0101_x.py", "dev/breeze/commands/x.py",
+		"scripts/ci/y.py", "airflow/cli/commands/dag_command.py", "pkg/__main__.py",
+	}
+	for _, p := range cold {
+		if !isColdPath(p) {
+			t.Errorf("isColdPath(%q) = false, want true", p)
+		}
+	}
+	hot := []string{"airflow/jobs/scheduler_job_runner.py", "airflow/models/dagrun.py"}
+	for _, p := range hot {
+		if isColdPath(p) {
+			t.Errorf("isColdPath(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestAnalyze_PythonUrllibParseNotIO(t *testing.T) {
+	// urllib.parse.* is pure in-memory URL string work, not network I/O — a loop over
+	// a small tuple calling it (airflow's is_safe_url) must NOT be flagged as an N+1.
+	funcs := []funcInfo{
+		{Name: "s.is_safe_url", File: "airflow/api/security.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls:       []string{"urllib.parse.urlparse", "urllib.parse.urljoin", "urllib.parse.unquote"},
+			CallsInLoop: []string{"urllib.parse.urlparse", "urllib.parse.urljoin", "urllib.parse.unquote"}},
+	}
+	if f, ok := findFinding(analyze(funcs, nil, nil, nil), "s.is_safe_url", "call-in-loop"); ok {
+		t.Errorf("urllib.parse loop must not be an N+1: %+v", f)
+	}
+}
+
+func TestAnalyze_PythonUrllibRequestIsIO(t *testing.T) {
+	// urllib.request.urlopen IS network I/O and must stay a high N+1 in a route handler.
+	funcs := []funcInfo{
+		{Name: "s.fetch_all", File: "airflow/api/x.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			Calls: []string{"urllib.request.urlopen"}, CallsInLoop: []string{"urllib.request.urlopen"}},
+	}
+	f, ok := findFinding(analyze(funcs, nil, map[string]bool{"s.fetch_all": true}, nil), "s.fetch_all", "call-in-loop")
+	if !ok || f.Severity != "high" {
+		t.Errorf("urllib.request.urlopen loop = %q (ok=%v), want high", f.Severity, ok)
+	}
+}
+
+func TestAnalyze_BoundedLoopCallNotN1(t *testing.T) {
+	// A confirmed DB call that appears in calls_in_loop but NOT in calls_in_scaling_loop
+	// (it only runs inside a bounded loop) is not an N+1.
+	funcs := []funcInfo{
+		{Name: "app.boundedSetup", File: "app/s.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"session.execute"}, CallsInScalingLoop: []string{}, HasScalingLoopCalls: true},
+		{Name: "app.realN1", File: "app/r.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"session.execute"}, CallsInScalingLoop: []string{"session.execute"}, HasScalingLoopCalls: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if f, ok := findFinding(got, "app.boundedSetup", "call-in-loop"); ok {
+		t.Errorf("call only in a bounded loop must not be an N+1: %+v", f)
+	}
+	if _, ok := findFinding(got, "app.realN1", "call-in-loop"); !ok {
+		t.Errorf("call in a scaling loop must be reported")
+	}
+}
+
+func TestAnalyze_ScalingLoopCallsFallback(t *testing.T) {
+	// An extractor that did not emit calls_in_scaling_loop falls back to calls_in_loop.
+	funcs := []funcInfo{
+		{Name: "app.f", File: "app/f.py", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"session.execute"}}, // HasScalingLoopCalls == false
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "app.f", "call-in-loop"); !ok {
+		t.Errorf("fallback to calls_in_loop failed: not reported")
+	}
+}
+
+func TestAnalyze_DeepCompoundedRelabeledAndCapped(t *testing.T) {
+	// f (depth 1) → g (depth 1) → h (depth 1) → i (depth 1): effective depth 4. A deep
+	// cross-call-graph estimate is relabeled O(n³+) and capped at medium.
+	funcs := []funcInfo{
+		{Name: "p.f", File: "p/f.go", Line: 1, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"p.g"}},
+		{Name: "p.g", File: "p/g.go", Line: 1, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"p.h"}},
+		{Name: "p.h", File: "p/h.go", Line: 1, LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"p.i"}},
+		{Name: "p.i", File: "p/i.go", Line: 1, LoopDepth: 1, LoopCount: 1},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	c, ok := findFinding(got, "p.f", "compounded")
+	if !ok {
+		t.Fatalf("no compounded finding for p.f; got %+v", got)
+	}
+	if c.Depth != 4 || c.Label() != "depth 4+" {
+		t.Errorf("deep compounded depth = %d, label = %q; want depth 4 shown as %q", c.Depth, c.Label(), "depth 4+")
+	}
+	if c.Severity != "medium" {
+		t.Errorf("deep compounded severity = %q, want medium (capped)", c.Severity)
+	}
+}
+
+func TestAnalyze_HeuristicN1IsMedium_ConfirmedIsHigh(t *testing.T) {
+	// A JVM curated-method match (Room insert) is probable, not fact-confirmed → medium.
+	// A storage-backed call → high.
+	storage := map[string]bool{"data.Db.loadUser": true}
+	funcs := []funcInfo{
+		{Name: "ui.A.f", File: "ui/A.kt", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"dao.insert"}},
+		{Name: "ui.B.g", File: "ui/B.kt", Line: 1, Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"data.Db.loadUser"}},
+	}
+	got := analyze(funcs, storage, nil, nil)
+	if a, ok := findFinding(got, "ui.A.f", "call-in-loop"); !ok || a.Severity != "medium" {
+		t.Errorf("curated-method N+1 = %q (ok=%v), want medium", a.Severity, ok)
+	}
+	if b, ok := findFinding(got, "ui.B.g", "call-in-loop"); !ok || b.Severity != "high" {
+		t.Errorf("storage-backed N+1 = %q (ok=%v), want high", b.Severity, ok)
+	}
+}
+
+// TestBoundedFanout_RubyInMemoryCallKeepsDiscount pins the Ruby guard that analyze()
+// applies to in-loop calls but isBoundedFanout used to omit: `opts.merge` is a Hash#merge
+// (in-memory), not a DB round-trip, so a mailer fan-out that dispatches AND merges a Hash
+// is still a bounded fan-out. Without the guard the generic keyword list reads "merge" as
+// I/O, suppresses the discount, and compounds the CALLER to O(n²) — a false finding.
+func TestBoundedFanout_RubyInMemoryCallKeepsDiscount(t *testing.T) {
+	funcs := []funcInfo{
+		{
+			Name: "Notifier#fanout", File: "app/services/notifier.rb", Line: 20, Exported: true,
+			LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"deliver_later", "opts.merge"},
+		},
+		{
+			Name: "Caller#run", File: "app/services/caller.rb", Line: 5, Exported: true,
+			LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"Notifier#fanout"},
+		},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if c, ok := findFinding(got, "Caller#run", "compounded"); ok {
+		t.Errorf("caller of a bounded Ruby fan-out must not be compounded: %+v", c)
+	}
+}
+
+// TestEffectiveDepthOf_BoundedFanoutIsZero pins the contract effectiveDepthOf's own comment
+// states — it "must repeat" computeEffectiveDepths's special-case logic because it recomputes
+// per-fact, not per-name. The isEventLoop mirror was there; the isBoundedFanout mirror was not,
+// so the two paths disagreed on the same function.
+func TestEffectiveDepthOf_BoundedFanoutIsZero(t *testing.T) {
+	fanout := funcInfo{
+		Name: "Mailer#notify", File: "app/mailers/mailer.rb", Line: 11, Exported: true,
+		LoopDepth: 2, LoopCount: 2,
+		CallsInLoop: []string{"deliver_later"},
+	}
+	funcs := []funcInfo{fanout}
+	byName := map[string]funcInfo{fanout.Name: fanout}
+	markNonScaling(funcs, byName, nil, nil)
+
+	eff := computeEffectiveDepths(byName)
+	if eff[fanout.Name] != 0 {
+		t.Fatalf("computeEffectiveDepths(bounded fan-out) = %d, want 0", eff[fanout.Name])
+	}
+	if got := effectiveDepthOf(funcs[0], eff, byName); got != 0 {
+		t.Errorf("effectiveDepthOf(bounded fan-out) = %d, want 0 (must mirror computeEffectiveDepths)", got)
+	}
+}
+
+// TestBoundedFanout_JvmExecutorSubmitIsDispatch pins the JVM half of the bounded fan-out
+// discount. A loop that only hands each item to an executor does no scaling work in-process,
+// so it must not compound its CALLER to O(n²). Regression for thingsboard's
+// DefaultDataUpdateService.upgradeRuleNodes, which was reported high-severity O(n³) because
+// processRuleNodePack's `executorService.submit` loop was read as a scaling loop.
+func TestBoundedFanout_JvmExecutorSubmitIsDispatch(t *testing.T) {
+	funcs := []funcInfo{
+		{
+			Name: "svc.processPack", File: "src/main/java/svc/Updater.java", Line: 88, Exported: true,
+			LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"node.getId", "executorService.submit", "log.warn"},
+		},
+		{
+			Name: "svc.upgradeAll", File: "src/main/java/svc/Updater.java", Line: 59, Exported: true,
+			LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"svc.processPack"},
+		},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if c, ok := findFinding(got, "svc.upgradeAll", "compounded"); ok {
+		t.Errorf("caller of a JVM executor fan-out must not be compounded: %+v", c)
+	}
+}
+
+// TestBoundedFanout_JdbcExecuteIsNotDispatch pins a deliberate exclusion. `execute` is NOT a
+// dispatch verb: Executor.execute collides with JDBC Statement.execute, and the dispatch check
+// runs BEFORE the expensive check — so admitting it would let a real per-iteration query be read
+// as a job dispatch and silence a true N+1. Adding "execute" for symmetry must fail here.
+func TestBoundedFanout_JdbcExecuteIsNotDispatch(t *testing.T) {
+	funcs := []funcInfo{{
+		Name: "dao.loadAllRows", File: "src/main/java/dao/Dao.java", Line: 20, Exported: true,
+		LoopDepth: 1, LoopCount: 1,
+		CallsInLoop: []string{"stmt.execute", "executorService.submit"},
+	}}
+	f := funcs[0]
+	byName := map[string]funcInfo{f.Name: f}
+	markNonScaling(funcs, byName, nil, nil)
+	if funcs[0].BoundedFanout {
+		t.Error("a loop containing a JDBC stmt.execute is per-iteration I/O, not a bounded fan-out")
+	}
+}
+
+// TestBoundedFanout_SubmitOutsideJvmIsNotDispatch pins the language gate: `submit` is an ordinary
+// in-memory verb outside the JVM (a form submit, a queue helper), so it must not silently discount
+// a scaling loop in Ruby/TS/Swift.
+func TestBoundedFanout_SubmitOutsideJvmIsNotDispatch(t *testing.T) {
+	funcs := []funcInfo{{
+		Name: "Form#submit_all", File: "app/services/form.rb", Line: 7, Exported: true,
+		LoopDepth: 1, LoopCount: 1,
+		CallsInLoop: []string{"form.submit"},
+	}}
+	f := funcs[0]
+	byName := map[string]funcInfo{f.Name: f}
+	markNonScaling(funcs, byName, nil, nil)
+	if funcs[0].BoundedFanout {
+		t.Error("`submit` outside a JVM file must not be read as a job dispatch")
+	}
+}
+
+// TestIsTestPath_SharedWithOrphans pins perf onto the shared facts.IsTestPath.
+// perf's own copy knew nothing of the Gradle/KMP test source sets, so functions
+// under androidTest/ were analyzed as production code; and its Swift/Kotlin
+// basename suffixes silently skipped production A/B-test features. Both halves are
+// pinned here so the two analyzers cannot drift apart again.
+func TestIsTestPath_SharedWithOrphans(t *testing.T) {
+	testPaths := []string{
+		// Segments perf's old switch was missing entirely (this is bug new/51).
+		"app/src/androidTest/java/de/nebenan/app/ui/EspressoMocks.kt",
+		"shared/src/commonTest/kotlin/FooTest.kt",
+		"shared/src/jvmTest/kotlin/BarTest.kt",
+		"internal/testutil/helpers.go",
+		"src/dashboard/fixtures/mockNativeFilters.ts",
+		"tests_common/pytest_plugins.py",
+		// Already covered, must stay covered.
+		"Tests/Testability/Sources/Assert.swift",
+		"Mocks/APIStub.swift",
+		"src/components/__tests__/Button.tsx",
+		"internal/engine/cache_test.go",
+		"superset/conftest.py",
+	}
+	for _, p := range testPaths {
+		if !isTestPath(p) {
+			t.Errorf("isTestPath(%q) = false, want true", p)
+		}
+	}
+
+	// fixed/28 class: production code named like a test. perf's old Swift/Kotlin
+	// basename suffixes claimed every one of these, so their performance findings
+	// were being silently dropped.
+	prodPaths := []string{
+		"Sources/NebenanFoundation/Components/KindnessReminderABTest/KindnessReminderABTest.swift",
+		"Sources/NebenanFoundation/Components/Tracking/Tracking+ShortenNameABTest.swift",
+		"Sources/NebenanFoundation/Components/Settings/Settings.ABUserTests.swift",
+		"api/src/main/java/de/nebenan/app/api/model/ABTest.kt",
+		"app/jobs/test_job.rb",
+		"superset/cli/test_db.py",
+	}
+	for _, p := range prodPaths {
+		if isTestPath(p) {
+			t.Errorf("isTestPath(%q) = true, want false — production code must not be skipped", p)
+		}
+	}
+}
+
+// --- new/56: the summary must be computed from the set the caller is shown ---
+
+// perfFindingsFixture mimics a mixed repo: Kotlin symbols whose NAME embeds the
+// path, and Ruby symbols whose name does not (the case package= never handled).
+func perfFindingsFixture() []Finding {
+	return []Finding{
+		{Symbol: "app/src/main/java/de/nebenan/app/ui.Feed.load", Package: "app/src/main/java/de/nebenan/app/ui",
+			File: "app/src/main/java/de/nebenan/app/ui/Feed.kt", Severity: "high", BigO: "O(n²)", Kind: "call-in-loop"},
+		{Symbol: "app/src/androidTest/java/de/nebenan/app.FeedTest.check", Package: "app/src/androidTest/java/de/nebenan/app",
+			File: "app/src/androidTest/java/de/nebenan/app/FeedTest.kt", Severity: "medium", BigO: "O(n)", Kind: "call-in-loop"},
+		// Ruby: the symbol name carries no path at all.
+		{Symbol: "ABResult.refresh_all", Package: "app/models",
+			File: "app/models/ab_result.rb", Severity: "medium", BigO: "O(n)", Kind: "call-in-loop"},
+		{Symbol: "E2eTest::CleanUp#call", Package: "app/interactors/e2e_test",
+			File: "app/interactors/e2e_test/clean_up.rb", Severity: "low", BigO: "O(n)", Kind: "nested-loop"},
+	}
+}
+
+// TestSummarize_HonorsFilter is the core of new/56. The headline count must equal
+// the number of rows the caller is actually shown. Before the fix, the summary was
+// built from the unfiltered slice eleven lines before filterFindings ran, so
+// package="androidTest" printed the repo-wide total (61) above an empty table.
+func TestSummarize_HonorsFilter(t *testing.T) {
+	all := perfFindingsFixture()
+
+	tests := []struct {
+		name      string
+		in        args
+		wantCount int
+		wantHigh  int
+		wantMed   int
+		wantLow   int
+	}{
+		{"unfiltered", args{}, 4, 1, 2, 1},
+		// The reported repro.
+		{"package=androidTest", args{Package: "androidTest"}, 1, 0, 1, 0},
+		// The Ruby silent zero: package= must match the PACKAGE, not the symbol name.
+		{"package=app/models (ruby)", args{Package: "app/models"}, 1, 0, 1, 0},
+		// The second, independent instance — the severity counts must be filtered too.
+		{"min_severity=high", args{MinSeverity: "high"}, 1, 1, 0, 0},
+		{"symbol= name match", args{Symbol: "ABResult"}, 1, 0, 1, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filtered := filterFindings(all, tt.in)
+			sum := summarize(all, filtered)
+
+			if sum.TotalFindings != tt.wantCount {
+				t.Errorf("TotalFindings = %d, want %d (must equal the rows shown, %d)",
+					sum.TotalFindings, tt.wantCount, len(filtered))
+			}
+			if sum.TotalFindings != len(filtered) {
+				t.Errorf("headline (%d) disagrees with the finding list (%d) — this is new/56",
+					sum.TotalFindings, len(filtered))
+			}
+			if sum.BySeverity["high"] != tt.wantHigh || sum.BySeverity["medium"] != tt.wantMed || sum.BySeverity["low"] != tt.wantLow {
+				t.Errorf("BySeverity = high %d / medium %d / low %d, want high %d / medium %d / low %d",
+					sum.BySeverity["high"], sum.BySeverity["medium"], sum.BySeverity["low"],
+					tt.wantHigh, tt.wantMed, tt.wantLow)
+			}
+		})
+	}
+}
+
+// TestFilterFindings_PackageMatchesPackageNotJustName pins the second defect. The
+// Finding carried no Package field, so package= was implemented as a substring match
+// on the symbol NAME — identical to symbol=. That works by accident where the name
+// embeds the path (Kotlin/Swift/Go) and returns a silent, permanent zero on Ruby,
+// whose names carry none. On nan/nebenan, 64 symbols under app/models/ are flaggable
+// and package="app/models" matched none of them.
+func TestFilterFindings_PackageMatchesPackageNotJustName(t *testing.T) {
+	all := perfFindingsFixture()
+
+	got := filterFindings(all, args{Package: "app/models"})
+	if len(got) != 1 || got[0].Symbol != "ABResult.refresh_all" {
+		t.Fatalf("package=\"app/models\" returned %d findings, want the Ruby model finding; got %+v", len(got), got)
+	}
+
+	// The documented contract is "package OR name", so a name fragment must keep
+	// working — narrowing to package-only would break a documented call.
+	if got := filterFindings(all, args{Package: "ABResult"}); len(got) != 1 {
+		t.Errorf("package= must still match a symbol name (documented contract); got %d", len(got))
+	}
+
+	// And it must not over-match: a package that matches nothing stays empty.
+	if got := filterFindings(all, args{Package: "app/controllers"}); len(got) != 0 {
+		t.Errorf("package=\"app/controllers\" matched %d findings, want 0", len(got))
+	}
+}
+
+// TestRenderPerfSummary_NamesTheFilter — a bare "0 findings." cannot be told apart
+// from a filter that silently matched nothing, which is precisely how the package=
+// defect stayed invisible. The headline states the filter and the population.
+func TestRenderPerfSummary_NamesTheFilter(t *testing.T) {
+	all := perfFindingsFixture()
+	in := args{Package: "androidTest"}
+	filtered := filterFindings(all, in)
+
+	out := renderPerfSummary(summarize(all, filtered), filtered, in)
+	for _, want := range []string{`under package="androidTest"`, "(of 4 repo-wide)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary does not name the filter: want %q in\n%s", want, out)
+		}
+	}
+
+	unfiltered := renderPerfSummary(summarize(all, all), all, args{})
+	if strings.Contains(unfiltered, "repo-wide") {
+		t.Errorf("unfiltered summary should not qualify its count:\n%s", unfiltered)
+	}
+}
+
+// TestRenderPerfSummary_HeadlineIsPreLimit is a regression I introduced while fixing
+// new/56 and caught by running the tool, not by a test.
+//
+// new/56 moved the summary behind the filter — correctly — but renderPerfSummary
+// built its Scoped from the slice AFTER the display limit had truncated it, so the
+// headline counted the limit. On python/superset the default view read:
+//
+//	Performance: 100 findings.
+//	Across 764 function(s) (high 145 / medium 499 / low 267).      ← sums to 911
+//
+// The headline is the LIMIT; the tier counts are the real filtered total. Exactly the
+// defect new/56 was about — a headline disagreeing with the numbers beside it —
+// reintroduced by its own fix, because every test called summarize() directly and none
+// exercised a result set larger than the limit.
+//
+// The count must always be the filtered, PRE-limit total. The display list is capped
+// separately (renderPerfSummary shows its own topN).
+func TestRenderPerfSummary_HeadlineIsPreLimit(t *testing.T) {
+	all := make([]Finding, 0, 250)
+	for i := 0; i < 250; i++ {
+		all = append(all, Finding{
+			Symbol: fmt.Sprintf("pkg/app.Fn%d", i), Package: "pkg/app", File: "pkg/app/f.go",
+			Severity: "high", BigO: "O(n)", Kind: "call-in-loop",
+		})
+	}
+
+	sum := summarize(all, all)
+	if sum.TotalFindings != 250 {
+		t.Fatalf("TotalFindings = %d, want 250", sum.TotalFindings)
+	}
+
+	out := renderPerfSummary(sum, all, args{})
+	if !strings.Contains(out, "250 findings") {
+		t.Errorf("headline must report the filtered total (250), not the display limit; got:\n%s",
+			strings.SplitN(out, "\n", 2)[0])
+	}
+	// And it must still agree with the severity line below it.
+	if !strings.Contains(out, "high 250") {
+		t.Errorf("severity line disagrees with the headline:\n%s", out)
+	}
+}
+
+// TestIsColdPath_CommandsIsNotColdByItself is new/47. isColdPath downranks a finding
+// to `low` and caps confidence at 0.4. Its CLI rule was:
+//
+//	strings.Contains(file, "/cli/commands/") || strings.Contains(file, "/commands/")
+//
+// The second half matched ANY path containing /commands/. CQRS, command buses and
+// event sourcing all use commands/ as a first-class production directory, so a real
+// N+1 in a command handler was pushed below every high and medium finding — invisible
+// in the default view.
+//
+// On python/superset all 101 flaggable symbols under superset/commands/ were
+// downranked, including an O(n³+) call-in-loop in BaseStreamingCSVExportCommand.
+// _execute_query_and_stream — a streaming query executor, about as hot-path as code
+// gets — and none of them was cold by any other rule.
+//
+// The existing TestIsColdPath could never have caught this: both of its /commands/
+// paths matched an earlier rule first ("dev/breeze/..." via the `dev` segment,
+// "airflow/cli/commands/..." via /cli/commands/), so the bare pattern had ZERO
+// independent coverage.
+func TestIsColdPath_CommandsIsNotColdByItself(t *testing.T) {
+	production := []string{
+		"superset/commands/dashboard/importers/v1/utils.py",
+		"superset/commands/streaming_export/base.py",
+		"api/commands/payment/handler.py",
+		"internal/services/commands/sync/processor.go",
+		"src/domain/commands/user/create_handler.ts",
+	}
+	for _, p := range production {
+		if isColdPath(p) {
+			t.Errorf("isColdPath(%q) = true — a production command handler must not be downranked", p)
+		}
+	}
+
+	// The specific half is correct and stays: a CLI command really is one-shot.
+	cold := []string{
+		"airflow/cli/commands/dag_command.py",
+		"superset/cli/commands/foo.py",
+	}
+	for _, p := range cold {
+		if !isColdPath(p) {
+			t.Errorf("isColdPath(%q) = false, want true (/cli/commands/ is still cold)", p)
+		}
+	}
+
+	// The other cold rules are untouched.
+	for _, p := range []string{
+		"migrations/versions/abc.py", "dev/breeze/x.py", "scripts/gen.py",
+		"app/__main__.py", "setup.py", "benchmarks/run.py",
+	} {
+		if !isColdPath(p) {
+			t.Errorf("isColdPath(%q) = false, want true", p)
+		}
+	}
+}
+
+// TestIsIgnoredPath_DoublestarGlobs is new/48. isIgnoredPath matched with path.Match,
+// which has NO `**` — `*` cannot cross `/`. So the doc's own advertised examples
+// silently matched nothing: an operator setting ENOLA_PERF_EXCLUDE to hide a generated
+// tree got zero exclusions and no error. It now uses pathglob.Match, the **-capable
+// matcher the OSS engine has had since the ignore globs were directory-scoped.
+func TestIsIgnoredPath_DoublestarGlobs(t *testing.T) {
+	t.Setenv("ENOLA_PERF_EXCLUDE", "**/proto/**,src/legacy/**,**/*.pb.go,*.thrift.go")
+
+	ignored := []string{
+		"a/b/c/proto/messages.py",    // **/proto/** — a dir at any depth
+		"proto/x.go",                 // ditto, at the root
+		"src/legacy/deep/nested.ts",  // src/legacy/** — recursive, not one level
+		"gen/api/v1/service.pb.go",   // **/*.pb.go — a basename glob at any depth
+		"any/where/schema.thrift.go", // a bare basename glob (the basename fallback)
+	}
+	for _, p := range ignored {
+		if !isIgnoredPath(p) {
+			t.Errorf("isIgnoredPath(%q) = false, want true — the documented pattern does not work", p)
+		}
+	}
+
+	for _, p := range []string{"superset/commands/handler.py", "src/app/main.ts", "internal/proto_helper.go"} {
+		if isIgnoredPath(p) {
+			t.Errorf("isIgnoredPath(%q) = true, want false — over-matched", p)
+		}
+	}
+
+	// Unset → no-op, and no pattern may accidentally match everything. t.Setenv above
+	// already registered the restore, so this only has to clear it for the rest of
+	// this test — but a failure to clear would make the assertion below vacuous.
+	if err := os.Unsetenv("ENOLA_PERF_EXCLUDE"); err != nil {
+		t.Fatalf("clearing ENOLA_PERF_EXCLUDE: %v", err)
+	}
+	if isIgnoredPath("superset/commands/handler.py") {
+		t.Error("with no globs set, nothing should be ignored")
+	}
+}
+
+// TestRiskScore_RouteHandlerEscalation is the CONSUMER half of new/18, and the half
+// that makes the whole thing observable.
+//
+// collect() keyed routeHandlers by the route's raw `handler` prop, which goextractor
+// renders from the REGISTRATION site — the receiver VARIABLE chain
+// ("h.weatherHandler.GetDailyWeatherRange"). analyze() and riskScore() then look it up
+// by the canonical symbol name. Disjoint key spaces: on fairwayhub/golf, 1397 handler
+// props intersect 13482 symbol names exactly TWICE (both Python). So no Go or Ruby route
+// handler has EVER been escalated, and the comment promising a handler is "always hot"
+// described behaviour the code did not have.
+//
+// The engine now resolves the route to its handler structurally (handled_by, v111), so
+// read the resolved EDGE rather than re-deriving it from a name that cannot match.
+func TestRiskScore_RouteHandlerEscalation(t *testing.T) {
+	handler := Finding{
+		Symbol: "internal/adapters/http/weather.HandlerV2.GetDailyWeatherRange",
+		File:   "internal/adapters/http/weather/handler_v2.go",
+		Kind:   "call-in-loop", BigO: "O(n)", Severity: "high", Confidence: 0.9,
+	}
+	plain := Finding{
+		Symbol: "internal/app/weather.Service.GetDailyWeatherRange",
+		File:   "internal/app/weather/service.go",
+		Kind:   "call-in-loop", BigO: "O(n)", Severity: "high", Confidence: 0.9,
+	}
+
+	// The resolved set, as bindHTTPHandlers now provides it: canonical symbol names.
+	routeHandlers := map[string]bool{
+		"internal/adapters/http/weather.HandlerV2.GetDailyWeatherRange": true,
+	}
+
+	hot := riskScore(handler, routeHandlers)
+	cold := riskScore(plain, routeHandlers)
+
+	if hot <= cold {
+		t.Errorf("a route handler must outrank the same finding off the request path: handler=%.2f plain=%.2f", hot, cold)
+	}
+	// The escalation is a 1.3x lift, and it has never once applied on the corpus.
+	if want := cold * 1.3; hot < want-0.001 || hot > want+0.001 {
+		t.Errorf("riskScore = %.3f, want %.3f (1.3x the non-handler score)", hot, want)
+	}
+
+	// And the receiver-VARIABLE spelling from the registration site must NOT be what we
+	// key on — that is the bug. A set keyed that way escalates nothing.
+	byRawProp := map[string]bool{"h.weatherHandler.GetDailyWeatherRange": true}
+	if riskScore(handler, byRawProp) != cold {
+		t.Error("keying on the raw registration-site handler prop escalated something — it cannot match a symbol name")
+	}
+}
+
+// TestCollectRouteHandlers_FromResolvedEdge pins the actual defect site. riskScore and
+// analyze were always correct GIVEN a correctly-keyed set; this is what handed them a set
+// keyed by the registration-site expression, which can never match a symbol name.
+func TestCollectRouteHandlers_FromResolvedEdge(t *testing.T) {
+	routes := []facts.Fact{
+		// A Go route as the engine now leaves it: the raw prop is the registration-site
+		// expression, and the resolved symbol is on the handled_by edge.
+		{
+			Kind: facts.KindRoute, Name: "/api/weather/daily-range",
+			Props: map[string]any{
+				"language": "go", "method": "GET",
+				"handler": "h.weatherHandler.GetDailyWeatherRange",
+			},
+			Relations: []facts.Relation{
+				{Kind: facts.RelHandledBy, Target: "internal/adapters/http/weather.HandlerV2.GetDailyWeatherRange"},
+			},
+		},
+		// A Flask route, whose prop already IS the canonical name — the fallback keeps it.
+		{
+			Kind: facts.KindRoute, Name: "/health",
+			Props: map[string]any{"language": "python", "handler": "mediapipe/app.health"},
+		},
+	}
+
+	got := collectRouteHandlers(routes)
+
+	if !got["internal/adapters/http/weather.HandlerV2.GetDailyWeatherRange"] {
+		t.Error("the resolved handled_by target is not in routeHandlers — the escalation still cannot fire")
+	}
+	if !got["mediapipe/app.health"] {
+		t.Error("the Python fallback regressed: a prop that already is a canonical name must still match")
+	}
+}
+
+// TestIsExpensiveDartCall is the guard on the fourth ecosystem-specific handler.
+//
+// Dart earns one the way Swift, the JVM and TypeScript did, and measurably: the shared
+// expensiveMethods list carries `where` for Ruby, where `Model.where(...)` is a lazy
+// ActiveRecord query — but in Dart `.where()` is `Iterable.where`, the standard
+// in-memory filter and the direct equivalent of JavaScript's `.filter()`. Measured on
+// AppFlowy's Flutter half, the generic gate produced 58 call-in-loop findings dominated
+// by `children.where` inside a loop, which is list processing and not I/O.
+func TestIsExpensiveDartCall(t *testing.T) {
+	storage := map[string]bool{"mobile/lib/db.assets": true}
+	byName := map[string]funcInfo{
+		"repo.loadPage": {Name: "repo.loadPage", PerformsIO: true},
+	}
+	// Short-name performs_io index, from the extractor's import-gated io_direct plus
+	// its transitive closure.
+	ioMethods := map[string]bool{"syncRemote": true, "call": true, "build": true}
+
+	expensive := []string{
+		"mobile/lib/db.assets",       // storage fact
+		"repo.loadPage",              // resolved callee flagged performs_io
+		"service.syncRemote",         // performs_io wrapper via the short-name index
+		"_db.select",                 // drift receiver — immich's real N+1 shape
+		"_db.insertOnConflictUpdate", // drift round-trip method
+		"db.rawQuery",                // sqflite
+		"dio.get",                    // HTTP receiver token
+		"http.post",                  // HTTP receiver token
+		"file.readAsString",          // dart:io
+		"rootBundle.loadString",      // asset I/O
+	}
+	for _, c := range expensive {
+		if !isExpensiveDartCall(c, storage, byName, ioMethods) {
+			t.Errorf("isExpensiveDartCall(%q) = false, want true", c)
+		}
+	}
+
+	cheap := []string{
+		// The collision this handler exists for: Dart's in-memory collection API.
+		"children.where", "items.map", "list.insert", "map.update",
+		"nodes.firstWhere", "values.fold", "set.add",
+		// Dispatch primitives. `callback.call(x)` is how a function object is invoked,
+		// so a short-name performs_io match on `call` would make every callback
+		// invocation in the codebase look like per-iteration I/O — 12 of AppFlowy's 28
+		// remaining findings were driven by nothing else. `build` is a widget
+		// constructing its subtree.
+		"callback.call", "widget.build",
+		// A locally-defined helper with no I/O evidence.
+		"utils.formatDuration",
+	}
+	for _, c := range cheap {
+		if isExpensiveDartCall(c, storage, byName, ioMethods) {
+			t.Errorf("isExpensiveDartCall(%q) = true, want false", c)
+		}
+	}
+}
+
+// The cross-call form of the hierarchical rule. `for _, x := range xs { g(x) }`,
+// where g loops over what it was handed, visits each element of each x once across
+// the whole nest — so the callee finishes the caller's walk instead of running one
+// per element, and its depth must not compound.
+func TestAnalyze_ContinuedWalkDoesNotCompound(t *testing.T) {
+	continued := []funcInfo{
+		{Name: "p.Outer", File: "p/o.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"p.inner"}, CallsInScalingLoop: []string{"p.inner"},
+			HasScalingLoopCalls: true, CallsOnLoopElement: []string{"p.inner"}},
+		{Name: "p.inner", File: "p/i.go", LoopDepth: 1, LoopCount: 1, LoopsOverParam: true},
+	}
+	if f, ok := findFinding(analyze(continued, nil, nil, nil), "p.Outer", "compounded"); ok {
+		t.Errorf("a continued walk must not compound; got %s", f.BigO)
+	}
+
+	// Both halves are required, and each control removes one of them.
+	//
+	// The callee loops over a parameter, but this caller passes it something else:
+	// nothing says the two loops walk the same data.
+	notPassed := []funcInfo{
+		{Name: "p.Outer", File: "p/o.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"p.inner"}, CallsInScalingLoop: []string{"p.inner"},
+			HasScalingLoopCalls: true},
+		{Name: "p.inner", File: "p/i.go", LoopDepth: 1, LoopCount: 1, LoopsOverParam: true},
+	}
+	if _, ok := findFinding(analyze(notPassed, nil, nil, nil), "p.Outer", "compounded"); !ok {
+		t.Errorf("a callee that is not handed the element must still compound")
+	}
+
+	// The element is passed, but the callee walks its own state, so the work really
+	// is one traversal per element.
+	ownState := []funcInfo{
+		{Name: "p.Outer", File: "p/o.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"p.inner"}, CallsInScalingLoop: []string{"p.inner"},
+			HasScalingLoopCalls: true, CallsOnLoopElement: []string{"p.inner"}},
+		{Name: "p.inner", File: "p/i.go", LoopDepth: 1, LoopCount: 1},
+	}
+	if _, ok := findFinding(analyze(ownState, nil, nil, nil), "p.Outer", "compounded"); !ok {
+		t.Errorf("a callee looping over its own state must still compound")
+	}
+}
+
+// A call-in-loop finding says how often the call is made, which the loops around
+// it decide. What the callee does per call belongs to the `compounded` finding.
+func TestCallInLoopExponentIsItsOwnNestingNotTheCallGraphs(t *testing.T) {
+	funcs := []funcInfo{
+		{
+			Name: "app.DeleteAll", File: "app/delete.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"db.Delete"}, Calls: []string{"db.Delete"},
+		},
+		// The callee loops twice over its own arguments. Compounding makes the
+		// caller's effective depth 3, which is not the number of round-trips.
+		{Name: "db.Delete", File: "db/delete.go", LoopDepth: 2, LoopCount: 2},
+	}
+	got := analyze(funcs, nil, nil, nil)
+
+	c, ok := findFinding(got, "app.DeleteAll", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop finding for app.DeleteAll; got %+v", got)
+	}
+	if c.BigO != "O(n)" {
+		t.Errorf("call-in-loop BigO = %s, want O(n): one call per iteration of one loop", c.BigO)
+	}
+	// The callee's cost is still reported, as what it is.
+	comp, ok := findFinding(got, "app.DeleteAll", "compounded")
+	if !ok || comp.Depth != 3 {
+		t.Errorf("compounded finding = %+v (ok=%v), want depth 3", comp, ok)
+	}
+}
+
+func TestCallInLoopCountsItsOwnNest(t *testing.T) {
+	funcs := []funcInfo{{
+		Name: "app.Sync", File: "app/sync.go", LoopDepth: 2, LoopCount: 2,
+		CallsInLoop: []string{"db.Query"}, Calls: []string{"db.Query"},
+	}}
+	c, ok := findFinding(analyze(funcs, nil, nil, nil), "app.Sync", "call-in-loop")
+	if !ok || c.Depth != 2 || c.BigO != "" {
+		t.Errorf("call-in-loop = %+v (ok=%v), want depth 2 from the function's own two-deep nest and no Big-O", c, ok)
+	}
+}
+
+// Go drops the keywords that name another ecosystem's API, and a name that states
+// or builds something is not doing I/O whatever noun it ends in.
+func TestGoCallGateUsesGoVerbsAndPartOfSpeech(t *testing.T) {
+	notIO := []string{
+		"pkg/usage.Ingester.mergeBack",   // `merge` is SQLAlchemy's, not Go's
+		"pkg/usage.aggregateField",       // `aggregate` is Prisma's
+		"issue.IsPullRequest",            // a predicate
+		"pkg/schema.isCloudWatchQuery",   // an unexported predicate
+		"pkg/kinds.NewAzureMonitorQuery", // a constructor
+		"models/db.ErrCancelledf",        // an error value, under a db package
+		"pkg/tracker.Issue.Labels",       // `Issue` is not `Is` + `sue`: no verb either
+	}
+	for _, c := range notIO {
+		if isExpensiveGoCall(c, nil, nil) {
+			t.Errorf("%s read as I/O", c)
+		}
+	}
+	isIO := []string{
+		"models/actions.UpdateTask", "repo.FindByID", "stmt.ExecContext", "pkg/store.queryRows",
+		"client.DoRequest", "models/db.GetEngine", "sql.Open", "tracker.IssueUpdate",
+		"services/actions.loadJobTaskOutputs",        // found by name or not at all: Go has no performs_io
+		"pkg/infra/db.DB.WithTransactionalDbSession", // runs its closure in a transaction
+	}
+	for _, c := range isIO {
+		if !isExpensiveGoCall(c, nil, nil) {
+			t.Errorf("%s not read as I/O", c)
+		}
+	}
+	if !isExpensiveGoCall("pkg/x.NewThing", map[string]bool{"pkg/x.NewThing": true}, nil) {
+		t.Errorf("a storage fact is I/O whatever its name")
+	}
+}
+
+func TestPHPInMemoryCallsAreNotIO(t *testing.T) {
+	for _, c := range []string{"array_merge", "array_merge_recursive", "query.where", "whereIn", "builder.whereExists"} {
+		if !phpInMemory(c) {
+			t.Errorf("%s not recognised as in-memory", c)
+		}
+	}
+	for _, c := range []string{"Model.save", "db.array_merge", "wherever", "repo.findWhere"} {
+		if phpInMemory(c) {
+			t.Errorf("%s read as in-memory", c)
+		}
+	}
+}
+
+// The short-name index in TypeScript: a name is I/O when every function bearing it
+// is. One init that does I/O does not make every init a network call, and an
+// insertAll with an in-memory namesake says nothing about which one `dao.insertAll`
+// is. With no such namesake the call is reported.
+func TestTSShortNameIsIOOnlyWhenEveryBearerIs(t *testing.T) {
+	render := funcInfo{
+		Name: "ui/page.render", File: "ui/page.ts", LoopDepth: 1, LoopCount: 1,
+		CallsInLoop: []string{"r.init", "dao.insertAll"}, Calls: []string{"r.init", "dao.insertAll"},
+	}
+	base := []funcInfo{
+		{Name: "net/socket.Client.init", File: "net/socket.ts", PerformsIO: true},
+		{Name: "ui/widget.Widget.init", File: "ui/widget.ts"},
+		{Name: "data/dao.UserDao.insertAll", File: "data/dao.ts", PerformsIO: true},
+		{Name: "data/dao.Dao.insertAll", File: "data/base.ts", PerformsIO: true}, // the interface's declaration, flagged through its implementer
+		render,
+	}
+	c, ok := findFinding(analyze(base, nil, nil, nil), "ui/page.render", "call-in-loop")
+	if !ok || len(c.Calls) != 1 || c.Calls[0].Callee != "dao.insertAll" {
+		t.Fatalf("render = %+v (ok=%v), want one call, dao.insertAll: every insertAll does I/O and one init does not", c, ok)
+	}
+	if c.Calls[0].Basis != basisIOIndex || c.Severity != "medium" {
+		t.Errorf("dao.insertAll rests on %q at %s, want the index at medium: it is still a name", c.Calls[0].Basis, c.Severity)
+	}
+
+	withNamesake := append([]funcInfo{{Name: "data/mem.Buffer.insertAll", File: "data/mem.ts"}}, base...)
+	if c, ok := findFinding(analyze(withNamesake, nil, nil, nil), "ui/page.render", "call-in-loop"); ok {
+		t.Errorf("an in-memory insertAll exists, and dao.insertAll was still read as the other one: %+v", c)
+	}
+}
+
+// A callee that resolves is judged by the function it resolves to. The index is
+// for a callee nobody could see.
+func TestResolvedCalleeIsNotReadThroughTheShortNameIndex(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "src/api.Client.execute", File: "src/api.ts", PerformsIO: true},
+		{Name: "src/plan.Step.execute", File: "src/plan.cc"}, // another language: not a TypeScript namesake
+		{Name: "src/mesh.Recombinator.execute", File: "src/mesh.ts"},
+		{
+			Name: "src/run.all", File: "src/run.ts", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"src/mesh.Recombinator.execute"},
+		},
+	}
+	if c, ok := findFinding(analyze(funcs, nil, nil, nil), "src/run.all", "call-in-loop"); ok {
+		t.Errorf("a resolved callee with no I/O was reported for sharing a name with one that has: %+v", c)
+	}
+}
+
+// Python keeps the wider index. Its unresolved callees are mostly real clients
+// held in attributes, whose method names are common words.
+func TestPythonKeepsTheWiderShortNameIndex(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "hooks/s3.S3Hook.get_key", File: "hooks/s3.py", PerformsIO: true},
+		{Name: "util/cache.LocalCache.get_key", File: "util/cache.py"},
+		{
+			Name: "ops/copy.run", File: "ops/copy.py", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"s3_hook.get_key"},
+		},
+	}
+	if _, ok := findFinding(analyze(funcs, nil, nil, nil), "ops/copy.run", "call-in-loop"); !ok {
+		t.Errorf("s3_hook.get_key in a loop is not reported")
+	}
+}
+
+// C# keeps the generic gate; only collection methods are taken out of it.
+func TestCSharpCollectionMethodsAreNotIO(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "Lib.Provider.DeleteEpisode", File: "Lib/Provider.cs"}, // resolved, no performs_io: an interface hides it
+		{
+			Name: "Lib.Provider.Run", File: "Lib/Provider.cs", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"Lib.Provider.DeleteEpisode", "_cache.AddOrUpdate", "videos.InsertRange"},
+		},
+	}
+	c, ok := findFinding(analyze(funcs, nil, nil, nil), "Lib.Provider.Run", "call-in-loop")
+	if !ok {
+		t.Fatalf("DeleteEpisode in a loop must still be reported")
+	}
+	if len(c.Evidence) != 1 || c.Evidence[0] != "call_in_loop=Lib.Provider.DeleteEpisode" {
+		t.Errorf("evidence = %v, want only DeleteEpisode", c.Evidence)
+	}
+}
+
+// A resolved TypeScript callee that does no I/O is not I/O for sharing a name with
+// an ORM method.
+func TestResolvedTSCalleeIsJudgedByItsOwnIO(t *testing.T) {
+	byName := map[string]funcInfo{"src/chart.aggregate": {Name: "src/chart.aggregate"}}
+	if isExpensiveTSCall("src/chart.aggregate", nil, byName, nil) {
+		t.Errorf("a local aggregate() that does no I/O read as a Prisma aggregate")
+	}
+	if !isExpensiveTSCall("prisma.user.aggregate", nil, byName, nil) {
+		t.Errorf("an unresolved ORM aggregate must still be I/O")
+	}
+}
+
+// A function with no branch cannot be recursive and return, so a self-call in one
+// names a different function of the same name: forwarding, not recursion.
+func TestBranchFreeFunctionIsNotRecursive(t *testing.T) {
+	funcs := []funcInfo{
+		// `fn local_addr(&self) { self.local_addr() }` in a trait impl.
+		{Name: "net.TcpListener.local_addr", File: "net/tcp.rs", Recursive: true, Cyclomatic: 1},
+		// A real walk: the loop is its base case.
+		{Name: "tree.Node.walk", File: "tree/node.rs", Recursive: true, Cyclomatic: 2, LoopDepth: 1, LoopCount: 1},
+		// No cyclomatic reported: nothing is proven, so the finding stays.
+		{Name: "legacy.descend", File: "legacy/x.rb", Recursive: true},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	if _, ok := findFinding(got, "net.TcpListener.local_addr", "recursion"); ok {
+		t.Errorf("a branch-free forwarding method reported as recursive")
+	}
+	for _, name := range []string{"tree.Node.walk", "legacy.descend"} {
+		if _, ok := findFinding(got, name, "recursion"); !ok {
+			t.Errorf("%s no longer reported as recursive", name)
+		}
+	}
+}
+
+func TestColdPathRecognisesWhereOneShotCodeLives(t *testing.T) {
+	cold := []string{
+		"Jellyfin.Server/Migrations/Routines/FixDates.cs", // .NET capitalises it
+		"db/migrate/20240101000000_add_index.rb",
+		"db/post_migrate/20240101000000_backfill.rb",
+		"db/old_migrations/20140101000000_move_counts.rb",
+		"lib/tasks/fake_data.rake",
+		"lib/tasks/helpers.rb",
+		"extras/cleanup.rake",
+		"lib/mastodon/cli/maintenance.rb",
+		"airflow-core/src/airflow/cli/simple_table.py",
+		".github/actions/changelog/index.js",
+		"docs/plugins/remark-localize-badges.mjs",
+		"build-logic/convention/src/main/kotlin/Graph.kt",
+	}
+	for _, f := range cold {
+		if !isColdPath(f) {
+			t.Errorf("%s not recognised as a cold path", f)
+		}
+	}
+	hot := []string{
+		"app/models/story.rb",
+		"pkg/migration/schemaversion/v34.go", // runs on every dashboard load
+		"services/migrate/run.go",            // not under db/
+		"internal/server/docs.go",            // a file, not a docs directory
+		"pkg/api/cli.go",
+		"app/lib/tasks_presenter.rb",
+		"superset/commands/chart/export.py", // commands/ is a production layer
+	}
+	for _, f := range hot {
+		if isColdPath(f) {
+			t.Errorf("%s read as a cold path", f)
+		}
+	}
+}
+
+// The exponent of a call-in-loop finding is the nesting around the call, not the
+// function's deepest nest.
+func TestCallInLoopExponentIsTheNestingAroundTheCall(t *testing.T) {
+	sync := funcInfo{
+		Name: "app.Sync", File: "app/sync.py", LoopDepth: 2, LoopCount: 3,
+		ScalingLoopDepth: 2, HasScalingDepth: true,
+		CallsInLoop:        []string{"session.execute"},
+		CallsInScalingLoop: []string{"session.execute"}, HasScalingLoopCalls: true,
+		Calls: []string{"session.execute"},
+	}
+
+	// One query per row at depth 1; the depth-2 nest is a matrix built further down.
+	sync.CallDepth = map[string]int{"session.execute": 1}
+	c, ok := findFinding(analyze([]funcInfo{sync}, nil, nil, nil), "app.Sync", "call-in-loop")
+	if !ok || c.BigO != "O(n)" {
+		t.Errorf("call at depth 1 in a depth-2 function: %+v (ok=%v), want O(n)", c, ok)
+	}
+
+	// The same call inside the nest is reported as in a nest of two. Whether the
+	// two loops multiply is not something the count says, so no Big-O is stated,
+	// and the finding says why.
+	sync.CallDepth = map[string]int{"session.execute": 2}
+	c, ok = findFinding(analyze([]funcInfo{sync}, nil, nil, nil), "app.Sync", "call-in-loop")
+	if !ok || c.Depth != 2 || c.BigO != "" || c.Label() != "depth 2" {
+		t.Errorf("call at depth 2: %+v (ok=%v), want depth 2 and no Big-O", c, ok)
+	}
+	if !strings.Contains(c.Why, "inside 2 nested loops") || !strings.Contains(c.Why, "not a complexity") {
+		t.Errorf("a call in a nest does not say what its depth means: %q", c.Why)
+	}
+
+	// An extractor that reports no per-call depth keeps the function-wide bound.
+	sync.CallDepth = nil
+	c, ok = findFinding(analyze([]funcInfo{sync}, nil, nil, nil), "app.Sync", "call-in-loop")
+	if !ok || c.Depth != 2 || c.BigO != "" {
+		t.Errorf("no per-call depth: %+v (ok=%v), want the function's depth of 2", c, ok)
+	}
+}
+
+// A call in a nest ranks where it ranked when it carried an exponent: the label
+// changed, and what is worth looking at first did not.
+func TestCallInANestKeepsItsRank(t *testing.T) {
+	for depth, want := range map[int]float64{2: 2, 3: 3, 4: 4, 7: 4} {
+		f := Finding{Kind: "call-in-loop", Depth: depth}
+		if got := findingWeight(f); got != want {
+			t.Errorf("weight at depth %d = %v, want %v", depth, got, want)
+		}
+	}
+	if got := findingWeight(Finding{Kind: "call-in-loop", BigO: "O(n)"}); got != 1 {
+		t.Errorf("weight in one loop = %v, want 1", got)
+	}
+}
+
+func TestCallDepthPropHasToLineUpWithItsCalls(t *testing.T) {
+	calls := []string{"a.save", "b.load"}
+	got := callDepthProp(map[string]any{propCallsInScalingLoopDepth: []any{float64(1), float64(2)}}, calls)
+	if got["a.save"] != 1 || got["b.load"] != 2 {
+		t.Errorf("after a JSONL round trip: %v", got)
+	}
+	if got := callDepthProp(map[string]any{propCallsInScalingLoopDepth: []int{1}}, calls); got != nil {
+		t.Errorf("a depth list of the wrong length must be ignored, got %v", got)
+	}
+	if got := callDepthProp(map[string]any{}, calls); got != nil {
+		t.Errorf("an absent prop is nil, got %v", got)
+	}
+}
+
+// A callee multiplies with the loops around its call, not with the caller's deepest
+// nest somewhere else.
+func TestCompoundingUsesTheDepthTheCalleeIsCalledAt(t *testing.T) {
+	helper := funcInfo{Name: "app.bounds", File: "app/b.ts", LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true}
+	caller := funcInfo{
+		Name: "app.snap", File: "app/s.ts", LoopDepth: 2, LoopCount: 3, ScalingLoopDepth: 2, HasScalingDepth: true,
+		CallsInLoop:        []string{"app.bounds"},
+		CallsInScalingLoop: []string{"app.bounds"}, HasScalingLoopCalls: true,
+	}
+
+	// bounds() is called from a depth-1 map; the depth-2 pair loop is a sibling.
+	// 1 + 1 does not exceed the function's own 2, so nothing compounds.
+	caller.CallDepth = map[string]int{"app.bounds": 1}
+	if c, ok := findFinding(analyze([]funcInfo{caller, helper}, nil, nil, nil), "app.snap", "compounded"); ok {
+		t.Errorf("callee at depth 1 beside a depth-2 nest reported as compounding: %+v", c)
+	}
+
+	// Called from inside the pair loop it really is one level deeper.
+	caller.CallDepth = map[string]int{"app.bounds": 2}
+	c, ok := findFinding(analyze([]funcInfo{caller, helper}, nil, nil, nil), "app.snap", "compounded")
+	if !ok || c.Depth != 3 {
+		t.Errorf("callee at depth 2: %+v (ok=%v), want depth 3", c, ok)
+	}
+
+	// No per-call depth: the old upper bound.
+	caller.CallDepth = nil
+	c, ok = findFinding(analyze([]funcInfo{caller, helper}, nil, nil, nil), "app.snap", "compounded")
+	if !ok || c.Depth != 3 {
+		t.Errorf("no per-call depth: %+v (ok=%v), want the upper bound, depth 3", c, ok)
+	}
+}
+
+// A callee that loops over the parameter the element arrives in is finishing the
+// caller's walk. One that loops over a different parameter multiplies.
+func TestCrossCallNeedsTheParameterTheElementArrivesIn(t *testing.T) {
+	caller := funcInfo{
+		Name: "app.r", File: "app/r.ts", LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+		CallsInLoop:        []string{"app.render", "app.hasQuery"},
+		CallsInScalingLoop: []string{"app.render", "app.hasQuery"}, HasScalingLoopCalls: true,
+		CallDepth:          map[string]int{"app.render": 1, "app.hasQuery": 1},
+		CallsOnLoopElement: []string{"app.render", "app.hasQuery"},
+		ElementArg:         map[string]int{"app.render": 0, "app.hasQuery": 0},
+	}
+	loops := func(name string, param int) funcInfo {
+		return funcInfo{
+			Name: name, File: "app/x.ts", LoopDepth: 1, LoopCount: 1, ScalingLoopDepth: 1, HasScalingDepth: true,
+			LoopsOverParam: true, LoopParams: map[int]bool{param: true},
+		}
+	}
+
+	// render(frame) loops over frame: no compounding.
+	only := caller
+	only.CallsInLoop, only.CallsInScalingLoop = []string{"app.render"}, []string{"app.render"}
+	if c, ok := findFinding(analyze([]funcInfo{only, loops("app.render", 0)}, nil, nil, nil), "app.r", "compounded"); ok {
+		t.Errorf("a callee continuing the walk reported as compounding: %+v", c)
+	}
+
+	// hasQuery(frame, words) loops over words, parameter 1: it multiplies.
+	c, ok := findFinding(analyze([]funcInfo{caller, loops("app.render", 0), loops("app.hasQuery", 1)}, nil, nil, nil), "app.r", "compounded")
+	if !ok || c.Depth != 2 {
+		t.Errorf("a callee looping over a different parameter: %+v (ok=%v), want compounded at depth 2", c, ok)
+	}
+
+	// Without positions (the Go extractor) the pair of booleans decides, as before.
+	legacy := only
+	legacy.ElementArg = nil
+	g := loops("app.render", 0)
+	g.LoopParams = nil
+	if c, ok := findFinding(analyze([]funcInfo{legacy, g}, nil, nil, nil), "app.r", "compounded"); ok {
+		t.Errorf("the boolean pair alone must still discount: %+v", c)
+	}
+}
+
+// Which kinds claim a complexity and which state a count. A call-in-loop or
+// recursion finding has a Big-O and no depth; a nested-loop or compounded one has
+// a depth, no Big-O, and says in words that the depth is not a complexity.
+func TestOnlyCallInLoopAndRecursionClaimABigO(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "p.nest", File: "p/n.go", LoopDepth: 3, LoopCount: 3},
+		{Name: "p.caller", File: "p/c.go", LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"p.looper"}},
+		{Name: "p.looper", File: "p/l.go", LoopDepth: 1, LoopCount: 1},
+		{Name: "p.nplus1", File: "p/q.go", LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{"db.Query"}},
+		{Name: "p.walk", File: "p/w.go", Recursive: true, Cyclomatic: 2},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	want := map[string]bool{"nested-loop": false, "compounded": false, "call-in-loop": true, "recursion": true}
+	seen := map[string]bool{}
+	for _, f := range got {
+		claims, known := want[f.Kind]
+		if !known {
+			t.Fatalf("unexpected kind %q", f.Kind)
+		}
+		seen[f.Kind] = true
+		if claims {
+			if f.BigO == "" || f.Depth != 0 || f.Label() != f.BigO {
+				t.Errorf("%s (%s): BigO=%q depth=%d label=%q; want a Big-O and no depth", f.Symbol, f.Kind, f.BigO, f.Depth, f.Label())
+			}
+			continue
+		}
+		if f.BigO != "" || f.Depth < 2 || !strings.HasPrefix(f.Label(), "depth ") {
+			t.Errorf("%s (%s): BigO=%q depth=%d label=%q; want a depth and no Big-O", f.Symbol, f.Kind, f.BigO, f.Depth, f.Label())
+		}
+		if !strings.Contains(f.Why, depthIsNotComplexity) {
+			t.Errorf("%s (%s): why does not say the depth is not a complexity: %q", f.Symbol, f.Kind, f.Why)
+		}
+		if f.Severity == "high" {
+			t.Errorf("%s (%s): a structural finding ranked high", f.Symbol, f.Kind)
+		}
+	}
+	for kind := range want {
+		if !seen[kind] {
+			t.Errorf("no %s finding produced; the fixture should yield one of each kind", kind)
+		}
+	}
+}
+
+// A project's own package named http is not the HTTP client, and an ORM's method
+// name is not a Go API. Both produced high-severity findings on a codebase that
+// does neither.
+func TestGoInRepoHTTPPackageAndORMNamesAreNotConfirmedIO(t *testing.T) {
+	funcs := []funcInfo{
+		// A linker package called http: matches routes in memory.
+		{Name: "internal/signals/http.resolveCall", File: "internal/signals/http/http.go"},
+		{
+			Name: "internal/signals/http.Contribute", File: "internal/signals/http/http.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"internal/signals/http.resolveCall"},
+		},
+		// A syntax-tree helper that recurses through a loop over children.
+		{
+			Name: "internal/ast.findFirstIdentifier", File: "internal/ast/walk.go", LoopDepth: 1, LoopCount: 1,
+			Recursive: true, Cyclomatic: 3, CallsInLoop: []string{"internal/ast.findFirstIdentifier"},
+		},
+		// The real thing: the standard library's client, once per item.
+		{
+			Name: "internal/fetch.All", File: "internal/fetch/all.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"net/http.Get"},
+		},
+		// And an in-repo client wrapper, whose package name says what it is.
+		{Name: "pkg/lokihttp.client.sendBatch", File: "pkg/lokihttp/client.go"},
+		{
+			Name: "pkg/push.Flush", File: "pkg/push/flush.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"pkg/lokihttp.client.sendBatch"},
+		},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	for _, name := range []string{"internal/signals/http.Contribute", "internal/ast.findFirstIdentifier"} {
+		if f, ok := findFinding(got, name, "call-in-loop"); ok {
+			t.Errorf("%s reported as a call-in-loop: %+v", name, f)
+		}
+	}
+	// Reported, and medium: a package name is a reading too. `net/http` also holds
+	// `ResponseWriter.Header`, which returns a map.
+	for _, name := range []string{"internal/fetch.All", "pkg/push.Flush"} {
+		f, ok := findFinding(got, name, "call-in-loop")
+		if !ok || f.Severity != "medium" {
+			t.Errorf("%s: %+v (ok=%v), want a medium call-in-loop", name, f, ok)
+		}
+	}
+}
+
+// A call-in-loop finding names every expensive call in the loop, and says of each
+// what it rests on. The four here pass the same gate on four different grounds.
+func TestCallInLoopStatesTheBasisOfEachCall(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "data/repo.Repo.loadAll", File: "data/repo.py", PerformsIO: true},
+		{Name: "data/other.Thing.refresh", File: "data/other.py", PerformsIO: true},
+		{
+			Name: "app/job.run", File: "app/job.py", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"orders", "data/repo.Repo.loadAll", "cache.refresh", "requests.get", "merge_rows"},
+		},
+	}
+	storage := map[string]bool{"orders": true}
+	c, ok := findFinding(analyze(funcs, storage, nil, nil), "app/job.run", "call-in-loop")
+	if !ok {
+		t.Fatalf("no call-in-loop finding")
+	}
+	want := map[string]string{
+		"orders":                 basisStorage,
+		"data/repo.Repo.loadAll": basisResolvedIO,
+		"cache.refresh":          basisIOIndex, // Thing.refresh does I/O; nothing says this is it
+		"requests.get":           basisIOReceiver,
+		"merge_rows":             basisName,
+	}
+	if len(c.Calls) != len(want) || len(c.Calls) != len(c.Evidence) {
+		t.Fatalf("calls = %+v, evidence = %v, want %d of each", c.Calls, c.Evidence, len(want))
+	}
+	for i, ce := range c.Calls {
+		if c.Evidence[i] != "call_in_loop="+ce.Callee {
+			t.Errorf("calls[%d] = %q, evidence[%d] = %q: not in the same order", i, ce.Callee, i, c.Evidence[i])
+		}
+		if ce.Basis != want[ce.Callee] {
+			t.Errorf("basis of %s = %q, want %q", ce.Callee, ce.Basis, want[ce.Callee])
+		}
+	}
+}
+
+// Go is confirmed by its package and by nothing else, so its basis is read the same
+// way: a Go helper is not on the method index for sharing a name with a function in
+// another language that does I/O.
+func TestCallBasisReadsGoByPackage(t *testing.T) {
+	byName := map[string]funcInfo{}
+	ioMethods := map[string]bool{"Save": true, "findFirst": true}
+	for callee, want := range map[string]string{
+		"net/http.Client.Do":   basisIOReceiver,
+		"store.Save":           basisName,
+		"ast.findFirst":        basisName,
+		"internal/db.Tx.Query": basisIOReceiver,
+	} {
+		if got := callBasis(funcInfo{}, callee, true, nil, byName, byName, ioMethods); got != want {
+			t.Errorf("callBasis(%s) = %q, want %q", callee, got, want)
+		}
+	}
+}
+
+// A callee that resolves to a function flagged performs_io is reported whatever it
+// is called, in a language whose gate reads names only. The converse does not
+// hold: a resolved callee with no flag is still judged by its name, because the
+// flag stops at a call on a field.
+func TestResolvedPerformsIOCalleeIsReportedInAnyLanguage(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "Lib/IO.Helper.Resolve", File: "Lib/IO/Helper.cs", PerformsIO: true}, // File.ResolveLinkTarget
+		{Name: "Lib/IO.Helper.Normalize", File: "Lib/IO/Helper.cs"},
+		{Name: "Lib/Tv.Provider.DeleteEpisode", File: "Lib/Tv/Provider.cs"}, // _library.DeleteItem(…): no edge, no flag
+		{
+			Name: "Lib/IO.Helper.Walk", File: "Lib/IO/Helper.cs", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"Lib/IO.Helper.Resolve", "Lib/IO.Helper.Normalize"},
+		},
+		{
+			Name: "Lib/Tv.Provider.Prune", File: "Lib/Tv/Provider.cs", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"Lib/Tv.Provider.DeleteEpisode"},
+		},
+		{Name: "pkg/store.load", File: "pkg/store/store.go", PerformsIO: true},
+		{
+			Name: "pkg/job.Run", File: "pkg/job/job.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"pkg/store.load"},
+		},
+	}
+	got := analyze(funcs, nil, nil, nil)
+
+	walk, ok := findFinding(got, "Lib/IO.Helper.Walk", "call-in-loop")
+	if !ok || walk.Severity != "high" || len(walk.Calls) != 1 ||
+		walk.Calls[0] != (CallEvidence{Callee: "Lib/IO.Helper.Resolve", Basis: basisResolvedIO}) {
+		t.Errorf("Walk = %+v (ok=%v), want one high call on Resolve by resolved-io", walk, ok)
+	}
+	if p, ok := findFinding(got, "Lib/Tv.Provider.Prune", "call-in-loop"); !ok || p.Severity != "medium" {
+		t.Errorf("Prune = %+v (ok=%v): a resolved callee with no flag is still read by its name", p, ok)
+	}
+	if r, ok := findFinding(got, "pkg/job.Run", "call-in-loop"); !ok || r.Severity != "high" {
+		t.Errorf("Run = %+v (ok=%v), want high: Go has the same rule once it has the fact", r, ok)
+	}
+}
+
+// A call the extractor identified as an I/O entry point confirms the finding, where
+// the same call known only by its package does not. And the builder beside it in
+// the loop is told apart from it.
+func TestCallTheExtractorIdentifiedAsIOIsConfirmed(t *testing.T) {
+	funcs := []funcInfo{
+		{
+			Name: "models/token.Convert", File: "models/token/convert.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"models/db.SQLSession.Cols", "xorm.io/xorm.Session.Update", "strings.TrimSpace"},
+			IOCalls:     []string{"xorm.io/xorm.Session.Update"},
+		},
+		{
+			Name: "web/page.Fill", File: "web/page/fill.go", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"net/http.ResponseWriter.Header"},
+		},
+	}
+	got := analyze(funcs, nil, nil, nil)
+	c, ok := findFinding(got, "models/token.Convert", "call-in-loop")
+	if !ok || c.Severity != "high" {
+		t.Fatalf("Convert = %+v (ok=%v), want a high call-in-loop", c, ok)
+	}
+	basis := map[string]string{}
+	for _, ce := range c.Calls {
+		basis[ce.Callee] = ce.Basis
+	}
+	if basis["xorm.io/xorm.Session.Update"] != basisPrimitive {
+		t.Errorf("Update rests on %q, want %q", basis["xorm.io/xorm.Session.Update"], basisPrimitive)
+	}
+	if b, named := basis["models/db.SQLSession.Cols"]; named && basisIsFact(b) {
+		t.Errorf("Cols, a builder, is confirmed by %q", b)
+	}
+	if f, ok := findFinding(got, "web/page.Fill", "call-in-loop"); ok && f.Severity == "high" {
+		t.Errorf("a header read is confirmed I/O for being in net/http: %+v", f)
+	}
+}
+
+// Go stays out of the method-name index: a Go function that reaches a query does
+// not make a TypeScript call of the same name I/O.
+func TestGoFunctionsDoNotFeedTheIOMethodIndex(t *testing.T) {
+	funcs := []funcInfo{
+		{Name: "pkg/store.Store.preparePlot", File: "pkg/store/store.go", PerformsIO: true},
+		{
+			Name: "ui/chart.build", File: "ui/chart.ts", LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{"builder.preparePlot"},
+		},
+	}
+	if f, ok := findFinding(analyze(funcs, nil, nil, nil), "ui/chart.build", "call-in-loop"); ok {
+		t.Errorf("a TypeScript call matched a Go function's name: %+v", f)
+	}
+}
+
+// The query-loops explainer's findings are findings of this tool too, the ones it
+// counts in its rollup included. A one-shot surface ranks low, as it does there.
+func TestQueryLoopFindingsAreListedByTheTool(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(facts.Fact{Kind: facts.KindStorage, Name: "Account", Repo: "app",
+		Props: map[string]any{"storage_kind": "model", "language": "ruby"}})
+	add := func(name, file string, depth int) {
+		store.Add(facts.Fact{Kind: facts.KindSymbol, Name: name, Repo: "app", File: file, Line: 12,
+			Props: map[string]any{"language": "ruby", "symbol_kind": "method", "loop_depth": depth,
+				"calls_in_loop": []string{"Account.find_by"}}})
+	}
+	add("MoveWorker#carry_over!", "app/workers/move_worker.rb", 1)
+	add("Report#matrix", "app/models/report.rb", 2)
+	add("Backfill#up", "db/migrate/20240101000000_backfill.rb", 1)
+
+	got := queryLoopFindings(store, nil)
+	byName := map[string]Finding{}
+	for _, f := range got {
+		byName[f.Symbol] = f
+	}
+	w, ok := byName["MoveWorker#carry_over!"]
+	if !ok {
+		t.Fatalf("no finding for the worker; got %+v", got)
+	}
+	if w.Kind != kindQueryLoop || w.Severity != "high" || w.BigO != "O(n)" || w.Line != 12 ||
+		len(w.Calls) != 1 || w.Calls[0] != (CallEvidence{Callee: "Account.find_by", Basis: basisTypedReceiver, Depth: 1}) {
+		t.Errorf("worker finding = %+v, want a high O(n) query-loop on Account.find_by", w)
+	}
+	// Nested two deep it states a depth, not a product it cannot vouch for.
+	if m := byName["Report#matrix"]; m.BigO != "" || m.Depth != 2 {
+		t.Errorf("matrix: big_o %q depth %d, want a depth of 2 and no Big-O", m.BigO, m.Depth)
+	}
+	if b, ok := byName["Backfill#up"]; ok && b.Severity != "low" {
+		t.Errorf("a migration's finding is ranked %q, want low", b.Severity)
+	}
+}
+
+// A kind filter narrows the findings and the counts drawn from them alike.
+func TestFilterFindings_Kind(t *testing.T) {
+	all := perfFindingsFixture()
+
+	if got := filterFindings(all, args{Kind: "nested-loop"}); len(got) != 1 || got[0].Kind != "nested-loop" {
+		t.Errorf("kind=nested-loop: got %d findings, want the one nested-loop", len(got))
+	}
+	if got := filterFindings(all, args{Kind: "call-in-loop, nested-loop"}); len(got) != len(all) {
+		t.Errorf("a comma-separated list is a union: got %d, want %d", len(got), len(all))
+	}
+	if got := filterFindings(all, args{Kind: "recursion"}); len(got) != 0 {
+		t.Errorf("kind=recursion: got %d findings, want none", len(got))
+	}
+	in := args{Kind: "nested-loop"}
+	out := renderPerfSummary(summarize(all, filterFindings(all, in)), filterFindings(all, in), in)
+	if !strings.Contains(out, `kind="nested-loop"`) {
+		t.Errorf("a filtered headline must name the kind filter; got:\n%s", out)
+	}
+}
+
+// A misspelt kind is refused: matching nothing would read as a clean repository.
+func TestUnknownKinds(t *testing.T) {
+	if bad := unknownKinds("call-in-loop,query-loop, recursion,nested-loop,compounded"); len(bad) != 0 {
+		t.Errorf("every kind the analyzer reports must be accepted; refused %v", bad)
+	}
+	if bad := unknownKinds("n+1, call-in-loop,loops"); len(bad) != 2 || bad[0] != "loops" || bad[1] != "n+1" {
+		t.Errorf("unknownKinds = %v, want [loops n+1]", bad)
+	}
+	if bad := unknownKinds(""); len(bad) != 0 {
+		t.Errorf("no kind is no error; got %v", bad)
+	}
+}
+
+// Pages must tile the findings: every one on exactly one page, and the last page
+// saying it is the last.
+func TestPage_TilesTheFindings(t *testing.T) {
+	all := make([]Finding, 25)
+	for i := range all {
+		all[i] = Finding{Symbol: fmt.Sprintf("pkg.F%02d", i), Kind: "recursion", Severity: "medium"}
+	}
+	var seen []string
+	offset, calls := 0, 0
+	for {
+		shown, at, next := page(all, offset, 10)
+		if at != offset {
+			t.Fatalf("page reported offset %d, asked for %d", at, offset)
+		}
+		for _, f := range shown {
+			seen = append(seen, f.Symbol)
+		}
+		calls++
+		if next == 0 {
+			break
+		}
+		offset = next
+	}
+	if calls != 3 || len(seen) != len(all) {
+		t.Fatalf("got %d findings over %d pages, want %d over 3", len(seen), calls, len(all))
+	}
+	for i, s := range seen {
+		if s != all[i].Symbol {
+			t.Fatalf("page order differs from rank at %d: %s", i, s)
+		}
+	}
+	if shown, at, next := page(all, 99, 10); len(shown) != 0 || at != len(all) || next != 0 {
+		t.Errorf("an offset past the end is an empty last page; got %d findings, offset %d, next %d", len(shown), at, next)
+	}
+	if shown, _, next := page(all, -3, 100); len(shown) != len(all) || next != 0 {
+		t.Errorf("a negative offset reads from the start; got %d findings, next %d", len(shown), next)
+	}
+}
+
+// Overloads share a symbol name and a kind. Their order must not depend on the
+// order they were found in, or a page boundary between them moves from call to call.
+func TestSortFindings_OrdersOverloads(t *testing.T) {
+	a := Finding{Symbol: "pkg.T.Get", Kind: "call-in-loop", Severity: "high", File: "t.cs", Line: 40}
+	b := Finding{Symbol: "pkg.T.Get", Kind: "call-in-loop", Severity: "high", File: "t.cs", Line: 12}
+	for _, in := range [][]Finding{{a, b}, {b, a}} {
+		sortFindings(in)
+		if in[0].Line != 12 || in[1].Line != 40 {
+			t.Errorf("overloads must sort by line; got %d then %d", in[0].Line, in[1].Line)
+		}
+	}
+}
+
+func TestPageLine(t *testing.T) {
+	if got := pageLine(0, 7, 7); got != "" {
+		t.Errorf("a complete table needs no page line; got %q", got)
+	}
+	if got := pageLine(100, 100, 250); !strings.Contains(got, "101 to 200 of 250") || !strings.Contains(got, "offset=200") {
+		t.Errorf("a middle page must say what it shows and where the next starts; got %q", got)
+	}
+	if got := pageLine(200, 50, 250); !strings.Contains(got, "201 to 250 of 250") || strings.Contains(got, "offset=") {
+		t.Errorf("the last page names no next offset; got %q", got)
+	}
+}
+
+// A call the extractor resolved to a library member that does no I/O is not
+// reported, whatever its name: `sqlalchemy.update` builds a statement. The call
+// beside it that the extractor named as the I/O is, and rests on that fact.
+func TestAnalyze_PureCallIsNotReadByItsName(t *testing.T) {
+	loop := funcInfo{Name: "app/store.rename", File: "app/store.py", Exported: true, LoopDepth: 1, LoopCount: 1,
+		CallsInLoop: []string{"sqlalchemy.update", "sqlalchemy.orm.Session.execute"}}
+	// Something in the repository that does I/O under the same short name, which is
+	// what put `update` on the method index.
+	other := funcInfo{Name: "app/dao.Dao.update", File: "app/dao.py", PerformsIO: true}
+
+	named := loop
+	if _, ok := findFinding(analyze([]funcInfo{named, other}, nil, nil, nil), "app/store.rename", "call-in-loop"); !ok {
+		t.Fatal("without the extractor's reading the loop is reported by name: the fixture is wrong")
+	}
+
+	classed := loop
+	classed.PureCalls = []string{"sqlalchemy.update"}
+	classed.IOCalls = []string{"sqlalchemy.orm.Session.execute"}
+	f, ok := findFinding(analyze([]funcInfo{classed, other}, nil, nil, nil), "app/store.rename", "call-in-loop")
+	if !ok {
+		t.Fatal("Session.execute in a loop must be reported")
+	}
+	if len(f.Calls) != 1 || f.Calls[0].Callee != "sqlalchemy.orm.Session.execute" || f.Calls[0].Basis != basisPrimitive {
+		t.Errorf("calls = %+v, want Session.execute alone, resting on %s", f.Calls, basisPrimitive)
+	}
+
+	onlyPure := loop
+	onlyPure.CallsInLoop = []string{"sqlalchemy.update"}
+	onlyPure.PureCalls = []string{"sqlalchemy.update"}
+	if _, ok := findFinding(analyze([]funcInfo{onlyPure, other}, nil, nil, nil), "app/store.rename", "call-in-loop"); ok {
+		t.Error("a loop whose only named call is a statement builder must not be reported")
+	}
+}
+
+// A receiver token read off a resolved callee's own name says where the function
+// is declared, not what it is called on.
+func TestAnalyze_ReceiverTokenInAResolvedCalleesOwnPath(t *testing.T) {
+	loop := func(callee string) funcInfo {
+		return funcInfo{Name: "Lib/Movies.Provider.Fill", File: "Lib/Movies/Provider.cs", Exported: true,
+			LoopDepth: 1, LoopCount: 1, CallsInLoop: []string{callee}}
+	}
+	reported := func(funcs ...funcInfo) bool {
+		_, ok := findFinding(analyze(funcs, nil, nil, nil), "Lib/Movies.Provider.Fill", "call-in-loop")
+		return ok
+	}
+
+	// "db." is in "Tmdb.", and the method formats a string.
+	url := funcInfo{Name: "Lib/Tmdb.TmdbManager.GetPosterUrl", File: "Lib/Tmdb/TmdbManager.cs"}
+	if reported(loop(url.Name), url) {
+		t.Error("a resolved callee that reaches no I/O must not be reported for a token in its own path")
+	}
+	// The same callee, reaching I/O: reported, and on that fact.
+	url.PerformsIO = true
+	if !reported(loop(url.Name), url) {
+		t.Error("a resolved callee that reaches I/O must be reported")
+	}
+	// A method named for I/O keeps its name's reading.
+	save := funcInfo{Name: "Lib/Tmdb.TmdbManager.SaveImage", File: "Lib/Tmdb/TmdbManager.cs"}
+	if !reported(loop(save.Name), save) {
+		t.Error("a resolved callee whose method is an I/O verb is still read by that verb")
+	}
+	// An unresolved call on a receiver that is named for a database is what the
+	// token is for.
+	if !reported(loop("db.Lookup")) {
+		t.Error("an unresolved call on a `db.` receiver must still be reported")
+	}
+}
+
+// A Java accessor on a receiver nothing types is not read through the short-name
+// index, whatever client class happens to bear the same name.
+func TestAnalyze_JavaAccessorIsNotReadByTheIndex(t *testing.T) {
+	client := funcInfo{Name: "rest/Client.getDevice", File: "rest/Client.java", PerformsIO: true}
+	load := funcInfo{Name: "rest/Client.loadDevice", File: "rest/Client.java", PerformsIO: true}
+	loop := func(callee string) funcInfo {
+		return funcInfo{Name: "app/Sync.run", File: "app/Sync.java", Exported: true, LoopDepth: 1, LoopCount: 1,
+			CallsInLoop: []string{callee}}
+	}
+	if _, ok := findFinding(analyze([]funcInfo{loop("dto.getDevice"), client, load}, nil, nil, nil), "app/Sync.run", "call-in-loop"); ok {
+		t.Error("dto.getDevice() must not be reported because a client has a getDevice that makes a request")
+	}
+	if _, ok := findFinding(analyze([]funcInfo{loop("gateway.loadDevice"), client, load}, nil, nil, nil), "app/Sync.run", "call-in-loop"); !ok {
+		t.Error("a non-accessor name every bearer of which performs I/O is still read through the index")
+	}
+}

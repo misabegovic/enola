@@ -1,13 +1,15 @@
 package rubyextractor
 
 import (
+	"slices"
 	"sort"
 	"strings"
 
+	ruby "github.com/enola-labs/enola/internal/extractors/rubyextractor/grammar"
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
 
 // sortedKeys returns the keys of a set in deterministic (sorted) order — used to
@@ -27,10 +29,22 @@ func sortedKeys(m map[string]bool) []string {
 // regex produced is preserved here, with higher fidelity (heredocs, multi-line
 // expressions, endless methods, and nested scopes are handled by the grammar).
 func extractFileAST(src []byte, relFile string, isRails, exportedByPackwerk bool) []facts.Fact {
+	out, _ := extractFileASTCounted(src, relFile, isRails, exportedByPackwerk)
+	return out
+}
+
+func extractFileASTCounted(src []byte, relFile string, isRails, exportedByPackwerk bool) ([]facts.Fact, queueCounts) {
+	out, queues, _, _ := extractFileASTWithAccess(src, relFile, isRails, exportedByPackwerk)
+	return out, queues
+}
+
+// extractFileASTWithAccess also reports whether the tree held an error node,
+// after which tree-sitter's recovery may have dropped what the file declares.
+func extractFileASTWithAccess(src []byte, relFile string, isRails, exportedByPackwerk bool) ([]facts.Fact, queueCounts, []accessCall, bool) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(ruby.Language())); err != nil {
-		return nil
+		return nil, queueCounts{}, nil, false
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
@@ -56,15 +70,15 @@ func extractFileAST(src []byte, relFile string, isRails, exportedByPackwerk bool
 	// file-scope fact so the collector can mark same-prefix methods as used.
 	if len(w.dynamicPrefixes) > 0 {
 		idx := w.ensureFileRefFact()
-		w.out[idx].Props["dynamic_send_prefixes"] = sortedKeys(w.dynamicPrefixes)
+		w.out[idx].SetProp("dynamic_send_prefixes", sortedKeys(w.dynamicPrefixes))
 	}
 	// Drop the file-scope reference fact if it carries neither call edges nor
 	// dynamic-dispatch prefixes, so empty facts never reach the store.
 	if w.fileRefIdx >= 0 && len(w.out[w.fileRefIdx].Relations) == 0 &&
-		w.out[w.fileRefIdx].Props["dynamic_send_prefixes"] == nil {
+		w.out[w.fileRefIdx].PropAny("dynamic_send_prefixes") == nil {
 		w.out = append(w.out[:w.fileRefIdx], w.out[w.fileRefIdx+1:]...)
 	}
-	return w.out
+	return w.out, w.queues, w.access, root.HasError()
 }
 
 // ensureFileRefFact returns the index of this file's lazily-created file-scope
@@ -79,11 +93,11 @@ func (w *rubyWalker) setModelTable(table string) {
 		if fact.Kind != facts.KindStorage || fact.Props == nil {
 			continue
 		}
-		if kind, _ := fact.Props["storage_kind"].(string); kind != "model" {
+		if kind, _ := fact.PropAny("storage_kind").(string); kind != "model" {
 			continue
 		}
-		fact.Props["table"] = table
-		fact.Props["table_source"] = "declared"
+		fact.SetProp("table", table)
+		fact.SetProp("table_source", "declared")
 		return
 	}
 }
@@ -99,7 +113,7 @@ func (w *rubyWalker) setModuleTableNamePrefix(node *sitter.Node) {
 		return
 	}
 	if prefix := plainStringBody(node.ChildByFieldName("body"), w.src); prefix != "" {
-		w.out[s.symFactIdx].Props["table_name_prefix"] = prefix
+		w.out[s.symFactIdx].SetProp("table_name_prefix", prefix)
 	}
 }
 
@@ -173,6 +187,8 @@ type rubyScope struct {
 	// (meant to be included), which makes the module abstract for package metrics.
 	hasInstanceMethod bool
 	symFactIdx        int // index into w.out of this scope's class/module symbol fact, or -1
+	queueDeclared     bool
+	sidekiqJob        bool
 }
 
 type rubyWalker struct {
@@ -211,6 +227,20 @@ type rubyWalker struct {
 	loopDepth int
 	selfName  string
 	selfShort string
+
+	queues queueCounts
+
+	// access holds this file's calls to an ActiveRecord verb, for the
+	// repository pass; accessOwner names the method whose body is being walked.
+	access      []accessCall
+	accessSeen  map[string]bool
+	accessOwner string
+
+	// The enclosing loops that repeat, innermost last, and for each whether it adds
+	// a factor of the input. scalingDepth counts those that do. See scaling.go.
+	loops        []rubyLoop
+	loopScales   []bool
+	scalingDepth int
 }
 
 // rubyBodyMetrics accumulates per-method complexity signals during the single
@@ -221,7 +251,13 @@ type rubyBodyMetrics struct {
 	decisions   int             // decision points (cyclomatic = 1 + decisions)
 	callsInLoop []string        // distinct call targets invoked at loop depth >= 1
 	inLoopSeen  map[string]bool // dedup set for callsInLoop
-	recursive   bool            // body directly calls the enclosing method
+	// scalingLoopDepth is loopDepth less the loops over what an enclosing loop
+	// bound. callsInScalingLoop are the in-loop calls made once per element, and
+	// scalingCallDepth the deepest scaling nest around each.
+	scalingLoopDepth   int
+	callsInScalingLoop []string
+	scalingCallDepth   map[string]int
+	recursive          bool // body directly calls the enclosing method
 
 	// fieldsRead/fieldsWritten record which instance variables the body
 	// touches. They answer "which methods actually use @client", which is the
@@ -471,7 +507,7 @@ func (m *rubyBodyMetrics) recordFieldAccess(name string, write bool) {
 // over that batch. Counting the batch block as a loop as well double-counts and
 // mislabels a single O(n) pass as O(n²). (find_each yields individual elements
 // and is a genuine per-element loop, so it stays.) Both names remain in the
-// enterprise expensiveMethods gate, so a batch scan nested inside another loop is
+// analyzer's expensiveMethods gate, so a batch scan nested inside another loop is
 // still flagged by name — only the spurious extra depth is dropped.
 var rubyIterators = map[string]bool{
 	"each": true, "each_with_index": true, "each_with_object": true,
@@ -531,11 +567,12 @@ func (w *rubyWalker) recordInLoopCall(target string) {
 		w.metrics.inLoopSeen[target] = true
 		w.metrics.callsInLoop = append(w.metrics.callsInLoop, target)
 	}
+	w.recordScalingCall(target)
 }
 
 // rubyCheapMethods are obviously-cheap attribute/Enumerable/Kernel methods that
 // are not DB I/O. No-arg instance calls to these inside loops are not recorded in
-// calls_in_loop, to keep it focused (the enterprise association/keyword gate is
+// calls_in_loop, to keep it focused (the analyzer's association/keyword gate is
 // the real precision filter, so this list need not be exhaustive).
 var rubyCheapMethods = map[string]bool{
 	"id": true, "name": true, "to_s": true, "to_str": true, "to_i": true,
@@ -785,6 +822,9 @@ func (w *rubyWalker) handleModule(node *sitter.Node) {
 		// concrete and promote to abstract below once the body is known.
 		"abstract": false,
 	}
+	if doc := rubyDoc(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if bodyHasConcern(body, w.src) {
 		props["concern"] = true
 		props["abstract"] = true // Concern = behavior mixed into includers
@@ -834,6 +874,9 @@ func (w *rubyWalker) handleClass(node *sitter.Node) {
 		"symbol_kind": facts.SymbolClass,
 		"exported":    w.exported(),
 		"language":    "ruby",
+	}
+	if doc := rubyDoc(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
 	}
 	if w.isRails {
 		props["framework"] = "rails"
@@ -915,6 +958,7 @@ func (w *rubyWalker) handleClass(node *sitter.Node) {
 	// conditionals, hash/Proc literals, macro args) as uses of this class.
 	// walkForCalls returns at nested defs/classes, which get their own pass.
 	w.walkScopeForCalls(body, clsIdx, map[string]bool{}, nil)
+	w.closeJobClass(w.cur(), superclassBase, props)
 	w.pop()
 }
 
@@ -978,6 +1022,9 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 		"exported":    w.exported(),
 		"language":    "ruby",
 	}
+	if doc := rubyDoc(node, w.src); doc != "" {
+		facts.SetDocProp(props, doc)
+	}
 	if w.isRails {
 		props["framework"] = "rails"
 	}
@@ -1005,24 +1052,42 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	// the tentative state before the walks and commit after (see commitPendingStrPrefixes).
 	w.pendingStrPrefixes = nil
 	w.sawDispatcher = false
+	w.accessOwner = fullName
+	defer func() { w.accessOwner = "" }()
 	// Default parameter values (`def f(x = self.class.foo)`) contain real call
 	// references. Walk them with metrics off (params are not the body, so they must
 	// not affect the complexity score); seen is shared so body calls still dedup.
 	w.walkForCalls(node.ChildByFieldName("parameters"), ownerIdx, seen, locals)
 	w.metrics = &rubyBodyMetrics{params: parameterNames(node.ChildByFieldName("parameters"), w.src)}
 	w.loopDepth = 0
+	w.loops, w.loopScales, w.scalingDepth = nil, nil, 0
 	w.selfName = fullName
 	w.selfShort = name
 	w.walkForCalls(node.ChildByFieldName("body"), ownerIdx, seen, locals)
 	props["cyclomatic"] = 1 + w.metrics.decisions
 	if w.metrics.loopDepth > 0 {
 		props["loop_depth"] = w.metrics.loopDepth
+		// Beside it even when 0, so "every loop walks what an outer one bound" can
+		// be told from "not measured".
+		props["scaling_loop_depth"] = w.metrics.scalingLoopDepth
 	}
 	if w.metrics.loopCount > 0 {
 		props["loop_count"] = w.metrics.loopCount
 	}
 	if len(w.metrics.callsInLoop) > 0 {
 		props["calls_in_loop"] = w.metrics.callsInLoop
+		// Emitted even when empty: an absent key makes the consumer fall back to
+		// calls_in_loop, which is the list this one exists to narrow.
+		scaling := w.metrics.callsInScalingLoop
+		if scaling == nil {
+			scaling = []string{}
+		}
+		depths := make([]int, len(scaling))
+		for i, c := range scaling {
+			depths[i] = w.metrics.scalingCallDepth[c]
+		}
+		props["calls_in_scaling_loop"] = scaling
+		props["calls_in_scaling_loop_depth"] = depths
 	}
 	if len(w.metrics.fieldsRead) > 0 {
 		sort.Strings(w.metrics.fieldsRead)
@@ -1241,14 +1306,23 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 			}
 		}
 		w.loopDepth++
+		var vars []string
+		if p := node.ChildByFieldName("pattern"); p != nil { // `for x in xs`
+			vars = append(vars, rubyText(p, w.src))
+		}
+		w.pushLoop(rubyLoop{vars: vars}, true)
 		for i := uint(0); i < node.ChildCount(); i++ {
 			w.walkForCalls(node.Child(i), ownerIdx, seen, locals)
 		}
+		w.popLoop()
 		w.loopDepth--
 		return
 	case "call":
 		method := node.ChildByFieldName("method")
 		recv := node.ChildByFieldName("receiver")
+		if method != nil && kindOf(method) == "identifier" {
+			w.noteAccess(rubyText(method, w.src), recv, locals)
+		}
 		if method != nil && rubyPreloaders[rubyText(method, w.src)] && w.metrics != nil {
 			for _, association := range symbolNamesIn(node.ChildByFieldName("arguments"), w.src) {
 				w.metrics.recordPreload(association)
@@ -1324,12 +1398,12 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 				// name matches the enclosing method is a same-named call on a DIFFERENT
 				// object — the SimpleDelegator/decorator pattern (`@delegate.render`,
 				// `new.call`), not self-recursion.
-				w.addCall(ownerIdx, seen, name)
+				w.addForeignCall(ownerIdx, seen, name)
 				w.recordInLoopCall(name)
 			case w.loopDepth > 0:
 				// A no-arg single-level read inside a loop (the association read
 				// `u.posts` or `record.reload`). It is not a graph edge, but its method
-				// name feeds the perf metric so the enterprise analyzer can flag
+				// name feeds the perf metric so the performance analyzer can flag
 				// lazy-loaded association / per-iteration I/O (N+1).
 				//
 				// The RECEIVER is kept when it is a plain variable, and that is the
@@ -1404,7 +1478,16 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 					continue
 				}
 				w.loopDepth++
+				// A loop over what an enclosing loop bound (`post.comments.each`,
+				// `batch.each`) repeats and adds no factor: decided before the
+				// block's own parameters are in scope.
+				scales := !w.rootedAtLoopVar(recv)
+				w.pushLoop(rubyLoop{
+					vars:  blockParamNames(block, w.src),
+					batch: rubyBatchIterators[rubyText(method, w.src)],
+				}, scales)
 				w.walkForCalls(c, ownerIdx, seen, locals)
+				w.popLoop()
 				w.loopDepth--
 				continue
 			}
@@ -1458,6 +1541,7 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		if name := rubyText(node, w.src); name != "" && !locals[name] && !rubyNonCalls[name] {
 			w.addCall(ownerIdx, seen, name)
 			w.recordCallMetrics(name)
+			w.noteAccess(name, nil, locals)
 		}
 		return
 	case "constant", "scope_resolution":
@@ -1677,7 +1761,13 @@ func (w *rubyWalker) walkTestRefs(node *sitter.Node, add func(string)) {
 		method := node.ChildByFieldName("method")
 		recv := node.ChildByFieldName("receiver")
 		if target := w.callTarget(node); target != "" {
-			add(target)
+			// A call on a new instance is written "Const#name" for resolveRubyCalls to
+			// settle, which a reference fact never passes through; as written it can
+			// coincide with the name of an association, and the bare name of the
+			// method is emitted for the call's own identifier regardless.
+			if !strings.Contains(target, "#") {
+				add(target)
+			}
 		} else if recv == nil && method != nil && kindOf(method) == "identifier" {
 			if name := rubyText(method, w.src); !rubyNonCalls[name] {
 				add(name)
@@ -1724,7 +1814,7 @@ func (w *rubyWalker) addInstantiation(ownerIdx int, class, oneShot string) {
 	if w.out[ownerIdx].Props == nil {
 		w.out[ownerIdx].Props = map[string]any{}
 	}
-	existing, _ := w.out[ownerIdx].Props[OneShotCallProp].(string)
+	existing, _ := w.out[ownerIdx].PropAny(OneShotCallProp).(string)
 	entry := class + "." + oneShot
 	for _, seen := range strings.Fields(existing) {
 		if seen == entry {
@@ -1732,9 +1822,9 @@ func (w *rubyWalker) addInstantiation(ownerIdx int, class, oneShot string) {
 		}
 	}
 	if existing == "" {
-		w.out[ownerIdx].Props[OneShotCallProp] = entry
+		w.out[ownerIdx].SetProp(OneShotCallProp, entry)
 	} else {
-		w.out[ownerIdx].Props[OneShotCallProp] = existing + " " + entry
+		w.out[ownerIdx].SetProp(OneShotCallProp, existing+" "+entry)
 	}
 }
 
@@ -1758,6 +1848,24 @@ func oneShotCallOn(newCall *sitter.Node, src []byte) string {
 		return ""
 	}
 	return rubyText(method, src)
+}
+
+// foreignCallsProp lists, on a method fact and only until resolveRubyCalls has
+// run, the bare names it wrote for a call on a receiver that is not self. A bare
+// name says nothing of its receiver, so the binder refuses these.
+const foreignCallsProp = "foreign_calls"
+
+// addForeignCall records a call written on a receiver other than self as the bare
+// name it has always been, and notes the name as not a call on self.
+func (w *rubyWalker) addForeignCall(ownerIdx int, seen map[string]bool, name string) {
+	w.addCall(ownerIdx, seen, name)
+	if w.out[ownerIdx].Props == nil {
+		w.out[ownerIdx].Props = map[string]any{}
+	}
+	names, _ := w.out[ownerIdx].PropAny(foreignCallsProp).([]string)
+	if !slices.Contains(names, name) {
+		w.out[ownerIdx].SetProp(foreignCallsProp, append(names, name))
+	}
 }
 
 // addCall appends a deduplicated RelCalls edge to the owner fact.
@@ -2036,6 +2144,12 @@ func (w *rubyWalker) callTarget(node *sitter.Node) string {
 		return ""
 	}
 
+	// `new.call(*args)` inside a class method: `new` without parentheses parses as an
+	// identifier, and is the same new instance as `new(...).call`.
+	if kindOf(recv) == "identifier" && rubyText(recv, w.src) == "new" {
+		return "#" + methodName
+	}
+
 	switch kindOf(recv) {
 	case "constant", "scope_resolution":
 		return rubyText(recv, w.src) + "." + methodName
@@ -2054,6 +2168,19 @@ func (w *rubyWalker) callTarget(node *sitter.Node) string {
 			return rubyText(recv, w.src) + "." + methodName
 		}
 	case "call":
+		// `PostStatusService.new.call(...)` calls an instance method of the class it
+		// builds, and `new(...).call` inside a class one of its own class. The
+		// constant and the method are kept together, "PostStatusService#call" and
+		// "#call", for resolveRubyCalls to settle; written as "new.call" they name
+		// nothing.
+		if inner := recv.ChildByFieldName("method"); inner != nil && rubyText(inner, w.src) == "new" {
+			switch innerRecv := recv.ChildByFieldName("receiver"); {
+			case innerRecv == nil:
+				return "#" + methodName
+			case kindOf(innerRecv) == "constant" || kindOf(innerRecv) == "scope_resolution":
+				return stripLeadingColons(rubyText(innerRecv, w.src)) + "#" + methodName
+			}
+		}
 		// `self.class.perform_when_readonly?`: the inner call is `self.class`
 		// (receiver kind "self", method "class"). Emit the OUTER method name, bare.
 		// No args-gate: the receiver is provably the class, so the name is provably
@@ -2138,6 +2265,7 @@ func (w *rubyWalker) handleAssignment(node *sitter.Node) {
 // --- body-level DSL calls ---
 
 func (w *rubyWalker) handleBodyCall(node *sitter.Node) {
+	w.readQueueDeclaration(node)
 	// Only bare method calls (no receiver) are DSL declarations.
 	if node.ChildByFieldName("receiver") != nil {
 		return
@@ -2573,6 +2701,30 @@ func firstPositionalPath(args *sitter.Node, src []byte) string {
 	return ""
 }
 
+// firstPositionalIsSymbol reports whether the argument firstPositionalPath reads
+// is a bare symbol (`get :index`) rather than a string (`get 'index'`). Rails
+// routes the two differently inside a member/collection scope: a symbol is an
+// action name, and a canonical action is served at the scope's own path.
+func firstPositionalIsSymbol(args *sitter.Node) bool {
+	if args == nil {
+		return false
+	}
+	for i := uint(0); i < args.ChildCount(); i++ {
+		c := args.Child(i)
+		switch kindOf(c) {
+		case "simple_symbol":
+			return true
+		case "string":
+			return false
+		case "pair":
+			if k := c.ChildByFieldName("key"); k != nil && kindOf(k) == "string" {
+				return false
+			}
+		}
+	}
+	return false
+}
+
 // isAllCaps reports whether s is an ALL_CAPS constant name (letters uppercase,
 // digits and underscores allowed). Matches the former constant regex.
 func isAllCaps(s string) bool {
@@ -2613,12 +2765,7 @@ func endColumn(node *sitter.Node) int {
 }
 
 // rubyText returns the source text covered by a node (nil-safe).
-func rubyText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
-	}
-	return string(src[node.StartByte():node.EndByte()])
-}
+func rubyText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
 
 // declaresAbstractClass reports whether a class body sets abstract_class.
 func declaresAbstractClass(node *sitter.Node, src []byte) bool {

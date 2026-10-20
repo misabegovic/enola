@@ -45,14 +45,19 @@ layers:
       - "pkg/install/**"
       - "pkg/explain/**"
       - "pkg/dashboard/**"
-      - "pkg/check/**"
-      - "pkg/diff/**"
   - name: orchestration
     paths:
       - "pkg/bootstrap/**"
       - "internal/server/**"
-      - "internal/drift/**"
       - "pkg/plan/**"
+      - "pkg/pack/**"
+      # The gate's grading, the currency gate and lint answer the MCP server's
+      # grade, constraints_ledger and constraints_lint tools as well as the
+      # commands, which call those tools; like plan and pack they sit with the
+      # server that serves them, below the commands.
+      - "pkg/check/**"
+      - "pkg/grade/**"
+      - "pkg/lint/**"
   - name: engine
     paths:
       - "internal/engine/**"
@@ -62,6 +67,21 @@ layers:
       - "internal/extractors/**"
       - "internal/linkers/**"
       - "internal/explainers/**"
+      # The three analyzers that each own an MCP tool as well as an explainer.
+      # They sit here rather than under internal/explainers because the explainer
+      # is one of their consumers, not their shape.
+      - "internal/metrics/**"
+      - "internal/orphans/**"
+      - "internal/perf/**"
+      # Endpoint impact: a route -> controller -> model walk over the store. It is
+      # analysis, not fact model, so it sits here rather than in internal/facts.
+      - "internal/endpoint/**"
+      # Name resolution and symbol impact, shared by the graph tools and `enola impact`.
+      - "internal/resolve/**"
+      - "internal/impact/**"
+      # Flow ranking: the entries of a program and what each reaches, read off
+      # the store like impact.
+      - "internal/flows/**"
       - "internal/renderers/**"
       - "internal/diff/**"
       - "internal/conformance/**"
@@ -77,17 +97,37 @@ layers:
       # dialect (forward slashes on every host) that internal/facts, every
       # extractor and every explainer build their paths with.
       - "internal/factpath/**"
+      # internal/pathglob is core: the ignore and test-glob matcher the engine walk,
+      # the config tests and perf share. It depends only on factpath.
+      - "internal/pathglob/**"
       - "internal/version/**"
       - "internal/filelock/**"
       - "internal/parallel/**"
       - "internal/litfold/**"
+      # internal/linescan is core, and depends on nothing: the line reader with no
+      # line-length limit that the extractors read source files with.
+      - "internal/linescan/**"
+      # internal/clientspec is core, and depends on nothing: it is the declared
+      # client vocabulary that internal/config loads and the extractors read.
+      - "internal/clientspec/**"
+      # internal/wireschema is core, and depends on nothing: it states what
+      # encoding/json writes for a type, which the contract command prints.
+      - "internal/wireschema/**"
+      # internal/providerspec is core in the same way: the declared provider
+      # vocabulary the config loads, without the code that runs a provider.
+      - "internal/providerspec/**"
       - "internal/gqlscan/**"
       - "internal/hookstate/**"
       - "internal/updatecheck/**"
       - "internal/upgrade/**"
       - "internal/cachecov/**"
+      # internal/archbudget is the same kind of package: a guard test and no code,
+      # importing nothing of enola's.
+      - "internal/archbudget/**"
       - "internal/estateref/**"
-      - "pkg/facts/**"
+      # internal/workspace is core, and depends on nothing of enola's: it finds the git
+      # repositories under a folder for the CLI, the subcommands and the MCP server.
+      - "internal/workspace/**"
       - "pkg/plugin/**"
       - "pkg/history/**"
       - "pkg/coverage/**"

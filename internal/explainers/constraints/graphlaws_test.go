@@ -91,6 +91,49 @@ func TestCapRuntime_RefusesWithoutACapture(t *testing.T) {
 	}
 }
 
+// Upstream's spec runner keys every frame by the spec file, so a capture from it
+// holds frames and none of them in application code. The budget used to skip
+// every frame outside its members and emit nothing, which read as kept.
+func TestCapRuntime_RefusesACaptureThatMissesThePart(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		componentIntent("services", "app/services/**"),
+		lawIntent("services-keep-their-budget", map[string]any{"cap_runtime": "services", "metric": "queries", "max": 20}),
+		method("ReportBuilder#call", "app/services/report_builder.rb"),
+		facts.Fact{Kind: facts.KindDependency, Name: "runtime-queries: spec/services/report_builder_spec.rb:ReportBuilder sums every account", File: "spec/services/report_builder_spec.rb", Repo: "app",
+			Props: map[string]any{"resolution_level": "runtime-observed", "observed_via": "query-counter", "frame_label": "ReportBuilder sums every account", "queries": 45}},
+		facts.Fact{Kind: facts.KindDependency, Name: "runtime-queries: spec/models/account_spec.rb:Account is valid", File: "spec/models/account_spec.rb", Repo: "app",
+			Props: map[string]any{"resolution_level": "runtime-observed", "observed_via": "query-counter", "frame_label": "Account is valid", "queries": 2}},
+	)
+	got, err := New().Explain(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hits []facts.Insight
+	for _, i := range got {
+		if strings.Contains(i.Title, "services-keep-their-budget") {
+			hits = append(hits, i)
+		}
+	}
+	if len(hits) != 1 || !strings.Contains(hits[0].Title, "cannot be evaluated: no frame in its members") {
+		t.Fatalf("want the second named refusal and no verdict, got %+v", hits)
+	}
+	if !strings.Contains(hits[0].Evidence[0].Detail, "cause "+CauseNoFrameInMembers) {
+		t.Fatalf("the refusal names its cause, got %q", hits[0].Evidence[0].Detail)
+	}
+	for _, want := range []string{"2 frame(s)", "spec/models/account_spec.rb", "spec/services/report_builder_spec.rb"} {
+		if !strings.Contains(hits[0].Description, want) {
+			t.Fatalf("the refusal names the frame count and the frames' files (%q), got %q", want, hits[0].Description)
+		}
+	}
+
+	store.Add(facts.Fact{Kind: facts.KindDependency, Name: "runtime-queries: app/services/report_builder.rb:call", File: "app/services/report_builder.rb", Repo: "app",
+		Props: map[string]any{"resolution_level": "runtime-observed", "observed_via": "query-counter", "frame_label": "call", "queries": 12}})
+	if titles := titlesOf(t, store, "services-keep-their-budget"); len(titles) != 0 {
+		t.Fatalf("a capture that reaches the part and keeps the budget reads as today, no verdict, got %v", titles)
+	}
+}
+
 func TestRequireConsumer_RefusesWithoutACounterparty(t *testing.T) {
 	store := facts.NewStore()
 	store.Add(
@@ -147,6 +190,28 @@ func TestRequireGoverned_NamesTheUnanchoredFile(t *testing.T) {
 	titles = titlesOf(t, store, "billing-is-governed")
 	if len(titles) != 1 || !strings.Contains(titles[0], "app/billing/refund.rb has no governing page") {
 		t.Fatalf("the anchored file passes and the other is named, got %v", titles)
+	}
+}
+
+// A symbol anchor governs its file for the file-level laws, exactly as a file
+// anchor to the same file does, so no law's verdict moves when a page narrows
+// its anchor to one method.
+func TestRequireGoverned_ASymbolAnchorGovernsItsFile(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		componentIntent("billing", "app/billing/**"),
+		lawIntent("billing-is-governed", map[string]any{"require_governed": "billing"}),
+		method("Billing::Charge#run", "app/billing/charge.rb"),
+		method("Billing::Charge#retry", "app/billing/charge.rb"),
+		method("Billing::Refund#run", "app/billing/refund.rb"),
+		facts.Fact{Kind: facts.KindIntent, Name: "page: wiki/app/adrs/charges.md", File: "wiki/app/adrs/charges.md", Repo: "docs", Props: map[string]any{"intent_kind": "page", "source": "wiki/app/adrs/charges.md", "status": "accepted"}},
+		facts.Fact{Kind: facts.KindIntent, Name: "anchor: app app/billing/charge.rb Billing::Charge#run", File: "wiki/app/adrs/charges.md", Repo: "docs",
+			Props:     map[string]any{"intent_kind": "anchor", "source": "wiki/app/adrs/charges.md", "path": "app/billing/charge.rb", "symbol": "Billing::Charge#run"},
+			Relations: []facts.Relation{{Kind: facts.RelDependsOn, Target: "app/app/billing/charge.rb"}}},
+	)
+	titles := titlesOf(t, store, "billing-is-governed")
+	if len(titles) != 1 || !strings.Contains(titles[0], "app/billing/refund.rb has no governing page") {
+		t.Fatalf("the file holding the anchored method is governed and the other file is named, got %v", titles)
 	}
 }
 

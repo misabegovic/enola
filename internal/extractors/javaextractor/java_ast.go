@@ -3,6 +3,7 @@ package javaextractor
 import (
 	"strings"
 
+	"github.com/enola-labs/enola/internal/extractors/tsutil"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -39,7 +40,7 @@ func extractFileAST(src []byte, relFile string) []facts.Fact {
 	root := tree.RootNode()
 	w.pkg = w.findPackage(root)
 	w.walkProgram(root)
-	return w.out
+	return append(w.out, w.testCases...)
 }
 
 type astWalker struct {
@@ -49,6 +50,13 @@ type astWalker struct {
 	pkg     string // dotted package name, e.g. "com.example.auth" ("" if none)
 
 	out []facts.Fact
+	// testCases are held apart from out and appended after the walk, so reading
+	// tests leaves the order of every other fact as it was.
+	testCases []facts.Fact
+	// testCaseStack is parallel to typeStack: whether each enclosing type extends a
+	// *TestCase, whose public no-argument test* methods JUnit 3 and runners built on
+	// it (Elasticsearch's ESTestCase) run without an annotation.
+	testCaseStack []bool
 
 	// importMap maps an imported simple type name to its fully-qualified name
 	// (e.g. "Store" -> "com.example.data.Store"). Used to resolve bare type
@@ -62,9 +70,11 @@ type astWalker struct {
 	typeStack   []string
 	methodStack []map[string]bool
 
-	// ownerStack[len-1] is the symbol fact currently being built; call-graph edges
-	// discovered while walking its body attach to it.
-	ownerStack []*facts.Fact
+	// ownerStack[len-1] is the index in out of the symbol fact currently being
+	// built; call-graph edges discovered while walking its body attach to it. An
+	// index rather than a pointer, because walking a body appends to out, and a
+	// pointer taken before an append that grows out names a copy nobody reads.
+	ownerStack []int
 
 	// routeStack is parallel to typeStack: each entry carries the Spring route
 	// context (whether the enclosing type is a @Controller/@RestController and its
@@ -85,8 +95,15 @@ type astWalker struct {
 	// an N+1 candidate.
 	scalingDepth int
 	repeatDepth  int
-	selfName     string
-	selfShort    string
+	// loopScopes are the enclosing loops' variables, for the rule in hierarchy.go.
+	loopScopes []javaLoopScope
+	// fieldTypes are the declared types of the enclosing classes' fields, innermost
+	// last, and localTypes those of the current method's parameters and locals
+	// (nil outside a method). See receivers.go.
+	fieldTypes []map[string]string
+	localTypes map[string]string
+	selfName   string
+	selfShort  string
 	// selfParams is the enclosing method's declared parameter count. A resolved
 	// self-call is only genuine recursion when its argument count matches — otherwise
 	// it is a call to a same-named overload, not recursion.
@@ -96,6 +113,8 @@ type astWalker struct {
 // javaBodyMetrics accumulates per-method complexity signals during the single
 // walkForCalls body traversal — mirrors the other extractors.
 type javaBodyMetrics struct {
+	// typedCalls are the calls made on a receiver of declared type (receivers.go).
+	typedCalls         []typedCall
 	loopDepth          int             // max loop nesting depth
 	loopCount          int             // number of loop constructs (syntactic + stream lambdas)
 	decisions          int             // decision points (cyclomatic = 1 + decisions)
@@ -104,6 +123,7 @@ type javaBodyMetrics struct {
 	scalingLoopDepth   int             // max nesting counting only unbounded (input-scaling) loops
 	callsInScalingLoop []string        // distinct targets invoked inside a repeating loop (N+1 candidates)
 	inScalingSeen      map[string]bool // dedup set for callsInScalingLoop
+	scalingCallDepth   map[string]int  // deepest scaling nesting each of those is called at (calldepth.go)
 	recursive          bool            // body directly calls the enclosing method
 	sawSuperSelf       bool            // body calls super.<enclosingName>() (override delegation)
 }
@@ -111,18 +131,22 @@ type javaBodyMetrics struct {
 // javaIterators are Stream/Collection methods whose lambda argument runs once per
 // element — i.e. a loop. A lambda passed to a method NOT in this set (Runnable,
 // Comparator, a listener, a Supplier) is deferred and not treated as a loop.
+//
+// Map.computeIfAbsent is not in it. Its lambda runs at most once, for the one key
+// it was given, and counting it turned every "group these into a map" loop into a
+// nest one level deeper than it is.
 var javaIterators = map[string]bool{
 	"forEach": true, "forEachOrdered": true, "map": true, "mapToInt": true,
 	"mapToLong": true, "mapToDouble": true, "mapToObj": true, "flatMap": true,
 	"filter": true, "reduce": true, "collect": true, "anyMatch": true,
 	"allMatch": true, "noneMatch": true, "peek": true, "sorted": true,
-	"removeIf": true, "replaceAll": true, "computeIfAbsent": true, "takeWhile": true,
+	"removeIf": true, "replaceAll": true, "takeWhile": true,
 	"dropWhile": true,
 }
 
 // javaCheapMethods are obviously-cheap methods that are not I/O. Calls to these on
 // an unknown receiver inside a loop are not recorded in calls_in_loop, keeping it
-// focused (the enterprise keyword gate is the real precision filter).
+// focused (the analyzer's keyword gate is the real precision filter).
 var javaCheapMethods = map[string]bool{
 	"toString": true, "equals": true, "hashCode": true, "get": true, "set": true,
 	"add": true, "remove": true, "put": true, "contains": true, "size": true,
@@ -198,10 +222,15 @@ func (w *astWalker) recordInLoop(target string) {
 	// candidate. Only a genuinely constant loop (a literal-bounded for, a for-each over
 	// a collection literal) excludes its calls; while(true)/for(;;) repeats, so its
 	// calls stay candidates even though its depth is discounted from the Big-O exponent.
+	// A call made once per round of a paging loop is the batched call.
+	if n := len(w.loopScopes); n > 0 && w.loopScopes[n-1].batch {
+		return
+	}
 	if w.repeatDepth > 0 {
 		if w.metrics.inScalingSeen == nil {
 			w.metrics.inScalingSeen = make(map[string]bool)
 		}
+		w.metrics.scalingCallDepth = noteCallDepth(w.metrics.scalingCallDepth, target, w.scalingDepth)
 		if !w.metrics.inScalingSeen[target] {
 			w.metrics.inScalingSeen[target] = true
 			w.metrics.callsInScalingLoop = append(w.metrics.callsInScalingLoop, target)
@@ -242,7 +271,10 @@ func javaSyntacticLoopClass(node *sitter.Node, src []byte) javaLoopClass {
 		if cond == nil {
 			return javaLoopInfinite
 		}
-		if javaConstantForCondition(cond) {
+		// Both ends have to be constant: `for (int i = n - 1; i >= 0; i--)` compares
+		// against a literal and still walks all n. The condition alone was once
+		// enough, which read every descending loop as constant.
+		if javaConstantForCondition(cond, src) && javaForStartsAtConstant(node, src) {
 			return javaLoopConstant
 		}
 	case "enhanced_for_statement":
@@ -264,20 +296,66 @@ func javaSyntacticLoopClass(node *sitter.Node, src []byte) javaLoopClass {
 // fixed number of times. A data-derived bound (`i < n`, `i < xs.size()`) or a compound
 // condition (`i < 3 && ok`) is conservatively treated as scaling — so no genuine O(n)
 // finding is ever deleted, only a clearly-constant one discounted.
-func javaConstantForCondition(cond *sitter.Node) bool {
+func javaConstantForCondition(cond *sitter.Node, src []byte) bool {
 	if cond == nil || kindOf(cond) != "binary_expression" {
 		return false
 	}
-	hasCmp, hasLiteral := false, false
+	hasCmp, hasConst := false, false
 	for i := uint(0); i < uint(cond.ChildCount()); i++ {
-		switch kindOf(cond.Child(i)) {
+		switch c := cond.Child(i); kindOf(c) {
 		case "<", "<=", ">", ">=", "!=":
 			hasCmp = true
 		case "decimal_integer_literal", "hex_integer_literal", "octal_integer_literal", "binary_integer_literal":
-			hasLiteral = true
+			hasConst = true
+		case "identifier":
+			// `i < MAX_ATTEMPTS`: a static final by its name.
+			hasConst = hasConst || javaIsScreamingConst(nodeText(c, src))
+		case "field_access":
+			// `i < Limits.MAX_ATTEMPTS`
+			if f := c.ChildByFieldName("field"); f != nil {
+				hasConst = hasConst || javaIsScreamingConst(nodeText(f, src))
+			}
 		}
 	}
-	return hasCmp && hasLiteral
+	return hasCmp && hasConst
+}
+
+// javaForStartsAtConstant reports whether a three-clause for initialises its
+// counter to an integer literal or a named constant. A loop with no initialiser,
+// or one starting from anything computed, does not qualify.
+func javaForStartsAtConstant(node *sitter.Node, src []byte) bool {
+	init := node.ChildByFieldName("init")
+	if init == nil {
+		return false
+	}
+	var value *sitter.Node
+	switch kindOf(init) {
+	case "local_variable_declaration":
+		for i := uint(0); i < uint(init.NamedChildCount()); i++ {
+			if d := init.NamedChild(i); kindOf(d) == "variable_declarator" {
+				if value != nil {
+					return false // two counters: not the simple form
+				}
+				value = d.ChildByFieldName("value")
+			}
+		}
+	case "assignment_expression":
+		value = init.ChildByFieldName("right")
+	}
+	if value == nil {
+		return false
+	}
+	switch kindOf(value) {
+	case "decimal_integer_literal", "hex_integer_literal", "octal_integer_literal", "binary_integer_literal":
+		return true
+	case "identifier":
+		return javaIsScreamingConst(nodeText(value, src))
+	case "field_access":
+		if f := value.ChildByFieldName("field"); f != nil {
+			return javaIsScreamingConst(nodeText(f, src))
+		}
+	}
+	return false
 }
 
 // javaConstantIterable reports whether a for-each iterates a compile-time-fixed number
@@ -314,9 +392,23 @@ func javaConstantIterable(value *sitter.Node, src []byte) bool {
 			return obj == "List" || obj == "Set" || obj == "Map"
 		case "asList":
 			return obj == "Arrays"
+		case "values":
+			// `Scope.values()`: the constants of an enum. The receiver has to be a
+			// type name and the call argument-less; `map.values()` is neither.
+			args := value.ChildByFieldName("arguments")
+			return javaTypeName(obj) && (args == nil || args.NamedChildCount() == 0)
 		}
 	}
 	return false
+}
+
+// javaTypeName reports whether s is an UpperCamelCase simple name: an initial
+// capital, no dots, and at least one lower-case letter (which a constant has not).
+func javaTypeName(s string) bool {
+	if s == "" || s[0] < 'A' || s[0] > 'Z' || strings.Contains(s, ".") {
+		return false
+	}
+	return strings.ContainsAny(s, "abcdefghijklmnopqrstuvwxyz")
 }
 
 // javaIsScreamingConst reports whether an identifier is SCREAMING_SNAKE_CASE — a
@@ -394,33 +486,44 @@ func javaStreamLambda(call *sitter.Node, src []byte) *sitter.Node {
 // at +1 (it runs per element), while walking everything else (receiver, other args)
 // at the current depth. Kind-checked so an ancestor with the same byte span isn't
 // mistaken for the lambda.
-// bounded is true when the iterator's receiver is a collection literal, so the callback
-// runs a fixed number of times and neither scales nor repeats.
-func (w *astWalker) walkJavaLambdaSubtree(node, lambda *sitter.Node, bounded bool) {
+// class says what the callback's loop is: constant over a collection literal
+// (neither scales nor repeats), repeating without scaling over what an enclosing
+// loop's element holds, or scaling.
+func (w *astWalker) walkJavaLambdaSubtree(node, lambda *sitter.Node, class javaLoopClass) {
 	if node == nil {
 		return
 	}
 	if kindOf(node) == "lambda_expression" && node.StartByte() == lambda.StartByte() && node.EndByte() == lambda.EndByte() {
+		// The callback is a loop of its own: a call in it is made per element, not
+		// once per round of whatever statement loop encloses it.
+		scope := javaLoopScope{amortizes: class.repeats()}
+		if p := node.ChildByFieldName("parameters"); p != nil && kindOf(p) == "identifier" {
+			scope.add(nodeText(p, w.src))
+		}
+		w.loopScopes = append(w.loopScopes, scope)
 		w.loopDepth++
-		if !bounded {
-			// An iterator receiver is either a literal (constant) or data-derived
-			// (scaling); it is never infinite, so repeating and scaling coincide here.
+		if class.scales() {
 			w.scalingDepth++
+		}
+		if class.repeats() {
 			w.repeatDepth++
 		}
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
 			w.walkForCalls(node.Child(i))
 		}
 		w.loopDepth--
-		if !bounded {
+		if class.scales() {
 			w.scalingDepth--
+		}
+		if class.repeats() {
 			w.repeatDepth--
 		}
+		w.loopScopes = w.loopScopes[:len(w.loopScopes)-1]
 		return
 	}
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		if c := node.Child(i); javaByteContains(c, lambda) {
-			w.walkJavaLambdaSubtree(c, lambda, bounded)
+			w.walkJavaLambdaSubtree(c, lambda, class)
 		} else {
 			w.walkForCalls(c)
 		}
@@ -462,13 +565,26 @@ func (w *astWalker) currentRoute() *routeScope {
 	return &w.routeStack[len(w.routeStack)-1]
 }
 
-func (w *astWalker) pushOwner(f *facts.Fact) { w.ownerStack = append(w.ownerStack, f) }
-func (w *astWalker) popOwner()               { w.ownerStack = w.ownerStack[:len(w.ownerStack)-1] }
-func (w *astWalker) currentOwner() *facts.Fact {
+func (w *astWalker) pushOwner(idx int) { w.ownerStack = append(w.ownerStack, idx) }
+func (w *astWalker) popOwner()         { w.ownerStack = w.ownerStack[:len(w.ownerStack)-1] }
+
+// noOwner is the owner index outside any declaration.
+const noOwner = -1
+
+func (w *astWalker) currentOwner() int {
 	if len(w.ownerStack) == 0 {
-		return nil
+		return noOwner
 	}
 	return w.ownerStack[len(w.ownerStack)-1]
+}
+
+// relate adds a relation to the fact at owner, addressed at the moment of the
+// append, and nothing outside a declaration.
+func (w *astWalker) relate(owner int, kind, target string) {
+	if owner == noOwner {
+		return
+	}
+	w.out[owner].Relations = append(w.out[owner].Relations, facts.Relation{Kind: kind, Target: target})
 }
 
 // canonicalName is the "<dir>.<QualifiedType>" fact name of a declaration.
@@ -554,10 +670,11 @@ func (w *astWalker) handleImport(node *sitter.Node) {
 	}
 
 	w.out = append(w.out, facts.Fact{
-		Kind:  facts.KindDependency,
-		Name:  w.dir + " -> " + importPath,
-		File:  w.relFile,
-		Line:  int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindDependency,
+		Name:    w.dir + " -> " + importPath,
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: props,
 		Relations: []facts.Relation{
 			{Kind: facts.RelImports, Target: importPath},
@@ -599,10 +716,11 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 		(!strings.Contains(modifierText, "private") && len(w.typeStack) > 0)
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.canonicalName(w.qualify(name)),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(w.qualify(name)),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": kind,
 			"exported":    exported,
@@ -613,14 +731,17 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := javaDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if strings.Contains(modifierText, "abstract") {
-		f.Props["abstract"] = true
+		f.SetProp("abstract", true)
 	}
 	if kindOf(node) == "record_declaration" {
-		f.Props["record"] = true
+		f.SetProp("record", true)
 	}
 	if kindOf(node) == "annotation_type_declaration" {
-		f.Props["annotation_class"] = true
+		f.SetProp("annotation_class", true)
 	}
 
 	// Inheritance: `extends` superclass + `implements`/`extends` interfaces.
@@ -636,13 +757,19 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 		w.out = append(w.out, *sf)
 	}
 
+	if hasAnnotation(annotations, "FeignClient", "Dao") || isSpringDataRepository(supers) {
+		f.SetProp(propIOType, true)
+	}
+
 	w.out = append(w.out, f)
-	owner := &w.out[len(w.out)-1]
+	owner := len(w.out) - 1
 	w.pushOwner(owner)
 
 	// Enter the type scope.
 	body := classBody(node)
 	w.typeStack = append(w.typeStack, name)
+	w.testCaseStack = append(w.testCaseStack, testCaseSuper(supers))
+	w.fieldTypes = append(w.fieldTypes, w.collectFieldTypes(body))
 	w.methodStack = append(w.methodStack, collectMethodNames(body, w.src))
 	w.routeStack = append(w.routeStack, routeScope{
 		isController:  isSpringController(annotations),
@@ -665,7 +792,9 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 	}
 
 	w.routeStack = w.routeStack[:len(w.routeStack)-1]
+	w.fieldTypes = w.fieldTypes[:len(w.fieldTypes)-1]
 	w.typeStack = w.typeStack[:len(w.typeStack)-1]
+	w.testCaseStack = w.testCaseStack[:len(w.testCaseStack)-1]
 	w.methodStack = w.methodStack[:len(w.methodStack)-1]
 	w.popOwner()
 }
@@ -673,7 +802,7 @@ func (w *astWalker) handleClassLike(node *sitter.Node, kind string) {
 // walkBody iterates the direct members of a class/interface/enum body, handling
 // nested declarations, methods, and fields. Non-declaration nodes are scanned for
 // constructor calls attributed to `owner`.
-func (w *astWalker) walkBody(body *sitter.Node, owner *facts.Fact) {
+func (w *astWalker) walkBody(body *sitter.Node, owner int) {
 	for i := uint(0); i < uint(body.ChildCount()); i++ {
 		c := body.Child(i)
 		switch kindOf(c) {
@@ -715,10 +844,11 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 	exported := strings.Contains(modifierText, "public")
 
 	f := facts.Fact{
-		Kind: facts.KindSymbol,
-		Name: w.canonicalName(w.qualify(name)),
-		File: w.relFile,
-		Line: int(node.StartPosition().Row) + 1,
+		Kind:    facts.KindSymbol,
+		Name:    w.canonicalName(w.qualify(name)),
+		File:    w.relFile,
+		Line:    int(node.StartPosition().Row) + 1,
+		EndLine: tsutil.EndLine(node, w.src), Column: tsutil.Column(node), EndColumn: tsutil.EndColumn(node, w.src),
 		Props: map[string]any{
 			"symbol_kind": facts.SymbolMethod,
 			"exported":    exported,
@@ -728,11 +858,14 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
+	if doc := javaDoc(node, w.src); doc != "" {
+		facts.SetDoc(&f, doc)
+	}
 	if t := w.enclosingType(); t != "" {
-		f.Props["receiver"] = t
+		f.SetProp("receiver", t)
 	}
 	if strings.Contains(modifierText, "static") {
-		f.Props["static"] = true
+		f.SetProp("static", true)
 	}
 
 	// Request-mapping annotation on a method: a server route on a @Controller, or an
@@ -742,25 +875,37 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 		line := int(node.StartPosition().Row) + 1
 		switch {
 		case rs.isFeignClient:
-			w.out = append(w.out, feignClientFacts(rs.basePath, rs.feignHint, annotations, w.relFile, line, w.dir)...)
+			w.out = append(w.out, feignClientFacts(rs.basePath, rs.feignHint, annotations, w.relFile, line, w.dir, w.canonicalName(w.qualify(name)))...)
 		case rs.isController:
 			w.out = append(w.out, springRouteFacts(rs.basePath, annotations, w.relFile,
 				line, w.dir, w.canonicalName(w.qualify(name)))...)
 		}
 	}
 
+	if junitTest(annotations) || w.junit3Test(node, name, modifierText) {
+		endLine, col, endCol := tsutil.Span(node, w.src)
+		w.testCases = append(w.testCases, facts.NewTestCase("java", w.relFile, append([]string(nil), w.typeStack...), name,
+			w.fqn(w.qualify(name)), int(node.StartPosition().Row)+1, endLine, col, endCol))
+	}
+
 	w.out = append(w.out, f)
 	ownerIdx := len(w.out) - 1
-	w.pushOwner(&w.out[ownerIdx])
+	w.pushOwner(ownerIdx)
 	// Set up per-method complexity tracking. walkForCalls is re-entrant (it
 	// dispatches nested type declarations back through handleMethod), so save and
-	// restore the outer state. Props are written via the stable index (the pointer
-	// may be invalidated if the body walk grows w.out).
+	// restore the outer state.
 	savedMetrics, savedDepth := w.metrics, w.loopDepth
 	savedScaling, savedRepeat := w.scalingDepth, w.repeatDepth
 	savedName, savedShort := w.selfName, w.selfShort
 	savedParams := w.selfParams
+	savedScopes := w.loopScopes
+	w.loopScopes = nil
+	defer func() { w.loopScopes = savedScopes }()
 	w.metrics = &javaBodyMetrics{}
+	savedLocals := w.localTypes
+	w.localTypes = make(map[string]string)
+	defer func() { w.localTypes = savedLocals }()
+	w.bindParameters(node)
 	w.loopDepth = 0
 	w.scalingDepth = 0
 	w.repeatDepth = 0
@@ -772,6 +917,9 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 	}
 	m := w.metrics
 	props := w.out[ownerIdx].Props
+	if len(m.typedCalls) > 0 {
+		props[propTypedCalls] = m.typedCalls
+	}
 	props["cyclomatic"] = 1 + m.decisions
 	if m.loopDepth > 0 {
 		props["loop_depth"] = m.loopDepth
@@ -792,19 +940,20 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 			m.callsInScalingLoop = []string{}
 		}
 		props["calls_in_scaling_loop"] = m.callsInScalingLoop
+		props["calls_in_scaling_loop_depth"] = callDepths(m.callsInScalingLoop, m.scalingCallDepth)
 	}
 	// A body that calls super.<self>() is an override delegating to a same-named
 	// overload, not genuine recursion — clear the arity-matched self-call flag.
 	if m.recursive && !m.sawSuperSelf {
 		props["recursive_self"] = true
 	}
-	// GAP-JV-02: flag genuine DB/network round-trips so enola-enterprise's
+	// GAP-JV-02: flag genuine DB/network round-trips so the performance analyzer's
 	// isExpensiveJvmCall I/O index sees the in-loop callee. Seeded from type-level
 	// signals (@FeignClient / Spring Data repository / @Dao) plus unambiguous query
 	// annotations (@Query/@Modifying/@Procedure) — never a bare HTTP verb or
 	// @GetMapping, which on server-side Java is an INBOUND handler, not I/O.
-	// performs_io == io_direct: no transitive pass (Java call edges are same-class
-	// only, and the consumer matches the flagged leaf callee by short name).
+	// performs_io is set here for the round-trip itself; ioclosure.Propagate
+	// carries it to the methods that reach one.
 	if w.methodPerformsIO(annotations) {
 		props["io_direct"] = true
 		props["performs_io"] = true
@@ -816,7 +965,7 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 	w.popOwner()
 }
 
-func (w *astWalker) handleField(node *sitter.Node, owner *facts.Fact) {
+func (w *astWalker) handleField(node *sitter.Node, owner int) {
 	modifiers := findChildByKind(node, "modifiers")
 	modifierText := ""
 	var annotations []javaAnnotation
@@ -862,10 +1011,11 @@ func (w *astWalker) handleField(node *sitter.Node, owner *facts.Fact) {
 			}
 		}
 		w.out = append(w.out, facts.Fact{
-			Kind:  facts.KindSymbol,
-			Name:  w.canonicalName(w.qualify(name)),
-			File:  w.relFile,
-			Line:  int(c.StartPosition().Row) + 1,
+			Kind:    facts.KindSymbol,
+			Name:    w.canonicalName(w.qualify(name)),
+			File:    w.relFile,
+			Line:    int(c.StartPosition().Row) + 1,
+			EndLine: tsutil.EndLine(c, w.src), Column: tsutil.Column(c), EndColumn: tsutil.EndColumn(c, w.src),
 			Props: props,
 			Relations: []facts.Relation{
 				{Kind: facts.RelDeclares, Target: w.dir},
@@ -873,8 +1023,8 @@ func (w *astWalker) handleField(node *sitter.Node, owner *facts.Fact) {
 		})
 	}
 
-	if injected && typeTarget != "" && owner != nil {
-		owner.Relations = append(owner.Relations, facts.Relation{Kind: facts.RelInjects, Target: typeTarget})
+	if injected && typeTarget != "" {
+		w.relate(owner, facts.RelInjects, typeTarget)
 	}
 	// A field initializer may contain a constructor call (`= new Foo()`).
 	w.walkForCalls(node)
@@ -884,7 +1034,7 @@ func (w *astWalker) handleField(node *sitter.Node, owner *facts.Fact) {
 // type of an injectable constructor: a sole constructor, a constructor annotated
 // @Autowired/@Inject, or (Lombok) when the class carries @RequiredArgsConstructor /
 // @AllArgsConstructor.
-func (w *astWalker) handleConstructorInjection(decl, body *sitter.Node, owner *facts.Fact, classAnns []javaAnnotation) {
+func (w *astWalker) handleConstructorInjection(decl, body *sitter.Node, owner int, classAnns []javaAnnotation) {
 	lombokInject := hasAnnotation(classAnns, "RequiredArgsConstructor", "AllArgsConstructor")
 
 	// record_declaration parameters are constructor parameters too.
@@ -906,8 +1056,8 @@ func (w *astWalker) handleConstructorInjection(decl, body *sitter.Node, owner *f
 				if mods == nil || !strings.Contains(nodeText(mods, w.src), "final") {
 					continue
 				}
-				if t := w.targetForType(c.ChildByFieldName("type")); t != "" && owner != nil {
-					owner.Relations = append(owner.Relations, facts.Relation{Kind: facts.RelInjects, Target: t})
+				if t := w.targetForType(c.ChildByFieldName("type")); t != "" {
+					w.relate(owner, facts.RelInjects, t)
 				}
 			}
 		}
@@ -936,17 +1086,14 @@ func (w *astWalker) handleConstructorInjection(decl, body *sitter.Node, owner *f
 	}
 }
 
-func (w *astWalker) injectParams(params *sitter.Node, owner *facts.Fact) {
-	if owner == nil {
-		return
-	}
+func (w *astWalker) injectParams(params *sitter.Node, owner int) {
 	for i := uint(0); i < uint(params.ChildCount()); i++ {
 		p := params.Child(i)
 		if kindOf(p) != "formal_parameter" {
 			continue
 		}
 		if t := w.targetForType(p.ChildByFieldName("type")); t != "" {
-			owner.Relations = append(owner.Relations, facts.Relation{Kind: facts.RelInjects, Target: t})
+			w.relate(owner, facts.RelInjects, t)
 		}
 	}
 }
@@ -960,13 +1107,27 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	}
 	kind := kindOf(node)
+	w.noteDeclaration(node, kind)
 
 	// A lambda is a deferred scope: its body runs when invoked, NOT per-iteration of
 	// the enclosing loops — so reset the loop depth for its subtree (e.g. a Runnable
 	// or listener defined inside a loop). A stream iterator's OWN lambda is handled
 	// in the method_invocation branch (its body walks at +1).
+	// A local initialised from the current element is still the current element:
+	// `List<Schema> parts = schema.getAllOf();` puts `parts` one step from it.
+	if kind == "variable_declarator" && len(w.loopScopes) > 0 {
+		if javaReachedThroughElement(node.ChildByFieldName("value"), w.src, w.loopScopes) {
+			if name := node.ChildByFieldName("name"); name != nil && kindOf(name) == "identifier" {
+				w.loopScopes[len(w.loopScopes)-1].add(nodeText(name, w.src))
+			}
+		}
+	}
+
 	if w.metrics != nil && kind == "lambda_expression" {
 		saved, savedScaling, savedRepeat := w.loopDepth, w.scalingDepth, w.repeatDepth
+		savedScopes := w.loopScopes
+		w.loopScopes = nil
+		defer func() { w.loopScopes = savedScopes }()
 		w.loopDepth, w.scalingDepth, w.repeatDepth = 0, 0, 0
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
 			w.walkForCalls(node.Child(i))
@@ -1006,6 +1167,26 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		// loop raises loop_depth but not scaling_loop_depth (the Big-O exponent); an
 		// infinite loop is discounted from the exponent but still repeats.
 		class := javaSyntacticLoopClass(node, w.src)
+		scope := javaLoopScope{amortizes: class.repeats()}
+		if kind == "enhanced_for_statement" {
+			// A loop over what belongs to an enclosing loop's element repeats
+			// without scaling (hierarchy.go).
+			if class.scales() && javaReachedThroughElement(node.ChildByFieldName("value"), w.src, w.loopScopes) {
+				class = javaLoopInfinite
+			}
+			scope.amortizes = class.repeats()
+			if name := node.ChildByFieldName("name"); name != nil {
+				scope.add(nodeText(name, w.src))
+			}
+		}
+		// A paging loop: what a round fetched is the round's element, so the loop
+		// that drains it is that loop's hierarchical inner loop.
+		for _, page := range javaBatchLoop(node, w.src) {
+			scope.batch, scope.amortizes = true, true
+			scope.add(page)
+		}
+		w.loopScopes = append(w.loopScopes, scope)
+		defer func() { w.loopScopes = w.loopScopes[:len(w.loopScopes)-1] }()
 		if w.metrics != nil {
 			w.metrics.loopCount++
 			w.metrics.decisions++
@@ -1016,6 +1197,19 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 				w.metrics.scalingLoopDepth = w.scalingDepth + 1
 			}
 		}
+		// What the loop draws from is evaluated once, before the first iteration:
+		// the collection of a for-each, the initializer of a for. Walking it with
+		// the body read `for (Schema s : schema.getAllOf())` as a call per element.
+		var once *sitter.Node
+		switch kind {
+		case "enhanced_for_statement":
+			once = node.ChildByFieldName("value")
+		case "for_statement":
+			once = node.ChildByFieldName("init")
+		}
+		if once != nil {
+			w.walkForCalls(once)
+		}
 		w.loopDepth++
 		if class.scales() {
 			w.scalingDepth++
@@ -1024,7 +1218,9 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 			w.repeatDepth++
 		}
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
-			w.walkForCalls(node.Child(i))
+			if c := node.Child(i); once == nil || c.StartByte() != once.StartByte() || c.EndByte() != once.EndByte() {
+				w.walkForCalls(c)
+			}
 		}
 		w.loopDepth--
 		if class.scales() {
@@ -1036,9 +1232,7 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		return
 	case "object_creation_expression":
 		if t := w.targetForType(node.ChildByFieldName("type")); t != "" {
-			if owner := w.currentOwner(); owner != nil {
-				owner.Relations = append(owner.Relations, facts.Relation{Kind: facts.RelInstantiates, Target: t})
-			}
+			w.relate(w.currentOwner(), facts.RelInstantiates, t)
 		}
 	case "method_invocation":
 		w.handleInvocation(node)
@@ -1050,18 +1244,27 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 				// count — it raises loop_depth but not the scaling depth. The depth bump
 				// happens at the lambda body inside walkJavaLambdaSubtree; here we only
 				// record the maxes.
-				bounded := javaStreamReceiverBounded(node, w.src)
+				class := javaLoopScaling
+				switch {
+				case javaStreamReceiverBounded(node, w.src):
+					class = javaLoopConstant
+				case javaReachedThroughElement(node.ChildByFieldName("object"), w.src, w.loopScopes):
+					// `page.getData().forEach(…)`, `schema.getAllOf().forEach(…)`:
+					// over what belongs to an enclosing loop's element. It repeats
+					// without scaling, as the statement form does (hierarchy.go).
+					class = javaLoopInfinite
+				}
 				w.metrics.loopCount++
 				w.metrics.decisions++
 				if w.loopDepth+1 > w.metrics.loopDepth {
 					w.metrics.loopDepth = w.loopDepth + 1
 				}
-				if !bounded && w.scalingDepth+1 > w.metrics.scalingLoopDepth {
+				if class.scales() && w.scalingDepth+1 > w.metrics.scalingLoopDepth {
 					w.metrics.scalingLoopDepth = w.scalingDepth + 1
 				}
 				for i := uint(0); i < uint(node.ChildCount()); i++ {
 					if c := node.Child(i); javaByteContains(c, lambda) {
-						w.walkJavaLambdaSubtree(c, lambda, bounded)
+						w.walkJavaLambdaSubtree(c, lambda, class)
 					} else {
 						w.walkForCalls(c)
 					}
@@ -1078,7 +1281,7 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 
 func (w *astWalker) handleInvocation(node *sitter.Node) {
 	owner := w.currentOwner()
-	if owner == nil {
+	if owner == noOwner {
 		return
 	}
 	nameNode := node.ChildByFieldName("name")
@@ -1094,8 +1297,8 @@ func (w *astWalker) handleInvocation(node *sitter.Node) {
 	w.detectRestTemplateCall(node, name)
 
 	// Resolve bare `foo()` and `this.foo()` calls against the enclosing class's
-	// own methods. Calls on other receivers are left unresolved (the receiver's
-	// type is not tracked), matching the Kotlin extractor's conservative model.
+	// own methods. A call on another receiver is resolved where that receiver's
+	// type is declared (receivers.go), and left as text otherwise.
 	isThis := obj != nil && nodeText(obj, w.src) == "this"
 	if obj != nil && w.metrics != nil && name == w.selfShort && nodeText(obj, w.src) == "super" {
 		// super.<self>() — an override delegating to its supertype. Note it so an
@@ -1105,16 +1308,23 @@ func (w *astWalker) handleInvocation(node *sitter.Node) {
 	if obj == nil || isThis {
 		if methods := w.currentMethods(); methods[name] {
 			target := w.dir + "." + w.enclosingType() + "." + name
-			owner.Relations = append(owner.Relations, facts.Relation{
-				Kind:   facts.RelCalls,
-				Target: target,
-			})
+			w.relate(owner, facts.RelCalls, target)
 			w.recordCallMetrics(target, javaArgCount(node))
+		} else if t := w.enclosingType(); t != "" {
+			// Not declared here: inherited, if a supertype of this repository
+			// declares it (receivers.go settles that).
+			w.noteTypedCall(name, w.fqn(t), name)
 		}
-	} else if w.metrics != nil && w.loopDepth > 0 && !javaCheapMethods[name] {
-		// Method call on a non-this receiver inside a loop (repo.findById(), …). No
-		// graph edge today, but its name feeds the perf metric so the enterprise
-		// analyzer can flag per-iteration JPA/JDBC/network I/O.
+		return
+	}
+	// A receiver whose type is declared: receivers.go.
+	recvText := nodeText(obj, w.src)
+	w.noteTypedCall(writtenCall(recvText, name), w.receiverType(obj), name)
+	if w.metrics != nil && w.loopDepth > 0 && !javaCheapMethods[name] {
+		// Method call on a non-this receiver inside a loop (repo.findById(), …). Its
+		// text feeds the perf metric so the performance analyzer can flag
+		// per-iteration JPA/JDBC/network I/O; where the receiver's type is declared
+		// in this repository, resolveTypedCalls replaces the text with the method.
 		tgt := name
 		if recv := nodeText(obj, w.src); recv != "" {
 			tgt = recv + "." + name
@@ -1378,9 +1588,45 @@ func firstNamedChild(node *sitter.Node) *sitter.Node {
 	return nil
 }
 
-func nodeText(node *sitter.Node, src []byte) string {
-	if node == nil {
-		return ""
+func nodeText(node *sitter.Node, src []byte) string { return tsutil.Text(node, src) }
+
+// junitAnnotations mark a method JUnit 4 and 5 (and TestNG, which spells its
+// annotation the same) run as a test. A parameterised or repeated test is one
+// method however many times it runs, and a test factory's dynamic tests are
+// named only when it runs, so each is one test here.
+var junitAnnotations = map[string]bool{
+	"Test": true, "ParameterizedTest": true, "RepeatedTest": true, "TestFactory": true, "TestTemplate": true,
+}
+
+func junitTest(annotations []javaAnnotation) bool {
+	for _, a := range annotations {
+		if junitAnnotations[a.name] {
+			return true
+		}
 	}
-	return string(src[node.StartByte():node.EndByte()])
+	return false
+}
+
+func testCaseSuper(supers []string) bool {
+	for _, s := range supers {
+		if strings.HasSuffix(s, "TestCase") {
+			return true
+		}
+	}
+	return false
+}
+
+// junit3Test is JUnit 3's rule, which its runner and the runners built on it
+// apply by name: a public method named test* with no parameters in a class that
+// extends a TestCase.
+func (w *astWalker) junit3Test(method *sitter.Node, name, modifierText string) bool {
+	if len(w.testCaseStack) == 0 || !w.testCaseStack[len(w.testCaseStack)-1] {
+		return false
+	}
+	if kindOf(method) != "method_declaration" || !strings.HasPrefix(name, "test") || !strings.Contains(modifierText, "public") ||
+		strings.Contains(modifierText, "static") {
+		return false
+	}
+	params := method.ChildByFieldName("parameters")
+	return params != nil && params.NamedChildCount() == 0
 }

@@ -69,6 +69,18 @@ type Binder interface {
 	Bind(ctx context.Context, store *facts.Store) error
 }
 
+// IndexBinder is a Binder whose Bind changes no fact: it only derives an index the
+// store keeps beside them (the target aliases). Such an index is not written to
+// facts.jsonl, so a store restored from disk has none; the engine reruns every
+// IndexBinder over a restored store before building its graph, which reproduces it
+// exactly because it is a function of the facts alone. A binder that changes facts
+// must not declare this: rerunning it would apply its change a second time.
+type IndexBinder interface {
+	Binder
+	// DerivesIndexOnly marks the binder as safe to rerun on a restored store.
+	DerivesIndexOnly()
+}
+
 // ---------------------------------------------------------------------------
 // Cross-repo signals
 // ---------------------------------------------------------------------------
@@ -182,6 +194,12 @@ var (
 	BucketImports   = Bucket{Name: "imports", CountProp: "import_count", SamplesProp: "import_samples"}
 	BucketTopics    = Bucket{Name: "topics", CountProp: "topic_count", SamplesProp: "topic_samples"}
 	BucketSymbols   = Bucket{Name: "symbols", CountProp: "symbol_count", SamplesProp: "symbol_samples", UnverifiedProp: "name_match_count"}
+
+	// BucketParamEndpoints holds the endpoints of an HTTP edge that matched only because a
+	// server path parameter absorbed a literal client segment (the opt-in
+	// linking.match_literal_against_params). Each is in BucketEndpoints too; this names the
+	// subset resting on the looser rule, so a reader can weigh it.
+	BucketParamEndpoints = Bucket{Name: "param_segment_endpoints", CountProp: "param_segment_endpoint_count", SamplesProp: "param_segment_endpoints"}
 )
 
 // Coverage tallies, per consumer repo, how many outbound call sites a signal detected

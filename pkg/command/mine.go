@@ -4,9 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/enola-labs/enola/internal/eslintscaffold"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/intent"
 	"github.com/enola-labs/enola/internal/mining"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 	"github.com/enola-labs/enola/pkg/check"
@@ -22,6 +24,10 @@ func (r *Runner) ConstraintsMine(args []string) {
 	includeTautologies := fs.Bool("include-tautologies", false, "also print candidates whose statement holds by construction; suppressed and counted by default")
 	top := fs.Int("top", 50, "how many ranked candidates the text report prints (0 = all)")
 	jsonlPath := fs.String("jsonl", "", "also write the full report as a JSONL artifact to this path")
+	byComponent := fs.Bool("by-component", false, "mine edge candidates over the parts the repository's declaration names (components in enola/constraints/ and enola-intent.yaml, and the layers of a layer order) instead of directories; a pair of parts with no crossing is proposed when the source part's outgoing count clears --min-support, with that support printed beside it")
+	minResolution := fs.Float64("min-resolution", defaults.MinResolution, "with --by-component, the share of an edge kind's edges that must land on something measured before candidates over that kind are proposed; under it they are listed as ones that cannot be checked here")
+	withCrossings := fs.Bool("with-crossings", false, "with --by-component, also propose a forbid or allow-only the code already crosses, naming the crossings as exceptions; off by default, because a crossing between declared parts reads as a seam the declaration may intend")
+	rejectionsPath := fs.String("rejections", mining.RejectionsFileName, "the file of rejected candidates, relative to the repository: identity, owner, since and because per entry; a candidate it names is not proposed, and mine never writes it")
 	scaffoldDir := fs.String("scaffold-eslint", "", "write ESLint rule scaffolds (rule, RuleTester test, index.js) for the candidates a file-local rule can express into this directory; the rest are listed with the reason they stay constraint proposals")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: "+r.name()+" constraints mine [flags] [repo_path|config_path]\n\n"+
@@ -31,6 +37,17 @@ func (r *Runner) ConstraintsMine(args []string) {
 			"names every exception, and renders a would-be rule `constraints lint` accepts.\n"+
 			"Candidates are proposals for operator review: mining never writes a\n"+
 			"declaration, never touches enola/constraints/, and never feeds the check path.\n"+
+			"With --by-component, the edge candidates are about the parts the repository\n"+
+			"declares rather than its directories: each ordered pair of parts and each of\n"+
+			"calls and imports gets a forbid when none of the source part's resolved edges\n"+
+			"of that kind land in the target part, and each part an allow-only over the\n"+
+			"parts its edges do land in (--with-crossings admits named exceptions too).\n"+
+			"Every candidate prints its support (the source part's outgoing count and how\n"+
+			"that kind resolves over the declared parts); a candidate over a kind resolving\n"+
+			"under --min-resolution is listed as one that cannot be checked here, and one a\n"+
+			"declared rule already states is listed as declared. Neither is proposed.\n"+
+			"A candidate whose identity "+mining.RejectionsFileName+" names is not proposed\n"+
+			"in either grouping; the file is written by people, never by mine.\n"+
 			"With --scaffold-eslint DIR, candidates whose statement is a file-local syntactic\n"+
 			"check (a naming regularity over JS/TS declarations, a forbidden import between\n"+
 			"two directories) are also written as ESLint rule scaffolds under DIR, so an\n"+
@@ -39,6 +56,7 @@ func (r *Runner) ConstraintsMine(args []string) {
 			"  0  report produced (even with zero candidates)\n"+
 			"  2  the command could not run (no snapshot, bad flag)\n\nFlags:\n")
 		fs.PrintDefaults()
+		r.writeHelpFooter(fs.Output(), args, "constraints mine")
 	}
 	if err := fs.Parse(args); err != nil {
 		os.Exit(check.StatusUsageError.ExitCode())
@@ -51,6 +69,9 @@ func (r *Runner) ConstraintsMine(args []string) {
 	}
 	if *maxExceptions < 0 {
 		r.constraintsFatal("--max-exceptions %d must not be negative", *maxExceptions)
+	}
+	if *minResolution < 0 || *minResolution > 1 {
+		r.constraintsFatal("--min-resolution %v is outside [0..1]", *minResolution)
 	}
 
 	var arg string
@@ -73,13 +94,46 @@ func (r *Runner) ConstraintsMine(args []string) {
 		}
 		store.Add(f)
 	}
-
-	report := mining.Mine(store, mining.Config{
+	repoPath := tgt.repoPaths[0]
+	rejections, err := mining.LoadRejections(repoPath, *rejectionsPath)
+	if err != nil {
+		r.constraintsFatal("%v", err)
+	}
+	cfg := mining.Config{
 		MinSupport:         *minSupport,
 		MinConfidence:      *minConfidence,
 		MaxExceptions:      *maxExceptions,
 		IncludeTautologies: *includeTautologies,
-	})
+		MinResolution:      *minResolution,
+		Rejections:         rejections,
+		WithCrossings:      *withCrossings,
+	}
+
+	var report *mining.Report
+	if *byComponent {
+		decl, err := intent.LoadRepoFile(repoPath)
+		if err != nil {
+			r.constraintsFatal("%v", err)
+		}
+		compiled := intent.CompileFacts(decl)
+		label := filepath.Base(repoPath)
+		declaresParts := false
+		for _, f := range compiled {
+			if f.Repo == "" {
+				f.Repo = label
+			}
+			if kind := f.PropString("intent_kind"); kind == "component" || kind == "layer" {
+				declaresParts = true
+			}
+			store.Add(f)
+		}
+		if !declaresParts {
+			r.constraintsFatal("--by-component needs declared parts, and %s declares none: no component in %s and no layers in %s", repoPath, intent.ConstraintsDirName, intent.RepoFileName)
+		}
+		report = mining.MineParts(store, cfg)
+	} else {
+		report = mining.Mine(store, cfg)
+	}
 	_, _ = fmt.Fprintf(os.Stdout, "Snapshot: %s\n", outDir)
 	report.WriteText(os.Stdout, *top)
 

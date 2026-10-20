@@ -63,60 +63,6 @@ func TestTokenBudgetEnforcement(t *testing.T) {
 	}
 }
 
-func TestDetectDominantLanguage(t *testing.T) {
-	tests := []struct {
-		name     string
-		facts    []facts.Fact
-		wantLang string
-	}{
-		{
-			"go dominant",
-			[]facts.Fact{
-				{Kind: facts.KindModule, Props: map[string]any{"language": "go"}},
-				{Kind: facts.KindModule, Props: map[string]any{"language": "go"}},
-				{Kind: facts.KindModule, Props: map[string]any{"language": "go"}},
-				{Kind: facts.KindModule, Props: map[string]any{"language": "typescript"}},
-			},
-			"go",
-		},
-		{
-			"no modules",
-			nil,
-			"",
-		},
-		{
-			"single language",
-			[]facts.Fact{
-				{Kind: facts.KindModule, Props: map[string]any{"language": "swift"}},
-			},
-			"swift",
-		},
-		{
-			// A tie is settled by name, not by whichever key the map happened to
-			// yield first: on a repository split evenly between two languages the
-			// guidance rendered changed between two runs of one binary.
-			"tie settled by name",
-			[]facts.Fact{
-				{Kind: facts.KindModule, Props: map[string]any{"language": "swift"}},
-				{Kind: facts.KindModule, Props: map[string]any{"language": "swift"}},
-				{Kind: facts.KindModule, Props: map[string]any{"language": "go"}},
-				{Kind: facts.KindModule, Props: map[string]any{"language": "go"}},
-			},
-			"go",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			snapshot := makeSnapshot(tt.facts, nil)
-			got := detectDominantLanguage(snapshot)
-			if got != tt.wantLang {
-				t.Errorf("detectDominantLanguage = %q, want %q", got, tt.wantLang)
-			}
-		})
-	}
-}
-
 func TestRender_EmptySnapshot(t *testing.T) {
 	snapshot := makeSnapshot(nil, nil)
 	r := New(4000)
@@ -592,5 +538,26 @@ func TestFeatureGuide_ServesADeclaredOrder(t *testing.T) {
 	}
 	if !strings.Contains(got, "Outside that order: wiring") {
 		t.Errorf("unordered layers must be named as exempt:\n%s", got)
+	}
+}
+
+// Both readers take a module only when a target names one exactly, so a Rust
+// item import (`src/core.count`) counted nowhere; read by its carried file it
+// is an edge from src/hooks to src/core.
+func TestItemImport_CountsInDependencyRulesAndCriticalModules(t *testing.T) {
+	snapshot := &facts.Snapshot{Facts: []facts.Fact{
+		{Kind: facts.KindModule, Name: "src/hooks", File: "src/hooks"},
+		{Kind: facts.KindModule, Name: "src/core", File: "src/core"},
+		{Kind: facts.KindSymbol, Name: "src/core.count", File: "src/core/count.rs"},
+		{Kind: facts.KindDependency, Name: "src/hooks -> crate::core::count", File: "src/hooks/run.rs",
+			Props:     map[string]any{facts.PropTargetFile: "src/core/count.rs"},
+			Relations: []facts.Relation{{Kind: facts.RelImports, Target: "src/core.count"}}},
+	}}
+	r := New(4000)
+	if rules := r.renderDependencyRules(snapshot); !strings.Contains(rules, "- `src/hooks` -> `src/core`") {
+		t.Errorf("dependency rules miss the item import:\n%s", rules)
+	}
+	if critical := r.renderCriticalModules(snapshot); !strings.Contains(critical, "`src/core` | 1 | 0 |") {
+		t.Errorf("critical modules miss src/core's fan-in:\n%s", critical)
 	}
 }

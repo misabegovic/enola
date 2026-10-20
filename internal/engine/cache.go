@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/enola-labs/enola/internal/extractors"
 	"github.com/enola-labs/enola/internal/facts"
@@ -20,6 +21,362 @@ import (
 	"github.com/enola-labs/enola/pkg/plugin"
 )
 
+// v318: loop shapes. Python: a call in a block that ends by leaving the loop
+// (break, return, raise, and no continue before it) runs at most once and is not
+// a call per element (pythonextractor/terminal.go, as goextractor/terminal.go);
+// a `while` over a counter its body steps by more than one is a page loop; and
+// a call in a for statement's iterable belongs to the loop AROUND that statement,
+// so a batch or round loop's rule now sees it. Go: a loop whose condition
+// advances a cursor (`for rows.Next()`) is never a batch loop, so a query per row
+// in its body is a query per row.
+// v317: Java and C#. A call on a receiver whose declared type is a LIBRARY's is
+// classed by that library's member (javaextractor/ioprim.go, dotnetextractor/
+// ioprim.go): `jdbcTemplate.update`, `entityManager.find`, `query.ToListAsync`
+// and `_tmdb.GetMovieAsync` make the method io_direct and are named in io_calls;
+// an in-loop call on a collection, a JSON tree or a logger is named in
+// pure_calls. Before, I/O was seeded only from types the repository declares
+// (Java) or from method names on any receiver (C#). A library call makes an
+// overloaded name io_direct only when every overload makes one or delegates.
+// Java: a call on the result of a method of the class is typed by that method's
+// return type (`getJdbcTemplate().execute(…)`), and an interface every extender
+// of which is a repository is an io_type. C#: `base.M(…)` is an edge to the
+// declaration the override extends.
+// v316: Python round loops (pythonextractor/pollloop.go). A poll (`while` with a
+// sleep, or `while True` left by a test of what the round fetched), a retry (`for`
+// over a counter with a sleep, or over a retry library's attempts) and a cursor
+// (`while request is not None`, moved on by the response) add no nesting, and a
+// call at their own level is the round's, not a call per element. A loop that
+// takes an element each round, a chain walk and a walk that stops early are not
+// round loops.
+// v315: Python. A library call is classed by its member (v313) also where the
+// library's import root is a directory name of the repository, which made its
+// targets read as internal: a provider tree holding `providers/google/…` kept
+// every `google.cloud.…Client` call dotted and unclassed.
+// v314: Python receivers typed by what the source declares
+// (pythonextractor/returntypes.go). A call on the result of a method of the same
+// class or a function of the same file resolves by its return annotation
+// (`self.get_conn().delete_blob(…)`), and so does a local bound to one, when every
+// binding of the name agrees. A call on an imported module-level name resolves by
+// the annotation or constructor it is declared with (`security_manager.x(…)`).
+// The generated clients of google-cloud and kubernetes, and the SFTP clients of
+// paramiko and asyncssh, are I/O by type. And an in-loop call whose receiver
+// nothing types is recorded as written when its method is I/O by name
+// (`conn.execute`): before, a loop named only the calls that resolved.
+// v313: Python. A call that resolution placed in a library is classed by the
+// member it names (pythonextractor/ioprim.go): `sqlalchemy.orm.Session.execute`,
+// `requests.get` and `os.path.exists` make the function io_direct and are named in
+// io_calls; `Session.delete`, `sqlalchemy.update` and `re.search` are named in
+// pure_calls, which the performance analyzer takes over a reading of the name.
+// v312: a Rails association declared inside `with_options class_name: 'X' do … end`
+// takes that class. It had been derived from the association's own name, which
+// named a class no model has, and the association was dropped as unresolved, along
+// with every `through:` that passes over it. On one application that was the
+// follow, block and mute relationships of its account model.
+// v311: TypeScript I/O that the callee's name does not show. A resolved call on
+// Angular's HttpClient (`this.http.post(…)`, through the declared type of the
+// constructor parameter property) is io_direct and named in io_calls. A call that
+// hands the global fetch to a wrapper (`fetchRetry(fetch, opts)`) is io_direct. And
+// a call on the result of one of the file's own functions resolves by that
+// function's declared return type, where it is a plain class name
+// (`getInstance().delete(x)`).
+// v310: Python. The in-loop call lists are resolved with the calls relations: they
+// were left dotted, so a callee under a source root or behind a re-export never
+// matched a symbol. A call on `self.x` resolves by what the class declares it
+// holds there (an annotation, the constructor or the typed parameter it is
+// assigned from, the return annotation of a property of that name). And the
+// object-store client methods of boto3 and google-cloud-storage are io_direct by
+// name, since they are called on a client no receiver type describes.
+// v309: Kotlin calls on a receiver of declared type are calls edges, as in Java
+// (v307) and C# (v308): a constructor property, a property, a parameter, a typed
+// local, a local constructed with `Type(…)`, an object named by its type. And a
+// supertype written by its simple name is an implements edge to the type it names
+// where this repository declares one; the target used to be the bare name, which
+// matched no fact, so nothing could follow a Kotlin interface to its implementers.
+// v308: C# calls on a receiver of declared type are calls edges, as in Java since
+// v307: a field, a property, a primary-constructor parameter, a parameter, a typed
+// local, `var x = new T()`. The bare method name such a call has always emitted is
+// still emitted; beside it there is now an edge to the method the declared type or
+// one of its base types declares, and the in-loop lists carry that name. A call on
+// a receiver whose type is not written down is unchanged.
+// v307: Java calls on a receiver of declared type are calls edges. The receiver's
+// type is read where the source writes it (a field, a parameter, a typed local,
+// `var x = new T()`, a for-each variable, a capitalised static receiver), and the
+// edge is made when this repository declares the type and it or a supertype
+// declares the method. A call was an edge only on `this` before, so the graph
+// stopped at every injected dependency. The in-loop lists carry the resolved name.
+// A type every method of which is a round trip (Spring Data repository, Feign
+// client, Room DAO) carries io_type, and a call on one that lands on no declaration
+// (an inherited `save`) is named in the caller's io_calls.
+// v306: paging loops in Java. A while or do-while whose body binds a local from a
+// call, loops over that local, and goes round again depending on it (its condition
+// reads it, or an `if` that breaks or returns does) takes its input a page at a
+// time: the loop that drains the page adds no factor, and the fetch, made once per
+// round, leaves calls_in_scaling_loop. The third condition is what keeps an
+// iterator walk that queries per element out. A stream callback is now a loop under
+// the same rules as a statement loop: over what an enclosing loop's element holds it
+// repeats without scaling. And in Go, a call in a block that ends by leaving the
+// innermost loop (a return, a panic, the loop's own break) is made at most once per
+// entry: it leaves calls_in_loop and calls_in_scaling_loop, as a call in the loop's
+// head does.
+// v305: Ruby methods carry scaling_loop_depth, calls_in_scaling_loop and
+// calls_in_scaling_loop_depth. loop_depth already left out a loop over a literal or
+// a constant; what was missing is the nest around each call (a call-in-loop finding
+// took its exponent from the method's deepest nest, wherever the call sat), a loop
+// over what an enclosing loop bound (`list.accounts.each` inside `lists.each` visits
+// each account once, and adds no factor), and the batch iterators: a call made
+// directly in an each_slice / in_groups_of block runs once per batch and is not
+// listed.
+// v304: Go functions carry io_direct, io_calls and performs_io. A body that calls an
+// I/O entry point (by package MEMBER: net/http.Client.Do and not
+// ResponseWriter.Header, xorm Session.Find and not Session.Where) is io_direct and
+// names the call in io_calls; the shared closure carries it on. Three things make a
+// project's own wrappers readable: an interface assertion (`var _ Engine =
+// (*xorm.Session)(nil)`) ties an interface to what implements it; a call on a method
+// promoted from an embedded type is rewritten to the method's declaration, in the
+// calls relation and in the calls_in_loop family, so the edge no longer dangles; and
+// a builder chain of a known query library resolves through to the call that runs
+// it. Two things keep the flag from meaning "everything": a logging, tracing or
+// metrics package is opaque to the closure, and a call made only inside a once.Do
+// (calls_once) is not followed.
+// v303: performs_io is propagated by one shared closure (internal/extractors/ioclosure)
+// in place of seven copies, and it follows a call on an interface method or an
+// abstract method to the implementers' methods of that name. A caller holding an
+// injected interface used to stop there, one hop short of the I/O. Java and Kotlin
+// run it too, over the calls edges they have: their performs_io had been the
+// round-trip method alone.
+// v302: a C-style for is fixed-count only when it both starts and stops at a constant,
+// in C/C++, C# and PHP as in TypeScript and Java since v300. The condition alone used
+// to decide, so `for (i = n - 1; i >= 0; i--)` was read as constant for comparing
+// against a literal: it left scaling_loop_depth and its calls left
+// calls_in_scaling_loop. A loop the analysis had been ignoring is counted again.
+// v301: batch loops in Go and Python. A loop that takes its input a batch at a time
+// (a paging `for {}` / `while`, a stepped range, a call named for chunking) and
+// drains what each round fetched is one pass over the rows: the drain loop adds no
+// scaling depth, and a call made once per round leaves calls_in_scaling_loop, since
+// it is the batched call and not an N+1. A call inside the drain loop is unaffected,
+// and so is a loop that walks a chain or queries per element of a range.
+// v300: loops fixed by name add no scaling depth, as loops over a literal already did.
+// TypeScript, Python and Rust recognise an ALL_CAPS constant as a collection or a
+// bound (Java and Kotlin already did), views of one (`Object.entries(X)`, `X.items()`,
+// `X.iter()`), and in TypeScript and Python a local bound once to a literal and never
+// grown. TypeScript's C-style for is constant against a literal or constant bound,
+// which it never was. Python and Java read an enum (`for s in State`,
+// `State.values()`), and Java a named bound (`i < MAX_ATTEMPTS`).
+// v299: the cross-call hierarchical facts, until now Go's alone, in TypeScript and
+// Python: calls_on_loop_element (a call inside a scaling loop is handed the loop's
+// element) and loops_over_param (a scaling loop walks what a parameter or the
+// receiver holds). Both languages also say WHERE: calls_on_loop_element_arg is the
+// argument position carrying the element, loops_over_param_index the parameter
+// positions walked, -1 for the receiver, so the analyzer can require that the two
+// meet. A callee looping over a different parameter multiplies.
+// v298: calls_in_scaling_loop_depth, a slice parallel to calls_in_scaling_loop giving
+// the deepest scaling nesting each of those calls sits in. scaling_loop_depth is the
+// function's deepest nest anywhere; a call-in-loop finding needs the nesting around
+// the call, and the two differ whenever a deeper nest elsewhere does not contain it.
+// Go, TypeScript, Python, PHP, Kotlin, Java, Rust, C# and C/C++.
+// v297: what a loop draws from is evaluated once, so it is walked outside the loop:
+// a range operand and for-init in Go, the collection of a for..of / foreach / for-each
+// / for-in in TypeScript, PHP, Python, Java, Kotlin and Rust (C# already did). A call
+// there is no longer in calls_in_loop and an iterator there no longer nests. Java's
+// Map.computeIfAbsent lambda, which runs at most once, is no longer a loop.
+// v296: the hierarchical-loop rule, until now Go's alone, in TypeScript, PHP, Python,
+// Kotlin, Rust, Java and C#. A loop over what belongs to the element an enclosing loop
+// is on (`for job of jobs { for need of job.needs }`) visits each child once, so it
+// raises loop_depth and leaves scaling_loop_depth alone; its calls stay N+1 candidates.
+// The collection has to be reached through the element: a member, a method, a
+// subscript or a lookup keyed by it, directly or through a local assigned from it. A
+// call on another receiver that only takes the variable (`xs.slice(i + 1)`) is the
+// all-pairs loop and keeps counting. Java and C# cover statement loops only.
+// v295: recursive_self needs a call written in a form that can reach the enclosing
+// function, not just an edge that names it. Rust: a bare `f()` inside a method is the
+// free function (`drop(x)` in `Drop::drop`), and a parameter named like its method is
+// a value. Kotlin: a call passing an argument by a name the function does not declare
+// (`apply(plugin = …)` inside `apply(target)`) is another function. PHP: `parent::m()`
+// and `$other->m()` are not `$this->m()`. C#: `base.M()` is the parent's. Python: a
+// bare name inside a method is never that method. Edges are unchanged.
+// v294: C/C++ extracts the definitions tree-sitter's error recovery displaced. A
+// function it could not close swallows every later definition into its body; those
+// are now extracted in the enclosing scope, and their calls and decision points no
+// longer count for the function that swallowed them (one 125-line function had
+// reported a cyclomatic complexity of 714). Definitions left under an ERROR node,
+// which were dropped whole, are extracted too; loose declarations and expression
+// fragments in the region are not. A local class's inline methods stay with their
+// function, and a statement recovery misread as a definition named `if` stays a
+// statement.
+// v293: a Go struct's field edges name every declared type its field types mention,
+// through slices, arrays, maps, channels, pointers, generic arguments and function
+// signatures, so a struct used only as `[]T` or `map[K]T` is no longer edge-less.
+// A predeclared type, a type parameter and an unnamed type emit nothing; they used
+// to emit `pkg.string` and `pkg.`. A bare call whose name the package does not
+// declare (a parameter, a closure bound to a local) is no longer recorded as a
+// call to `pkg.<name>`, in the call edges or in the loop-call lists.
+// v292: C/C++ resolves a type name declared in several directories (vendored copies
+// of one header, two modules that each define a Config) per referencing fact: the
+// only copy with the member, else the caller's own directory, else the one copy its
+// includes reach. It used to take whichever declaration was indexed last, for
+// receiver calls, Type::method() calls, base classes and constructors alike. A name
+// no rule can tell apart is left unresolved. Once the directory is known, a type or
+// member inside a namespace is reached by its simple name (a base class `Surface`
+// lands on dir.geo::Surface instead of a dir.Surface nothing declares), and a
+// receiver declared as a reference (`T &x`, `const T &x`) is typed like a pointer
+// or a local, so calls through it are edges.
+// v291: Rust keeps test-local declarations out of production facts, records calls
+// evaluated by tracing::instrument, marks ABI/framework and ctor/divan/starlark
+// registrations, and tags const-local functions as compile-time context. It also
+// recognizes callback values across wildcard imports, shorthand fields and casts,
+// excludes foreign declarations, and classifies attributes structurally.
+// v290: a Go type alias (`type Store = facts.Store`) resolves to the type it names
+// wherever a type is read: a parameter, field, result or literal declared under the
+// alias reaches the methods of the aliased type instead of naming them under the
+// alias, where nothing declares them. A defined type keeps its own name.
+// v289: Go method calls resolve where the source declares the type of what they are
+// called on: a parameter or named result, a variable assigned from a call into this
+// module (one result or several), and a call on a call's result or on a type
+// assertion. These were recorded as the literal "r.Method", or not at all when the
+// callee passed over a call, so a method read as having no callers. A parameter the
+// body declares again under another type resolves to neither.
+// v288: Python function references in parameter defaults and module-level assignment
+// values, plus C++ function references in file-scope static_assert declarations and
+// non-type template defaults, emit edges. Functions reached only through those forms
+// no longer appear dead.
+// v287: Python requests/httpx/aiohttp calls are client routes (python-http-client):
+// module calls through the file's imports and calls on a client instance it binds,
+// with the URL reduced to a path, and the enclosing function as caller.
+//
+// v286: a TypeScript function held by an object literal in a top-level declaration
+// is a symbol, "<dir>.<decl>.<key path>" (object_member), framework_registered when
+// the literal was handed to a call. `x.member()` resolves when x is such a
+// declaration or a name imported from the repository; package imports stay
+// unresolved.
+//
+// v285: a Go route whose handler is a package function (`Home`, or `repo.Home`
+// through the file's imports) carries handler_target, the function's fact name; the
+// http-handler binder binds it to the function symbol of exactly that name.
+//
+// v284: Java and Dart client call sites name their caller. Java reads the walker's
+// owning method (a Feign route names the interface method declaring it); Dart
+// records each function's extent as it emits it, its signature and body being
+// sibling nodes, and assigns callers from those spans.
+//
+// v283: an Angular HttpClient request names its caller, the service member making
+// it. Those requests are emitted repo-wide after the per-file caller pass, so they
+// are attributed where the collector walks the class.
+//
+// v282: a TypeScript call on this.<field>.<method>() names the method of the field's
+// stated type: a constructor parameter property, an annotated field, or a `new` /
+// inject() initializer. It was left unresolved, which hid every call a class makes
+// through the services it is handed.
+//
+// v281: a TypeScript name imported from a package is called by "<package>.<name>",
+// the specifier as written, where it used to fall through to "<dir>.<name>" and name
+// a symbol of the importing module. A framework alias ($lib, ~, @/, #) or a baseUrl
+// path that exactly one repository file ends in resolves to that file's directory. The import-aliases binder resolves such a
+// target to the declaring symbol when a loaded repository declares the package.
+//
+// v280: Kotlin and Swift client call sites name their caller too, through the shared
+// callsite pass the TypeScript extractor now uses. A Retrofit route's caller is the
+// interface method it annotates; a URLSession request's is the method building it.
+//
+// v279: a TypeScript hand-written client call site names the symbol whose body makes
+// it (caller): the innermost function containing the call that the file emitted a
+// symbol for, paired to its node by line through wrapping declarations only. A
+// callback with no symbol credits the enclosing function; module scope and
+// object-literal properties get no caller.
+//
+// v278: a Python route handler defined inside a function (the router-factory
+// pattern) is a symbol, named under its enclosing symbol and tagged route_handler.
+// Its routes carry handler and handled_by, and its body's calls are credited to it
+// instead of to the factory. Other nested defs stay part of their enclosing symbol.
+//
+// v277: server routes name their handler method with handled_by at extraction, for
+// the decorator and annotation frameworks where the method is the one the route sits
+// on: NestJS/Inversify (dir.Class.method), Spring (the handler prop, already the
+// method's symbol name), Python route decorators and @api_view, add_api_route when
+// the file declares the named function, and Symfony Route attributes when the file
+// declares Class::method. Registration-style routes (Go, axum, Django urls.py,
+// Laravel, Play) are unchanged: their handler is the call-site expression.
+//
+// v276: Scala reads capture-checking syntax. The grammar moves from
+// tree-sitter-scala v0.24.1 to v0.26.2, vendored and regenerated at ABI 14 the
+// way the Dart grammar is, because v0.25.0+ ship ABI 15. v0.24.1 had no
+// capture sets: on `() ->{this} Unit`, `T^{C}` or `class Box[T, C^]` its error
+// recovery re-synced past the set, so methods vanished, a class's members were
+// hoisted to the enclosing object and whole objects' members to package scope,
+// all under `parse_errors: 0`. Measured on a capture-checked Scala 3 codebase
+// of 318 files: 33 parsed with errors before and none after, 94 symbols move
+// to their correct owner and 19 that were dropped reappear, and the dependency
+// facts are unchanged.
+// v275: Python router mounts follow the application layout FastAPI documents.
+// A relative from-import binds a submodule (`from .internal import admin`) to its
+// module path, so `admin.router` resolves to its group and its include_router
+// prefix applies; dots past the first climb packages (`from ..deps import f`
+// had resolved one package too shallow, leaving the reference dangling). A
+// computed include_router or APIRouter prefix (`settings.API_V1_STR`,
+// `API + "/v1"`) resolves through the v274 constant table, including a class
+// default read through a module-level instance (`settings = Settings()`). A
+// module-level `router = build_router()` names its factory's router, and a
+// router defined in a package __init__ resolves from `pkg.router`, including one
+// imported relatively (`from . import explore`). A router built from an APIRouter
+// subclass the repository declares (`UserAPIRouter(prefix=...)`) is a router. A
+// route registered on "" is named "/" when no mount composes onto it.
+// v274: Python reads the FastAPI/Starlette route forms beyond `@router.get("/x")`:
+// @x.api_route (verbs from methods=, default GET), @x.websocket/@x.websocket_route
+// (GET, protocol=websocket), add_api_route/add_route and their websocket forms
+// (module level and in controller methods, `self.router` keyed to its class), and
+// route-decorated defs under a module-level if/try. A path held in a constant, an
+// f-string or a `+` concatenation resolves repo-wide against module- and class-level
+// string constants, through imports; a route whose path does not resolve is dropped,
+// never emitted half-known. The engine also keeps a build/, tmp/ or dist/ directory
+// that holds an __init__.py: it is a Python package, not build output.
+// v273: the hierarchical rule crosses call boundaries. Go records, per in-loop call,
+// whether the callee is handed an element of the caller's loop (calls_on_loop_element)
+// and, per function, whether its own loops walk something a caller passed it
+// (loops_over_param). `for _, x := range xs { g(x) }` where g loops over what it
+// received visits each element of each x once across the whole nest, so the callee is
+// finishing the caller's walk rather than running one per element, and its depth no
+// longer compounds. Both halves are required: passing the element proves nothing when
+// the callee loops over package state, and looping over a parameter proves nothing
+// when the caller passes something else.
+//
+// A value computed from the element counts as the element (`rel := norm(f); use(rel)`),
+// or the rule would only ever fire on a bare loop variable, which is the minority of
+// call sites. That taint also reaches the LOCAL hierarchical rule, which is why nested
+// loops over derived collections stopped counting too.
+//
+// On this repository the high tier fell from 250 to 103. A second labeled sample, ten
+// of the 170 findings that stopped being high, was read to check the direction: all
+// ten were over-counts (internal/perf/testdata/high_tier_labels.jsonl, sample
+// "removed"). The two paths that compute effective depth had to be changed together;
+// they answer the same question, once memoised per name and once recomputed per fact.
+//
+// v272: Go's scaling_loop_depth gains three bounded-loop rules, so nesting that
+// cannot grow with the input stops entering the Big-O exponent. A loop with a literal
+// trip count (`for d := 1; d <= 10; d++`), a loop that advances an index its enclosing
+// loop already advances (one scan of a buffer, not a scan per byte), and a range over
+// a collection rebuilt from a composite literal on every iteration (at most a couple
+// of entries, however large the graph) are each proved constant syntactically.
+//
+// The hierarchical discount that already existed had to be split from the new ones:
+// reaching a collection through an outer loop's variable cancels a factor only when
+// the outer loop contributed one, so under a constant outer it must not apply, or a
+// plain walk reads as O(1). A hierarchical loop still passes the hierarchy on.
+//
+// Measured on this repository: a hand-labeled sample of 35 of its 250 high findings
+// held 3 that scale and 32 that count a loop which cannot
+// (internal/perf/testdata/high_tier_labels.jsonl). Every rule fails closed, so a loop
+// it cannot prove bounded keeps counting.
+//
+// v271: Go records a function used as a VALUE. analyzeBody walked bodies for CallExpr
+// only, so `"go.mod": readGoMod` in a dispatch table and `rc.lock(f, "yarn.lock",
+// yarnLock)` as an argument left the callee with no incoming edge; package-level var
+// and const initializers were not walked at all, so `var repoRoot = findRepoRoot()`
+// was invisible too. Both read as dead code at HIGH confidence — the tier documented
+// as the safest to delete. On enola itself, 23 of 27 first-party high-confidence
+// findings were one of these two shapes, every one false. Package-level references
+// hang on the package fact, because the table holding them is usually an unexported
+// var with no symbol of its own. Resolution stays narrow (a bare identifier naming
+// this package's own top-level function) and a redeclared name suppresses the edge,
+// so a shadow costs a reference rather than inventing one.
 // cacheVersion is mixed into every cache key. Bump it whenever the fact schema or
 // an extractor's output format changes in a way that invalidates stored facts.
 // v2: Swift URLSession extractor precision (file-URL exclusion, interpolation fix).
@@ -386,7 +743,7 @@ import (
 // genuine DB/network round-trips — every method of a @FeignClient interface or a
 // Spring Data repository interface (extends JpaRepository/CrudRepository/…), any
 // @Query/@Modifying/@Procedure method, and Room ops inside a @Dao interface. This
-// populates enola-enterprise's isExpensiveJvmCall I/O index, which was empty on
+// populates the performance analyzer's isExpensiveJvmCall I/O index, which was empty on
 // pure-Java Spring/JPA repos (v57 wired the prop for Kotlin only), so a per-iteration
 // repository call now ranks a confirmed N+1 `high` instead of a keyword guess. The
 // seed is deliberately type-level and never keys off a bare HTTP verb (@GET/@GetMapping),
@@ -2415,7 +2772,494 @@ import (
 // inside the URL. The separator is now the last `@` before the range's protocol
 // colon, and a spec is unquoted per entry, since a multi-spec header quotes the
 // whole list and the comma split leaves each end with a lone quote.
-const cacheVersion = "v265"
+// v266: TypeScript reads requests made through in-house clients the config declares
+// (clients:, internal/clientspec). `this.<member>.<method>(…)` on a member whose
+// declared type a spec names becomes a client route: its path folded through the
+// enclosing class's own fields and single-assigned locals, its verb read from an
+// options object, its service name kept as a target hint. The declared clients enter
+// the extractor's cache key, so editing them re-extracts.
+// v267: TypeScript accounts for each declared in-house client per repository: one
+// extraction fact per client (typescript:client:<name>) with its receivers, the calls
+// made through it, the routes they became and the calls skipped by cause. Emitted even
+// when a client found nothing, so a client that matches nothing anywhere is reported.
+// v268: a Go package's own top-level function shadows the predeclared identifier of
+// the same name, so `min(a, b)` in a package declaring min resolves to that function
+// instead of being dropped as a builtin. Repositories predating Go 1.21 carry their
+// own min/max helpers, and with no incoming edge the dead-code analyzer reported them
+// at high confidence while they were called. Also adds `benches` to the shared
+// test-path segments (Cargo builds it as bench targets), which the TypeScript
+// extractor consults.
+// v269: TypeScript path aliases follow relative tsconfig extends chains, preserving
+// child-over-parent replacement and resolving each paths target relative to the file
+// that declared it. JSONC comments and trailing commas are accepted as TypeScript does.
+// v270: SvelteKit reads literal kit.alias fallbacks before generated config exists,
+// keeps tsconfig paths authoritative, and classifies $app/$env/$service-worker imports
+// as framework-provided rather than unresolved third-party dependencies.
+// v319: Python callable fallback/configuration references, package test imports;
+// documentation symbols no longer enter the dead-code candidate population.
+// Fallback, metadata and literal reflection uses carry names edges, not calls;
+// orphan detection sees them while call coupling excludes them.
+// v320: the Swift, Scala (Play routes), Dart (pubspec), Kotlin and JVM line readers have no
+// line-length limit. A line over the old limit (1 MB, or bufio's 64 KB default) ended the
+// scan silently and dropped everything after it in that file.
+// v321: a repository whose leading language is plain JavaScript is detected by the
+// TypeScript extractor without a tsconfig, a framework dependency or a package.json.
+// v322: JavaScript declarations inside a function the file calls at once (the wrapper a
+// script for a <script> tag is written in, and a universal-module factory) are the
+// file's symbols; they were read as that function's locals and emitted nothing.
+// v323: a wrapper function's plain variables are not symbols, and a function passed to a
+// wrapper (a universal-module factory) is no longer read; a variable whose value is a
+// function expression is a function, in a wrapper or a module.
+// v324: a declaration a JavaScript wrapper hands out (the object or value it returns, a
+// property of the global object or of the CommonJS module) is exported; a plain variable
+// handed out that way is kept.
+// v325: a Laravel route's handler names its controller by fully-qualified class, through
+// the routes file's imports, Route::namespace and Route::controller groups, and the
+// controller namespace; invokable controllers are handlers; the route carries
+// handled_by to the method's declaration, on a parent class or trait when inherited.
+// v326: PHP emits a model storage fact for each concrete Eloquent model (a class that
+// reaches an Eloquent base class through its parents), with the table it declares or the
+// one Eloquent derives, and an association fact per relation method.
+// v327: a PHP instance call whose receiver type the source declares ($this, a typed or
+// constructor-assigned property of $this, a typed parameter) gains a calls edge to the
+// declared method, beside its bare name; an interface receiver also reaches its only
+// implementer.
+// v328: every PHP file under a routes directory is read for Laravel routes, not only the
+// skeleton's four names; the action array ['uses' => 'Ctrl@method', 'as' => 'name'] names
+// the handler and the route; a call on an object created in place ((new A)->run()) gains
+// its resolved calls edge, and so does a framework method called on an Eloquent model.
+// v329: a PHP class name no import covers resolves relative to its namespace, for a
+// parent, an interface, a trait, a static call and a `new`; a class gains an injects
+// edge to each class its constructor takes.
+// v330: a PHP class named without being called (Foo::class, a class constant or enum
+// case, a static property) is a names reference: from the method, from the class for
+// what its body states outside a method, and from a file-reference fact for file scope.
+// v331: a Laravel resource registers only the actions ->only / ->except leave it, names
+// each parameter after the singular of its segment, nests on a dot and takes a path
+// prefix on a slash; update answers to PUT and PATCH; Route::resources and apiResources
+// are read.
+// v332: a Laravel routes file is registered under the scopes of whatever loads it: a
+// group handed the file, withRouting (the api file under apiPrefix), or a require inside
+// a group's closure. Its routes carry that prefix, once per place that loads it.
+// v333: a Go function, method or type and a Python function, method or class carry a
+// doc prop, the first paragraph of the comment or docstring written on it.
+// v334: a Go route registered through a verb that takes middleware before its handler
+// (`m.Post("/login", bind(form), SignInPost)`) names the last argument as the handler,
+// not the first.
+// v335: a Go route registered inside a mount's function literal carries the mount's
+// path: chi's Route("/api", func(r chi.Router) {...}), and a Group("/user", func() {...})
+// whose literal registers on the receiver. A local closure that registers routes
+// registers them where it is called, under each mount it is called in.
+// v336: a Go file that registers routes through the module's own router package (one
+// that imports a router framework and declares its verbs) is read in that framework;
+// Combo("/p").Get(h).Post(mw, h) is one route per verb; a router one function builds
+// and another attaches with Mount("/api/v1", pkg.Routes()) is served under that path;
+// a chi verb with a path and no handler is not a route.
+// v337: a Rails route's handled_by names a declared symbol or is not emitted. The
+// handler is looked for inside the namespace its engine isolates, on the ancestors
+// of its controller when the action is inherited, and under the one class whose name
+// differs only in casing (an acronym inflection). A singular resource is bound to the
+// pluralized controller when that controller is declared.
+// v338: a call-registered server route (Express, Fastify, Hono, Koa) names its
+// handler, the last argument or the function a wrapper around it is given, and is
+// bound to it when it is a function the file declares or imports. A router that
+// reaches its mount through a barrel (`export * from`, `export { r } from`) composes,
+// and so does a mount whose prefix appends a string constant.
+// v339: an axum or utoipa route is bound to its handler: a bare name to the function
+// of the route's file, or the only one of that name in the crate, and a path to the
+// function in the module the path ends in. A router built inside a #[cfg(test)]
+// module is not a route.
+// v340: Go routes on a path group, g.MatchPath("GET,HEAD", "/<name:*>", mw, h) under
+// m.PathGroup("/p/*", func ...), are read, one per method. A group or mount path
+// held in a string constant or a local string variable is read as written there. A
+// verb's pattern with no leading slash gets one when it is written on the router
+// itself. A path written as a raw string no longer keeps its backticks.
+// v341: a module's own router package that imports no framework is recognized by its
+// verbs (three of Get/Post/Put/Delete/Patch taking a pattern and handlers), and the
+// files that import it are read chi-style, on known routers only: a parameter or a
+// struct field of one of its router types, a group literal's parameter, a variable
+// assigned from one. A handler written `wrap(h.M)` names h.M, and a method value on
+// the enclosing method's receiver resolves to that method.
+// v342: a Nuxt or SvelteKit page route is bound to the component its file declares,
+// and a SvelteKit page also to the load in the +page.server or +page file beside it.
+// v343: a Ruby call is resolved to the method it reaches where one declared method
+// fits: a call on self to the caller's class or the ancestor declaring it, a constant
+// from the caller's namespace outward, and `Const.new.call` / `new(...).call` /
+// `new.call` to the instance method of the class built.
+// v344: a static call on one of a Laravel application's own facades is resolved to the
+// method of the class its key is bound to in a service provider, by bind/singleton or
+// a $bindings/$singletons array entry.
+// v345: a TypeScript call on a namespace import of this repository's module,
+// `import * as api from '$lib/api'; api.get()`, is a call of the enclosing function
+// to "<moduleDir>.get"; it was only a file-level reference.
+// v346: a TypeScript method call on a local built with `new C(...)`, or on a local or
+// parameter annotated with a class, names C's method when C is imported or declared
+// in the file.
+// v347: a function a command-line command runs carries a `command` prop, "<program>
+// <name>": Go string-keyed dispatch on an argument (nested dispatch as subcommands),
+// cobra and urfave/cli command literals, and Python click and typer `.command()`.
+// v348: an MCP tool's handler carries a `tool` prop and framework_registered. In Go a
+// handler passed to AddTool as a literal is given a symbol "<pkg>.tool:<name>" with the
+// literal's calls; in Python a function under @x.tool(...) or an imported @tool(...).
+// v349: TypeScript and Ruby symbols carry a `doc` prop: a JSDoc block or a run of `//`
+// lines above a TypeScript declaration or its export, and a run of `#` lines above a
+// Ruby def, class or module, each up to its first tag and without tool directives.
+// v350: Java, C# and PHP symbols carry a `doc` prop: a Javadoc or PHP docblock up
+// to its first tag, the <summary> of a C# `///` XML comment, or a run of line comments
+// above the declaration and its annotations or attributes.
+// v351: a doc is made valid UTF-8 before it is stored, so a comment in another
+// encoding is written the same on a cold run and from the cache.
+// v352: Drizzle queries, TS interface I/O closure (io_members), NestJS literal global prefix, Dart retrofit methods are I/O.
+// v353: a TypeScript call that is I/O by its method name alone (findOne, findMany) and
+// resolves into a package that is not an ORM is not I/O.
+// v354: a TypeScript setter carries accessor "set". Beside a getter of the same name
+// its I/O is its own: reading the property no longer performs the setter's I/O.
+// v355: a Ruby singleton call resolved to the ancestor that declares it still couples
+// the caller's module to the module of the class the code names.
+// v356: a Python parameter, local or attribute annotation names one type or none: a
+// forward reference without its quotes, Optional/Union/type/Annotated unwrapped, and
+// any other generic as its base, so List[X] no longer credits X with list methods.
+// v357: a click command is named by the path of groups it is reached through: a
+// group by its declared name, nested groups and add_command attachments followed
+// across files, and add_command's name= over the command's own.
+// v358: a go_router route's handler is the screen its builder builds, read through
+// wrappers that pass it on as `child:` and through a block body with one return.
+// v359: a concatenated Go route path is known when every part is (literals, string
+// constants, local strings): "/v1"+"/items" is /v1/items, not /items, and a route
+// whose path has a part computed at run time is not emitted under the readable part.
+// v360: a .svelte or .vue component script resolves a call on a namespace import of
+// the repository, or on a module-level object, as an ordinary file does.
+// v361: a SvelteKit form action is a POST route of type "action" at its page's path
+// (`?/<name>` for a named one), handled by the action.
+// v362: a Next.js page route is handled by its component, and an App Router route.ts
+// is one route per HTTP verb it exports, each handled by that function.
+// v363: a TypeScript MCP tool's handler carries a `tool` prop and framework_registered:
+// an inline handler of .tool, .registerTool or a register…Tool wrapper is given a
+// symbol "<dir>.tool:<name>" with its calls, in a file that imports an MCP library.
+// v364: Python commands declared with argparse (add_parser + set_defaults(func=)) or
+// in a command table (name= and func=, grouped by name= and subcommands=) carry a
+// `command` prop on their handler, in a file that imports argparse.
+// v365: a Go route handler that is a method value on a local whose type a struct
+// literal states (`r := artifactRoutes{...}`; `m.Put(p, r.upload)`) names that
+// type's method as its handler_target.
+// v366: a root click group is named by the pyproject console script that runs it,
+// pointing at the group or at a function that calls it.
+// v367: a capitalized bare Kotlin call is also a calls edge where the repository
+// declares a function under the name it would have (a Compose function call).
+// v368: a TypeScript file in a workspace package that is a Next.js app (its own
+// package.json or next.config declares it) is read as Next.js, though the
+// repository's root package is not one. A page that re-exports its screen
+// (`export { default } from "..."`) is handled by that module's default export, and a
+// test path is no Pages Router route.
+// v369: an inline ASP.NET Core minimal-API handler (a lambda or anonymous method) is
+// given a symbol "<dir>.<Type>.handler:<VERB>:<line>" with its calls, and handles its route.
+// v370: a console script whose target its module only imports is followed through
+// that import, so the root click group it runs is named by the script.
+// v371: an http4s route's case clause body is given a symbol
+// "<dir>.<Type>.handler:<VERB>:<line>" that owns its calls, and handles the route.
+// v372: a pekko-http route's handler block (the block its path directive wraps, or
+// the one a conjoined (path & verb) is applied to) is given a symbol
+// "<dir>.<Type>.handler:<line>" that owns its calls, and handles the route.
+// v373: Scalatra routes, verb("/path")(action) statements of a class, trait or
+// object body in a repository that depends on Scalatra, each handled by a symbol
+// "<dir>.<Type>.handler:<VERB>:<line>" that owns the action's calls.
+// v374: a WordPress hook registration is handled by the function or Class::method
+// its string callback names.
+// v375: a WordPress array callback (array( $this, 'm' ), [ Foo::class, 'm' ], ...)
+// and a REST route's 'callback' option name their method, and bind to it.
+// v376: a WordPress hook fact is of route type "hook", and a hook point (do_action,
+// apply_filters) is role client, the firing side; hooks are kept out of HTTP matching.
+// v377: a minimal-API handler named by a local function of the registering method
+// is given one symbol "<dir>.<Type>.<Method>.<Function>" with its calls, for every
+// route it serves.
+// v378: a Go router held in a local variable and mounted, r.Mount("/api", api),
+// serves its routes under the mount path wherever the Mount sits in the function.
+// v379: a Next.js package under a directory of examples, samples or demos
+// (examples/with-nextjs, example-apps/) is no Next.js app of the repository.
+// v380: a Go module fact carries doc, its package comment (doc.go first).
+// v381: a Python module fact carries doc, its __init__.py module docstring.
+// v382: a Java module fact carries doc, the Javadoc of its package-info.java.
+// v383: a TypeScript module fact carries doc, the file-level JSDoc block of its index file.
+// v384: Rust symbols carry doc from `///` and `/** */`, and Rust modules from `//!`.
+// v385: Kotlin symbols carry doc, their KDoc or `//` run.
+// v386: Scala symbols carry doc, their Scaladoc or `//` run.
+// v387: Swift symbols carry doc, their `///` lines or `/** */` block.
+// v388: Dart symbols carry doc, their `///` lines or `/** */` block.
+// v389: C and C++ symbols carry doc, their Doxygen block or line-comment run; a
+// definition's own doc wins over its prototype's.
+// v390: a symbol or module whose comment says more than its doc carries the whole
+// text in doc_text, which the engine moves to the store's side table.
+// v391: the module-edges binder stops guessing when one symbol name is declared
+// in two production modules of one repository. This channel's, from finding
+// 0025; upstream has no such entry. The caller of a rolled-up relation is now
+// the module of the file that declares it rather than the module that won the
+// name's placement, so a call made from the losing declaration is no longer
+// credited to the winner, and a target the repository declares in two
+// production modules derives no edge at all, counted as unresolved under
+// ambiguous_declaring_module. Module edges move on any repository where a name
+// is shadowed; readings that walk them (cycles, depth, coupling, layers) move
+// with them.
+// It was v266 here until the align to 0.4.22, whose own entries spent v266
+// through v271 first, and v272 until the align to 0.4.26, whose entries spent
+// v272 through v287, and v288 until the align to 0.4.28, whose entries spent
+// v288 through v318, and v319 until the align to 0.4.32, whose entries spent
+// v319 through v390, so each time it took the next free number above upstream's
+// and this channel's later entries moved with it (v319 through v353 became v391
+// through v425).
+// v392: Rust calls resolve by path and by written receiver in one crate-wide pass
+// over per-file records, from crate roots Cargo builds; the same-directory guess and
+// the bare call landing on a sibling method are gone. Every calls relation is counted
+// once on a rust:calls extraction fact, resolved or under one named cause, and a
+// target whose fact name several files declare keeps its bare leaf. Loop call lists
+// and recursion are read from final targets. Calls targets move on every Rust
+// repository and one extraction fact is added; imports and dependency facts are
+// unchanged.
+// v393: A Rust `use` leaf lands on what it names, read by the same crate-wide pass.
+// An item lands on its fact and carries the file that declares it (target_file); a
+// module lands on the directory holding its file; an item with no fact lands on its
+// file's directory; external leaves keep their target. A leaf that also binds a
+// module the pass cannot place, or that names a type and a value of two
+// declarations, is refused; a use binds a name only in the namespaces it names, so a
+// glob beside it may fill the others, and a function an item macro declares leaves
+// the type namespace to a module of the name. Every reader that walks an imports target to
+// a module reads the carried file first, so item imports reach the module that
+// declares them. A leaf the pass does not place keeps a walk read from the module
+// tree: crate:: from the crate root Cargo names (so a root build.rs no longer sends
+// them to "."), or from the nearest crate root for a file no root reaches, and
+// self:: or super:: from the module the leaf is written in, a test module included.
+// Every internal leaf
+// is counted on a rust:imports extraction fact, each refused call is counted by
+// cause on the fact that made it (unresolved_calls), and a call to a name several
+// files declare becomes a dependency fact carrying the chosen file. A resolved call
+// whose name the chosen file does not declare (a function nested in a method body)
+// is refused rather than linked to another file's fact. Imports, module edges and
+// every reading over them move on Rust repositories.
+// v394: Go facts read from a node carry its span: end_line, and the start and end
+// columns, beside the line they already had (symbols, interface methods, exported
+// consts and vars, imports, routes, client calls, storage and topics). No fact's
+// identity or relations move, and evidence citing a Go fact carries the span with it.
+// The reference-only pass over _test.go files also emits one test_case per function
+// go test runs, which is outside this cache and listed here because it lands with it.
+// v395: Python symbols (functions, methods, classes), imports and the storage a
+// model's class or a __tablename__ statement declares carry their node's span, the
+// same one CPython's ast reports (a decorator is outside it). Routes read from
+// decorator or urlpatterns text keep their start line. A *_test.py module the test
+// globs leave to production also yields a test_case per test pytest collects, beside
+// its symbols; the reference-only pass does the same for tests/ and test_*.py.
+// v396: Ruby test files name their tests: RSpec examples by the full description
+// rspec prints, minitest methods and Rails test blocks by Class#method. A label built
+// at run time (interpolation, an it with no description, an escape) gets no fact and
+// is counted on a ruby:test_cases coverage fact. Ruby spans are unchanged; the pass
+// is outside this cache and the version moves because what the extractor emits did.
+// v397: TypeScript and JavaScript symbols (functions, arrow-function constants,
+// classes and their members) and imports carry their node's span; an exported
+// declaration starts at its keyword. Tests written with describe, it and test (and
+// mocha's context, suite and specify, Playwright's test.describe) become test_case
+// facts named by jest's full name, in .test.* and .spec.* files and under
+// __tests__; a colocated test file the globs leave to production names its tests
+// beside its facts without making its directory a module. A table (.each), a label
+// that is not a literal and the tests under a DSL member the reader does not know are
+// counted on typescript:test_cases and typescript:colocated_test_cases.
+// v398: Java classes, methods, fields and imports carry their node's span (a method
+// from its first annotation, as a Java parser's range starts). A method JUnit 4 or 5
+// runs (@Test, @ParameterizedTest, @RepeatedTest, @TestFactory, @TestTemplate), and a
+// public no-argument test* method of a TestCase subclass, which JUnit 3's rule runs
+// unannotated, gets a test_case beside the symbol already emitted for it, named
+// package.Class.method. Test cases are appended after the walk (finding 0034).
+// v399: Kotlin classes, objects, functions, properties, type aliases and imports
+// carry their node's span. A function JUnit runs gets a test_case beside its symbol,
+// named package.Class.function without backticks; a Kotest FunSpec's root test and a
+// StringSpec's test are named by their label. A templated label and a test under a
+// context are counted on kotlin:test_cases, each under its own cause.
+// v400: Scala definitions and imports carry their node's span. The reference-only
+// pass over src/test names ScalaTest's and MUnit's tests registered with a literal
+// label: test("label") by the label, and a FunSpec it under describe by the describe
+// texts and its own joined with spaces. An interpolated label, an escape or a label
+// expression is counted on scala:test_cases.
+// v401: C# type, member and using declarations carry their node's span. The
+// reference-only pass names the methods xUnit, NUnit and MSTest select by attribute,
+// by the fully qualified name the test platform filters on (nested types joined
+// with +); a theory or a test case with rows is one method. A test project the globs
+// leave to production (Google.Protobuf.Test) names its tests beside its symbols.
+// v402: PHP classes, functions, methods, constants, enum cases, properties and uses
+// carry their node's span. A PHPUnit test (a public test* method, or one marked
+// #[Test] or @test, in a TestCase subclass) gets a test_case beside its symbol named
+// Class::method; Pest's top-level test() and it() are named by their description,
+// and a label that is not a literal is counted on php:test_cases.
+// v403: Swift types, protocols, extensions, functions, properties, type aliases and
+// imports carry their node's span. XCTest's test*() method of a class inheriting a
+// *TestCase and swift-testing's @Test function get a test_case beside their symbol,
+// named as swift test list prints them (Target.Type/method; function() for
+// swift-testing), the target read from the Tests/<Target>/ directory.
+// v404: Dart classes, members, enums, typedefs, extensions and imports carry their
+// node's span; a function or method runs from its signature to its body, which
+// the grammar makes a sibling. The reference-only pass names package:test's and
+// flutter_test's test, testWidgets and group registrations by their descriptions
+// joined with spaces; a $ substitution or an escape is counted on dart:test_cases.
+// v405: C and C++ classes, enums, functions, fields, declarations, variables and
+// aliases carry their node's span. In a file that reaches GoogleTest's or
+// Catch2's header through its includes, directly or through the project's own
+// headers, or a header such a file includes, TEST and TEST_F become test_case
+// facts named Suite.Name and Catch2's TEST_CASE by its literal name, read at file
+// scope, in namespaces, in every preprocessor branch but #if 0 and inside a
+// stretch the grammar could not parse, each spanning its macro to its body's
+// brace; TEST_P and the typed tests are counted on cpp:test_cases as
+// instantiated_name, since their instantiation builds the name.
+// v406: A Python test defined twice under one name in a module or class, and a
+// minitest method defined twice in a class body, give one test_case, from the
+// later definition: the one the module or class holds when its runner reads it.
+// A Python class rebound by a class of the same name that subclasses it keeps
+// its tests, which run under that name, less those the subclass redefines.
+// v407: A Terraform block's line is the line of its keyword. The block patterns
+// open with (?m)^\s*, which runs across line breaks, so a block after a blank
+// line was recorded on the blank line above it (finding 0035).
+// v408: Terraform blocks and their module dependencies carry their span, keyword
+// to closing brace; a locals entry, whose value the scanner does not read to its
+// end, carries none. Proto services and messages span keyword to closing brace,
+// an rpc and the route it serves to its semicolon or its options' closing brace.
+// A markdown document spans its text and a section the text it heads, to the
+// next heading of its level or higher, less trailing blank lines.
+// v409: Rust items, use and extern crate dependencies, and Axum and utoipa routes
+// carry their node's span. A function under #[test] or another attribute the
+// test_ref pass accepts becomes a test_case named as cargo test lists it: the
+// module path from its target's crate root, through the file's inline modules,
+// to the function. A test in a file whose place in a module tree is unknown, and
+// a #[test_case] or #[rstest] function, whose cases build its names, are counted
+// on rust:test_cases; the file's test_ref is unchanged.
+// v410: A Ruby or TypeScript client call whose URL is an absolute http(s) literal
+// with a host written out is no longer dropped: it yields the client route its path
+// would, the root path when the URL has none, with external and the host as
+// written, the rule the Go, Scala, Swift and Kotlin extractors already follow. A
+// host holding an interpolation still yields nothing and is counted as
+// host-interpolated, on ruby:http-client and on a new typescript:http-client fact
+// that also counts the hosts read.
+// v411: A Ruby job's queue becomes a topic fact where the class states it: a
+// queue_as, or a sidekiq_options carrying queue:, directly in a class body, whose
+// queue is a symbol or a string with no interpolation, yields one storage fact named
+// for the queue with storage_kind topic, messaging_role consumer, messaging activejob
+// or sidekiq, source ruby-job-queue and the class as code_symbol, whatever the
+// class's rails_component. No queue is implied: a block, a method, a constant, an
+// interpolation, a declaration outside a class body and a job class that declares
+// nothing of its own yield nothing and are counted on a ruby:job-queues fact.
+// v412: The v338 reading of an absolute URL refuses two shapes that are not calls.
+// Measured with v338 over the corpus, 3 of 36 external routes named no call: two
+// Ruby doc-comment lines and one TypeScript test-data object holding a url beside a
+// body. An absolute URL on a comment line (Ruby #, TypeScript //, /* or *) is not
+// read or counted, and the options-object passes read one only from an object that
+// states a verb. Relative paths keep the reading they had.
+// v413: A page anchor may carry symbol:, a fact name in the anchored file. Its
+// anchor fact is named with the symbol after the path and carries it as a prop,
+// beside the same repo-qualified file relation a file anchor has; an anchor
+// without one compiles exactly as before, and a symbol on the directory form
+// fails the block.
+// v414: A Ruby method reads or writes the table of an ActiveRecord model where a
+// call to a verb of three closed lists names the model exactly: its class written
+// as the receiver, no receiver inside the model's own class, or an association
+// that class itself declares. Each is a reads or writes relation from the method
+// to the model's storage fact, both for find_or_create_by and its kin; the write
+// list is the cqrs recipe's. Every other call to a verb emits nothing and is
+// counted by cause on a ruby:access fact, which a repository declaring no model
+// does not get. calls edges are unchanged.
+// v415: KiCad 6 to 10 projects are read, board first. A board and each sheet file
+// of its schematic tree are modules, the tree drawn as dependencies with an
+// imports edge; a footprint is a part and a net reaching a pad is a net, both
+// symbols, a part depending on each net its pads reach and declaring the sheet
+// its UUID path names, or the board when it has no path. A reference footprints
+// share is suffixed with each one's UUID. Power symbols mark rails, the project
+// file's class lists and patterns mark net classes. A file outside format
+// versions 20211014 to 20260306, or unparsable, emits nothing, and what was not
+// read or placed is counted on the kicad:* extraction facts. A repository with no
+// board or sheet runs nothing.
+// v416: A calls or instantiates relation written by a Ruby fact (its language, or
+// for a provider fact with none its .rb, .rake or .ru file or Rakefile) keeps its
+// target_id only when the fact the name lookup found is a symbol or an association.
+// A bare call named config, tags or / found the config/ directory, the tags table
+// or the root route by name alone, and wrote that as the call's resolution. The
+// id is only ever dropped, never added or moved; relation text, kinds and order,
+// every other language and every other relation kind are unchanged.
+// v417: A Java method or class keeps every calls, instantiates and injects
+// relation its walk records. The walker held a pointer to the fact it was
+// building while walking its body appended more facts (a local or nested type, a
+// field, a client route), and an append that grew the slice moved the fact, so
+// every edge recorded afterwards landed on a copy that was never written. Which
+// methods lost their edges depended on how many facts preceded them in the file.
+// No fact is added or removed and no relation changes; relations only return.
+// v418: The same for Kotlin: a function, class, object or property keeps every
+// calls, instantiates and injects relation its walk records. A class's own
+// methods append their facts while the class is walked, so an init block, a
+// property initializer or the supertype's constructor arguments after them lost
+// their edges once the slice grew, as did a function after a local declaration.
+// v419: A calls or instantiates relation, in every language, keeps its target_id
+// onto a fact the name lookup found only when that fact is a symbol or an
+// association, or is in the caller's own repository and is not a service node.
+// In a union a bare call name met same-named facts of other repositories (a
+// Rust default() a Ruby job queue named default) and its own repository's
+// service node, and the allow-only check read either as a landing. The id is
+// only ever dropped; aliases and every other relation kind are unchanged.
+// v420: The Ruby extractor names the files whose tree-sitter tree held an error
+// node, after which its recovery may drop what the file declares, on a
+// ruby:parse extraction fact (files read whole as resolved, the rest under
+// tree_sitter_error_node, listed as parsed_with_errors), and the receipt counts
+// each as a parse error. Before it every receipt read parse_errors: 0 while
+// once-campfire's eleven files with anonymous block forwarding (`def f(&)`)
+// lost 28 of their 50 methods. No symbol, relation or other fact changes.
+// v421: The Ruby grammar is vendored with a patch so anonymous block
+// forwarding parses when whitespace follows the `&` (`}, &` at the end of a
+// line, `&` alone before a closing parenthesis), where v0.23.1's scanner took
+// the `&` for the binary operator and recovery dropped what the file declared
+// after it. Files using it are read whole: their methods, classes, modules and
+// relations return, and they leave ruby:parse's parsed_with_errors. Measured
+// over the 13 Ruby entries, 21 files recover; every other file parses to the
+// same tree.
+// v422: prism is a built-in provider name. An entry named prism with no
+// command, and the every mode's catalogue, read the Rubydex index of the run
+// and write the calls whose receiver is the lexical enclosing class and new on
+// a written constant under the Prism reference script's names, each carrying
+// engine: rubydex, with the receiver Rubydex resolved. The seam pairs no two
+// names of one engine. The script runs only where a config names it with a
+// command; the rubydex name's facts are unchanged.
+// v423: The Ruby extractor reads each migration under db/migrate for what it
+// would do to a live table and records it on the migration's class:
+// migration_version, the tables it creates, the indexes it adds on an existing
+// table without algorithm: :concurrently (counted, with their tables), concurrent
+// indexes in a migration that keeps its DDL transaction, indexes a rollback adds
+// and add_reference indexes counted apart, NOT NULL columns without a default,
+// changed and removed columns, and whether it calls disable_ddl_transaction!; a
+// call continued over lines is read as one statement, and a ruby:migrations
+// extraction fact counts the files read. A db/migrate is read wherever a Rails
+// app root holds it, the repository root or below, and an engine's copied
+// <version>_<name>.<engine>.rb keeps its version. Before it the facts carried every
+// migration call by name and none of its arguments, so no rule could tell a safe
+// index from one that locks writes. No other fact changes.
+// v424: The Ruby extractor reads each Rails app's deploy files and emits a
+// runtime_unit fact (Name <declaring file>::<unit>) per thing they say runs in
+// production: Procfile processes (a Sidekiq process carrying its config's queues
+// and concurrency), Sidekiq configs no process names, periodic schedules in
+// config/schedule.yml, Solid Queue workers and recurring tasks (a recurring: key
+// in queue.yml marked not read when the locked solid_queue is 0.9 or later),
+// whenever's runner, rake and command lines, Kamal roles and accessories with
+// their hosts, railway.toml's start command, a Dockerfile's CMD and fly.toml's
+// processes. Each unit's runs edges name the job classes its entrypoint
+// reaches: a schedule's class, or every class declaring a queue a worker drains,
+// a class naming none on default. ERB and environment values are recorded as
+// unresolved. A ruby:runtime-units extraction fact counts the units. No other
+// fact changes.
+// v425: A Cargo dependency declared with a path (`{ path = "crates/pic" }` or
+// path = under its own table) carries that path as a path prop on its
+// dependency fact, so a crate the repository may hold is told from a package
+// fetched from elsewhere. No other fact changes.
+// v426: A Ruby call on self that a subclass overrides, and a call on a constant
+// that two enclosing scopes could each name (Admin::Search and ::Search from a
+// compact `class Admin::Controller`), keep the name the walker wrote instead of
+// binding to one declaration. Calls targets move on the repositories that have
+// either shape; the benchmark's forbidden bindings are refused.
+// v427: A bare Ruby call binds to the caller's own class only when the method
+// wrote it as a call on self: a name written for a call on another receiver, for
+// `super` or for `self.class.name` (which would bind to the method itself), and the
+// bare `new`, keep the name the walker wrote. A Ruby test reference no longer names a
+// call on a new instance "Const#name", which coincided with the name of an
+// association. Calls targets move on Ruby repositories.
+const cacheVersion = "v427"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
@@ -2473,6 +3317,14 @@ type extractorCache struct {
 	entries int   // entries emitted this run
 	werr    error // first write/encode failure; surfaced by save
 	closed  bool  // save or discard has run; further writes are refused
+
+	// mu serialises every entry point. Extractors reach the cache one at a time,
+	// but the provider seam runs its providers concurrently and each writes
+	// through this one spool: a per-file provider's entries and the built-in
+	// Rubydex provider's index interleaved their bytes in the buffered writer,
+	// which panicked a generate and could otherwise save a file that does not
+	// parse.
+	mu sync.Mutex
 }
 
 // buildIdentity identifies the binary that produced a cache entry: the release
@@ -2657,6 +3509,8 @@ func (c *extractorCache) decodeEntries(dec *json.Decoder) error {
 // get returns the cached facts for key (deep-copied from JSON, so the caller may
 // mutate them freely) and carries the original bytes forward to the next save.
 func (c *extractorCache) get(key string) ([]facts.Fact, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	raw, ok := c.prev[key]
 	if !ok {
 		return nil, false
@@ -2695,6 +3549,8 @@ func (c *extractorCache) get(key string) ([]facts.Fact, bool) {
 // that is about to replace the entry under the same key: carrying it forward and
 // then writing the replacement would put the key in the spool twice.
 func (c *extractorCache) peek(key string) ([]facts.Fact, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	raw, ok := c.prev[key]
 	if !ok {
 		return nil, false
@@ -2722,6 +3578,8 @@ func (p providerCache) Peek(key string) ([]facts.Fact, bool) {
 func (p providerCache) Put(key string, ff []facts.Fact) { p.c.put(p.key(key), ff) }
 
 func (c *extractorCache) put(key string, ff []facts.Fact) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.noPersist || c.closed {
 		return
 	}
@@ -2844,6 +3702,8 @@ func (c *extractorCache) fail(err error) {
 // runs; it simply is not sorted. Sorting would mean holding every entry to the end,
 // which is the thing this exists to stop.
 func (c *extractorCache) save() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.noPersist || c.closed {
 		return nil
 	}
@@ -2879,6 +3739,8 @@ func (c *extractorCache) save() error {
 // that does not reach save — a snapshot that fails during extraction, say — or the
 // temp file survives the process. Safe to call after save, and safe to defer.
 func (c *extractorCache) discard() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.closed {
 		return
 	}
@@ -2944,6 +3806,14 @@ func computeExtractorKeys(all []extractors.Extractor, files []string, hashes map
 		h := sha256.New()
 		h.Write([]byte(cacheVersion + "\x00" + name + "\x00" + sharedHash + "\x00"))
 		h.Write([]byte(hashFileSet(keyFiles[name], hashes)))
+		// Configuration the extractor reads decides its facts as surely as its files
+		// do. Written only when non-empty, so an extractor with nothing configured keys
+		// exactly as before and its existing cache stays valid.
+		if ck, ok := owners[name].(plugin.ConfigKeyed); ok {
+			if k := ck.ConfigKey(); k != "" {
+				h.Write([]byte("\x00config\x00" + k))
+			}
+		}
 		keys[name] = hex.EncodeToString(h.Sum(nil))
 	}
 	return keys

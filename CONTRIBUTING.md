@@ -5,7 +5,7 @@ Thank you for your interest in contributing to enola. Every contribution — cod
 ## Getting started
 
 1. **Fork and clone** the repository.
-2. Make sure you have **Go 1.25+** and a **C compiler** (for tree-sitter bindings).
+2. Make sure you have **Go 1.26+** and a **C compiler** (for tree-sitter bindings).
 3. Build and verify:
 
    ```bash
@@ -46,7 +46,7 @@ Two things follow for a contributor:
   that happens, which is the only reason it is caught.
 - **Nothing else is enforced.** enola fails on what a policy names and nothing more, so
   cycles, god-classes and the rest are reported on your pull request and allowed
-  through. That is deliberate — see [the README](README.md#what-fails-the-build).
+  through. That is deliberate — see [docs/GATING.md](docs/GATING.md#what-fails-the-build).
 
 ## Measuring memory
 

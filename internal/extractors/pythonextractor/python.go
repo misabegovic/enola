@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/extractors/detectnames"
+	"github.com/enola-labs/enola/internal/extractors/ioclosure"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/parallel"
@@ -83,37 +84,27 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 		}
 	}
 
-	// Pass 1: build a global symbol index across all Python files. Each file is
-	// indexed into a local table in parallel, then the tables are merged in file
-	// order so duplicate-module last-write-wins stays deterministic.
-	idx := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool)}
-	localIdxs := parallel.MapFiles(ctx, pyFiles, func(relFile string) *pySymbolIndex {
-		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
-		if err != nil {
-			return nil
-		}
-		local := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool)}
-		buildFileIndex(src, relFile, local)
-		return local
-	})
-	for _, m := range localIdxs {
-		if m == nil {
-			continue
-		}
-		for qualName, info := range m.classes {
-			idx.classes[qualName] = info
-		}
-		for module, defs := range m.moduleDefs {
-			idx.moduleDefs[module] = defs
-		}
-	}
-	finalizeImplMap(idx)
-
-	// Pass 2: extract facts using the populated symbol index (read-only here, so
-	// the per-file work is fully independent and parallel-safe).
+	// One parse per file. Each file emits its facts and, from the SAME tree, the
+	// slice of the symbol index it contributes. There used to be a separate indexing
+	// pass ahead of this one, which read and parsed every file a second time purely
+	// to populate the index; measured on two corpus repositories it was 15-18% of
+	// this extractor's wall time.
+	//
+	// Only one lookup in the walk is genuinely cross-file (the implementor calls of
+	// a receiver's type), so that one is held back per file and answered below once
+	// the index is merged. The other two only ask about the file's own module.
 	type pyFileResult struct {
-		ff   []facts.Fact
-		topo pyRouterTopology
+		ff      []facts.Fact
+		topo    pyRouterTopology
+		idx     *pySymbolIndex
+		pending []pyImplCall
+		pkgDoc  string
+	}
+	// The file modules are known before any file is walked, and a relative import
+	// needs them to tell `from .internal import admin` (a submodule) from a symbol.
+	walkModules := make(map[string]bool, len(pyFiles))
+	for _, f := range pyFiles {
+		walkModules[strings.TrimSuffix(f, ".py")] = true
 	}
 	perFileFacts := parallel.MapFiles(ctx, pyFiles, func(relFile string) pyFileResult {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
@@ -121,18 +112,44 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 			log.Printf("[python-extractor] error reading %s: %v", relFile, err)
 			return pyFileResult{}
 		}
-		ff, topo := extractFileAST(src, relFile, isDjango, isFlask, isFastAPI, idx)
+		ff, topo, local, pending, pkgDoc := extractFileIndexed(src, relFile, isDjango, isFlask, isFastAPI, walkModules)
 		// gRPC client call sites (stub.Method(...)) become client-role routes,
 		// detected from source since generated *_pb2_grpc.py stubs are typically
 		// not committed. Names are provisional (short service) and resolved to the
 		// fully-qualified wire path by the engine before cross-repo linking.
 		ff = append(ff, extractPyGRPCClientFacts(src, relFile)...)
-		return pyFileResult{ff: ff, topo: topo}
+		// A *_test.py module outside the test globs is indexed as production, and
+		// its tests are named beside the symbols already emitted for them.
+		ff = append(ff, pyTestCases(src, relFile)...)
+		return pyFileResult{ff: ff, topo: topo, idx: local, pending: pending, pkgDoc: pkgDoc}
 	})
+
+	// Merge the per-file indices in file order, so duplicate-module last-write-wins
+	// stays deterministic, then answer the held-back lookups against the result.
+	idx := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool), globals: make(map[string]string)}
+	for _, r := range perFileFacts {
+		if r.idx == nil {
+			continue
+		}
+		for qualName, info := range r.idx.classes {
+			idx.classes[qualName] = info
+		}
+		for module, defs := range r.idx.moduleDefs {
+			idx.moduleDefs[module] = defs
+		}
+		for name, typ := range r.idx.globals {
+			idx.globals[name] = typ
+		}
+	}
+	finalizeImplMap(idx)
+	for _, r := range perFileFacts {
+		applyPendingImplementors(r.ff, r.pending, idx)
+	}
 
 	var allFacts []facts.Fact
 	var routerTopos []pyRouterTopology
 	modules := make(map[string]bool)
+	pkgDocs := make(map[string]string)
 	for i, r := range perFileFacts {
 		// Route refs index into the file's own slice; rebase them onto the
 		// repo-wide one now that this file's offset is known.
@@ -140,9 +157,15 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 		for j := range r.topo.routes {
 			r.topo.routes[j].idx += base
 		}
+		for j := range r.topo.paths {
+			r.topo.paths[j].idx += base
+		}
 		allFacts = append(allFacts, r.ff...)
 		routerTopos = append(routerTopos, r.topo)
 		modules[factpath.Dir(pyFiles[i])] = true
+		if r.pkgDoc != "" {
+			pkgDocs[factpath.Dir(pyFiles[i])] = r.pkgDoc
+		}
 	}
 
 	// The packages (dirs with __init__.py) let suffix matching tell a real
@@ -174,93 +197,47 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 	// canonical slash symbol names (dropping stdlib/third-party edges) now that the
 	// full file set is known. Without this, functions reached via absolute imports
 	// have no incoming edge and read as dead code.
-	resolveCallTargets(allFacts, fileModules, pkgDirs)
+	resolveCallTargetsWith(allFacts, fileModules, pkgDirs, idx.globals)
+	// Before resolveImplementsTargets, which consumes the import bindings a console
+	// script's target may have to be followed through.
+	composeCommandNames(allFacts, fileModules, pkgDirs)
 	resolveImplementsTargets(allFacts, fileModules, pkgDirs)
 
 	// Fold FastAPI include_router mount prefixes onto the bare decorator paths, so
 	// a route reads as the path it actually serves ("/api/v1/cognify") rather than
 	// the leaf its router declares ("/"). Runs last among the index-based passes:
 	// it rebuilds the fact slice, invalidating the route indices it consumes.
+	// Resolve routes registered on a computed path (`@router.get(HEALTH_PATH)`) and
+	// computed router prefixes (`prefix=settings.API_V1_STR`) against the
+	// repository's string constants first, so composing joins real prefixes onto
+	// real leaves. Unresolved routes are dropped after composing.
+	consts := newConstResolver(routerTopos, fileModules, pkgDirs, buildReexportIndex(allFacts, pkgDirs))
+	resolveRoutePaths(allFacts, routerTopos, consts)
+	resolveRouterPrefixes(routerTopos, consts)
 	allFacts = composeRouterPrefixes(allFacts, routerTopos, fileModules, pkgDirs)
+	allFacts = dropPendingRoutes(allFacts)
 
 	// Propagate the walk-time io_direct flag transitively across the (now canonical)
 	// call graph into performs_io, so a function that reaches DB/network I/O only through
-	// helpers is still flagged — the signal the enterprise analyzer reads to tell a real
+	// helpers is still flagged — the signal the performance analyzer reads to tell a real
 	// per-iteration I/O call from a name that merely collides with a DB verb.
-	computePyPerformsIO(allFacts)
+	ioclosure.Propagate(allFacts)
 
 	for dir := range modules {
+		props := map[string]any{"language": "python"}
+		if doc := pkgDocs[dir]; doc != "" {
+			facts.SetDocProp(props, doc)
+		}
 		allFacts = append(allFacts, facts.Fact{
-			Kind: facts.KindModule,
-			Name: dir,
-			File: dir,
-			Props: map[string]any{
-				"language": "python",
-			},
+			Kind:  facts.KindModule,
+			Name:  dir,
+			File:  dir,
+			Props: props,
 		})
 	}
 
+	allFacts = append(allFacts, extractConfiguredPythonRefs(ctx, repoPath, files, pyFiles, allFacts)...)
 	return allFacts, nil
-}
-
-// computePyPerformsIO propagates the per-body io_direct flag transitively across the
-// call graph into a performs_io prop, so a function that reaches DB/network/file I/O only
-// through helpers is still flagged. Mirrors computeTSPerformsIO: a monotone fixpoint that
-// only ever flips false→true, so it is cycle-safe. Only edges to known symbol names
-// propagate (unresolved external calls are ignored), so the closure stays within the repo.
-func computePyPerformsIO(allFacts []facts.Fact) {
-	exists := make(map[string]bool)
-	for i := range allFacts {
-		if allFacts[i].Kind == facts.KindSymbol {
-			exists[allFacts[i].Name] = true
-		}
-	}
-
-	io := make(map[string]bool)      // name → performs I/O (directly or transitively)
-	adj := make(map[string][]string) // name → called names that are known symbols
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		if b, _ := f.Props["io_direct"].(bool); b {
-			io[f.Name] = true
-		}
-		seen := make(map[string]bool)
-		for _, r := range f.Relations {
-			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
-				continue
-			}
-			seen[r.Target] = true
-			adj[f.Name] = append(adj[f.Name], r.Target)
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for name, callees := range adj {
-			if io[name] {
-				continue
-			}
-			for _, c := range callees {
-				if io[c] {
-					io[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	for i := range allFacts {
-		f := &allFacts[i]
-		if f.Kind == facts.KindSymbol && io[f.Name] {
-			if f.Props == nil {
-				f.Props = map[string]any{}
-			}
-			f.Props["performs_io"] = true
-		}
-	}
 }
 
 // --- Regex patterns used by the AST walker ---
@@ -273,12 +250,12 @@ var (
 	// `\s*` spans the newline of a multi-line decorator. When method is `route`
 	// (Flask), the HTTP verbs live in a `methods=[...]` kwarg parsed by
 	// routeMethodsListRe below, defaulting to GET.
-	routeDecoratorRe = regexp.MustCompile(`^\s*@([\w.]+)\.(route|get|post|put|delete|patch|head|options)\s*\(\s*(?:path\s*=\s*)?["']([^"']*)["']`)
+	routeDecoratorRe = regexp.MustCompile(`^\s*@([\w.]+)\.(route|api_route|websocket|websocket_route|get|post|put|delete|patch|head|options)\s*\(\s*(?:path\s*=\s*)?["']([^"']*)["']`)
 
 	// routeMethodRe matches a route-method decorator in ANY path form (literal,
 	// path= keyword, or a computed expression), used to tag the handler as a
 	// framework-dispatched entry point even when the path isn't a parseable literal.
-	routeMethodRe = regexp.MustCompile(`^\s*@[\w.]+\.(?:route|get|post|put|delete|patch|head|options)\s*\(`)
+	routeMethodRe = regexp.MustCompile(`^\s*@[\w.]+\.(?:route|api_route|websocket|websocket_route|get|post|put|delete|patch|head|options)\s*\(`)
 
 	// exposeDecoratorRe matches Flask-AppBuilder's @expose("/path", methods=[...]) —
 	// which has no receiver dot, so routeDecoratorRe cannot match it. It is the
@@ -289,7 +266,7 @@ var (
 	// routeMethodsListRe extracts the `methods=[...]` kwarg of a Flask route/expose
 	// decorator. Group: (list body) — the uppercase verbs are then pulled by
 	// httpMethodWordRe, mirroring @api_view.
-	routeMethodsListRe = regexp.MustCompile(`methods\s*=\s*\[([^\]]+)\]`)
+	routeMethodsListRe = regexp.MustCompile(`methods\s*=\s*[\[({]([^\])}]+)[\])}]`)
 
 	// tableNameRe matches SQLAlchemy __tablename__ assignments. Group: (table).
 	tableNameRe = regexp.MustCompile(`^\s*__tablename__\s*=\s*["']([^"']+)["']`)
@@ -317,7 +294,11 @@ var (
 	anyTOMLSectionRe = regexp.MustCompile(`^\s*\[`)
 	// entryPointValueRe matches an entry-point line `name = "module.path:attr"`,
 	// capturing the module path and the attribute (a function or Class.method).
-	entryPointValueRe = regexp.MustCompile(`^\s*[^=\[\]#]+=\s*["']([A-Za-z_][\w.]*):([A-Za-z_][\w.]*)["']`)
+	// consoleScriptsSectionRe is the table of programs a package installs, whose
+	// keys are the names a user types.
+	consoleScriptsSectionRe = regexp.MustCompile(`^\s*\[\s*project\.scripts\s*\]`)
+	consoleScriptNameRe     = regexp.MustCompile(`^\s*["']?([\w.-]+)["']?\s*=`)
+	entryPointValueRe       = regexp.MustCompile(`^\s*[^=\[\]#]+=\s*["']([A-Za-z_][\w.]*):([A-Za-z_][\w.]*)["']`)
 
 	// registrationDecorators are decorator names (matched on the last dotted segment)
 	// that REGISTER their function with a framework, which then dispatches it — so the
@@ -364,10 +345,12 @@ func extractEntryPoints(repoPath string, files []string) []facts.Fact {
 			continue
 		}
 		var rels []facts.Relation
-		inEntryPoints := false
+		var scripts []string
+		inEntryPoints, inScripts := false, false
 		for _, line := range strings.Split(string(data), "\n") {
 			if anyTOMLSectionRe.MatchString(line) {
 				inEntryPoints = entryPointSectionRe.MatchString(line)
+				inScripts = consoleScriptsSectionRe.MatchString(line)
 				continue
 			}
 			if !inEntryPoints {
@@ -375,15 +358,22 @@ func extractEntryPoints(repoPath string, files []string) []facts.Fact {
 			}
 			if m := entryPointValueRe.FindStringSubmatch(line); m != nil {
 				rels = append(rels, facts.Relation{Kind: facts.RelCalls, Target: m[1] + "." + m[2]})
+				if n := consoleScriptNameRe.FindStringSubmatch(line); inScripts && n != nil {
+					scripts = append(scripts, n[1]+"\t"+m[1]+"."+m[2])
+				}
 			}
 		}
 		if len(rels) > 0 {
+			props := map[string]any{"language": "python"}
+			if len(scripts) > 0 {
+				props[propConsoleScripts] = scripts
+			}
 			out = append(out, facts.Fact{
 				Kind:      facts.KindFileRef,
 				Name:      rel,
 				File:      rel,
 				Line:      1,
-				Props:     map[string]any{"language": "python"},
+				Props:     props,
 				Relations: rels,
 			})
 		}

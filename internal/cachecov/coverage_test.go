@@ -33,6 +33,626 @@ import (
 // test functions that assert the behavior that version introduced. v1 is the
 // implicit baseline (no changelog line), so coverage starts at v2.
 var versionCoverage = map[int][]string{
+	// A Cargo path dependency names where it lives, so a crate the repository may hold is never read as a package from elsewhere
+	// A Ruby self call a subclass overrides, and a constant two scopes could name, keep their written names
+	// A bare Ruby call binds only where written on self, and a new-instance call outside a method is no association name
+	427: {"TestRubyCalls_ANameThatMayBeAnotherReceiversKeepsItsName", "TestRubyTestRefs_ACallOnANewInstanceIsNotNamedAsConstHashName"},
+	426: {"TestRubyCalls_ASelfCallASubclassOverridesKeepsItsName", "TestRubyCalls_AConstantTwoScopesCouldNameKeepsItsName"},
+	425: {"TestManifests_CargoReadsBothSpellings", "TestManifests_CargoReadsTableSections"},
+	// A Rails app's deploy files become runtime_unit facts whose runs edges name the job classes their entrypoints reach
+	424: {"TestRuntimeUnits_AProcfileWorkerRunsTheJobsOfTheQueuesItsConfigLists", "TestRuntimeUnits_AQueueNamedInTheCommandsEnvironmentIsTheWorkersQueue",
+		"TestRuntimeUnits_APeriodicScheduleRunsItsClassAndNamesOneThatDoesNotExist", "TestRuntimeUnits_SolidQueueWorkersRecurringTasksAndAKeyTheLockedVersionDoesNotRead",
+		"TestRuntimeUnits_WheneverRunnerRakeAndCommand", "TestRuntimeUnits_KamalRolesAccessoriesAndAPlaceholderHost",
+		"TestRuntimeUnits_RailwayDockerfileAndFly", "TestRuntimeUnits_ANestedAppIsReadAtItsOwnRootAndCounted", "TestRuntimeUnits_AWorkerRunsOnlyItsOwnAppsJobs"},
+	// A Rails migration's class carries what it would do to a live table: unsafe and concurrent-in-transaction indexes, NOT NULL without a default, its version and the tables it creates
+	423: {"TestMigrations_AnIndexOnAnExistingTableWithoutConcurrentlyIsUnsafe", "TestMigrations_AConcurrentIndexOutsideTheTransactionIsSafe",
+		"TestMigrations_AConcurrentIndexInsideTheTransactionIsNamed", "TestMigrations_AnIndexOnATableTheFileCreatesIsSafe", "TestMigrations_ContinuationLinesAreOneStatement",
+		"TestMigrations_NotNullWithoutADefaultIsNamed", "TestMigrations_ARollbackIndexIsCountedApart", "TestMigrations_AReferenceIndexesUnlessToldNot",
+		"TestMigrations_ACleanMigrationCarriesZeroCounts", "TestMigrations_AClassOutsideDbMigrateIsNotRead",
+		"TestMigrations_AnAppNestedInTheRepositoryIsRead", "TestMigrations_AnEngineMigrationKeepsItsVersion"},
+	// prism is the Rubydex engine answering under the Prism reference script's names, from the run's one index, and never paired with itself
+	422: {"TestCollect_WritesTheEnclosingClassCallsUnderThePrismNames", "TestCollect_TheSkippedSameClassCallIsThePrismSidesFact",
+		"TestRun_PrismAndRubydexBuiltInsShareOneEngine", "TestRun_PrismBuiltInIsServedFromItsOwnIndexEntry",
+		"TestPairing_OneEngineBehindTwoNamesIsNoAgreement", "TestNewPlan_EveryOffersPrismAsTheBuiltIn", "TestValidate_PrismIsABuiltInName", "TestCollect_ACallInADefaultParameterIsNotWrittenOnTheClass"},
+	// The vendored Ruby grammar reads anonymous block forwarding followed by whitespace, and the binary `&` keeps its meaning
+	421: {"TestExtract_AnonymousBlockForwardingReadsTheWholeFile", "TestGrammar_AmpersandIsBinaryAfterAnOperandAndABlockArgumentAfterAComma"},
+	// The Ruby extractor names the files tree-sitter read only in part, and the receipt counts each as a parse error
+	420: {"TestExtract_NamesTheFilesTheParserLeftAnErrorIn", "TestGenerate_ARubyFileReadInPartIsAParseError"},
+	// A call lands on another repository's fact only when it is a symbol or an association, and never on a service node
+	419: {"TestCallTargetID_ACallOntoAnotherRepositorysNonSymbolGetsNoID", "TestCallTargetID_ACallOntoAServiceNodeGetsNoID",
+		"TestCallTargetID_CrossRepositoryEdgesThatLandKeepTheirID", "TestCallTargetID_ACallStillLandsInItsOwnRepository",
+		"TestExplain_AllowOnlyCallMatchingAnotherRepositorysQueueIsNoLanding", "TestExplain_AllowOnlyCallMatchingAServiceNodeIsNoLanding",
+		"TestCrossRepoCalls_AUnionAddsNoBreachToALawKeptAlone"},
+	// A Kotlin function, class, object or property keeps every edge its walk records however the fact slice grows under it
+	418: {"TestKotlinWalk_FunctionKeepsEdgesWhenItsBodyGrowsTheFacts", "TestKotlinWalk_ClassKeepsEdgesRecordedAfterItsMembers",
+		"TestKotlinWalk_ObjectKeepsEdgesRecordedAfterItsMembers", "TestKotlinWalk_EdgesDoNotDependOnWhereTheSliceGrows"},
+	// A Java method or class keeps every edge its walk records however the fact slice grows under it
+	417: {"TestJavaWalk_MethodKeepsEdgesWhenItsBodyGrowsTheFacts", "TestJavaWalk_ClassKeepsInjectsWhenItsFieldsGrowTheFacts",
+		"TestJavaWalk_ClassKeepsEdgesRecordedAfterItsNestedTypes", "TestJavaWalk_EdgesDoNotDependOnWhereTheSliceGrows"},
+	// A Ruby call keeps a target_id only onto a symbol or an association; the id is dropped, never added or moved
+	416: {"TestCallTargetID_RubyCallOntoANonSymbolGetsNoID", "TestCallTargetID_RubyCallOntoASymbolOrAnAssociationKeepsItsID",
+		"TestCallTargetID_NoIDIsAddedOrMoved", "TestCallTargetID_ProviderFactsAreReadAsRubyByTheirFile",
+		"TestCallTargetID_OtherRelationKindsKeepTheirID", "TestCallTargetID_OtherLanguagesKeepCallsOntoRoutes",
+		"TestCallTargetID_WritesAreByteIdentical"},
+	// KiCad boards read board first: modules, parts, nets, placement by UUID path, rails, classes; the rest counted on kicad:*
+	415: {"TestKiCad_BoardModuleCountsWhatThePadsReach", "TestKiCad_TwoLevelHierarchyPlacesAPartOnEachLevel",
+		"TestKiCad_PathWinsOverTheSheetFields", "TestKiCad_ADuplicateReferenceSuffixesEveryFootprintSharingIt",
+		"TestKiCad_ABoardOnlyFootprintDeclaresTheBoard", "TestKiCad_NetsComeFromPadsOnly", "TestKiCad_RailsFromPowerSymbols",
+		"TestKiCad_ClassesFromThePatterns", "TestKiCad_KiCad10InlineNets", "TestKiCad_KiCad6SpellingsAndNumberedTable",
+		"TestKiCad_UnknownVersionAndUnparsableFilesAreCountedNotRead", "TestKiCad_ASchematicWithNoBoardYieldsItsTreeOnly",
+		"TestKiCad_NothingToReadEmitsNothing", "TestKiCad_Deterministic"},
+	// A Ruby method's reads and writes of a model's table, on an exact receiver only; the rest counted on ruby:access
+	414: {"TestRubyAccess_ExactReceiversEmitReadsAndWrites", "TestRubyAccess_UnresolvedCallsAreCountedByCause",
+		"TestRubyAccess_OtherConstantsAndOwnVerbsAreRefused", "TestRubyAccess_NoModelNoRecord", "TestRubyAccess_WriteListIsTheCqrsRecipes"},
+	// A page anchor narrowed to a symbol compiles with its symbol beside the file relation
+	413: {"TestMDIntent_SymbolAnchorCarriesItsSymbol"},
+	// An absolute URL on a comment line, or in an options object stating no verb, is not a call to a host
+	412: {"TestRubyExternalHost_CommentIsNotACall", "TestTSExternalHost_CommentIsNotACall", "TestTSExternalHost_DataObjectIsNotACall"},
+	// A Ruby job's literal queue in its own class body is a consumer topic fact; every unread declaration and queueless job is counted
+	411: {"TestRubyJobQueueDeclared_LiteralForms", "TestRubyJobQueueDeclared_WhateverTheComponent",
+		"TestRubyJobQueueDeclared_UnreadFormsYieldNothingAndAreCounted", "TestRubyJobQueueDeclared_NoImpliedDefault",
+		"TestRubyJobQueueDeclared_CountedOnTheExtractionRecord"},
+	// A Ruby or TypeScript call to an absolute URL with a literal host is an external client route; an interpolated host is counted
+	410: {"TestRubyExternalHost_LiteralHostKept", "TestRubyExternalHost_InterpolatedHostRefusedAndCounted", "TestRubyExternalHost_ThroughAParameter",
+		"TestRubyExternalHost_CountedOnTheExtractionRecord", "TestTSExternalHost_LiteralHostKept", "TestTSExternalHost_InterpolatedHostRefusedAndCounted",
+		"TestTSExternalHost_CountedOnTheExtractionRecord"},
+	// Rust facts carry their node's span; #[test] functions become test_case facts named as cargo lists them
+	409: {"TestSymbolSpanRust", "TestTestCaseFactsRust", "TestTestCaseRust_OutsideModuleTree", "TestTestCaseRust_Parameterised"},
+	// Terraform blocks, proto declarations and markdown documents and sections carry their span
+	408: {"TestSymbolSpanHCL", "TestSymbolSpanGRPC", "TestSymbolSpanMarkdown"},
+	// A Terraform block's line is its keyword's, not the blank line above it
+	407: {"TestHCL_BlockLineIsItsKeyword"},
+	// A shadowed Python test and a redefined minitest method give one test_case
+	406: {"TestTestCaseShadowedPython", "TestTestCaseRedefinedMinitest"},
+	// C and C++ facts carry their node's span; GoogleTest and Catch2 tests become test_case facts
+	405: {"TestSymbolSpanCpp", "TestTestCaseFactsCpp", "TestTestCaseCoverageCpp", "TestTestCaseNeedsFrameworkInclude",
+		"TestTestCaseThroughProjectHeader", "TestNamesTestFramework", "TestTestCaseUnderPreprocessorBranch",
+		"TestTestCaseSpanStartsAtTheMacro", "TestTestCaseInsideParseError"},
+	// Dart facts carry their node's span; package:test tests become test_case facts
+	404: {"TestSymbolSpanDart", "TestTestCaseFactsDart", "TestTestCaseLabelNotLiteral_Dart"},
+	// Swift facts carry their node's span; XCTest and swift-testing tests become test_case facts
+	403: {"TestSymbolSpanSwift", "TestTestCaseFactsSwift"},
+	// PHP facts carry their node's span; PHPUnit and Pest tests become test_case facts
+	402: {"TestSymbolSpanPHP", "TestTestCaseFactsPHP", "TestTestCaseLabelNotLiteral_PHP"},
+	// C# facts carry their node's span; xUnit, NUnit and MSTest methods become test_case facts
+	401: {"TestSymbolSpanCSharp", "TestTestCaseFactsCSharp", "TestTestCaseFactsCSharp_IndexedAsProduction"},
+	// Scala facts carry their node's span; ScalaTest and MUnit tests become test_case facts
+	400: {"TestSymbolSpanScala", "TestTestCaseFactsScala", "TestTestCaseLabelNotLiteral_Scala"},
+	// Kotlin facts carry their node's span; JUnit functions and Kotest root tests become test_case facts
+	399: {"TestSymbolSpanKotlin", "TestTestCaseFactsKotlin", "TestTestCaseLabelNotLiteral_Kotlin"},
+	// Java facts carry their node's span; JUnit test methods get a test_case beside their symbol
+	398: {"TestSymbolSpanJava", "TestTestCaseFactsJava", "TestTestCaseFactsJava_JUnit3"},
+	// TypeScript facts carry their node's span; describe/it tests become test_case facts
+	397: {"TestSymbolSpanTypeScript", "TestTestCaseFactsTypeScript", "TestTestCaseLabelNotLiteral_TypeScript"},
+	// RSpec examples and minitest tests become test_case facts; run-time labels are counted
+	396: {"TestSymbolSpanRuby", "TestTestCaseFactsRuby", "TestTestCaseLabelNotLiteral"},
+	// Python facts carry their node's span; pytest's tests become test_case facts
+	395: {"TestSymbolSpanPython", "TestSymbolSpanTreeSitter", "TestTestCaseFactsPython", "TestTestCaseFactsPython_ThroughTheTestPass"},
+	// Go facts carry their node's span; go test's tests become test_case facts
+	394: {"TestSymbolSpanGo", "TestSymbolSpanGo_RouteCarriesTheCallsSpan", "TestSymbolSpanGo_SpanStaysOffTheTestRef", "TestTestCaseFactsGo", "TestTestCaseFactsGo_TestRefIsByteIdentical"},
+	// Rust use leaves land on the item with its file or on the module directory; every import reader reads the carried file; imports, refused calls and shared-name calls are counted and placed
+	393: {"TestExtract_ItemImportLandsOnTheItemWithItsFile", "TestExtract_ModuleImportLandsOnItsDirectoryWithoutAFile", "TestExtract_AliasGroupAndReexportChainLandOnTheItem", "TestExtract_ExternalImportKeepsItsTarget", "TestExtract_ImportOfAnItemWithoutAFactLandsOnItsDirectory", "TestExtract_NamespaceTwinImportLandsAsTheModule", "TestExtract_PrivateModuleTwinReadFromAnotherCrateIsTheItem", "TestExtract_RootBuildScriptNoLongerSendsCrateImportsToTheRoot", "TestExtract_RustImportsCensusCountsEveryInternalLeaf", "TestExtract_RefusedCallsAreCountedOnTheFactThatMadeThem", "TestExtract_SharedNameCallBecomesADependencyByFile", "TestImportTargets_AnItemTargetLandsOnItsFilesDirectory", "TestImportTargets_ASharedNameResolvesByTheCarriedFile", "TestImportTargets_ANameNotDeclaredAtTheCarriedFileIsRefused", "TestImportTargets_WithoutACarriedFileTheReaderKeepsItsWalk", "TestImportTargets_RepoPrefixedFilesMatchARepoRelativeTargetFile", "TestCallByFileName_TwoTargetFilesStayTwoFactsAfterFreeze", "TestGraph_ItemImportTargetBecomesAModuleEdgeToItsFilesModule", "TestBuildModuleGraph_ItemTargetLandsOnItsFilesModule", "TestCollectItemImportCouplesToItsFilesModule", "TestDetectViolations_ItemImportResolvesByItsCarriedFile", "TestBind_AnItemImportIsAPairTheExtractorConnected", "TestItemImport_CountsInDependencyRulesAndCriticalModules", "TestComputeHotspots_ItemImportCouplesToItsFilesModule", "TestExplain_ASharedNameCallBindsByItsCarriedFile", "TestExtract_LeafNamingATypeAndAValueRefusesBoth", "TestExtract_ModuleWithoutAFileBesideAnItemRefuses", "TestExtract_CallNamedForAFileThatDoesNotDeclareItRefuses", "TestExtract_UseOfAValueBesideAGlobHoldingTheTypeRefuses", "TestExtract_SuperInATestModuleStartsAtItsOwnModule", "TestExtract_CrateLeafOutsideTheModuleTreeStartsAtTheNearestCrateRoot", "TestExtract_MacroFunctionBesideAModuleIsANamespaceTwin"},
+	392: {"TestExtract_PathAcrossFilesResolves", "TestExtract_UseAliasNamesTheItem", "TestExtract_InternalGlobIsLookedInto", "TestExtract_BareCallResolvesThroughInternalImport", "TestExtract_LibPathFromTheManifestIsACrateRoot", "TestExtract_BinTargetPathIsACrateRoot", "TestExtract_DeclaredTestTargetIsACrateRoot", "TestExtract_PatchedDependencyNamesTheWorkspaceCrate", "TestExtract_AssociatedFunctionWithItsImplInAnotherFile", "TestExtract_TypedParameterReceiver", "TestExtract_SelfFieldReceiver", "TestExtract_TypedLetReceiver", "TestExtract_StructLiteralLetReceiver", "TestExtract_TypePathCallResolvesToThatTypesMethod", "TestExtract_LoopCallListsCarryResolvedTargets", "TestExtract_RecursionThroughThePassIsRecorded", "TestExtract_ClosureShadowingAFunctionRefuses", "TestExtract_BareCallNeverReachesAMethod", "TestExtract_SiblingFileFunctionIsNotInScope", "TestExtract_InherentAndTraitMethodOfOneNameRefuse", "TestExtract_TraitMethodByPathRefuses", "TestExtract_TraitMethodUnderABoundRefuses", "TestExtract_PinnedSelfWrapperMethodRefuses", "TestExtract_ReceiverInAUserMacroRefuses", "TestExtract_CfgMacroItemRefuses", "TestExtract_CfgTestUseIsNotABinding", "TestExtract_TwoUsesOfOneNameRefuse", "TestExtract_SpecializedImplRefusesAMethodCall", "TestExtract_TraitWithTypeArgumentsRefuses", "TestExtract_BlanketImplOnAReferenceRefuses", "TestExtract_TwinInlineModulesRefuseTheirSharedNames", "TestExtract_ItemMacroBodyIsReadAsItems", "TestExtract_SharedNameKeepsTheBareLeaf", "TestExtract_TestRefHoldsEachFinalTargetOnce", "TestExtract_FileNoCrateRootReachesIsOutsideTheTree", "TestExtract_CfgItemBesideCfgUseRefuses", "TestExtract_RustCallsCensusCountsEveryRelation", "TestExtract_FactsIdenticalAtOneAndSixteenWorkers", "TestAST_BareCallDoesNotReachASiblingMethod"}, // Rust calls resolve by path and written receiver in one crate-wide pass from Cargo crate roots, each refusal one named cause, every calls relation counted once
+	391: {"TestBind_ACallIsAttributedToTheModuleOfItsOwnFile", "TestBind_ANameTwoModulesDeclareIsRefusedAsATarget"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      // module edges: the caller is the module of its own file, and a name two production modules of one repository declare derives no edge
+	390: {
+		"TestDocText_LeavesTheFactsForTheSideTable",
+		"TestSetDoc",
+	},
+	389: {
+		"TestCppDoc_Declarations",
+		"TestCppDoc_PrototypeAndDefinition",
+	},
+	388: {
+		"TestDartDoc_Declarations",
+	},
+	387: {
+		"TestSwiftDoc_Declarations",
+	},
+	386: {
+		"TestScalaDoc_Definitions",
+	},
+	385: {
+		"TestKotlinDoc_Declarations",
+	},
+	384: {
+		"TestRustDoc_Items",
+		"TestRustDoc_Modules",
+	},
+	383: {
+		"TestDoc_IndexFileBlock",
+	},
+	382: {
+		"TestDoc_PackageInfo",
+	},
+	381: {
+		"TestPythonDoc_PackageDocstring",
+	},
+	380: {
+		"TestGoDoc_PackageComment",
+	},
+	379: {
+		"TestFileRoutes_NextJSPackageInAWorkspace",
+	},
+	378: {
+		"TestExtractRoutes_MountOfALocalRouter",
+	},
+	377: {
+		"TestMinimalAPI_LocalFunctionHandler",
+	},
+	376: {
+		"TestWordPressHookPointsAreTheFiringSide",
+	},
+	375: {
+		"TestWordPressArrayAndRestCallbacks",
+	},
+	374: {
+		"TestWordPressHookRegistrationsAreHandled",
+	},
+	373: {
+		"TestScalatraRoutesAndActions",
+	},
+	372: {
+		"TestPekkoRouteBlockIsTheHandler",
+	},
+	371: {
+		"TestHTTP4sCaseBodyIsTheHandler",
+	},
+	370: {
+		"TestCommands_RootGroupNamedByConsoleScript",
+	},
+	369: {
+		"TestMinimalAPI_LambdaHandlerIsASymbol",
+		"TestMinimalAPI_HandlerBindingAndLambdas",
+	},
+	368: {
+		"TestFileRoutes_NextJSPackageInAWorkspace",
+	},
+	367: {
+		"TestKotlinCapitalizedCallOfAFunction",
+	},
+	366: {
+		"TestCommands_RootGroupNamedByConsoleScript",
+	},
+	365: {
+		"TestExtractRoutes_MethodValueOnALocalStruct",
+	},
+	364: {
+		"TestCommands_ArgparseAndCommandTables",
+	},
+	363: {
+		"TestMCPTools_RegisteredHandlers",
+	},
+	362: {
+		"TestFileRoutes_NextJSPagesAndRouteHandlers",
+	},
+	361: {
+		"TestFileRoutes_SvelteKitFormActionsArePostRoutes",
+	},
+	360: {
+		"TestNamespaceImportCall_InComponentScripts",
+	},
+	359: {
+		"TestExtractRoutes_ConcatenatedPathNeedsEveryPart",
+	},
+	358: {
+		"TestNavigationRouteHandlerIsTheScreen",
+	},
+	357: {
+		"TestCommands_ComposedThroughGroups",
+	},
+	356: {
+		"TestAST_QuotedAnnotation_AttributeCall",
+	},
+	355: {
+		"TestRubyCalls_AncestorSingletonKeepsTheNamedClass",
+	},
+	354: {
+		"TestPropagate_ApartFactAnswersForItself",
+		"TestAccessor_SetterIOIsNotTheGetters",
+	},
+	353: {
+		"TestIONamedCall_ResolvedTargetDecides",
+		"TestIONamedCall_InheritedAndDeclaredMethods",
+	},
+	352: {
+		"TestDrizzle_BuilderChainsAreQueries",
+		"TestDrizzle_NotWithoutTheDependency",
+		"TestDrizzle_UseCaseReachesQueryThroughPort",
+		"TestPropagate_InterfaceMemberWithoutAFact",
+		"TestPropagate_BodilessMembersAreOptIn",
+		"TestNestGlobalPrefix_LiteralIsApplied",
+		"TestNestGlobalPrefix_NotAppliedUnlessCertain",
+		"TestRetrofitMethodIsIO",
+	},
+	351: {
+		"TestDocSummary_InvalidUTF8",
+	},
+	350: {
+		"TestDoc_Javadoc",
+		"TestDoc_XMLDocSummary",
+		"TestDoc_PHPDocblock",
+	},
+	349: {
+		"TestDoc_JSDocAndLineComments",
+		"TestDoc_CommentLinesAboveTheDeclaration",
+	},
+	348: {
+		"TestTools_MCPAddTool",
+		"TestTools_DecoratedFunctions",
+	},
+	347: {
+		"TestCommands_StringKeyedDispatch",
+		"TestCommands_CobraAndUrfaveLiterals",
+		"TestCommands_ClickAndTyper",
+		"TestAnalyze_ACommandIsAnEntryNamedByItsCommand",
+		"TestAnalyze_CommandsRankAfterTheRoutesOfAServer",
+	},
+	346: {
+		"TestLocalTypes_NewAndAnnotatedParameters",
+	},
+	345: {
+		"TestNamespaceImportCall_NamesTheExport",
+	},
+	344: {
+		"TestFacadeCalls_ReachTheBoundClass",
+	},
+	343: {
+		"TestRubyCalls_ServiceObjectOnANewInstance",
+		"TestRubyCalls_InheritedMethodAndNamespacedConstant",
+	},
+	342: {
+		"TestFileRoutes_NuxtPageBoundToItsComponent",
+		"TestFileRoutes_SvelteKitPageBoundToComponentAndLoad",
+	},
+	341: {
+		"TestOwnRouter_RoutesOnAFieldAndInGroups",
+		"TestOwnRouter_OnlyAKnownRouterRegisters",
+		"TestOwnRouter_AnHTTPClientIsNotARouter",
+		"TestRouteHandlerExpr_FactoryBuiltFromAValue",
+	},
+	340: {
+		"TestExtractRoutes_PathGroupMatchPath",
+		"TestExtractRoutes_PathHeldInAConstantOrVariable",
+	},
+	339: {
+		"TestAxumHandler_BareNameAndModulePath",
+		"TestAxumHandler_ImportedBareName",
+		"TestUtoipaHandler_FunctionUnderTheAttribute",
+		"TestAxumRoutes_TestModuleRouterIsNotARoute",
+	},
+	338: {
+		"TestServerRouteHandler_LastArgumentThroughAWrapper",
+		"TestServerRouteHandler_ImportedHandlerOnAMountedRouter",
+		"TestRouterMount_RouterImportedThroughABarrel",
+		"TestRouterMount_PrefixWithAStringConstant",
+		"TestLastCallArgument",
+	},
+	337: {
+		"TestRouteBinding_EngineIsolatedNamespace",
+		"TestRouteBinding_UndeclaredHandlerIsNotBound",
+		"TestRouteBinding_InheritedAction",
+		"TestRouteBinding_AcronymNamespace",
+		"TestRouteBinding_SingularResourceBoundWhenDeclared",
+	},
+	336: {
+		"TestExtractRoutes_OwnRouterPackage",
+		"TestExtractRoutes_ComboChain",
+		"TestExtractRoutes_MountedBuilder",
+		"TestExtractRoutes_ChiVerbNeedsAHandler",
+	},
+	335: {
+		"TestExtractRoutes_FuncLitMount_ChiRoute",
+		"TestExtractRoutes_FuncLitMount_GroupOnTheReceiver",
+		"TestExtractRoutes_FuncLitMount_LocalClosureCalledUnderEachMount",
+		"TestExtractRoutes_FuncLitMount_ReachesACalledFunction",
+		"TestExtractRoutes_FuncLitMount_DynamicPathIsNotGuessed",
+	},
+	334: {
+		"TestExtractRoutes_ChiVerbWithMiddlewareTakesTheLastArgument",
+	},
+	333: {
+		"TestGoDoc_FunctionsMethodsAndTypes",
+		"TestPythonDoc_FunctionsMethodsAndClasses",
+		"TestPythonDoc_NestedRouteHandler",
+	},
+	332: {
+		"TestLaravelMounts_ProviderPrefixesReachTheRoutes",
+		"TestLaravelMounts_WithRouting",
+		"TestLaravelMounts_RequireInsideAGroupAndTwice",
+		"TestRouteFilePath",
+	},
+	331: {
+		"TestLaravelRoutes_Resource",
+		"TestLaravelRoutes_ResourceOnlyAndExcept",
+		"TestLaravelRoutes_NestedAndPrefixedResources",
+		"TestLaravelRoutes_PluralRegistrars",
+	},
+	330: {
+		"TestNamedClassesAreReferences",
+		"TestFileWithoutFileScopeNamesEmitsNoFileReference",
+	},
+	329: {
+		"TestClassReferencesResolveLikePHP",
+		"TestGlobalNamespaceClassReferencesStayBare",
+		"TestConstructorParametersAreInjected",
+	},
+	328: {
+		"TestLaravelRoutes_ActionArray",
+		"TestReceiverCalls_ObjectCreatedInPlace",
+		"TestReceiverCalls_FrameworkMethodOnAModel",
+		"TestIsLaravelRouteFile",
+	},
+	327: {
+		"TestReceiverCalls_PropertyTypes",
+		"TestReceiverCalls_ParameterThisAndInheritedMethod",
+		"TestReceiverCalls_SameNamespaceTypeNeedsNoImport",
+		"TestReceiverCalls_InterfaceReachesItsOnlyImplementer",
+	},
+	326: {
+		"TestEloquentModels_TableIsDeclaredOrDerived",
+		"TestEloquentModels_ThroughABaseClassInAnotherFile",
+		"TestEloquentAssociations",
+	},
+	325: {
+		"TestLaravelRoutes_HandlerClassIsExpandedThroughImports",
+		"TestLaravelRoutes_ControllerAndNamespaceGroups",
+		"TestBindLaravelHandlers_ResolvesTheControllerClass",
+		"TestBindLaravelHandlers_InheritedActionBindsToItsDeclaration",
+	},
+	324: {
+		"TestWrapperExposedDeclarationsAreExported",
+		"TestWrapperKeepsPrivateWhatItDoesNotHandOut",
+	},
+	323: {
+		"TestWrapperKeepsCodeAndDropsPlainVariables",
+		"TestModuleVariablesAreKept",
+	},
+	322: {
+		"TestWrapperFunctionDeclarationsAreFileLevel",
+		"TestOnlyImmediatelyCalledFunctionsAreWrappers",
+		"TestWrapperNestingAndModulesUnchanged",
+	},
+	321: {
+		"TestJavaScriptLeads",
+		"TestDetectPlainJavaScriptProject",
+	},
+	320: {
+		"TestTypeReferencesAfterLongLine",
+		"TestPlayRoutesAfterLongLine",
+		"TestPubspecAfterLongLine",
+		"TestSourceRootAfterLongLine",
+		"TestReadPackageAfterLongLine",
+	},
+	319: {
+		"TestFactoryStringsRequireDeclaredSymbols",
+		"TestNamedReferencesDoNotCountAsCallCoupling",
+		"TestCollectNamedReferencesProtectSymbols",
+		"TestAST_FallbackConstantsAreNotConstructors",
+		"TestClassifyExcludesDocumentSymbols",
+		"TestExtractTestRefs_PackageDefinitionsAndReexports",
+		"TestExtractConfiguredEntryPoints",
+		"TestConfiguredValuesDoNotTreatDockerArgumentsAsHandlers",
+		"TestAST_FactoryStringsAndFallbackCallbacks",
+		"TestAST_LiteralReflectionAndCallableMetadata",
+		"TestPythonConfigurationAffectsCacheKey",
+	},
+	318: {"TestTerminalBlocksAndPageCounters", "TestRowCursorWithAQueryPerRowIsNotABatchLoop"}, // Python at-most-once calls and page counters; Go row cursor is not a batch loop
+	317: { // Java and C#: a call on a library-typed receiver is io_calls or pure_calls by the library's member
+		"TestJavaLibraryCall", "TestJavaCallOnALibraryReceiverIsClassedByMember",
+		"TestCSharpLibraryCall", "TestCSharpCallOnALibraryReceiverIsClassedByMember",
+		"TestJavaLibraryIODoesNotMarkAnOverloadedName", "TestJavaCallOnAGetterResultIsTypedByItsReturnType",
+		"TestJavaInterfaceSharedByRepositoriesIsAnIOType", "TestCSharpBaseCallReachesTheBaseDeclaration",
+	},
+	316: {"TestRoundLoopCallsAreNotPerElement"},                         // Python: a poll, a retry and a cursor are round loops; their own calls are not per element
+	315: {"TestLibraryCallIsClassedWhereItsRootIsARepositoryDirectory"}, // Python: a library whose import root is also a repo directory name is still classed by member
+	314: { // Python: receivers typed by return annotations and by module-level declarations; untyped in-loop I/O calls recorded as written
+		"TestPyValueType", "TestCallOnAccessorResultResolvesByReturnAnnotation",
+		"TestCallOnModuleGlobalResolvesByDeclaredType", "TestUntypedIOCallInLoopIsRecordedAsWritten",
+	},
+	313: { // Python: a call resolved to a library member is io_calls or pure_calls by what the member is
+		"TestPyLibraryCall", "TestLibraryCallsAreClassedByMember", "TestLibraryTableDoesNotClaimARepositoryModule",
+		"TestAnalyze_PureCallIsNotReadByItsName",
+	},
+	312: {"TestAssociationsInsideWithOptionsTakeItsClassName"}, // a Rails association inside with_options class_name: takes that class
+	311: { // TypeScript: Angular HttpClient calls and fetch handed to a wrapper are io_direct; a call on a declared result resolves
+		"TestAngularHttpClientCallIsDirectIO",
+		"TestFetchHandedToAWrapperAndCallOnADeclaredResult",
+	},
+	310: { // Python: in-loop callees resolve with the relations; self.x calls resolve by the attribute's declared type
+		"TestPySelfAttributeCallResolvesByItsDeclaredType",
+		"TestPyInLoopCalleesResolveUnderASourceRoot",
+	},
+	309: { // Kotlin: a call on a receiver of declared type is a calls edge; a supertype by simple name is a canonical implements edge
+		"TestKotlinCallOnADeclaredReceiverIsAnEdge",
+		"TestKotlinDeclaredReceiverForms",
+	},
+	308: { // C#: a call on a receiver of declared type is a calls edge, resolved through base types and interfaces
+		"TestCSharpCallOnAnInjectedFieldIsAnEdge",
+		"TestCSharpDeclaredReceiverForms",
+		"TestCSharpTypedCallLandsOnADeclarationOrIsNotMade",
+	},
+	307: { // Java: a call on a receiver of declared type is a calls edge, resolved through supertypes; io_type and inherited repository methods
+		"TestJavaCallOnAnInjectedFieldIsAnEdge",
+		"TestJavaCallOnAnUndeclaredReceiverIsNotAnEdge",
+		"TestJavaTypedCallResolvesThroughSupertypesLocalsAndStatics",
+		"TestJavaInheritedRepositoryMethodIsNamedAsIO",
+	},
+	306: { // Java paging loops and stream callbacks under the statement-loop rules; Go calls on a path that leaves the loop are not per element
+		"TestJavaBatchLoop_DoWhilePaging",
+		"TestJavaBatchLoop_WhileTrueWithStreamDrain",
+		"TestJavaBatchLoop_IteratorWalkIsNotPaging",
+		"TestJavaBatchLoop_FetchWithoutADrainIsNotPaging",
+		"TestJavaStreamCallbackOverTheElementAddsNoDepth",
+		"TestGoCallOnThePathThatLeavesTheLoopIsNotPerElement",
+		"TestGoBreakInsideSwitchDoesNotLeaveTheLoop",
+		"TestGoNestedLoopCallBeforeAnOuterExitStillRepeats",
+		"TestGoFirstMatchLoopStillCallsPerElement",
+	},
+	305: { // Ruby scaling_loop_depth and per-call depth: parent-then-children loops add no factor, batch iterator calls are not per element
+		"TestRbScaling_CallDepthIsTheLoopsAroundTheCall",
+		"TestRbScaling_LoopOverTheOuterElementAddsNoDepth",
+		"TestRbScaling_IndependentInnerLoopStillScales",
+		"TestRbScaling_BatchIteratorCallIsNotPerElement",
+		"TestRbScaling_ConstantLoopCallsAreNotListed",
+	},
+	304: { // Go io_direct / io_calls / performs_io: entry points by member, asserted facades, promoted-method calls, once and logging barriers
+		"TestGoIOPrimitive_IsByMemberNotByPackage",
+		"TestGoPerformsIO_FromAPrimitiveThroughWrappers",
+		"TestGoPerformsIO_ThroughAnAssertedFacade",
+		"TestGoPromotedMethodCallResolvesToItsDeclaration",
+		"TestGoPerformsIO_StopsAtOnceAndAtLogging",
+	},
+	303: { // one shared performs_io closure, following interface and abstract methods to implementers; Java and Kotlin propagate
+		"TestPropagate_ReachesThroughWrappersAndCycles",
+		"TestPropagate_FollowsAnInterfaceToItsImplementers",
+		"TestPropagate_FollowsThroughAnExtendingInterface",
+		"TestPropagate_ConcreteBaseMethodIsNotItsOverride",
+		"TestJavaMethodReachesAQueryInItsOwnClass",
+	},
+	302: { // a for loop is fixed-count only when both ends are constant (C/C++, C#, PHP): a descending loop to a literal scales
+		"TestCppDescendingLoopToALiteralStillScales",
+		"TestPHPDescendingLoopToALiteralStillScales",
+		"TestCSharpDescendingLoopToALiteralStillScales",
+	},
+	301: { // batch loops (paging, stepped, chunking) in Go and Python: the drain loop adds no scaling depth and the per-round call is not an N+1 candidate
+		"TestBatchLoopDrainIsNotNestingAndItsQueryIsNotAnNPlusOne",
+		"TestLoopsThatOnlyResembleBatchingKeepTheirCalls",
+		"TestPyBatchLoopDrainIsNotNestingAndItsQueryIsNotAnNPlusOne",
+		"TestPyLoopsThatOnlyResembleBatchingKeepTheirCalls",
+	},
+	300: { // loops fixed by name (ALL_CAPS constants, enums, constant bounds, literal locals) add no scaling depth in TS, Python, Rust, Java
+		"TestTsConstantLoopsAddNoScalingDepth",
+		"TestTsLoopsThatOnlyLookConstantStillScale",
+		"TestTsCallInConstantLoopIsNotAnNPlusOneCandidate",
+		"TestPyConstantLoopsAddNoScalingDepth",
+		"TestPyLoopsThatOnlyLookConstantStillScale",
+		"TestRustConstantLoopsAddNoScalingDepth",
+		"TestRustLoopsThatOnlyLookConstantStillScale",
+		"TestJavaEnumAndNamedBoundLoopsAddNoScalingDepth",
+		"TestJavaLoopsThatOnlyLookConstantStillScale",
+	},
+	299: { // calls_on_loop_element(_arg) and loops_over_param(_index) in TypeScript and Python
+		"TestTsCrossCallFacts",
+		"TestTsCrossCallThroughTheReceiver",
+		"TestPyCrossCallFacts",
+	},
+	298: { // calls_in_scaling_loop_depth: the scaling nesting each in-loop call sits in, parallel to calls_in_scaling_loop
+		"TestGoCallDepthIsTheNestingAroundTheCall",
+		"TestTsCallDepthIsTheNestingAroundTheCall",
+		"TestPyCallDepthIsTheNestingAroundTheCall",
+		"TestPHPCallDepthIsTheNestingAroundTheCall",
+		"TestKtCallDepthIsTheNestingAroundTheCall",
+		"TestJavaCallDepthIsTheNestingAroundTheCall",
+		"TestRustCallDepthIsTheNestingAroundTheCall",
+		"TestCSharpCallDepthIsTheNestingAroundTheCall",
+		"TestCppCallDepthIsTheNestingAroundTheCall",
+	},
+	297: { // a loop's operand/collection is evaluated once and walked outside the loop (Go, TS, PHP, Python, Java, Kotlin, Rust); Java computeIfAbsent is not a loop
+		"TestRangeOperandIsNotCalledPerIteration",
+		"TestTsLoopHeaderIsNotPerIteration",
+		"TestPHPForeachCollectionIsNotPerIteration",
+		"TestPyForIterableIsNotPerIteration",
+		"TestJavaForEachCollectionIsNotPerIteration",
+		"TestJavaComputeIfAbsentIsNotALoop",
+		"TestKtForCollectionIsNotPerIteration",
+		"TestRustForIterableIsNotPerIteration",
+	},
+	296: { // hierarchical loops (inner collection reached through the outer element) add no scaling depth in TS, PHP, Python, Kotlin, Rust, Java, C#; independent loops still multiply
+		"TestTsHierarchicalLoopAddsNoScalingDepth",
+		"TestTsIndependentLoopsStillMultiply",
+		"TestTsHierarchyNeedsAnAmortizingOuterLoop",
+		"TestTsHierarchicalLoopStillRepeats",
+		"TestPHPHierarchicalLoopAddsNoScalingDepth",
+		"TestPHPIndependentLoopsStillMultiply",
+		"TestPHPHierarchicalLoopStillRepeats",
+		"TestPyHierarchicalLoopAddsNoScalingDepth",
+		"TestPyIndependentLoopsStillMultiply",
+		"TestPyHierarchicalLoopStillRepeats",
+		"TestKtHierarchicalLoopAddsNoScalingDepth",
+		"TestKtIndependentLoopsStillMultiply",
+		"TestKtHierarchicalLoopStillRepeats",
+		"TestRustHierarchicalLoopAddsNoScalingDepth",
+		"TestRustIndependentLoopsStillMultiply",
+		"TestJavaHierarchicalLoopAddsNoScalingDepth",
+		"TestJavaIndependentLoopsStillMultiply",
+		"TestCSharpHierarchicalLoopAddsNoScalingDepth",
+		"TestCSharpIndependentLoopsStillMultiply",
+	},
+	295: { // recursive_self needs a call form that can reach the enclosing function: Rust bare/value names, Kotlin foreign named arguments, PHP parent:: and other receivers, C# base., Python bare names in methods
+		"TestRustRecursion_SameNameIsNotSelfCall",
+		"TestRustRecursion_RealSelfCallsStillFlagged",
+		"TestKtRecursion_ForeignNamedArgumentIsNotSelfCall",
+		"TestKtRecursion_OwnNamedArgumentStillFlagged",
+		"TestPHPRecursion_SameNameIsNotSelfCall",
+		"TestPHPRecursion_RealSelfCallsStillFlagged",
+		"TestCSharpRecursion_BaseCallIsNotSelfCall",
+		"TestPyRecursion_BareCallInMethodIsNotSelfCall",
+		"TestPyRecursion_RealSelfCallsStillFlagged",
+	},
+	294: { // C/C++: definitions that parse-error recovery nested in another function's body, or left under an ERROR node, are extracted
+		"TestDefinitionsSwallowedByAnUnclosedFunctionAreExtracted",
+		"TestDefinitionsUnderAnErrorNodeAreExtracted",
+		"TestLocalClassMethodsStayWithTheirFunction",
+		"TestMisreadStatementIsNotExtractedAsADefinition",
+		"TestStackedLoopMacrosStayPartOfTheirFunction",
+		"TestLoopMacroBlockStaysPartOfItsFunction",
+		"TestAttributeMacroOnALocalIsNotADefinition",
+		"TestSwallowedKAndRDefinitionIsExtracted",
+	},
+	293: { // Go: struct field edges name the declared types inside composite field types and nothing else; a bare call through a local func value is not a package call
+		"TestStructFieldEdgesReachTypesInsideCompositeTypes",
+		"TestStructFieldEdgesNameOnlyDeclaredTypes",
+		"TestBareCallThroughLocalFuncValueIsNotAPackageCall",
+	},
+	292: { // C/C++: duplicated type names resolve per referencing fact; namespaced types and members resolve by simple name; reference receivers are typed
+		"TestReceiverCallBindsToTheCopyTheCallerIncludes",
+		"TestReceiverCallStaysUnboundWhenNoCopyIsVisible",
+		"TestReceiverCallPrefersTheCallersOwnDirectory",
+		"TestReceiverCallBindsToTheOnlyCopyDeclaringTheMethod",
+		"TestBaseClassBindsToTheCopyTheCallerIncludes",
+		"TestConstructorBindsToTheCopyTheCallerIncludes",
+		"TestScopedCallBindsToTheCopyTheCallerIncludes",
+		"TestDuplicatedTypeWithNoVisibleCopyIsNotGuessed",
+		"TestNamespacedMemberResolvesInsideTheChosenDirectory",
+		"TestBaseClassInsideNamespaceResolvesByItsSimpleName",
+		"TestReferenceParameterAndLocalReceiverCalls",
+		"TestFileScopeMacroReferenceStaysInItsOwnDirectory",
+	},
+	291: {
+		"TestAST_CfgTestMod_LocalFunctionsStayTestOnly",
+		"TestAST_InstrumentAttributeRecordsCalls",
+		"TestAST_RustRuntimeEntrypointsAreFrameworkRegistered",
+		"TestAST_FunctionInsideConstCarriesCompileTimeContext",
+		"TestConfidenceTier_CompileTimeFunction",
+		"TestAST_CodexRuntimeRegistrationPatterns",
+		"TestAST_CallbackMethodKeepsWildcardImportedFunctionReachable",
+		"TestAST_RuntimeEntrypointsUseStructuralAttributePaths",
+	}, // Rust dead-code precision: test/compile-time contexts, callback values, FFI and macro registrations, and structural attributes
+	290: {"TestCallThroughATypeAliasLandsOnTheAliasedType"},                                                                                                                                                                                                                                                                                                  // Go: a type alias resolves to the type it names
+	289: {"TestCallOnATypedParameterResolvesToItsMethod", "TestChainedCallResolvesThroughTheDeclaredResult", "TestLocalAssignedFromACallTakesItsDeclaredResult", "TestRedeclaredParameterIsNotResolved", "TestNoTypeIsInventedWhereNoneIsDeclared"},                                                                                                          // Go: a method call resolves through the declared type of a parameter, a call's result or a type assertion
+	288: {"TestAST_ParameterDefaultFunctionValueEmitsEdge", "TestAST_MainGuardTupleAssignedCallbacksEmitFileRefs", "TestCppFileScopeStaticAssertReferencesConstexprFunction", "TestCppNonTypeTemplateDefaultReferencesFunction"},                                                                                                                             // Python/C++: function-valued defaults and file-scope references keep live functions reachable
+	287: {"TestPythonHTTPClientCalls", "TestGolden"},                                                                                                                                                                                                                                                                                                         // Python: requests/httpx/aiohttp calls are client routes with a caller
+	286: {"TestObjectMemberSymbols", "TestClientCallers_NameTheEnclosingSymbol", "TestConfidence_ObjectMemberIsLow", "TestGolden"},                                                                                                                                                                                                                           // TypeScript: object-literal functions are symbols; x.member() resolves through them
+	285: {"TestHandlerTarget", "TestBind_ExactlyNamedHandlers", "TestGolden"},                                                                                                                                                                                                                                                                                // Go: package-function route handlers carry handler_target and bind exactly
+	284: {"TestJavaClientCalls_NameTheirCaller", "TestDartClientCalls_NameTheirCaller", "TestAttributeSpans_NarrowestSpanWins", "TestGolden"},                                                                                                                                                                                                                // Java and Dart client call sites name their caller
+	283: {"TestAngularRequestNamesItsCallingMethod", "TestGolden"},                                                                                                                                                                                                                                                                                           // TypeScript: Angular HttpClient requests name their calling method
+	282: {"TestFieldTypeCalls_ResolveThroughTheStatedType", "TestGolden"},                                                                                                                                                                                                                                                                                    // TypeScript: this.field.method() resolves through the field's stated type
+	281: {"TestImportedPackageCallsArePackageQualified", "TestFileIndex_ResolvesInternalSpecifiersOnly", "TestGolden"},                                                                                                                                                                                                                                       // TypeScript: calls to package-imported names are package-qualified; alias and baseUrl imports resolve to their file
+	280: {"TestRetrofitRoutes_CallerIsTheInterfaceMethod", "TestURLSessionRoutes_CallerIsTheEnclosingMethod", "TestClientCallers_NameTheEnclosingSymbol", "TestGolden"},                                                                                                                                                                                      // Kotlin and Swift client call sites name their caller through the shared callsite pass
+	279: {"TestClientCallers_NameTheEnclosingSymbol", "TestGolden"},                                                                                                                                                                                                                                                                                          // TypeScript: a hand-written client call site names its enclosing symbol as caller
+	278: {"TestRouteHandlers_FactoryNestedHandlerIsASymbol", "TestGolden"},                                                                                                                                                                                                                                                                                   // Python: a route handler nested in a router factory is a symbol the route names with handled_by
+	277: {"TestDecoratorRoutes_HandledByTheDecoratedMethod", "TestSpring_RoutesHandledByTheMappedMethod", "TestRouteHandlers_HandledByDeclaredSymbols", "TestSymfonyRoutes_HandledByTheAttributedMethod", "TestGolden"},                                                                                                                                      // decorator/annotation server routes name their handler method with handled_by (NestJS, Spring, Python, Symfony)
+	276: {"TestCaptureCheckingSyntax", "TestGrammarSmoke", "TestWalkerNodeKindsStillExist", "TestGolden"},                                                                                                                                                                                                                                                    // Scala: the grammar is vendored at tree-sitter-scala v0.26.2 (ABI 14), which reads capture-checking syntax that v0.24.1 recovered from by dropping and mis-nesting symbols
+	275: {"TestRouteForms_RelativeSubmoduleMount", "TestRouteForms_ComputedMountPrefixes", "TestRouteForms_LocalPrefixIsNotAConstant", "TestRouteForms_FactoryAliasInPackage", "TestRouteForms_APIRouterSubclass", "TestRouteForms_EmptyPathIsRoot"},                                                                                                         // Python: relative submodule imports and `..` resolve; computed mount/constructor prefixes resolve through the constant table
+	274: {"TestRouteForms_APIRouteAndWebsocket", "TestRouteForms_AddAPIRouteCalls", "TestRouteForms_AddRouteNeedsAPath", "TestRouteForms_GuardedDefinitions", "TestRouteForms_ConstantPaths", "TestRouteForms_LocalNameIsNotAConstant", "TestRouteForms_ConstantPathComposesWithMount", "TestRouteForms_NonPathConstantIsDropped", "TestPyPackageExemption"}, // Python: api_route, websocket, add_api_route, guarded defs and constant paths become routes; a Python package named build/tmp/dist is not ignored
+	273: {"TestExtract_CallsOnLoopElement", "TestExtract_LoopsOverParam", "TestExtract_ScalingDepth_ForWithoutCondition", "TestAnalyze_ContinuedWalkDoesNotCompound", "TestLabelCorpus_ShapeAndCounts"},                                                                                                                                                      // Go: a call handed the caller's loop element, and a callee that loops over what it was passed, together mark a continued walk whose depth must not compound
+	272: {"TestExtract_ScalingDepth_ConstBoundedLoop", "TestExtract_ScalingDepth_SharedCursorLoop", "TestExtract_ScalingDepth_LocalLiteralCollection", "TestExtract_ScalingDepth_HierarchicalIsLinear", "TestExtract_ScalingDepth_AllPairsIsQuadratic", "TestScalingDepthCorpus", "TestScalingDepthCorpus_ControlsHoldDepth"},                                // Go: constant trip counts, shared cursors and per-iteration literal collections stop counting toward scaling_loop_depth; the hierarchical discount now applies only under a loop that scales
+	271: {"TestPackageLevelDispatchTableReferencesItsFuncs", "TestPackageLevelInitializerCallIsAReference", "TestFuncValueInBodyIsReferenced", "TestStructLiteralKeyIsNotAReference", "TestShadowedNameDoesNotBecomeAReference"},                                                                                                                             // Go: a function used as a value, and package-level initializers, are references
+	270: {"TestStaticSvelteKitAliases_LiteralsOnly", "TestSvelteKitAliasFallbacks_TsconfigWins", "TestExtract_SvelteKitVirtualDependencyIsFrameworkProvided"},
+	269: {"TestParseTSConfigAliases_FollowsExtendsAndRebasesDeclaringFile", "TestParseTSConfigAliases_ChildPathsReplaceParent", "TestParseTSConfigAliases_ExtendsCycleFailsClosed"},
+	268: {"TestPackageFuncShadowsBuiltin"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        // Go: a package's own func shadows the predeclared identifier of that name
+	267: {"TestConfiguredClient_AccountsPerSpec"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 // TypeScript: one account per declared client per repository, including clients that found nothing
+	266: {"TestConfiguredClient_FoldsFieldAndLocalConst", "TestConfiguredClient_UnconfiguredTypeIsIgnored", "TestClientSpecs_EditingOnlyTheConfigReExtracts"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     // TypeScript: requests through a declared in-house client become client routes, and editing the declared clients re-extracts
 	265: {"TestManifests_YarnLockResolvesAliasAndProtocolRanges"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 // npm: a yarn.lock descriptor whose range carries its own @ (an npm alias, a git+ssh URL) resolves, so a lockfile-pinned dependency is no longer reported unpinned
 	264: {"TestResolveImports_StdlibListIsComplete"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              // Python: the stdlib set is complete against sys.stdlib_module_names, so a stdlib import is never reported as a third-party dependency
 	263: {"TestExtract_DeferredImportProp", "TestExtract_MethodLocalImportEmittedOnce"},                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           // Python: imports that do not run at module-import time (function/class-body, TYPE_CHECKING) are marked deferred; module-level try/if imports are not

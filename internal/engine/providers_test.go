@@ -12,6 +12,7 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/goextractor"
 	"github.com/enola-labs/enola/internal/facts"
 	"github.com/enola-labs/enola/internal/providers"
+	"github.com/enola-labs/enola/internal/providerspec"
 )
 
 // writeFakeProvider writes an executable script honoring the provider
@@ -32,7 +33,7 @@ func writeFakeProvider(t *testing.T, jsonl string) string {
 	return path
 }
 
-func providerSnapshot(t *testing.T, repo string, provs []providers.Provider) *facts.Snapshot {
+func providerSnapshot(t *testing.T, repo string, provs []providerspec.Spec) *facts.Snapshot {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Providers = provs
@@ -52,7 +53,7 @@ func TestProviders_FactsMergeLabeledAndCensusRecorded(t *testing.T) {
 	repo := writeGoRepo(t)
 	script := writeFakeProvider(t,
 		`{"kind":"dependency","name":"prov-call: m.M -> m.N","file":"m.go","props":{"resolution_level":"name-only"},"relations":[{"kind":"calls","target":"m.N"}]}`)
-	snap := providerSnapshot(t, repo, []providers.Provider{{Name: "fake", Command: []string{script}}})
+	snap := providerSnapshot(t, repo, []providerspec.Spec{{Name: "fake", Command: []string{script}}})
 
 	var got *facts.Fact
 	for i, f := range snap.Facts {
@@ -82,7 +83,7 @@ func TestProviders_FactsMergeLabeledAndCensusRecorded(t *testing.T) {
 
 func TestProviders_MissingCommandIsACensusSkipNeverAnError(t *testing.T) {
 	repo := writeGoRepo(t)
-	snap := providerSnapshot(t, repo, []providers.Provider{
+	snap := providerSnapshot(t, repo, []providerspec.Spec{
 		{Name: "ghost", Command: []string{"/no/such/enola-provider"}}})
 	if len(snap.Meta.Providers) != 1 || !snap.Meta.Providers[0].Skipped ||
 		!strings.Contains(snap.Meta.Providers[0].Reason, "not found") {
@@ -100,7 +101,7 @@ func TestProviders_SnapshotIsDeterministic(t *testing.T) {
 	script := writeFakeProvider(t,
 		`{"kind":"symbol","name":"zz-last","file":"m.go","props":{"resolution_level":"name-only"}}`+"\n"+
 			`{"kind":"dependency","name":"prov-call: m.M -> m.N","file":"m.go","props":{"resolution_level":"name-only"},"relations":[{"kind":"calls","target":"m.N"}]}`)
-	provs := []providers.Provider{{Name: "fake", Command: []string{script}}}
+	provs := []providerspec.Spec{{Name: "fake", Command: []string{script}}}
 	first := providerSnapshot(t, repo, provs)
 	second := providerSnapshot(t, repo, provs)
 	if first.Meta.SnapshotID != second.Meta.SnapshotID {
@@ -131,7 +132,7 @@ func GetOrders(w http.ResponseWriter, r *http.Request) {}
 `)
 	script := writeFakeProvider(t,
 		`{"kind":"route","name":"runtime-route: GET /api/users","file":".enola-runtime/boot.json","props":{"resolution_level":"runtime-observed","observed_via":"rails-boot","method":"GET","path":"/api/users"}}`)
-	snap := providerSnapshot(t, repo, []providers.Provider{{Name: "runtime", Command: []string{script}}})
+	snap := providerSnapshot(t, repo, []providerspec.Spec{{Name: "runtime", Command: []string{script}}})
 
 	byName := map[string]facts.Fact{}
 	for _, f := range snap.Facts {
@@ -161,7 +162,7 @@ func TestProviders_DeclaredContractStampsTheExtractedSymbol(t *testing.T) {
 	repo := writeGoRepo(t)
 	script := writeFakeProvider(t,
 		`{"kind":"symbol","name":"rbs-signature: ..M","file":"sig/m.rbs","props":{"resolution_level":"declared","declared_in":"sig/m.rbs","receiver":".","method":"M","singleton":true,"signature":"() -> void"},"relations":[{"kind":"has_method","target":"..M"}]}`)
-	snap := providerSnapshot(t, repo, []providers.Provider{{Name: "rbs", Command: []string{script}}})
+	snap := providerSnapshot(t, repo, []providerspec.Spec{{Name: "rbs", Command: []string{script}}})
 
 	byName := map[string]facts.Fact{}
 	for _, f := range snap.Facts {
@@ -193,7 +194,7 @@ func TestProviders_ExtractorIdentityWinsCollisions(t *testing.T) {
 	// claiming the same name+kind must be skipped, never overwrite it.
 	script := writeFakeProvider(t,
 		`{"kind":"symbol","name":"..M","file":"m.go","props":{"resolution_level":"name-only","forged":true}}`)
-	snap := providerSnapshot(t, repo, []providers.Provider{{Name: "fake", Command: []string{script}}})
+	snap := providerSnapshot(t, repo, []providerspec.Spec{{Name: "fake", Command: []string{script}}})
 	for _, f := range snap.Facts {
 		if f.Name == "..M" && f.Props["forged"] == true {
 			t.Fatal("a provider fact overwrote an extractor identity")
